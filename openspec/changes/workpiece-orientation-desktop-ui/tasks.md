@@ -8,7 +8,7 @@
 
 ## 2. Qt 5.14.2 应用
 
-- [ ] 2.1 创建 qmake Qt Widgets 工程、包含 TCP 主机/端口的 `app_config.json.example`、主窗口布局及后端状态显示。
+- [x] 2.1 创建 qmake Qt Widgets 工程、包含 TCP 主机/端口的 `app_config.json.example`、主窗口布局及后端状态显示。
 - [ ] 2.2 实现 `BackendClient` 的 QTcpSocket 连接、握手、UTF-8 JSON 行缓冲、请求关联、忙状态和断线处理。
 - [ ] 2.3 实现 `BackendProcessManager` 的已有服务发现、QProcess 按需启动、服务所有权、120 秒启动超时、显式重启和所有权关闭。
 - [ ] 2.4 实现工件列表刷新、名称输入、正反面各 5 张模板选择、同名覆盖确认和建库请求。

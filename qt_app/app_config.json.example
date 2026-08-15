@@ -1,0 +1,11 @@
+{
+  "python_executable": "E:/python/anaconda3/envs/shitu/python.exe",
+  "backend_script": "E:/Project/wang/pp_813/src/orientation_tcp_service.py",
+  "project_root": "E:/Project/wang/pp_813",
+  "model_dir": "E:/Project/wang/pp_813/third_party/models/shiru_rec/general_PPLCNetV2_base_pretrained_v1.0_infer",
+  "library_dir": "E:/Project/wang/pp_813/runtime_library",
+  "host": "127.0.0.1",
+  "port": 37651,
+  "startup_timeout_ms": 120000,
+  "request_timeout_ms": 120000
+}

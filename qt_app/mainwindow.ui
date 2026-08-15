@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="windowTitle">
+   <string>工件正反面检测</string>
+  </property>
+  <property name="minimumSize">
+   <size><width>1100</width><height>720</height></size>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <item>
+     <layout class="QHBoxLayout" name="backendLayout">
+      <item><widget class="QLabel" name="backendStatusLabel"><property name="text"><string>后端：未连接</string></property></widget></item>
+      <item><spacer name="backendSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+      <item><widget class="QPushButton" name="restartBackendButton"><property name="text"><string>重启后端</string></property></widget></item>
+     </layout>
+    </item>
+    <item>
+     <widget class="QGroupBox" name="libraryGroupBox">
+      <property name="title"><string>工件模板库</string></property>
+      <layout class="QGridLayout" name="libraryLayout">
+       <item row="0" column="0"><widget class="QLabel" name="workpieceLabel"><property name="text"><string>工件：</string></property></widget></item>
+       <item row="0" column="1"><widget class="QComboBox" name="workpieceComboBox"/></item>
+       <item row="0" column="2"><widget class="QPushButton" name="refreshWorkpiecesButton"><property name="text"><string>刷新列表</string></property></widget></item>
+       <item row="1" column="0"><widget class="QLabel" name="nameLabel"><property name="text"><string>新工件名称：</string></property></widget></item>
+       <item row="1" column="1" colspan="2"><widget class="QLineEdit" name="workpieceNameEdit"/></item>
+       <item row="2" column="0"><widget class="QLabel" name="frontTemplatesLabel"><property name="text"><string>正面模板：未选择（0/5）</string></property></widget></item>
+       <item row="2" column="1"><widget class="QPushButton" name="chooseFrontTemplatesButton"><property name="text"><string>选择正面 5 张</string></property></widget></item>
+       <item row="2" column="2"><widget class="QLabel" name="frontTemplatesFilesLabel"><property name="text"><string/></property></widget></item>
+       <item row="3" column="0"><widget class="QLabel" name="backTemplatesLabel"><property name="text"><string>反面模板：未选择（0/5）</string></property></widget></item>
+       <item row="3" column="1"><widget class="QPushButton" name="chooseBackTemplatesButton"><property name="text"><string>选择反面 5 张</string></property></widget></item>
+       <item row="3" column="2"><widget class="QLabel" name="backTemplatesFilesLabel"><property name="text"><string/></property></widget></item>
+       <item row="4" column="1" colspan="2"><widget class="QPushButton" name="registerButton"><property name="text"><string>建立工件库</string></property></widget></item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="inspectionLayout">
+      <item>
+       <widget class="QGroupBox" name="imageGroupBox">
+        <property name="title"><string>待测图片</string></property>
+        <layout class="QVBoxLayout" name="imageLayout">
+         <item><widget class="QLabel" name="imagePreviewLabel"><property name="minimumSize"><size><width>480</width><height>360</height></size></property><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string>请选择待测图片</string></property></widget></item>
+         <item><widget class="QPushButton" name="chooseImageButton"><property name="text"><string>选择待测图片</string></property></widget></item>
+         <item><widget class="QPushButton" name="predictButton"><property name="text"><string>开始检测</string></property></widget></item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="resultGroupBox">
+        <property name="title"><string>检测结果</string></property>
+        <layout class="QVBoxLayout" name="resultLayout">
+         <item><widget class="QLabel" name="resultLabel"><property name="text"><string>尚未检测</string></property></widget></item>
+         <item><widget class="QLabel" name="reviewLabel"><property name="styleSheet"><string notr="true">color: #b00020; font-weight: bold;</string></property></widget></item>
+         <item><widget class="QTextEdit" name="evidenceTextEdit"><property name="readOnly"><bool>true</bool></property></widget></item>
+        </layout>
+       </widget>
+      </item>
+     </layout>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
