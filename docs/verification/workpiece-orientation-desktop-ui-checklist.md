@@ -16,11 +16,12 @@
 
 ## 自动化验收
 
-- Python 非集成测试：`45 passed, 3 deselected`。
+- Python 非集成测试：`47 passed, 3 deselected`。
 - Qt AppConfig：5/5。
 - Qt BackendClient：8/8。
 - Qt BackendProcessManager：7/7。
 - Qt MainWindow：7/7。
+- 真实服务集成：M1、M2、M7 各 `1 passed`（固定 seed=20260813，中文路径建库/预测）。
 - `openspec validate workpiece-orientation-desktop-ui --strict` 通过。
 
 真实模型闭环需要显式执行：
