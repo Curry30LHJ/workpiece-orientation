@@ -10,7 +10,7 @@
 
 - [x] 2.1 创建 qmake Qt Widgets 工程、包含 TCP 主机/端口的 `app_config.json.example`、主窗口布局及后端状态显示。
 - [x] 2.2 实现 `BackendClient` 的 QTcpSocket 连接、握手、UTF-8 JSON 行缓冲、请求关联、忙状态和断线处理。
-- [ ] 2.3 实现 `BackendProcessManager` 的已有服务发现、QProcess 按需启动、服务所有权、120 秒启动超时、显式重启和所有权关闭。
+- [x] 2.3 实现 `BackendProcessManager` 的已有服务发现、QProcess 按需启动、服务所有权、120 秒启动超时、显式重启和所有权关闭。
 - [ ] 2.4 实现工件列表刷新、名称输入、正反面各 5 张模板选择、同名覆盖确认和建库请求。
 - [ ] 2.5 实现待测图片选择、原图预览、检测请求，以及标签、原始证据、决策来源、耗时和复检提示展示。
 - [ ] 2.6 使用假 TCP 服务和 Qt Test 覆盖半行/多行 JSON、请求标识不匹配、服务复用、按需启动、`SERVER_BUSY`、断线、配置错误和按钮状态。
