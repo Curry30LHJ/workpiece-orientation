@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 
 import cv2
 import numpy as np
@@ -50,6 +51,27 @@ def test_register_creates_uuid_manifest_and_fixed_label_folders(tmp_path: Path):
     assert manifest["labels"] == {"0": "front", "1": "back"}
     assert len(list((record.root / "0").glob("*"))) == 5
     assert len(list((record.root / "1").glob("*"))) == 5
+
+
+def test_register_accepts_unicode_source_paths(tmp_path: Path):
+    source_front = image_set(tmp_path, "front", 10)
+    source_back = image_set(tmp_path, "back", 20)
+    unicode_root = tmp_path / "中文工件" / "待建库"
+    unicode_root.mkdir(parents=True)
+    front = []
+    back = []
+    for index, source in enumerate(source_front):
+        target = unicode_root / f"正面-{index}.png"
+        shutil.copy2(source, target)
+        front.append(target)
+    for index, source in enumerate(source_back):
+        target = unicode_root / f"反面-{index}.png"
+        shutil.copy2(source, target)
+        back.append(target)
+
+    record, _ = WorkpieceLibrary(tmp_path / "库").register("M7", front, back, False, fake_builder)
+
+    assert record.name == "M7"
 
 
 def test_register_rejects_existing_name_without_replace(tmp_path: Path):

@@ -7,9 +7,9 @@ from pathlib import Path
 import time
 from typing import Any, Callable, Sequence
 
-import cv2
 import numpy as np
 
+from src.image_io import read_color_image
 from src.shitu_baseline import classify_embedding
 
 
@@ -77,7 +77,7 @@ def _to_cpu(value: Any) -> Any:
 
 
 def _read_image(path: Path) -> np.ndarray:
-    image = cv2.imread(str(path))
+    image = read_color_image(path)
     if image is None:
         raise ImageUnreadableError(f"Unable to read image: {path}")
     return image
@@ -127,9 +127,11 @@ class OrientationClassifier:
     @classmethod
     def load(cls, project_root: Path, model_dir: Path) -> "OrientationClassifier":
         """Load the production Paddle and Torch models lazily at service startup."""
+        # On Windows, Paddle and PyTorch can expose incompatible DLLs when Paddle
+        # is imported first. Load the Torch/ALIKED stack before PaddleClas.
+        from src.aliked_lightglue_matcher import build_models
         from paddleclas.deploy.python.predict_rec import RecPredictor
         from paddleclas.deploy.utils import config as paddle_config
-        from src.aliked_lightglue_matcher import build_models
 
         config_path = project_root / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml"
         config = paddle_config.get_config(str(config_path), show=False)

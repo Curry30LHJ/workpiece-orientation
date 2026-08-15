@@ -13,8 +13,7 @@ import tempfile
 import uuid
 from typing import Callable, Sequence
 
-import cv2
-
+from src.image_io import read_color_image
 from src.orientation_classifier import TemplateCache
 
 
@@ -81,7 +80,7 @@ def _validate_images(paths: Sequence[Path], label: str) -> tuple[Path, ...]:
         seen.add(key)
         if path.suffix.lower() not in IMAGE_EXTENSIONS or not path.is_file():
             raise InvalidTemplateSetError(f"Invalid {label} image: {path}")
-        if cv2.imread(str(path)) is None:
+        if read_color_image(path) is None:
             raise InvalidTemplateSetError(f"Unreadable {label} image: {path}")
         resolved.append(path.resolve())
     return tuple(resolved)

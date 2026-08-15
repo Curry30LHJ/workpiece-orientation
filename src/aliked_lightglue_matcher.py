@@ -4,6 +4,16 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import os
+from pathlib import Path
+import sys
+
+if os.name == "nt":
+    _torch_lib = Path(sys.prefix) / "Lib" / "site-packages" / "torch" / "lib"
+    if _torch_lib.is_dir():
+        os.add_dll_directory(str(_torch_lib))
+        os.environ["PATH"] = str(_torch_lib) + os.pathsep + os.environ.get("PATH", "")
+
 import torch
 from lightglue import ALIKED, LightGlue
 from lightglue.utils import numpy_image_to_torch

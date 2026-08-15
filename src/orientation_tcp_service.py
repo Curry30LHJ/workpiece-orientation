@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 import socket
+import sys
 import threading
 from typing import Any, Mapping
 
@@ -29,6 +31,17 @@ LOGGER = logging.getLogger(__name__)
 PROTOCOL_VERSION = 1
 SERVICE_NAME = "workpiece-orientation"
 MAX_MESSAGE_BYTES = 1024 * 1024
+
+
+def _prepare_windows_torch_dll_path() -> None:
+    """Make the bundled PyTorch CUDA DLLs discoverable before importing torch."""
+    if os.name != "nt":
+        return
+    torch_lib = Path(sys.prefix) / "Lib" / "site-packages" / "torch" / "lib"
+    if not torch_lib.is_dir():
+        return
+    os.add_dll_directory(str(torch_lib))
+    os.environ["PATH"] = str(torch_lib) + os.pathsep + os.environ.get("PATH", "")
 
 
 class ServiceStartupError(RuntimeError):
@@ -317,6 +330,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.host != "127.0.0.1":
         raise SystemExit("INVALID_BIND_ADDRESS: only 127.0.0.1 is allowed")
+    _prepare_windows_torch_dll_path()
     classifier = OrientationClassifier.load(args.project_root, args.model_dir)
     library = WorkpieceLibrary(args.library_dir)
     for record, cache in library.recover(classifier.build_template_cache):

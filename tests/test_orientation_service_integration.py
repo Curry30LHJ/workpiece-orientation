@@ -12,6 +12,8 @@ import uuid
 
 import pytest
 
+from src.shitu_baseline import split_labels
+
 
 pytestmark = pytest.mark.integration
 
@@ -40,12 +42,10 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _copy_images(source: Path, target: Path) -> list[str]:
+def _copy_images(source_paths: list[Path], target: Path) -> list[str]:
     target.mkdir(parents=True, exist_ok=True)
-    paths = sorted(source.iterdir())
-    assert len(paths) >= 6, f"{source} must contain at least six images"
     copied = []
-    for index, source_path in enumerate(paths[:6]):
+    for index, source_path in enumerate(source_paths):
         destination = target / f"样本-{index}{source_path.suffix.lower()}"
         shutil.copy2(source_path, destination)
         copied.append(str(destination))
@@ -127,8 +127,11 @@ def running_service(integration_settings, tmp_path: Path):
 def test_service_label_matches_dataset_orientation(dataset_name: str, running_service, integration_settings):
     client, tmp_path = running_service
     dataset_dir = Path(integration_settings["root"]) / "data" / dataset_name
-    front = _copy_images(dataset_dir / "0", tmp_path / dataset_name / "正面")
-    back = _copy_images(dataset_dir / "1", tmp_path / dataset_name / "反面")
+    templates, held_out = split_labels(dataset_dir, template_count=5, seed=20260813)
+    front = _copy_images(templates["0"], tmp_path / dataset_name / "正面")
+    back = _copy_images(templates["1"], tmp_path / dataset_name / "反面")
+    front_query = _copy_images([held_out["0"][0]], tmp_path / dataset_name / "待测正面")[0]
+    back_query = _copy_images([held_out["1"][0]], tmp_path / dataset_name / "待测反面")[0]
     response = client.request(
         "register",
         name=dataset_name,
@@ -140,8 +143,8 @@ def test_service_label_matches_dataset_orientation(dataset_name: str, running_se
     workpiece_id = response["workpiece"]["id"]
     assert client.request("list_workpieces")["ok"] is True
 
-    front_prediction = client.request("predict", workpiece_id=workpiece_id, image_path=front[5])
-    back_prediction = client.request("predict", workpiece_id=workpiece_id, image_path=back[5])
+    front_prediction = client.request("predict", workpiece_id=workpiece_id, image_path=front_query)
+    back_prediction = client.request("predict", workpiece_id=workpiece_id, image_path=back_query)
     assert front_prediction["ok"] is True, front_prediction
     assert back_prediction["ok"] is True, back_prediction
     assert front_prediction["label"] == "front"
