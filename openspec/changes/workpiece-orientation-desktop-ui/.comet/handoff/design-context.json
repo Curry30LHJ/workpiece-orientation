@@ -1,0 +1,15 @@
+{
+  "change": "workpiece-orientation-desktop-ui",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "6936d7e562bde4ac9168c51c46fd2ae13028fae91ec4e2a705e9608db9b140ff",
+  "files": [
+    { "path": "openspec/changes/workpiece-orientation-desktop-ui/proposal.md", "sha256": "7b099fc06e0012a7576900a7f99c888f5a55bdf02eea35ba0431925a16aaac08" },
+    { "path": "openspec/changes/workpiece-orientation-desktop-ui/design.md", "sha256": "4678b8a1587837d11b91aec02d8fc7d3e45e3470a42463cbf98eb1ebf76aff76" },
+    { "path": "openspec/changes/workpiece-orientation-desktop-ui/tasks.md", "sha256": "c989575614355b2877bf1b043c3b4540835396268a396e82779efdee4cd837f9" },
+    { "path": "openspec/changes/workpiece-orientation-desktop-ui/specs/desktop-orientation-inspection/spec.md", "sha256": "59a2c0c25a73a87b50de43f651c56aebce1162b4867a00098438746d03720ebc" },
+    { "path": "openspec/changes/workpiece-orientation-desktop-ui/specs/python-inference-bridge/spec.md", "sha256": "a4a595ebd7a9d1ff058b44ab711684d6a2f432f17cb18ba28ad5254b8db54897" }
+  ]
+}

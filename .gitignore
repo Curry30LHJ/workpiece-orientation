@@ -1,0 +1,45 @@
+# Local datasets, generated reports, and downloaded dependencies
+data/
+reports/
+gallery/
+third_party/
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Model and feature cache artifacts
+*.pdmodel
+*.pdiparams
+*.pdiparams.info
+*.pth
+*.pt
+*.onnx
+*.npy
+*.npz
+
+# Qt/qmake build outputs
+build*/
+debug/
+release/
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+*.user
+.qmake.stash
+Makefile
+Makefile.Debug
+Makefile.Release
+
+# IDE and OS files
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
