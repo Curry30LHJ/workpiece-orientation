@@ -21,10 +21,21 @@ $probe = @'
 import json
 import socket
 import sys
+import time
 
 host = sys.argv[1]
 port = int(sys.argv[2])
-with socket.create_connection((host, port), timeout=15) as sock:
+deadline = time.monotonic() + 120
+sock = None
+while time.monotonic() < deadline:
+    try:
+        sock = socket.create_connection((host, port), timeout=2)
+        break
+    except OSError:
+        time.sleep(0.25)
+if sock is None:
+    raise SystemExit("orientation service did not become ready within 120 seconds")
+with sock:
     stream = sock.makefile("rwb")
     for request_id, command in (("smoke-hello", "hello"), ("smoke-list", "list_workpieces"), ("smoke-shutdown", "shutdown")):
         request = {"version": 1, "request_id": request_id, "command": command}
