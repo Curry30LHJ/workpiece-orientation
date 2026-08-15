@@ -1,11 +1,27 @@
 #include <QApplication>
+#include <QCoreApplication>
 
+#include "appconfig.h"
+#include "backendclient.h"
+#include "backendprocessmanager.h"
 #include "mainwindow.h"
 
 int main(int argc, char *argv[]) {
     QApplication application(argc, argv);
     application.setApplicationName(QStringLiteral("工件正反面检测"));
-    MainWindow window;
+    const QString configPath = QCoreApplication::applicationDirPath() + QStringLiteral("/app_config.json");
+    QString configError;
+    const std::optional<AppConfig> config = AppConfig::load(configPath, &configError);
+    if (!config.has_value()) {
+        MainWindow window;
+        window.setBackendError(configError);
+        window.show();
+        return application.exec();
+    }
+    BackendClient client;
+    BackendProcessManager manager(*config, &client, nullptr, &application);
+    MainWindow window(&client, &manager);
+    manager.start();
     window.show();
     return application.exec();
 }
