@@ -1,17 +1,17 @@
-"""Transactional persistent library for five front and five back templates."""
+"""Transactional persistent library for variable-sized template sets."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 from pathlib import Path
 import os
 import shutil
-import tempfile
 import uuid
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from src.image_io import read_color_image
 from src.orientation_classifier import TemplateCache
@@ -19,7 +19,6 @@ from src.orientation_classifier import TemplateCache
 
 LOGGER = logging.getLogger(__name__)
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png"}
-TEMPLATE_COUNT = 5
 
 
 class WorkpieceLibraryError(RuntimeError):
@@ -31,7 +30,7 @@ class InvalidWorkpieceNameError(WorkpieceLibraryError):
 
 
 class InvalidTemplateSetError(WorkpieceLibraryError):
-    """Raised when a front/back template set is not exactly five valid images."""
+    """Raised when a front/back template set is empty or contains invalid images."""
 
 
 class WorkpieceExistsError(WorkpieceLibraryError):
@@ -51,7 +50,9 @@ class WorkpieceRecord:
     back_images: tuple[Path, ...]
 
 
-CacheBuilder = Callable[[Sequence[Path], Sequence[Path]], TemplateCache]
+CacheProgressCallback = Callable[[str, int, int], None]
+CacheBuilder = Callable[[Sequence[Path], Sequence[Path], CacheProgressCallback | None], TemplateCache]
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 def _validate_name(name: str) -> str:
@@ -67,22 +68,46 @@ def _validate_name(name: str) -> str:
     return value
 
 
-def _validate_images(paths: Sequence[Path], label: str) -> tuple[Path, ...]:
-    if len(paths) != TEMPLATE_COUNT:
-        raise InvalidTemplateSetError(f"{label} requires exactly five images")
+def _image_fingerprint(image: Any) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(image.shape).encode("ascii"))
+    digest.update(str(image.dtype).encode("ascii"))
+    digest.update(image.tobytes())
+    return digest.hexdigest()
+
+
+def _validate_images(
+    paths: Sequence[Path],
+    label: str,
+    seen_images: dict[str, Path] | None = None,
+    on_image: Callable[[str, int, int], None] | None = None,
+) -> tuple[Path, ...]:
+    if not paths:
+        raise InvalidTemplateSetError(f"{label} requires at least one image")
     resolved: list[Path] = []
-    seen: set[str] = set()
-    for raw_path in paths:
+    local_seen: dict[str, Path] = {}
+    for index, raw_path in enumerate(paths, start=1):
         path = Path(raw_path)
-        key = str(path.resolve()).casefold()
-        if key in seen:
+        path_key = f"path:{str(path.resolve()).casefold()}"
+        if path_key in local_seen or (seen_images is not None and path_key in seen_images):
             raise InvalidTemplateSetError(f"Duplicate {label} template: {path}")
-        seen.add(key)
         if path.suffix.lower() not in IMAGE_EXTENSIONS or not path.is_file():
             raise InvalidTemplateSetError(f"Invalid {label} image: {path}")
-        if read_color_image(path) is None:
+        image = read_color_image(path)
+        if image is None:
             raise InvalidTemplateSetError(f"Unreadable {label} image: {path}")
-        resolved.append(path.resolve())
+        digest_key = f"content:{_image_fingerprint(image)}"
+        if digest_key in local_seen or (seen_images is not None and digest_key in seen_images):
+            raise InvalidTemplateSetError(f"Duplicate {label} image content: {path}")
+        resolved_path = path.resolve()
+        local_seen[path_key] = resolved_path
+        local_seen[digest_key] = resolved_path
+        if seen_images is not None:
+            seen_images[path_key] = resolved_path
+            seen_images[digest_key] = resolved_path
+        resolved.append(resolved_path)
+        if on_image is not None:
+            on_image(label, index, len(paths))
     return tuple(resolved)
 
 
@@ -105,17 +130,43 @@ class WorkpieceLibrary:
         name = _validate_name(manifest["name"])
         if record_id != root.name or manifest.get("labels") != {"0": "front", "1": "back"}:
             raise InvalidTemplateSetError(f"Invalid manifest: {manifest_path}")
-        front = _validate_images(sorted((root / "0").iterdir()), "front")
-        back = _validate_images(sorted((root / "1").iterdir()), "back")
+        seen_images: dict[str, Path] = {}
+        front = _validate_images(
+            sorted((root / "0").iterdir(), key=lambda path: path.name.casefold()),
+            "front",
+            seen_images,
+        )
+        back = _validate_images(
+            sorted((root / "1").iterdir(), key=lambda path: path.name.casefold()),
+            "back",
+            seen_images,
+        )
+        counts = manifest.get("template_counts")
+        if counts is not None:
+            if (
+                not isinstance(counts, dict)
+                or set(counts) != {"front", "back"}
+                or any(type(value) is not int or value <= 0 for value in counts.values())
+                or counts != {"front": len(front), "back": len(back)}
+            ):
+                raise InvalidTemplateSetError(f"Invalid template_counts: {manifest_path}")
         return WorkpieceRecord(record_id, name, root, front, back)
 
-    def _copy_templates(self, paths: Sequence[Path], target: Path) -> tuple[Path, ...]:
+    def _copy_templates(
+        self,
+        paths: Sequence[Path],
+        target: Path,
+        on_image: Callable[[int, int], None] | None = None,
+    ) -> tuple[Path, ...]:
         target.mkdir(parents=True, exist_ok=False)
         copied = []
+        width = max(2, len(str(len(paths) - 1)))
         for index, source in enumerate(paths):
-            destination = target / f"{index:02d}{source.suffix.lower()}"
+            destination = target / f"{index:0{width}d}{source.suffix.lower()}"
             shutil.copy2(source, destination)
             copied.append(destination)
+            if on_image is not None:
+                on_image(index + 1, len(paths))
         return tuple(copied)
 
     def register(
@@ -125,36 +176,111 @@ class WorkpieceLibrary:
         back_images: Sequence[Path],
         replace: bool,
         build_cache: CacheBuilder,
+        *,
+        progress_callback: ProgressCallback | None = None,
     ) -> tuple[WorkpieceRecord, TemplateCache]:
         display_name = _validate_name(name)
-        front = _validate_images(front_images, "front")
-        back = _validate_images(back_images, "back")
-        all_sources = {str(path).casefold() for path in (*front, *back)}
-        if len(all_sources) != TEMPLATE_COUNT * 2:
-            raise InvalidTemplateSetError("A source image cannot be used twice")
+        total = len(front_images) + len(back_images)
+
+        def report(event: dict[str, Any]) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(event)
+            except Exception:
+                LOGGER.debug("Ignoring registration progress callback failure", exc_info=True)
+
+        report({"phase": "validating", "completed": 0, "total": total})
+        seen_images: dict[str, Path] = {}
+        front = _validate_images(
+            front_images,
+            "front",
+            seen_images,
+            lambda label, completed, side_total: report(
+                {
+                    "phase": "validating",
+                    "label": label,
+                    "phase_completed": completed,
+                    "phase_total": side_total,
+                    "completed": 0,
+                    "total": total,
+                }
+            ),
+        )
+        back = _validate_images(
+            back_images,
+            "back",
+            seen_images,
+            lambda label, completed, side_total: report(
+                {
+                    "phase": "validating",
+                    "label": label,
+                    "phase_completed": completed,
+                    "phase_total": side_total,
+                    "completed": 0,
+                    "total": total,
+                }
+            ),
+        )
         existing = self._find_by_name(display_name)
         if existing is not None and not replace:
             raise WorkpieceExistsError(f"Workpiece already exists: {display_name}")
 
         self.library_dir.mkdir(parents=True, exist_ok=True)
         new_id = uuid.uuid4().hex
-        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=self.library_dir))
+        staging = self.library_dir / f".staging-{uuid.uuid4().hex}"
+        staging.mkdir()
         final_root = self.library_dir / new_id
         backup_root: Path | None = None
         try:
-            staged_front = self._copy_templates(front, staging / "0")
-            staged_back = self._copy_templates(back, staging / "1")
+            report({"phase": "copying", "completed": 0, "total": total})
+            staged_front = self._copy_templates(
+                front,
+                staging / "0",
+                lambda completed, side_total: report(
+                    {
+                        "phase": "copying",
+                        "label": "front",
+                        "phase_completed": completed,
+                        "phase_total": side_total,
+                        "completed": 0,
+                        "total": total,
+                    }
+                ),
+            )
+            staged_back = self._copy_templates(
+                back,
+                staging / "1",
+                lambda completed, side_total: report(
+                    {
+                        "phase": "copying",
+                        "label": "back",
+                        "phase_completed": completed,
+                        "phase_total": side_total,
+                        "completed": 0,
+                        "total": total,
+                    }
+                ),
+            )
             manifest = {
                 "schema_version": 1,
                 "id": new_id,
                 "name": display_name,
                 "labels": {"0": "front", "1": "back"},
+                "template_counts": {"front": len(front), "back": len(back)},
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             (staging / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            cache = build_cache(staged_front, staged_back)
+            report({"phase": "features", "completed": 0, "total": total})
+
+            def cache_progress(label: str, completed: int, side_total: int) -> None:
+                offset = len(front) if label == "back" else 0
+                report({"phase": "features", "completed": offset + completed, "total": total})
+
+            cache = build_cache(staged_front, staged_back, cache_progress)
+            report({"phase": "committing", "completed": total, "total": total})
             if existing is not None:
                 backup_root = self.library_dir / f".backup-{uuid.uuid4().hex}"
                 os.replace(existing.root, backup_root)
@@ -206,7 +332,7 @@ class WorkpieceLibrary:
                 record = self._record_from_root(root)
                 if self._find_by_name(record.name) is not None:
                     raise InvalidTemplateSetError(f"Duplicate workpiece name: {record.name}")
-                cache = build_cache(record.front_images, record.back_images)
+                cache = build_cache(record.front_images, record.back_images, None)
             except Exception as exc:
                 LOGGER.warning("Skipping invalid workpiece %s: %s", root, exc)
                 continue
