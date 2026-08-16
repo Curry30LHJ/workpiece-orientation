@@ -122,3 +122,46 @@ def test_build_template_cache_extracts_each_of_ten_templates_once(classifier, tm
     assert classifier.extractor.calls == 10
     assert cache.global_vectors["front"].shape == (5, 2)
     assert len(cache.local_features["back"]) == 5
+
+
+def test_build_template_cache_accepts_unequal_counts_and_reports_all_templates(classifier, tmp_path):
+    front = [write_marker(tmp_path / "front-0.png", 1)]
+    back = [write_marker(tmp_path / f"back-{index}.png", 2) for index in range(12)]
+    progress = []
+
+    cache = classifier.build_template_cache(
+        front,
+        back,
+        progress_callback=lambda label, done, total: progress.append((label, done, total)),
+    )
+
+    assert cache.global_vectors["front"].shape == (1, 2)
+    assert cache.global_vectors["back"].shape == (12, 2)
+    assert len(cache.local_features["front"]) == 1
+    assert len(cache.local_features["back"]) == 12
+    assert progress[-1] == ("back", 12, 12)
+    assert classifier.global_predictor.calls == 13
+    assert classifier.extractor.calls == 13
+
+
+def test_build_template_cache_rejects_an_empty_orientation(classifier, tmp_path):
+    back = [write_marker(tmp_path / "back-0.png", 2)]
+
+    with pytest.raises(ValueError, match="at least one"):
+        classifier.build_template_cache([], back)
+
+
+def test_prediction_scores_every_local_template(classifier, tmp_path):
+    front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(10)]
+    back = [write_marker(tmp_path / f"back-{index}.png", 2) for index in range(15)]
+    scored = []
+
+    def score(query_features, template_features, image_shape, matcher):
+        scored.append(template_features["marker"])
+        return {"score": 1.0}
+
+    classifier._score_feature_pair = score
+    classifier.set_template_cache("m", classifier.build_template_cache(front, back))
+    classifier.predict("m", write_marker(tmp_path / "query.png", 3))
+
+    assert len(scored) == 25

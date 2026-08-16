@@ -19,7 +19,6 @@ GLOBAL_MARGIN_THRESHOLD = 0.05
 LOCAL_MIN_SCORE = 4.0
 LOCAL_MIN_MARGIN = 0.5
 LOCAL_OVERRIDE_MARGIN = 3.0
-TEMPLATE_COUNT = 5
 
 
 class OrientationClassifierError(RuntimeError):
@@ -153,19 +152,25 @@ class OrientationClassifier:
         return _to_cpu(features)
 
     def build_template_cache(
-        self, front_paths: Sequence[Path], back_paths: Sequence[Path]
+        self,
+        front_paths: Sequence[Path],
+        back_paths: Sequence[Path],
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> TemplateCache:
-        if len(front_paths) != TEMPLATE_COUNT or len(back_paths) != TEMPLATE_COUNT:
-            raise ValueError("Each orientation requires exactly five templates")
+        if not front_paths or not back_paths:
+            raise ValueError("Each orientation requires at least one template")
         global_vectors: dict[str, np.ndarray] = {}
         local_features: dict[str, list[dict[str, Any]]] = {}
         for label, paths in (("front", front_paths), ("back", back_paths)):
             embeddings = []
             features = []
-            for path in paths:
+            total = len(paths)
+            for completed, path in enumerate(paths, start=1):
                 image = _read_image(Path(path))
                 embeddings.append(self._global_embedding(image))
                 features.append(self._extract_local(image))
+                if progress_callback is not None:
+                    progress_callback(label, completed, total)
             global_vectors[label] = np.stack(embeddings).astype(np.float32)
             local_features[label] = features
         return TemplateCache(global_vectors=global_vectors, local_features=local_features)
@@ -189,17 +194,16 @@ class OrientationClassifier:
         query_features = self._extract_features(image, self.extractor, self.device, roi_ratio=ROI_RATIO)
         local_scores: dict[str, float] = {}
         for label, candidates in cache.local_features.items():
-            gpu_candidates = [_move_tensors(features, self.device) for features in candidates]
             local_scores[label] = max(
                 float(
                     self._score_feature_pair(
                         query_features,
-                        features,
+                        _move_tensors(features, self.device),
                         image.shape[:2],
                         self.matcher,
                     )["score"]
                 )
-                for features in gpu_candidates
+                for features in candidates
             )
         local_prediction, local_margin = _decide_local_label(local_scores)
         local_is_decisive = local_prediction != "uncertain"
