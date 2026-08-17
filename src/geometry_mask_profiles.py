@@ -356,6 +356,16 @@ class GeometryMaskProfiles:
             "active": deepcopy(document["active"]),
             "profile_status": status,
             "legacy_archived": bool(manifest.get("interference_groups") or manifest.get("active_interference_groups")),
+            "templates": [
+                *[
+                    {"template_id": f"front:{path.name}", "direction": "front", "path": str(path)}
+                    for path in record.front_images
+                ],
+                *[
+                    {"template_id": f"back:{path.name}", "direction": "back", "path": str(path)}
+                    for path in record.back_images
+                ],
+            ],
         }
         if error:
             snapshot["profile_error"] = error

@@ -3,6 +3,7 @@
 #include "geometryrulecanvas.h"
 
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -18,6 +19,7 @@
 #include <QTextEdit>
 #include <QVBoxLayout>
 #include <QUuid>
+#include <QtMath>
 
 namespace {
 QJsonObject emptyDirection() {
@@ -47,6 +49,9 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     directionCombo_->addItem(QStringLiteral("正面"), QStringLiteral("front"));
     directionCombo_->addItem(QStringLiteral("反面"), QStringLiteral("back"));
     leftLayout->addWidget(directionCombo_);
+    templateCombo_ = new QComboBox(left);
+    templateCombo_->setObjectName(QStringLiteral("templatePreviewCombo"));
+    leftLayout->addWidget(templateCombo_);
     ruleList_ = new QListWidget(left);
     ruleList_->setObjectName(QStringLiteral("ruleList"));
     leftLayout->addWidget(ruleList_, 1);
@@ -65,6 +70,11 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     ruleForm->addRow(QStringLiteral("形状"), shapeCombo_);
     ruleForm->addRow(QStringLiteral("方向"), modeCombo_);
     ruleForm->addRow(QStringLiteral("安全边距"), marginSpin_);
+    rotationSpin_ = new QDoubleSpinBox(left);
+    rotationSpin_->setRange(-180.0, 180.0);
+    rotationSpin_->setDecimals(1);
+    rotationSpin_->setSuffix(QStringLiteral("°"));
+    ruleForm->addRow(QStringLiteral("旋转角度"), rotationSpin_);
     leftLayout->addLayout(ruleForm);
     auto *ruleButtons = new QHBoxLayout();
     auto *addButton = new QPushButton(QStringLiteral("新增规则"), left);
@@ -74,6 +84,9 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     ruleButtons->addWidget(addButton);
     ruleButtons->addWidget(deleteButton);
     leftLayout->addLayout(ruleButtons);
+    setAnchorButton_ = new QPushButton(QStringLiteral("将画布设为基准边界"), left);
+    setAnchorButton_->setObjectName(QStringLiteral("setAnchorButton"));
+    leftLayout->addWidget(setAnchorButton_);
 
     auto *center = new QWidget(splitter);
     auto *centerLayout = new QVBoxLayout(center);
@@ -116,40 +129,37 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
 
     connect(addButton, &QPushButton::clicked, this, &GeometryMaskManagerDialog::addRule);
     connect(deleteButton, &QPushButton::clicked, this, &GeometryMaskManagerDialog::deleteRule);
+    connect(setAnchorButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::setAnchorFromCanvas);
     connect(saveButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::saveDraft);
     connect(validateButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::validateDraft);
     connect(publishButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::publishDraft);
     connect(rollbackButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::rollbackDraft);
     connect(cancelButton_, &QPushButton::clicked, this, &QDialog::reject);
     connect(directionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-            &GeometryMaskManagerDialog::refreshRuleList);
+            [this](int) { refreshRuleList(); refreshTemplatePreview(); });
+    connect(templateCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            &GeometryMaskManagerDialog::refreshTemplatePreview);
     connect(ruleList_, &QListWidget::currentRowChanged, this, [this](int) { loadCurrentRuleIntoEditor(); });
     connect(overrideReasonEdit_, &QLineEdit::textChanged, this, &GeometryMaskManagerDialog::updatePublishState);
+    connect(rotationSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            [this](double value) { canvas_->setRotationDegrees(value); });
     connect(canvas_, &GeometryRuleCanvas::shapeChanged, this, [this](const QJsonObject &shape) {
         const int index = currentRuleIndex();
         if (index < 0) return;
         QJsonObject directionValue = directionObject();
         QJsonArray rules = rulesFor(directionValue);
         QJsonObject rule = rules.at(index).toObject();
-        QJsonObject geometry = rule.value(QStringLiteral("geometry")).toObject();
-        geometry.insert(QStringLiteral("cx"), 0.0);
-        geometry.insert(QStringLiteral("cy"), 0.0);
-        const QString shapeName = shape.value(QStringLiteral("shape")).toString();
-        if (shapeName == QStringLiteral("circle")) geometry.insert(QStringLiteral("r"), shape.value(QStringLiteral("r")));
-        if (shapeName == QStringLiteral("ellipse")) {
-            geometry.insert(QStringLiteral("rx"), shape.value(QStringLiteral("rx")));
-            geometry.insert(QStringLiteral("ry"), shape.value(QStringLiteral("ry")));
-        }
-        if (shapeName == QStringLiteral("rotated_rectangle")) {
-            geometry.insert(QStringLiteral("half_width"), shape.value(QStringLiteral("half_width")));
-            geometry.insert(QStringLiteral("half_height"), shape.value(QStringLiteral("half_height")));
-        }
+        QJsonObject geometry = ruleGeometryFromCanvasShape(shape);
+        if (geometry.isEmpty()) return;
         rule.insert(QStringLiteral("geometry"), geometry);
         rules.replace(index, rule);
         directionValue.insert(QStringLiteral("rules"), rules);
-        draft_.insert(direction(), directionValue);
+        QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
+        directions.insert(direction(), directionValue);
+        draft_.insert(QStringLiteral("directions"), directions);
     });
     refreshRuleList();
+    refreshTemplatePreview();
     updatePublishState();
 }
 
@@ -178,6 +188,112 @@ QJsonObject GeometryMaskManagerDialog::currentRule() const {
     return index >= 0 && index < rules.size() ? rules.at(index).toObject() : QJsonObject();
 }
 
+QJsonObject GeometryMaskManagerDialog::currentDirectionAnchor() const {
+    return directionObject().value(QStringLiteral("anchor")).toObject();
+}
+
+QJsonObject GeometryMaskManagerDialog::anchorFromCanvasShape(const QJsonObject &shape) const {
+    if (canvas_ == nullptr || canvas_->image().isNull()) return {};
+    const qreal width = canvas_->image().width();
+    const qreal height = canvas_->image().height();
+    const QString type = shape.value(QStringLiteral("shape")).toString();
+    QJsonObject coarse{{QStringLiteral("cx"), shape.value(QStringLiteral("cx")).toDouble() / width},
+                       {QStringLiteral("cy"), shape.value(QStringLiteral("cy")).toDouble() / height},
+                       {QStringLiteral("angle_deg"), shape.value(QStringLiteral("angle_deg")).toDouble()}};
+    if (type == QStringLiteral("circle")) {
+        coarse.insert(QStringLiteral("r"), shape.value(QStringLiteral("r")).toDouble() / qMin(width, height));
+    } else if (type == QStringLiteral("ellipse")) {
+        coarse.insert(QStringLiteral("rx"), shape.value(QStringLiteral("rx")).toDouble() / width);
+        coarse.insert(QStringLiteral("ry"), shape.value(QStringLiteral("ry")).toDouble() / height);
+    } else if (type == QStringLiteral("rotated_rectangle")) {
+        coarse.insert(QStringLiteral("half_width"), shape.value(QStringLiteral("half_width")).toDouble() / width);
+        coarse.insert(QStringLiteral("half_height"), shape.value(QStringLiteral("half_height")).toDouble() / height);
+    } else {
+        return {};
+    }
+    return QJsonObject{{QStringLiteral("shape"), type}, {QStringLiteral("coarse"), coarse}};
+}
+
+QJsonObject GeometryMaskManagerDialog::ruleGeometryFromCanvasShape(const QJsonObject &shape) const {
+    if (canvas_ == nullptr || canvas_->image().isNull()) return {};
+    const QJsonObject anchor = currentDirectionAnchor();
+    const QJsonObject coarse = anchor.value(QStringLiteral("coarse")).toObject();
+    if (anchor.isEmpty() || coarse.isEmpty()) return {};
+    const qreal width = canvas_->image().width();
+    const qreal height = canvas_->image().height();
+    const QString anchorType = anchor.value(QStringLiteral("shape")).toString();
+    const qreal anchorCx = coarse.value(QStringLiteral("cx")).toDouble() * width;
+    const qreal anchorCy = coarse.value(QStringLiteral("cy")).toDouble() * height;
+    const qreal anchorX = anchorType == QStringLiteral("rotated_rectangle")
+        ? coarse.value(QStringLiteral("half_width")).toDouble() * width
+        : anchorType == QStringLiteral("circle")
+            ? coarse.value(QStringLiteral("r")).toDouble() * qMin(width, height)
+            : coarse.value(QStringLiteral("rx")).toDouble() * width;
+    const qreal anchorY = anchorType == QStringLiteral("rotated_rectangle")
+        ? coarse.value(QStringLiteral("half_height")).toDouble() * height
+        : anchorType == QStringLiteral("circle")
+            ? anchorX
+            : coarse.value(QStringLiteral("ry")).toDouble() * height;
+    if (anchorX <= 0.0 || anchorY <= 0.0) return {};
+    const qreal angle = qDegreesToRadians(coarse.value(QStringLiteral("angle_deg")).toDouble());
+    const qreal dx = shape.value(QStringLiteral("cx")).toDouble() - anchorCx;
+    const qreal dy = shape.value(QStringLiteral("cy")).toDouble() - anchorCy;
+    const qreal localX = (dx * qCos(angle) + dy * qSin(angle)) / anchorX;
+    const qreal localY = (-dx * qSin(angle) + dy * qCos(angle)) / anchorY;
+    const qreal shapeAngle = shape.value(QStringLiteral("angle_deg")).toDouble()
+        - coarse.value(QStringLiteral("angle_deg")).toDouble();
+    QJsonObject geometry{{QStringLiteral("cx"), localX}, {QStringLiteral("cy"), localY},
+                         {QStringLiteral("angle_deg"), shapeAngle}};
+    const QString shapeType = shape.value(QStringLiteral("shape")).toString();
+    if (shapeType == QStringLiteral("circle")) {
+        geometry.insert(QStringLiteral("r"), shape.value(QStringLiteral("r")).toDouble() / qMin(anchorX, anchorY));
+    } else if (shapeType == QStringLiteral("ellipse")) {
+        geometry.insert(QStringLiteral("rx"), shape.value(QStringLiteral("rx")).toDouble() / anchorX);
+        geometry.insert(QStringLiteral("ry"), shape.value(QStringLiteral("ry")).toDouble() / anchorY);
+    } else if (shapeType == QStringLiteral("rotated_rectangle")) {
+        geometry.insert(QStringLiteral("half_width"), shape.value(QStringLiteral("half_width")).toDouble() / anchorX);
+        geometry.insert(QStringLiteral("half_height"), shape.value(QStringLiteral("half_height")).toDouble() / anchorY);
+    } else {
+        return {};
+    }
+    return geometry;
+}
+
+QJsonObject GeometryMaskManagerDialog::canvasShapeForRule(const QJsonObject &rule) const {
+    if (canvas_ == nullptr || canvas_->image().isNull()) return {};
+    const QJsonObject anchor = currentDirectionAnchor();
+    const QJsonObject coarse = anchor.value(QStringLiteral("coarse")).toObject();
+    const QJsonObject geometry = rule.value(QStringLiteral("geometry")).toObject();
+    if (anchor.isEmpty() || coarse.isEmpty() || geometry.isEmpty()) return {};
+    const qreal width = canvas_->image().width();
+    const qreal height = canvas_->image().height();
+    const QString anchorType = anchor.value(QStringLiteral("shape")).toString();
+    const qreal ax = anchorType == QStringLiteral("rotated_rectangle") ? coarse.value(QStringLiteral("half_width")).toDouble() * width
+        : anchorType == QStringLiteral("circle") ? coarse.value(QStringLiteral("r")).toDouble() * qMin(width, height)
+        : coarse.value(QStringLiteral("rx")).toDouble() * width;
+    const qreal ay = anchorType == QStringLiteral("rotated_rectangle") ? coarse.value(QStringLiteral("half_height")).toDouble() * height
+        : anchorType == QStringLiteral("circle") ? ax
+        : coarse.value(QStringLiteral("ry")).toDouble() * height;
+    const qreal baseAngle = coarse.value(QStringLiteral("angle_deg")).toDouble();
+    const qreal angle = qDegreesToRadians(baseAngle);
+    const qreal localX = geometry.value(QStringLiteral("cx")).toDouble() * ax;
+    const qreal localY = geometry.value(QStringLiteral("cy")).toDouble() * ay;
+    QJsonObject shape{{QStringLiteral("shape"), rule.value(QStringLiteral("shape"))},
+                      {QStringLiteral("cx"), coarse.value(QStringLiteral("cx")).toDouble() * width + localX * qCos(angle) - localY * qSin(angle)},
+                      {QStringLiteral("cy"), coarse.value(QStringLiteral("cy")).toDouble() * height + localX * qSin(angle) + localY * qCos(angle)},
+                      {QStringLiteral("angle_deg"), baseAngle + geometry.value(QStringLiteral("angle_deg")).toDouble()}};
+    const QString type = rule.value(QStringLiteral("shape")).toString();
+    if (type == QStringLiteral("circle")) shape.insert(QStringLiteral("r"), geometry.value(QStringLiteral("r")).toDouble() * qMin(ax, ay));
+    else if (type == QStringLiteral("ellipse")) {
+        shape.insert(QStringLiteral("rx"), geometry.value(QStringLiteral("rx")).toDouble() * ax);
+        shape.insert(QStringLiteral("ry"), geometry.value(QStringLiteral("ry")).toDouble() * ay);
+    } else if (type == QStringLiteral("rotated_rectangle")) {
+        shape.insert(QStringLiteral("half_width"), geometry.value(QStringLiteral("half_width")).toDouble() * ax);
+        shape.insert(QStringLiteral("half_height"), geometry.value(QStringLiteral("half_height")).toDouble() * ay);
+    }
+    return shape;
+}
+
 void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
     snapshot_ = snapshot;
     draft_ = snapshot.value(QStringLiteral("draft")).toObject();
@@ -197,6 +313,7 @@ void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
                               ? QStringLiteral("旧位置标注已归档，请使用几何规则重新标定")
                               : QString());
     refreshRuleList();
+    refreshTemplatePreview();
     updatePublishState();
 }
 
@@ -245,6 +362,43 @@ void GeometryMaskManagerDialog::refreshRuleList() {
     loadCurrentRuleIntoEditor();
 }
 
+void GeometryMaskManagerDialog::refreshTemplatePreview() {
+    if (!templateCombo_ || !canvas_) return;
+    const QString side = direction();
+    const QString previous = templateCombo_->currentData().toString();
+    templateCombo_->blockSignals(true);
+    templateCombo_->clear();
+    const QJsonArray templates = snapshot_.value(QStringLiteral("templates")).toArray();
+    for (const QJsonValue &value : templates) {
+        const QJsonObject item = value.toObject();
+        if (item.value(QStringLiteral("direction")).toString() != side) continue;
+        templateCombo_->addItem(item.value(QStringLiteral("template_id")).toString(), item.value(QStringLiteral("path")));
+    }
+    int index = templateCombo_->findData(previous);
+    if (index < 0) index = 0;
+    if (templateCombo_->count() > 0) templateCombo_->setCurrentIndex(index);
+    templateCombo_->blockSignals(false);
+    const QString path = templateCombo_->currentData().toString();
+    canvas_->setImage(path.isEmpty() ? QImage() : QImage(path));
+    const QJsonObject rule = currentRule();
+    if (!rule.isEmpty()) {
+        canvas_->setCoarseShape(canvasShapeForRule(rule));
+        rotationSpin_->setValue(rule.value(QStringLiteral("geometry")).toObject().value(QStringLiteral("angle_deg")).toDouble());
+    }
+}
+
+void GeometryMaskManagerDialog::setAnchorFromCanvas() {
+    const QJsonObject anchor = anchorFromCanvasShape(canvas_->coarseShape());
+    if (anchor.isEmpty()) return;
+    ensureDirectionObject(direction());
+    QJsonObject side = directionObject();
+    side.insert(QStringLiteral("anchor"), anchor);
+    QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
+    directions.insert(direction(), side);
+    draft_.insert(QStringLiteral("directions"), directions);
+    refreshRuleList();
+}
+
 void GeometryMaskManagerDialog::setCurrentRuleFromEditor() {
     const int index = currentRuleIndex();
     if (index < 0) return;
@@ -272,6 +426,8 @@ void GeometryMaskManagerDialog::loadCurrentRuleIntoEditor() {
     shapeCombo_->setCurrentIndex(shape == QStringLiteral("ellipse") ? 1 : shape == QStringLiteral("rotated_rectangle") ? 2 : 0);
     modeCombo_->setCurrentIndex(modeCombo_->findData(rule.value(QStringLiteral("mode")).toString()));
     marginSpin_->setValue(qRound(rule.value(QStringLiteral("margin_ratio")).toDouble(0.02) * 100.0));
+    rotationSpin_->setValue(rule.value(QStringLiteral("geometry")).toObject().value(QStringLiteral("angle_deg")).toDouble());
+    refreshTemplatePreview();
 }
 
 void GeometryMaskManagerDialog::addRule() {

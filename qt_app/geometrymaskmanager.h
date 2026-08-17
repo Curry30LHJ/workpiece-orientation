@@ -4,6 +4,7 @@
 #include <QJsonObject>
 
 class QComboBox;
+class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -44,6 +45,8 @@ private slots:
     void publishDraft();
     void rollbackDraft();
     void refreshRuleList();
+    void refreshTemplatePreview();
+    void setAnchorFromCanvas();
     void updatePublishState();
 
 private:
@@ -54,17 +57,23 @@ private:
     void loadCurrentRuleIntoEditor();
     QJsonObject currentRule() const;
     int currentRuleIndex() const;
+    QJsonObject currentDirectionAnchor() const;
+    QJsonObject canvasShapeForRule(const QJsonObject &rule) const;
+    QJsonObject anchorFromCanvasShape(const QJsonObject &shape) const;
+    QJsonObject ruleGeometryFromCanvasShape(const QJsonObject &shape) const;
 
     QJsonObject snapshot_;
     QJsonObject draft_;
     QJsonObject job_;
     bool busy_ = false;
     QComboBox *directionCombo_ = nullptr;
+    QComboBox *templateCombo_ = nullptr;
     QComboBox *shapeCombo_ = nullptr;
     QComboBox *modeCombo_ = nullptr;
     QLineEdit *ruleNameEdit_ = nullptr;
     QLineEdit *overrideReasonEdit_ = nullptr;
     QSpinBox *marginSpin_ = nullptr;
+    QDoubleSpinBox *rotationSpin_ = nullptr;
     QListWidget *ruleList_ = nullptr;
     QLabel *revisionLabel_ = nullptr;
     QLabel *statusLabel_ = nullptr;
@@ -75,5 +84,6 @@ private:
     QPushButton *publishButton_ = nullptr;
     QPushButton *rollbackButton_ = nullptr;
     QPushButton *cancelButton_ = nullptr;
+    QPushButton *setAnchorButton_ = nullptr;
     GeometryRuleCanvas *canvas_ = nullptr;
 };
