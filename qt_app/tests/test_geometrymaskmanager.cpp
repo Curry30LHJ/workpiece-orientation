@@ -1,9 +1,13 @@
 #include <QtTest/QtTest>
 
 #include <QPushButton>
+#include <QComboBox>
+#include <QImage>
 #include <QSignalSpy>
+#include <QTemporaryDir>
 
 #include "../geometrymaskmanager.h"
+#include "../geometryrulecanvas.h"
 
 class TestGeometryMaskManager : public QObject {
     Q_OBJECT
@@ -12,6 +16,7 @@ private slots:
     void publishDisabledUntilCompletedValidationMatchesDraft();
     void warningPublishRequiresOverrideReason();
     void saveAndDeleteRulesUpdateDraft();
+    void templatePreviewLoadsRepresentativeImage();
 };
 
 QJsonObject profileSnapshot(int libraryRevision, int draftRevision, int activeRevision) {
@@ -59,6 +64,29 @@ void TestGeometryMaskManager::saveAndDeleteRulesUpdateDraft() {
     remove->click();
     QVERIFY(dialog.draft().value("directions").toObject().value("front").toObject()
                 .value("rules").toArray().isEmpty());
+}
+
+void TestGeometryMaskManager::templatePreviewLoadsRepresentativeImage() {
+    QTemporaryDir directory;
+    const QString imagePath = directory.filePath(QStringLiteral("front.png"));
+    QImage image(80, 60, QImage::Format_RGB32);
+    image.fill(Qt::black);
+    QVERIFY(image.save(imagePath));
+    QJsonObject snapshot = profileSnapshot(1, 0, 0);
+    snapshot.insert(QStringLiteral("templates"), QJsonArray{
+        QJsonObject{{QStringLiteral("template_id"), QStringLiteral("front:front.png")},
+                    {QStringLiteral("direction"), QStringLiteral("front")},
+                    {QStringLiteral("path"), imagePath}}
+    });
+
+    GeometryMaskManagerDialog dialog;
+    dialog.setSnapshot(snapshot);
+    auto *combo = dialog.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
+    auto *canvas = dialog.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
+    QVERIFY(combo != nullptr);
+    QVERIFY(canvas != nullptr);
+    QCOMPARE(combo->count(), 1);
+    QCOMPARE(canvas->image().size(), QSize(80, 60));
 }
 
 QTEST_MAIN(TestGeometryMaskManager)
