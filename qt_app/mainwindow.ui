@@ -26,14 +26,18 @@
        <item row="0" column="2"><widget class="QPushButton" name="refreshWorkpiecesButton"><property name="text"><string>刷新列表</string></property></widget></item>
        <item row="1" column="0"><widget class="QLabel" name="nameLabel"><property name="text"><string>新工件名称：</string></property></widget></item>
        <item row="1" column="1" colspan="2"><widget class="QLineEdit" name="workpieceNameEdit"/></item>
-       <item row="2" column="0"><widget class="QLabel" name="frontTemplatesLabel"><property name="text"><string>正面模板：未选择（0/5）</string></property></widget></item>
-       <item row="2" column="1"><widget class="QPushButton" name="chooseFrontTemplatesButton"><property name="text"><string>选择正面 5 张</string></property></widget></item>
+       <item row="2" column="0"><widget class="QLabel" name="frontTemplatesLabel"><property name="text"><string>正面已选择 0 张</string></property></widget></item>
+       <item row="2" column="1"><widget class="QPushButton" name="chooseFrontTemplatesButton"><property name="text"><string>选择正面模板</string></property></widget></item>
        <item row="2" column="2"><widget class="QLabel" name="frontTemplatesFilesLabel"><property name="text"><string/></property></widget></item>
-       <item row="3" column="0"><widget class="QLabel" name="backTemplatesLabel"><property name="text"><string>反面模板：未选择（0/5）</string></property></widget></item>
-       <item row="3" column="1"><widget class="QPushButton" name="chooseBackTemplatesButton"><property name="text"><string>选择反面 5 张</string></property></widget></item>
+       <item row="3" column="0"><widget class="QLabel" name="backTemplatesLabel"><property name="text"><string>反面已选择 0 张</string></property></widget></item>
+       <item row="3" column="1"><widget class="QPushButton" name="chooseBackTemplatesButton"><property name="text"><string>选择反面模板</string></property></widget></item>
        <item row="3" column="2"><widget class="QLabel" name="backTemplatesFilesLabel"><property name="text"><string/></property></widget></item>
-       <item row="4" column="1" colspan="2"><widget class="QPushButton" name="registerButton"><property name="text"><string>建立工件库</string></property></widget></item>
-       <item row="5" column="1" colspan="2"><widget class="QLabel" name="libraryMessageLabel"><property name="text"><string/></property></widget></item>
+       <item row="4" column="0" colspan="3"><widget class="QLabel" name="templateWarningLabel"><property name="styleSheet"><string notr="true">color: #9a6700;</string></property><property name="text"><string/></property></widget></item>
+       <item row="5" column="0"><widget class="QLabel" name="registrationProgressLabel"><property name="text"><string>建库进度：未开始</string></property></widget></item>
+       <item row="5" column="1"><widget class="QProgressBar" name="registrationProgressBar"><property name="value"><number>0</number></property></widget></item>
+       <item row="5" column="2"><widget class="QLabel" name="registrationElapsedLabel"><property name="text"><string>耗时：0 ms</string></property></widget></item>
+       <item row="6" column="1" colspan="2"><widget class="QPushButton" name="registerButton"><property name="text"><string>建立工件库</string></property></widget></item>
+       <item row="7" column="1" colspan="2"><widget class="QLabel" name="libraryMessageLabel"><property name="text"><string/></property></widget></item>
       </layout>
      </widget>
     </item>
@@ -46,6 +50,12 @@
          <item><widget class="QLabel" name="imagePreviewLabel"><property name="minimumSize"><size><width>480</width><height>360</height></size></property><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string>请选择待测图片</string></property></widget></item>
          <item><widget class="QPushButton" name="chooseImageButton"><property name="text"><string>选择待测图片</string></property></widget></item>
          <item><widget class="QPushButton" name="predictButton"><property name="text"><string>开始检测</string></property></widget></item>
+         <item>
+          <layout class="QHBoxLayout" name="batchButtonLayout">
+           <item><widget class="QPushButton" name="chooseBatchImagesButton"><property name="text"><string>选择批量图片</string></property></widget></item>
+           <item><widget class="QPushButton" name="batchPredictButton"><property name="text"><string>批量检测</string></property></widget></item>
+          </layout>
+         </item>
         </layout>
        </widget>
       </item>
@@ -55,6 +65,8 @@
         <layout class="QVBoxLayout" name="resultLayout">
          <item><widget class="QLabel" name="resultLabel"><property name="text"><string>尚未检测</string></property></widget></item>
          <item><widget class="QLabel" name="reviewLabel"><property name="styleSheet"><string notr="true">color: #b00020; font-weight: bold;</string></property></widget></item>
+         <item><widget class="QLabel" name="batchSummaryLabel"><property name="text"><string/></property></widget></item>
+         <item><widget class="QTableWidget" name="batchResultsTableWidget"/></item>
          <item><widget class="QTextEdit" name="evidenceTextEdit"><property name="readOnly"><bool>true</bool></property></widget></item>
         </layout>
        </widget>
