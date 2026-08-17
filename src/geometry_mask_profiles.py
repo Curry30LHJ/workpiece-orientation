@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import threading
+import time
 import uuid
 from typing import Any, Mapping
 
@@ -40,6 +41,22 @@ class StaleGeometryProfileError(GeometryProfileError):
 
 class CorruptGeometryProfileError(GeometryProfileError):
     """Raised when an existing profile cannot be safely parsed or validated."""
+
+
+class GeometryValidationError(GeometryProfileError):
+    """Raised when a validation job cannot be created or completed."""
+
+
+class GeometryValidationJobNotFoundError(GeometryValidationError):
+    """Raised when a validation job id is unknown."""
+
+
+class GeometryProfilePublishError(GeometryProfileError):
+    """Raised when an explicit geometry profile publish cannot complete."""
+
+
+class GeometryProfileNotReadyError(GeometryProfilePublishError):
+    """Raised when a caller attempts to publish before validation completes."""
 
 
 def _finite(value: Any, field: str) -> float:
@@ -235,15 +252,35 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
 class GeometryMaskProfiles:
     """Persist drafts without allowing stale editors to overwrite newer state."""
 
-    def __init__(self, catalog_or_library: Any, calibrator: Any | None = None, *, start_worker: bool = True):
+    def __init__(
+        self,
+        catalog_or_library: Any,
+        calibrator: Any | None = None,
+        *,
+        start_worker: bool = True,
+        storage_dir: Path | None = None,
+    ):
         self.catalog = catalog_or_library
         self.calibrator = calibrator
-        # The worker is intentionally not started in this persistence step.  The
-        # flag is accepted now so the later validation implementation can be
-        # introduced without changing Qt/TCP construction code.
         self.start_worker = bool(start_worker)
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._operations: dict[str, dict[str, Any]] = {}
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._job_operations: dict[str, str] = {}
+        self._candidate_caches: dict[str, Any] = {}
+        library = getattr(self.catalog, "library", self.catalog)
+        library_root = getattr(library, "library_dir", None)
+        default_storage = Path(library_root) / ".geometry_mask_jobs" if library_root is not None else Path.cwd() / ".geometry_mask_jobs"
+        self.storage_dir = Path(storage_dir) if storage_dir is not None else default_storage
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.jobs_path = self.storage_dir / "jobs.json"
+        self._load_jobs()
+        self._stop = False
+        self._worker: threading.Thread | None = None
+        if self.start_worker:
+            self._worker = threading.Thread(target=self._worker_loop, name="geometry-mask-validation", daemon=True)
+            self._worker.start()
 
     def _record(self, workpiece_id: str):
         getter = getattr(self.catalog, "get", None)
@@ -374,3 +411,505 @@ class GeometryMaskProfiles:
             result = self._snapshot_for_record(record)
             self._operations[operation_key] = deepcopy(result)
             return result
+
+    # ------------------------------------------------------------------
+    # Background validation and immutable publication
+    # ------------------------------------------------------------------
+
+    def _load_jobs(self) -> None:
+        if not self.jobs_path.exists():
+            return
+        try:
+            payload = json.loads(self.jobs_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("jobs document must be an object")
+            operations = payload.get("operations", {})
+            jobs = payload.get("jobs", [])
+            if isinstance(operations, Mapping):
+                self._job_operations = {str(key): str(value) for key, value in operations.items()}
+            if isinstance(jobs, list):
+                for item in jobs:
+                    if not isinstance(item, Mapping) or not item.get("job_id"):
+                        continue
+                    job = deepcopy(dict(item))
+                    if job.get("state") == "running":
+                        job["state"] = "interrupted"
+                        job["error"] = "backend restarted during geometry validation"
+                    self._jobs[str(job["job_id"])] = job
+        except Exception as exc:
+            LOGGER.warning("Ignoring invalid geometry validation jobs: %s", exc)
+
+    def _persist_jobs(self) -> None:
+        payload = {
+            "jobs": list(self._jobs.values()),
+            "operations": dict(self._job_operations),
+        }
+        _atomic_write_json(self.jobs_path, payload)
+
+    @staticmethod
+    def _total_templates(record: Any) -> int:
+        return len(record.front_images) + len(record.back_images)
+
+    @staticmethod
+    def _profile_for_revision(profile: Mapping[str, Any], revision: int) -> dict[str, Any]:
+        candidate = deepcopy(dict(profile))
+        candidate["schema_version"] = PROFILE_SCHEMA_VERSION
+        candidate["profile_revision"] = int(revision)
+        return candidate
+
+    def _job_snapshot(self, job_id: str) -> dict[str, Any]:
+        try:
+            return deepcopy(self._jobs[job_id])
+        except KeyError as exc:
+            raise GeometryValidationJobNotFoundError(f"Unknown geometry validation job: {job_id}") from exc
+
+    def start_validation(
+        self,
+        workpiece_id: str,
+        *,
+        expected_library_revision: int,
+        expected_draft_revision: int,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id must be a non-empty string")
+        with self._condition:
+            if operation_id in self._job_operations:
+                return self._job_snapshot(self._job_operations[operation_id])
+            record = self._record(workpiece_id)
+            snapshot = self._snapshot_for_record(record)
+            if snapshot["profile_status"] in {"corrupt", "stale"}:
+                raise StaleGeometryProfileError(snapshot.get("profile_error", "geometry profile is not current"))
+            if record.revision != expected_library_revision:
+                raise StaleGeometryProfileError(
+                    f"workpiece revision changed: expected {expected_library_revision}, current {record.revision}"
+                )
+            if snapshot["draft_revision"] != expected_draft_revision:
+                raise StaleGeometryProfileError(
+                    f"draft revision changed: expected {expected_draft_revision}, current {snapshot['draft_revision']}"
+                )
+            job_id = uuid.uuid4().hex
+            now = time.time()
+            total = self._total_templates(record)
+            self._jobs[job_id] = {
+                "job_id": job_id,
+                "workpiece_id": workpiece_id,
+                "base_library_revision": record.revision,
+                "base_draft_revision": snapshot["draft_revision"],
+                "state": "queued",
+                "progress": {"completed": 0, "total": total, "phase": "queued"},
+                "warnings": [],
+                "regression": {"status": "not_run", "correct_to_wrong": 0},
+                "error": None,
+                "cancel_requested": False,
+                "created_at": now,
+                "updated_at": now,
+                "report": None,
+                "profile": self._profile_for_revision(snapshot["draft"], snapshot["draft_revision"]),
+            }
+            self._job_operations[operation_id] = job_id
+            self._persist_jobs()
+            self._condition.notify_all()
+            return self._job_snapshot(job_id)
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._job_snapshot(job_id)
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [deepcopy(job) for job in self._jobs.values()]
+
+    def action(self, job_id: str, action: str) -> dict[str, Any]:
+        if action not in {"cancel", "cleanup"}:
+            raise GeometryValidationError(f"unsupported geometry validation action: {action}")
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise GeometryValidationJobNotFoundError(f"Unknown geometry validation job: {job_id}")
+            if action == "cleanup":
+                if job["state"] not in {"completed", "failed", "cancelled", "interrupted"}:
+                    raise GeometryValidationError("only finished geometry validation jobs can be cleaned up")
+                self._candidate_caches.pop(job_id, None)
+                self._jobs.pop(job_id, None)
+                self._persist_jobs()
+                return {"job_id": job_id, "state": "removed"}
+            if job["state"] == "queued":
+                job["state"] = "cancelled"
+                job["updated_at"] = time.time()
+                job["error"] = "cancelled by operator"
+            elif job["state"] == "running":
+                job["cancel_requested"] = True
+            self._persist_jobs()
+            self._condition.notify_all()
+            return self._job_snapshot(job_id)
+
+    def _set_job_progress(self, job_id: str, label: str, completed: int, total: int) -> None:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            record = self._record(job["workpiece_id"])
+            job["progress"] = {
+                "completed": int(job["progress"].get("completed", 0)) + 1,
+                "total": self._total_templates(record),
+                "phase": "fitting",
+                "label": label,
+                "phase_completed": int(completed),
+                "phase_total": int(total),
+            }
+            job["updated_at"] = time.time()
+            self._persist_jobs()
+            if job.get("cancel_requested"):
+                raise GeometryValidationError("cancelled by operator")
+
+    @staticmethod
+    def _validation_warnings(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+        warnings: list[dict[str, Any]] = []
+        for label, items in report.items():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                index = item.get("index")
+                ignored_ratio = float(item.get("ignored_ratio", 0.0) or 0.0)
+                remaining_ratio = float(item.get("remaining_ratio", 1.0) or 0.0)
+                if ignored_ratio > 0.40:
+                    warnings.append({
+                        "orientation": label,
+                        "index": index,
+                        "code": "effective_area_low",
+                        "ignored_ratio": ignored_ratio,
+                    })
+                if remaining_ratio < 0.30:
+                    warnings.append({
+                        "orientation": label,
+                        "index": index,
+                        "code": "keypoint_retention_low",
+                        "remaining_ratio": remaining_ratio,
+                    })
+                if item.get("status") not in {"active", "not_configured"}:
+                    warnings.append({
+                        "orientation": label,
+                        "index": index,
+                        "code": "fit_not_active",
+                        "status": item.get("status"),
+                    })
+        return warnings
+
+    def _run_validation(self, job_id: str) -> None:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is None or job.get("state") != "queued":
+                return
+            job["state"] = "running"
+            job["progress"]["phase"] = "fitting"
+            job["updated_at"] = time.time()
+            self._persist_jobs()
+            workpiece_id = str(job["workpiece_id"])
+            profile = deepcopy(job["profile"])
+            expected_revision = int(job["base_library_revision"])
+        try:
+            record = self._record(workpiece_id)
+            if record.revision != expected_revision:
+                raise StaleGeometryProfileError(
+                    f"workpiece revision changed: expected {expected_revision}, current {record.revision}"
+                )
+            classifier = getattr(self.catalog, "classifier", None)
+            prepare = getattr(classifier, "prepare_geometry_cache", None)
+            if not callable(prepare):
+                raise GeometryValidationError("classifier does not support geometry validation")
+
+            def progress(label: str, completed: int, total: int) -> None:
+                self._set_job_progress(job_id, label, completed, total)
+
+            candidate, report = prepare(
+                workpiece_id,
+                record,
+                profile,
+                self.calibrator,
+                progress,
+            )
+            with self._condition:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    return
+                if job.get("cancel_requested"):
+                    job["state"] = "cancelled"
+                    job["error"] = "cancelled by operator"
+                    self._candidate_caches.pop(job_id, None)
+                else:
+                    warnings = self._validation_warnings(report)
+                    job["state"] = "completed"
+                    job["progress"] = {
+                        "completed": self._total_templates(record),
+                        "total": self._total_templates(record),
+                        "phase": "completed",
+                    }
+                    job["report"] = deepcopy(report)
+                    job["warnings"] = warnings
+                    job["candidate_profile"] = deepcopy(getattr(candidate, "geometry_profile", profile))
+                    job["regression"] = {
+                        "status": "not_run",
+                        "correct_to_wrong": 0,
+                    }
+                    self._candidate_caches[job_id] = candidate
+                job["updated_at"] = time.time()
+                self._persist_jobs()
+        except Exception as exc:
+            with self._condition:
+                job = self._jobs.get(job_id)
+                if job is not None:
+                    if job.get("cancel_requested") or "cancelled by operator" in str(exc):
+                        job["state"] = "cancelled"
+                    else:
+                        job["state"] = "failed"
+                    job["error"] = str(exc)
+                    job["updated_at"] = time.time()
+                    self._candidate_caches.pop(job_id, None)
+                    self._persist_jobs()
+
+    def run_next(self, *, force: bool = False) -> dict[str, Any] | None:
+        """Run one queued job synchronously; useful for deterministic service tests."""
+        with self._lock:
+            queued = next((job["job_id"] for job in self._jobs.values() if job.get("state") == "queued"), None)
+        if queued is None:
+            return None
+        self._run_validation(queued)
+        return self.get_job(queued)
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._condition:
+                while not self._stop and not any(job.get("state") == "queued" for job in self._jobs.values()):
+                    self._condition.wait(timeout=0.5)
+                if self._stop:
+                    return
+                queued = next(job["job_id"] for job in self._jobs.values() if job.get("state") == "queued")
+            self._run_validation(queued)
+
+    def _require_publish_job(
+        self,
+        workpiece_id: str,
+        job_id: str,
+        expected_library_revision: int,
+        expected_draft_revision: int,
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+        record = self._record(workpiece_id)
+        snapshot = self._snapshot_for_record(record)
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise GeometryValidationJobNotFoundError(f"Unknown geometry validation job: {job_id}")
+        if job.get("workpiece_id") != workpiece_id:
+            raise GeometryProfilePublishError("validation job belongs to another workpiece")
+        if job.get("state") != "completed":
+            raise GeometryProfileNotReadyError(f"validation job is {job.get('state')}")
+        if record.revision != expected_library_revision or snapshot["draft_revision"] != expected_draft_revision:
+            raise StaleGeometryProfileError("geometry validation result is stale")
+        if job.get("base_library_revision") != expected_library_revision or job.get("base_draft_revision") != expected_draft_revision:
+            raise StaleGeometryProfileError("geometry validation result is stale")
+        candidate = self._candidate_caches.get(job_id)
+        if candidate is None:
+            raise GeometryProfileNotReadyError("candidate cache is no longer available; validate again")
+        return record, snapshot, job
+
+    def _catalog_publish(
+        self,
+        workpiece_id: str,
+        candidate: Any,
+        *,
+        profile_revision: int,
+        previous_profile_revision: int | None,
+        expected_revision: int,
+        operation_id: str,
+    ) -> Any:
+        publisher = getattr(self.catalog, "publish_geometry_profile", None)
+        if callable(publisher):
+            return publisher(
+                workpiece_id,
+                candidate,
+                profile_revision=profile_revision,
+                previous_profile_revision=previous_profile_revision,
+                expected_revision=expected_revision,
+                operation_id=operation_id,
+            )
+        library = getattr(self.catalog, "library", self.catalog)
+        record = library.replace_geometry_profile_pointers(
+            workpiece_id,
+            expected_revision=expected_revision,
+            active_revision=profile_revision,
+            previous_active_revision=previous_profile_revision,
+        )
+        classifier = getattr(self.catalog, "classifier", None)
+        if classifier is not None:
+            classifier.set_template_cache(workpiece_id, candidate)
+        return record
+
+    @staticmethod
+    def _restore_bytes(path: Path, content: bytes | None) -> None:
+        if content is None:
+            if path.exists():
+                path.unlink()
+            return
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.restore")
+        try:
+            temporary.write_bytes(content)
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def publish(
+        self,
+        workpiece_id: str,
+        job_id: str,
+        *,
+        expected_library_revision: int,
+        expected_draft_revision: int,
+        operation_id: str,
+        override_reason: str = "",
+    ) -> dict[str, Any]:
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id must be a non-empty string")
+        operation_key = f"publish:{workpiece_id}:{operation_id}"
+        with self._condition:
+            cached = self._operations.get(operation_key)
+            if cached is not None:
+                return deepcopy(cached)
+            record, snapshot, job = self._require_publish_job(
+                workpiece_id, job_id, expected_library_revision, expected_draft_revision
+            )
+            if (job.get("warnings") or job.get("regression", {}).get("correct_to_wrong", 0)) and not str(override_reason).strip():
+                raise GeometryProfilePublishError("validation warnings or regressions require override_reason")
+            candidate = self._candidate_caches[job_id]
+            profile_revision = int(expected_draft_revision)
+            previous_revision = snapshot["active_revision"]
+            root = self._profile_root(record)
+            profile_path = root / "profile.json"
+            previous_bytes = profile_path.read_bytes() if profile_path.exists() else None
+            document, status, error = self._load_document(record)
+            if status == "corrupt":
+                raise CorruptGeometryProfileError(error or "geometry profile is corrupt")
+            candidate_profile = self._profile_for_revision(
+                getattr(candidate, "geometry_profile", None) or job.get("candidate_profile") or job["profile"],
+                profile_revision,
+            )
+            revision_payload = {
+                "schema_version": PROFILE_SCHEMA_VERSION,
+                "profile_revision": profile_revision,
+                "library_revision": expected_library_revision + 1,
+                "previous_active_revision": previous_revision,
+                "profile": deepcopy(candidate_profile),
+                "report": deepcopy(job.get("report") or {}),
+                "warnings": deepcopy(job.get("warnings") or []),
+                "regression": deepcopy(job.get("regression") or {}),
+                "published_at": time.time(),
+                "operation_id": operation_id,
+                "override_reason": str(override_reason),
+            }
+            revision_path = root / "revisions" / f"{profile_revision}.json"
+            _atomic_write_json(revision_path, revision_payload)
+            document.update(
+                {
+                    "library_revision": expected_library_revision + 1,
+                    "active_revision": profile_revision,
+                    "previous_active_revision": previous_revision,
+                    "active": deepcopy(candidate_profile),
+                }
+            )
+            _atomic_write_json(profile_path, document)
+            try:
+                published_record = self._catalog_publish(
+                    workpiece_id,
+                    candidate,
+                    profile_revision=profile_revision,
+                    previous_profile_revision=previous_revision,
+                    expected_revision=expected_library_revision,
+                    operation_id=operation_id,
+                )
+            except Exception as exc:
+                self._restore_bytes(profile_path, previous_bytes)
+                raise GeometryProfilePublishError(str(exc)) from exc
+            job["published"] = True
+            job["published_revision"] = profile_revision
+            job["updated_at"] = time.time()
+            result = self._snapshot_for_record(published_record)
+            result["job_id"] = job_id
+            result["override_reason"] = str(override_reason)
+            self._operations[operation_key] = deepcopy(result)
+            self._persist_jobs()
+            return result
+
+    def rollback(
+        self,
+        workpiece_id: str,
+        *,
+        expected_library_revision: int,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id must be a non-empty string")
+        operation_key = f"rollback:{workpiece_id}:{operation_id}"
+        with self._condition:
+            cached = self._operations.get(operation_key)
+            if cached is not None:
+                return deepcopy(cached)
+            record = self._record(workpiece_id)
+            snapshot = self._snapshot_for_record(record)
+            previous_revision = snapshot["previous_active_revision"]
+            if record.revision != expected_library_revision:
+                raise StaleGeometryProfileError("workpiece revision changed before rollback")
+            if previous_revision is None:
+                raise GeometryProfilePublishError("no previous geometry profile revision is available")
+            revision_path = self._profile_root(record) / "revisions" / f"{previous_revision}.json"
+            try:
+                payload = json.loads(revision_path.read_text(encoding="utf-8"))
+                profile = payload["profile"]
+            except Exception as exc:
+                raise GeometryProfilePublishError(f"unable to load rollback revision {previous_revision}") from exc
+            classifier = getattr(self.catalog, "classifier", None)
+            prepare = getattr(classifier, "prepare_geometry_cache", None)
+            if not callable(prepare):
+                raise GeometryProfilePublishError("classifier does not support geometry cache preparation")
+            candidate, report = prepare(workpiece_id, record, profile, self.calibrator, None)
+            current_active = snapshot["active_revision"]
+            document, status, error = self._load_document(record)
+            if status == "corrupt":
+                raise CorruptGeometryProfileError(error or "geometry profile is corrupt")
+            profile_path = self._profile_root(record) / "profile.json"
+            previous_bytes = profile_path.read_bytes() if profile_path.exists() else None
+            document.update(
+                {
+                    "library_revision": expected_library_revision + 1,
+                    "active_revision": previous_revision,
+                    "previous_active_revision": payload.get("previous_active_revision"),
+                    "active": deepcopy(profile),
+                }
+            )
+            _atomic_write_json(profile_path, document)
+            try:
+                published_record = self._catalog_publish(
+                    workpiece_id,
+                    candidate,
+                    profile_revision=int(previous_revision),
+                    previous_profile_revision=payload.get("previous_active_revision"),
+                    expected_revision=expected_library_revision,
+                    operation_id=operation_id,
+                )
+            except Exception as exc:
+                self._restore_bytes(profile_path, previous_bytes)
+                raise GeometryProfilePublishError(str(exc)) from exc
+            result = self._snapshot_for_record(published_record)
+            result["rollback_revision"] = previous_revision
+            result["report"] = report
+            self._operations[operation_key] = deepcopy(result)
+            self._persist_jobs()
+            return result
+
+    def shutdown(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
