@@ -441,6 +441,72 @@ class OrientationClassifier:
             ignored_regions={},
         ), report
 
+    def leave_one_out_report(self, record: Any, cache: TemplateCache) -> dict[str, Any]:
+        """Score each template against the other templates without re-extraction.
+
+        This is intentionally a small validation pass over the already-built
+        candidate cache.  It never calls Paddle, ALIKED, or LightGlue feature
+        extraction; only the cached vectors/features are compared.  A side
+        with one template cannot provide a leave-one-out same-side reference,
+        so that sample is reported as skipped instead of being called a
+        regression.
+        """
+        wrong = 0
+        evaluated = 0
+        skipped = 0
+        vectors = cache.global_vectors
+        features = cache.local_features
+        for label, paths in (("front", record.front_images), ("back", record.back_images)):
+            side_vectors = vectors.get(label)
+            side_features = features.get(label)
+            if side_vectors is None or not isinstance(side_features, list):
+                skipped += len(paths)
+                continue
+            for index, path in enumerate(paths):
+                if index >= len(side_features) or len(side_features) <= 1:
+                    skipped += 1
+                    continue
+                try:
+                    image = read_color_image(Path(path))
+                    if image is None:
+                        skipped += 1
+                        continue
+                    query_vector = np.asarray(side_vectors[index], dtype=np.float32)
+                    global_scores: dict[str, float] = {}
+                    local_scores: dict[str, float] = {}
+                    for candidate_label, candidate_vectors in vectors.items():
+                        candidate_array = np.asarray(candidate_vectors, dtype=np.float32)
+                        if candidate_label == label:
+                            candidate_array = np.delete(candidate_array, index, axis=0)
+                        if candidate_array.size == 0:
+                            continue
+                        global_scores[candidate_label] = float(np.max(candidate_array @ query_vector))
+
+                        candidate_features = features.get(candidate_label, [])
+                        if candidate_label == label:
+                            candidate_features = [
+                                item for item_index, item in enumerate(candidate_features)
+                                if item_index != index
+                            ]
+                        local_scores[candidate_label] = self._score_local(
+                            side_features[index], candidate_features, image.shape[:2]
+                        ) if candidate_features else 0.0
+                    if len(global_scores) < 2:
+                        skipped += 1
+                        continue
+                    fused = self._fuse_scores(global_scores, local_scores, time.perf_counter())
+                    evaluated += 1
+                    if fused.get("label") != label:
+                        wrong += 1
+                except (ImageUnreadableError, AttributeError, IndexError, KeyError, TypeError, ValueError):
+                    skipped += 1
+        return {
+            "status": "completed",
+            "correct_to_wrong": int(wrong),
+            "evaluated": int(evaluated),
+            "skipped": int(skipped),
+        }
+
     @staticmethod
     def _feature_keypoint_count(features: dict[str, Any]) -> int:
         keypoints = features.get("keypoints")

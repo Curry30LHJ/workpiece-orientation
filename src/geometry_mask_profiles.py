@@ -710,10 +710,27 @@ class GeometryMaskProfiles:
                     job["report"] = deepcopy(report)
                     job["warnings"] = warnings
                     job["candidate_profile"] = deepcopy(getattr(candidate, "geometry_profile", profile))
-                    job["regression"] = {
-                        "status": "not_run",
-                        "correct_to_wrong": 0,
-                    }
+                    leave_one_out = getattr(classifier, "leave_one_out_report", None)
+                    if callable(leave_one_out):
+                        try:
+                            job["regression"] = deepcopy(leave_one_out(record, candidate))
+                        except Exception as exc:
+                            LOGGER.warning("Geometry leave-one-out validation failed: %s", exc)
+                            job["regression"] = {
+                                "status": "failed",
+                                "correct_to_wrong": 0,
+                                "error": str(exc),
+                            }
+                    else:
+                        job["regression"] = {
+                            "status": "not_run",
+                            "correct_to_wrong": 0,
+                        }
+                    if job["regression"].get("status") == "failed":
+                        job["warnings"].append({
+                            "code": "leave_one_out_failed",
+                            "message": job["regression"].get("error", "留一验证失败"),
+                        })
                     self._candidate_caches[job_id] = candidate
                 job["updated_at"] = time.time()
                 self._persist_jobs()

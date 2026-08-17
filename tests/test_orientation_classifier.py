@@ -155,6 +155,24 @@ def test_active_geometry_profile_builds_directional_template_cache_and_query_fea
     assert result["geometry_mask"]["profile_revision"] == 3
 
 
+def test_leave_one_out_scores_cached_candidate_without_feature_reextraction(classifier, tmp_path):
+    front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(2)]
+    back = [write_marker(tmp_path / f"back-{index}.png", 2) for index in range(2)]
+    cache = classifier.build_template_cache(front, back)
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier._score_feature_pair = lambda *args: {"score": 1.0}
+    before_global = classifier.global_predictor.calls
+    before_local = classifier.extractor.calls
+
+    report = classifier.leave_one_out_report(record, cache)
+
+    assert report["status"] == "completed"
+    assert report["evaluated"] == 4
+    assert report["correct_to_wrong"] == 0
+    assert classifier.global_predictor.calls == before_global
+    assert classifier.extractor.calls == before_local
+
+
 def test_geometry_fit_failure_uses_raw_cache_and_sets_review(classifier, tmp_path):
     front = [write_marker(tmp_path / "front-0.png", 1)]
     back = [write_marker(tmp_path / "back-0.png", 2)]
