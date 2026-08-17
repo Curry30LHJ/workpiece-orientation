@@ -36,7 +36,16 @@ from src.workpiece_library import (
     WorkpieceLibrary,
 )
 from src.workpiece_catalog import RestoreConflictError, WorkpieceCatalog
-from src.geometry_mask_profiles import GeometryMaskProfiles
+from src.geometry_mask_profiles import (
+    CorruptGeometryProfileError,
+    GeometryMaskProfiles,
+    GeometryProfileNotReadyError,
+    GeometryProfilePublishError,
+    GeometryValidationError,
+    GeometryValidationJobNotFoundError,
+    InvalidGeometryProfileError,
+    StaleGeometryProfileError,
+)
 from src.template_evolution import (
     AnnotationGroupNotFoundError,
     DuplicateTemplateError,
@@ -120,6 +129,7 @@ class RuntimeSnapshot:
     error_message: str | None = None
     catalog: Any | None = None
     evolution: Any | None = None
+    geometry_profiles: Any | None = None
 
 
 class ServiceRuntime:
@@ -138,15 +148,25 @@ class ServiceRuntime:
             resolved_catalog = catalog or WorkpieceCatalog(library, classifier)
             evolution = None
             library_dir = getattr(library, "library_dir", None)
+            geometry_profiles = getattr(resolved_catalog, "geometry_profiles", None)
+            if geometry_profiles is None and library_dir is not None:
+                geometry_profiles = GeometryMaskProfiles(
+                    resolved_catalog,
+                    getattr(classifier, "geometry_calibrator", None),
+                    storage_dir=Path(library_dir) / ".geometry-mask-jobs",
+                )
+                setter = getattr(resolved_catalog, "set_geometry_profiles", None)
+                if callable(setter):
+                    setter(geometry_profiles)
             if library_dir is not None:
                 evolution = TemplateEvolution(
                     resolved_catalog,
                     Path(library_dir) / ".evolution",
-                    geometry_profiles=getattr(resolved_catalog, "geometry_profiles", None),
+                    geometry_profiles=geometry_profiles,
                 )
             self._snapshot = RuntimeSnapshot(
                 status="ready", classifier=classifier, library=library,
-                catalog=resolved_catalog, evolution=evolution,
+                catalog=resolved_catalog, evolution=evolution, geometry_profiles=geometry_profiles,
             )
 
     def set_failed(self, code: str, message: str) -> None:
@@ -387,6 +407,97 @@ class OrientationCommandDispatcher:
                         expected_revision=base_revision, operation_id=operation_id,
                     )
                 return self._response(request_id, ok=True, annotations=annotations)
+            if command in {
+                "get_geometry_mask_profile",
+                "save_geometry_mask_draft",
+                "validate_geometry_mask_draft",
+                "get_geometry_mask_validation_job",
+                "geometry_mask_validation_job_action",
+                "publish_geometry_mask_profile",
+                "rollback_geometry_mask_profile",
+            }:
+                if runtime.status != "ready" or runtime.geometry_profiles is None:
+                    return self._runtime_error(request_id, runtime)
+                profiles = runtime.geometry_profiles
+                if command == "get_geometry_mask_profile":
+                    workpiece_id = request.get("workpiece_id")
+                    if not isinstance(workpiece_id, str) or not workpiece_id:
+                        return self._error(request_id, "INVALID_REQUEST", "get_geometry_mask_profile requires workpiece_id")
+                    return self._response(request_id, ok=True, profile=profiles.snapshot(workpiece_id))
+                if command == "get_geometry_mask_validation_job":
+                    job_id = request.get("job_id")
+                    if not isinstance(job_id, str) or not job_id:
+                        return self._error(request_id, "INVALID_REQUEST", "get_geometry_mask_validation_job requires job_id")
+                    return self._response(request_id, ok=True, job=profiles.get_job(job_id))
+                if command == "geometry_mask_validation_job_action":
+                    job_id = request.get("job_id")
+                    action = request.get("action")
+                    if not isinstance(job_id, str) or not isinstance(action, str):
+                        return self._error(request_id, "INVALID_REQUEST", "geometry_mask_validation_job_action requires job_id and action")
+                    return self._response(request_id, ok=True, job=profiles.action(job_id, action))
+                workpiece_id = request.get("workpiece_id")
+                operation_id = request.get("operation_id")
+                if not isinstance(workpiece_id, str) or not workpiece_id:
+                    return self._error(request_id, "INVALID_REQUEST", f"{command} requires workpiece_id")
+                if not isinstance(operation_id, str) or not operation_id:
+                    return self._error(request_id, "INVALID_REQUEST", f"{command} requires operation_id")
+                if command == "save_geometry_mask_draft":
+                    base_library_revision = request.get("base_library_revision")
+                    base_draft_revision = request.get("base_draft_revision")
+                    draft = request.get("draft")
+                    if type(base_library_revision) is not int or type(base_draft_revision) is not int or not isinstance(draft, Mapping):
+                        return self._error(request_id, "INVALID_REQUEST", "save_geometry_mask_draft requires base revisions and draft")
+                    saved = profiles.save_draft(
+                        workpiece_id,
+                        draft,
+                        expected_library_revision=base_library_revision,
+                        expected_draft_revision=base_draft_revision,
+                        operation_id=operation_id,
+                    )
+                    return self._response(request_id, ok=True, profile=saved)
+                if command == "validate_geometry_mask_draft":
+                    base_library_revision = request.get("base_library_revision")
+                    base_draft_revision = request.get("base_draft_revision")
+                    if type(base_library_revision) is not int or type(base_draft_revision) is not int:
+                        return self._error(request_id, "INVALID_REQUEST", "validate_geometry_mask_draft requires base revisions")
+                    job = profiles.start_validation(
+                        workpiece_id,
+                        expected_library_revision=base_library_revision,
+                        expected_draft_revision=base_draft_revision,
+                        operation_id=operation_id,
+                    )
+                    return self._response(request_id, ok=True, job=job)
+                if command == "publish_geometry_mask_profile":
+                    job_id = request.get("job_id")
+                    base_library_revision = request.get("base_library_revision")
+                    base_draft_revision = request.get("base_draft_revision")
+                    override_reason = request.get("override_reason", "")
+                    if (
+                        not isinstance(job_id, str) or not job_id
+                        or type(base_library_revision) is not int
+                        or type(base_draft_revision) is not int
+                        or not isinstance(override_reason, str)
+                    ):
+                        return self._error(request_id, "INVALID_REQUEST", "publish_geometry_mask_profile requires job_id, base revisions and operation_id")
+                    published = profiles.publish(
+                        workpiece_id,
+                        job_id,
+                        expected_library_revision=base_library_revision,
+                        expected_draft_revision=base_draft_revision,
+                        operation_id=operation_id,
+                        override_reason=override_reason,
+                    )
+                    return self._response(request_id, ok=True, profile=published)
+                if command == "rollback_geometry_mask_profile":
+                    base_library_revision = request.get("base_library_revision")
+                    if type(base_library_revision) is not int:
+                        return self._error(request_id, "INVALID_REQUEST", "rollback_geometry_mask_profile requires base_library_revision")
+                    rolled_back = profiles.rollback(
+                        workpiece_id,
+                        expected_library_revision=base_library_revision,
+                        operation_id=operation_id,
+                    )
+                    return self._response(request_id, ok=True, profile=rolled_back)
             if command == "register":
                 if runtime.status != "ready":
                     return self._runtime_error(request_id, runtime)
@@ -451,6 +562,19 @@ class OrientationCommandDispatcher:
             return self._error(request_id, "WORKPIECE_NOT_FOUND", str(exc))
         except RestoreConflictError as exc:
             return self._error(request_id, "RESTORE_CONFLICT", str(exc))
+        except (InvalidGeometryProfileError, CorruptGeometryProfileError) as exc:
+            return self._error(request_id, "INVALID_GEOMETRY_PROFILE", str(exc))
+        except StaleGeometryProfileError as exc:
+            return self._error(request_id, "STALE_GEOMETRY_PROFILE", str(exc))
+        except GeometryProfileNotReadyError as exc:
+            return self._error(request_id, "GEOMETRY_VALIDATION_NOT_READY", str(exc))
+        except GeometryValidationJobNotFoundError as exc:
+            return self._error(request_id, "GEOMETRY_VALIDATION_FAILED", str(exc))
+        except GeometryProfilePublishError as exc:
+            code = "GEOMETRY_OVERRIDE_REQUIRED" if "override_reason" in str(exc) else "GEOMETRY_VALIDATION_FAILED"
+            return self._error(request_id, code, str(exc))
+        except GeometryValidationError as exc:
+            return self._error(request_id, "GEOMETRY_VALIDATION_FAILED", str(exc))
         except StaleWorkpieceRevisionError as exc:
             return self._error(request_id, "STALE_WORKPIECE_REVISION", str(exc))
         except DuplicateTemplateError as exc:

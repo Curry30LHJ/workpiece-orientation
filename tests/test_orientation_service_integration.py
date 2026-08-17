@@ -20,7 +20,7 @@ pytestmark = pytest.mark.integration
 
 class JsonClient:
     def __init__(self, host: str, port: int):
-        self.sock = socket.create_connection((host, port), timeout=10)
+        self.sock = socket.create_connection((host, port), timeout=30)
         self.file = self.sock.makefile("rwb")
 
     def request(self, command: str, **fields):
@@ -91,16 +91,27 @@ def running_service(integration_settings, tmp_path: Path):
     ]
     process = subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     client = None
-    deadline = time.monotonic() + 120
+    # The production model stack can take several minutes to initialize. The
+    # service binds first and reports status=loading during that time, so keep
+    # the connection and continue the hello handshake on the same socket.
+    deadline = time.monotonic() + 600
     try:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(f"orientation service exited with code {process.returncode}")
             try:
                 client = JsonClient("127.0.0.1", port)
-                hello = client.request("hello")
-                if hello.get("ok") is True:
-                    break
+                while time.monotonic() < deadline:
+                    hello = client.request("hello")
+                    if hello.get("ok") is True and hello.get("ready") is True:
+                        break
+                    if hello.get("ok") is True and hello.get("status") == "loading":
+                        time.sleep(0.25)
+                        continue
+                    raise RuntimeError(f"orientation service handshake failed: {hello}")
+                else:
+                    raise TimeoutError("orientation service did not become ready")
+                break
             except OSError:
                 if client is not None:
                     client.close()
