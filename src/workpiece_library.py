@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -41,6 +42,10 @@ class FeatureBuildError(WorkpieceLibraryError):
     """Raised by a feature builder when a staging set cannot be indexed."""
 
 
+class StaleWorkpieceRevisionError(WorkpieceLibraryError):
+    """Raised when an annotation mutation targets an older workpiece revision."""
+
+
 @dataclass(frozen=True)
 class WorkpieceRecord:
     id: str
@@ -48,10 +53,14 @@ class WorkpieceRecord:
     root: Path
     front_images: tuple[Path, ...]
     back_images: tuple[Path, ...]
+    revision: int = 1
+    state: str = "active"
 
 
 CacheProgressCallback = Callable[[str, int, int], None]
 CacheBuilder = Callable[[Sequence[Path], Sequence[Path], CacheProgressCallback | None], TemplateCache]
+CacheLoader = Callable[[WorkpieceRecord], TemplateCache | None]
+CacheSaver = Callable[[WorkpieceRecord, TemplateCache], None]
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -117,6 +126,7 @@ class WorkpieceLibrary:
     def __init__(self, library_dir: Path):
         self.library_dir = Path(library_dir)
         self._records: dict[str, WorkpieceRecord] = {}
+        self._recycled_records: dict[str, WorkpieceRecord] = {}
 
     def _find_by_name(self, name: str) -> WorkpieceRecord | None:
         key = name.casefold()
@@ -150,7 +160,21 @@ class WorkpieceLibrary:
                 or counts != {"front": len(front), "back": len(back)}
             ):
                 raise InvalidTemplateSetError(f"Invalid template_counts: {manifest_path}")
-        return WorkpieceRecord(record_id, name, root, front, back)
+        revision = manifest.get("revision", 1)
+        if type(revision) is not int or revision <= 0:
+            raise InvalidTemplateSetError(f"Invalid revision: {manifest_path}")
+        state = manifest.get("state", "active")
+        if state not in {"active", "recycled"}:
+            raise InvalidTemplateSetError(f"Invalid state: {manifest_path}")
+        return WorkpieceRecord(record_id, name, root, front, back, revision, state)
+
+    @staticmethod
+    def _update_manifest(record: WorkpieceRecord, *, revision: int, state: str) -> None:
+        manifest_path = record.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["revision"] = revision
+        manifest["state"] = state
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _copy_templates(
         self,
@@ -269,6 +293,8 @@ class WorkpieceLibrary:
                 "labels": {"0": "front", "1": "back"},
                 "template_counts": {"front": len(front), "back": len(back)},
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "revision": 1,
+                "state": "active",
             }
             (staging / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -291,6 +317,8 @@ class WorkpieceLibrary:
                 final_root,
                 tuple(final_root / "0" / path.name for path in staged_front),
                 tuple(final_root / "1" / path.name for path in staged_back),
+                1,
+                "active",
             )
             self._records[new_id] = record
             if existing is not None:
@@ -307,9 +335,89 @@ class WorkpieceLibrary:
                 shutil.rmtree(staging)
             raise
 
-    def recover(self, build_cache: CacheBuilder) -> list[tuple[WorkpieceRecord, TemplateCache]]:
+    def append_templates(
+        self,
+        workpiece_id: str,
+        front_images: Sequence[Path],
+        back_images: Sequence[Path],
+        build_cache: CacheBuilder,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[WorkpieceRecord, TemplateCache]:
+        """Append confirmed templates while preserving the workpiece identity."""
+        existing = self._records[workpiece_id]
+        if not front_images and not back_images:
+            raise InvalidTemplateSetError("At least one confirmed template is required")
+        total = len(existing.front_images) + len(existing.back_images) + len(front_images) + len(back_images)
+        seen_images: dict[str, Path] = {}
+        for path in (*existing.front_images, *existing.back_images):
+            image = read_color_image(path)
+            if image is None:
+                raise InvalidTemplateSetError(f"Unreadable existing template: {path}")
+            resolved = Path(path).resolve()
+            seen_images[f"path:{str(resolved).casefold()}"] = resolved
+            seen_images[f"content:{_image_fingerprint(image)}"] = resolved
+        new_front = _validate_images(front_images, "front", seen_images) if front_images else ()
+        new_back = _validate_images(back_images, "back", seen_images) if back_images else ()
+        all_front = tuple(existing.front_images) + new_front
+        all_back = tuple(existing.back_images) + new_back
+        staging = self.library_dir / f".staging-{uuid.uuid4().hex}"
+        backup_root: Path | None = None
+        staging.mkdir(parents=True, exist_ok=False)
+        try:
+            staged_front = self._copy_templates(all_front, staging / "0")
+            staged_back = self._copy_templates(all_back, staging / "1")
+            manifest = json.loads((existing.root / "manifest.json").read_text(encoding="utf-8"))
+            manifest.update(
+                {
+                    "schema_version": max(2, int(manifest.get("schema_version", 1))),
+                    "id": existing.id,
+                    "name": existing.name,
+                    "labels": {"0": "front", "1": "back"},
+                    "template_counts": {"front": len(all_front), "back": len(all_back)},
+                    "revision": existing.revision + 1,
+                    "state": "active",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            (staging / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            cache = build_cache(staged_front, staged_back, None)
+            backup_root = self.library_dir / f".backup-{uuid.uuid4().hex}"
+            os.replace(existing.root, backup_root)
+            os.replace(staging, existing.root)
+            record = WorkpieceRecord(
+                existing.id,
+                existing.name,
+                existing.root,
+                tuple(existing.root / "0" / path.name for path in staged_front),
+                tuple(existing.root / "1" / path.name for path in staged_back),
+                existing.revision + 1,
+                "active",
+            )
+            self._records[workpiece_id] = record
+            shutil.rmtree(backup_root)
+            return record, cache
+        except Exception:
+            if existing.root.exists() and backup_root is not None and backup_root.exists():
+                shutil.rmtree(existing.root)
+            if backup_root is not None and backup_root.exists() and not existing.root.exists():
+                os.replace(backup_root, existing.root)
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise
+
+    def recover(
+        self,
+        build_cache: CacheBuilder,
+        *,
+        cache_loader: CacheLoader | None = None,
+        cache_saver: CacheSaver | None = None,
+    ) -> list[tuple[WorkpieceRecord, TemplateCache]]:
         self.library_dir.mkdir(parents=True, exist_ok=True)
         self._records.clear()
+        self._recycled_records.clear()
         for temporary in self.library_dir.iterdir():
             if temporary.name.startswith(".staging-"):
                 shutil.rmtree(temporary, ignore_errors=True)
@@ -330,14 +438,40 @@ class WorkpieceLibrary:
                 continue
             try:
                 record = self._record_from_root(root)
+                if record.state != "active":
+                    raise InvalidTemplateSetError(f"Inactive workpiece in active directory: {root}")
                 if self._find_by_name(record.name) is not None:
                     raise InvalidTemplateSetError(f"Duplicate workpiece name: {record.name}")
-                cache = build_cache(record.front_images, record.back_images, None)
+                cache = None
+                if cache_loader is not None:
+                    try:
+                        cache = cache_loader(record)
+                    except Exception as exc:
+                        LOGGER.warning("Ignoring invalid template cache for %s: %s", root, exc)
+                if cache is None:
+                    cache = build_cache(record.front_images, record.back_images, None)
+                    if cache_saver is not None:
+                        try:
+                            cache_saver(record, cache)
+                        except Exception as exc:
+                            LOGGER.warning("Unable to persist template cache for %s: %s", root, exc)
             except Exception as exc:
                 LOGGER.warning("Skipping invalid workpiece %s: %s", root, exc)
                 continue
             self._records[record.id] = record
             recovered.append((record, cache))
+        recycle_root = self.library_dir / ".recycled"
+        if recycle_root.is_dir():
+            for root in sorted(recycle_root.iterdir(), key=lambda path: path.name):
+                if not root.is_dir():
+                    continue
+                try:
+                    record = self._record_from_root(root)
+                    if record.state != "recycled":
+                        raise InvalidTemplateSetError(f"Invalid recycled state: {root}")
+                    self._recycled_records[record.id] = record
+                except Exception as exc:
+                    LOGGER.warning("Skipping invalid recycled workpiece %s: %s", root, exc)
         return recovered
 
     def list_workpieces(self) -> list[dict[str, str]]:
@@ -348,3 +482,257 @@ class WorkpieceLibrary:
 
     def get(self, workpiece_id: str) -> WorkpieceRecord:
         return self._records[workpiece_id]
+
+    def replace_geometry_profile_pointers(
+        self,
+        workpiece_id: str,
+        *,
+        expected_revision: int,
+        active_revision: int | None,
+        previous_active_revision: int | None,
+    ) -> WorkpieceRecord:
+        """Atomically update geometry profile pointers and the record revision.
+
+        This method intentionally does not inspect validation reports or build a
+        cache.  The catalog owns those concerns and calls this small persistence
+        boundary only after a candidate profile has been fully prepared.
+        """
+        record = self._records[workpiece_id]
+        if type(expected_revision) is not int or expected_revision != record.revision:
+            raise StaleWorkpieceRevisionError(
+                f"Workpiece revision changed: expected {expected_revision}, current {record.revision}"
+            )
+        for value, field in (
+            (active_revision, "active_revision"),
+            (previous_active_revision, "previous_active_revision"),
+        ):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise WorkpieceLibraryError(f"{field} must be a positive integer or null")
+        manifest_path = record.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        next_revision = record.revision + 1
+        manifest.update(
+            {
+                "schema_version": max(2, int(manifest.get("schema_version", 1))),
+                "revision": next_revision,
+                "state": "active",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "geometry_mask_active_revision": active_revision,
+                "geometry_mask_previous_active_revision": previous_active_revision,
+            }
+        )
+        temporary = manifest_path.with_name(f".{manifest_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(manifest, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, manifest_path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        updated = WorkpieceRecord(
+            record.id,
+            record.name,
+            record.root,
+            record.front_images,
+            record.back_images,
+            next_revision,
+            "active",
+        )
+        self._records[workpiece_id] = updated
+        return updated
+
+    def list_recycled(self) -> list[dict[str, str]]:
+        return [
+            {"id": record.id, "name": record.name, "revision": record.revision}
+            for record in sorted(self._recycled_records.values(), key=lambda item: item.name.casefold())
+        ]
+
+    def get_recycled(self, workpiece_id: str) -> WorkpieceRecord:
+        return self._recycled_records[workpiece_id]
+
+    def recycle(self, workpiece_id: str) -> WorkpieceRecord:
+        record = self._records[workpiece_id]
+        recycle_root = self.library_dir / ".recycled"
+        recycle_root.mkdir(parents=True, exist_ok=True)
+        target = recycle_root / record.id
+        if target.exists():
+            raise WorkpieceLibraryError(f"Recycled workpiece already exists: {record.id}")
+        next_revision = record.revision + 1
+        self._update_manifest(record, revision=next_revision, state="recycled")
+        os.replace(record.root, target)
+        recycled = WorkpieceRecord(
+            record.id,
+            record.name,
+            target,
+            tuple(target / "0" / path.name for path in record.front_images),
+            tuple(target / "1" / path.name for path in record.back_images),
+            next_revision,
+            "recycled",
+        )
+        self._records.pop(record.id, None)
+        self._recycled_records[record.id] = recycled
+        return recycled
+
+    def restore(self, workpiece_id: str) -> WorkpieceRecord:
+        record = self._recycled_records[workpiece_id]
+        if self._find_by_name(record.name) is not None or workpiece_id in self._records:
+            raise WorkpieceLibraryError(f"Restore conflict for workpiece: {record.name}")
+        target = self.library_dir / record.id
+        if target.exists():
+            raise WorkpieceLibraryError(f"Restore target already exists: {record.id}")
+        next_revision = record.revision + 1
+        self._update_manifest(record, revision=next_revision, state="active")
+        os.replace(record.root, target)
+        restored = WorkpieceRecord(
+            record.id,
+            record.name,
+            target,
+            tuple(target / "0" / path.name for path in record.front_images),
+            tuple(target / "1" / path.name for path in record.back_images),
+            next_revision,
+            "active",
+        )
+        self._recycled_records.pop(record.id, None)
+        self._records[record.id] = restored
+        return restored
+
+    def purge(self, workpiece_id: str) -> None:
+        record = self._recycled_records[workpiece_id]
+        shutil.rmtree(record.root)
+        self._recycled_records.pop(workpiece_id, None)
+
+    def save_annotation_groups(self, workpiece_id: str, groups: list[dict]) -> WorkpieceRecord:
+        record = self._records[workpiece_id]
+        manifest_path = record.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = max(2, int(manifest.get("schema_version", 1)))
+        next_revision = record.revision + 1
+        manifest["revision"] = next_revision
+        manifest["state"] = "active"
+        existing_groups = manifest.get("interference_groups", [])
+        merged: dict[str, dict] = {str(group.get("group_id", group.get("name", ""))): group for group in existing_groups}
+        for group in groups:
+            key = str(group.get("group_id", group.get("name", "")))
+            if key not in merged:
+                merged[key] = group
+                continue
+            current = dict(merged[key])
+            annotations = list(current.get("annotations", []))
+            for annotation in group.get("annotations", []):
+                identity = (annotation.get("orientation"), annotation.get("index"))
+                annotations = [item for item in annotations
+                               if (item.get("orientation"), item.get("index")) != identity]
+                annotations.append(annotation)
+            current.update({key_name: value for key_name, value in group.items() if key_name != "annotations"})
+            current["annotations"] = annotations
+            merged[key] = current
+        manifest["interference_groups"] = list(merged.values())
+        temp = manifest_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(manifest_path)
+        updated = WorkpieceRecord(
+            record.id,
+            record.name,
+            record.root,
+            record.front_images,
+            record.back_images,
+            next_revision,
+            "active",
+        )
+        self._records[workpiece_id] = updated
+        return updated
+
+    def get_annotation_document(self, workpiece_id: str) -> dict[str, Any]:
+        """Return a normalized draft/active annotation document.
+
+        Older manifests contain only ``interference_groups``.  They remain
+        readable; only groups whose propagation is already active are treated
+        as active until the first versioned mutation writes both collections.
+        """
+        record = self._records[workpiece_id]
+        manifest_path = record.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        draft_groups = deepcopy(manifest.get("interference_groups", []))
+        stored_active = manifest.get("active_interference_groups")
+        if stored_active is None:
+            active_groups = [
+                deepcopy(group)
+                for group in draft_groups
+                if group.get("enabled", True)
+                and group.get("propagation", {}).get("state") == "active"
+            ]
+        else:
+            active_groups = deepcopy(stored_active)
+        annotation_revision = manifest.get("annotation_revision", record.revision)
+        active_annotation_revision = manifest.get("active_annotation_revision", annotation_revision)
+        if type(annotation_revision) is not int or annotation_revision < 0:
+            annotation_revision = record.revision
+        if type(active_annotation_revision) is not int or active_annotation_revision < 0:
+            active_annotation_revision = annotation_revision
+        return {
+            "revision": record.revision,
+            "annotation_revision": annotation_revision,
+            "active_annotation_revision": active_annotation_revision,
+            "draft_groups": draft_groups,
+            "active_groups": active_groups,
+        }
+
+    def replace_annotation_document(
+        self,
+        workpiece_id: str,
+        draft_groups: list[dict],
+        *,
+        expected_revision: int,
+        active_groups: list[dict] | None = None,
+    ) -> WorkpieceRecord:
+        """Atomically replace draft annotations and optionally publish active groups."""
+        record = self._records[workpiece_id]
+        if type(expected_revision) is not int or expected_revision != record.revision:
+            raise StaleWorkpieceRevisionError(
+                f"Workpiece revision changed: expected {expected_revision}, current {record.revision}"
+            )
+        manifest_path = record.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        previous_document = self.get_annotation_document(workpiece_id)
+        next_revision = record.revision + 1
+        next_annotation_revision = previous_document["annotation_revision"] + 1
+        if active_groups is None:
+            next_active_groups = previous_document["active_groups"]
+            next_active_annotation_revision = previous_document["active_annotation_revision"]
+        else:
+            next_active_groups = deepcopy(active_groups)
+            next_active_annotation_revision = next_annotation_revision
+        manifest.update(
+            {
+                "schema_version": max(2, int(manifest.get("schema_version", 1))),
+                "revision": next_revision,
+                "state": "active",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "interference_groups": deepcopy(draft_groups),
+                "active_interference_groups": next_active_groups,
+                "annotation_revision": next_annotation_revision,
+                "active_annotation_revision": next_active_annotation_revision,
+            }
+        )
+        temp = manifest_path.with_suffix(".tmp")
+        try:
+            temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(manifest_path)
+        except Exception:
+            if temp.exists():
+                temp.unlink()
+            raise
+        updated = WorkpieceRecord(
+            record.id,
+            record.name,
+            record.root,
+            record.front_images,
+            record.back_images,
+            next_revision,
+            "active",
+        )
+        self._records[workpiece_id] = updated
+        return updated

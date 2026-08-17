@@ -12,6 +12,7 @@ from src.workpiece_library import (
     FeatureBuildError,
     InvalidTemplateSetError,
     InvalidWorkpieceNameError,
+    StaleWorkpieceRevisionError,
     WorkpieceExistsError,
     WorkpieceLibrary,
 )
@@ -165,6 +166,53 @@ def test_recover_rebuilds_each_valid_cache_once(tmp_path):
     assert len(calls) == 2
 
 
+def test_recover_uses_valid_cache_loader_without_rebuilding(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "lib")
+    record, expected_cache = library.register(
+        "M7", image_set(tmp_path, "front", 10, 1), image_set(tmp_path, "back", 20, 1), False, fake_builder
+    )
+    loaded = []
+
+    def cache_loader(candidate):
+        loaded.append(candidate.id)
+        return expected_cache
+
+    def unexpected_builder(front, back, progress_callback=None):
+        raise AssertionError("cache hit must not rebuild template features")
+
+    recovered = WorkpieceLibrary(tmp_path / "lib").recover(
+        unexpected_builder,
+        cache_loader=cache_loader,
+    )
+
+    assert [(item.id, item.name) for item, _ in recovered] == [(record.id, "M7")]
+    assert loaded == [record.id]
+    assert recovered[0][1] is expected_cache
+
+
+def test_recover_rebuilds_and_saves_when_cache_loader_misses(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "lib")
+    record, _ = library.register(
+        "M7", image_set(tmp_path, "front", 10, 1), image_set(tmp_path, "back", 20, 1), False, fake_builder
+    )
+    rebuilt = []
+    saved = []
+
+    def counting_builder(front, back, progress_callback=None):
+        rebuilt.append((tuple(front), tuple(back)))
+        return fake_builder(front, back, progress_callback)
+
+    recovered = WorkpieceLibrary(tmp_path / "lib").recover(
+        counting_builder,
+        cache_loader=lambda candidate: None,
+        cache_saver=lambda candidate, cache: saved.append((candidate.id, cache)),
+    )
+
+    assert len(recovered) == 1
+    assert len(rebuilt) == 1
+    assert saved == [(record.id, recovered[0][1])]
+
+
 def test_recover_restores_valid_backup_when_formal_directory_is_missing(tmp_path):
     library = WorkpieceLibrary(tmp_path / "lib")
     record, _ = library.register(
@@ -191,6 +239,21 @@ def test_register_persists_unequal_counts_and_manifest_counts(tmp_path):
     assert manifest["template_counts"] == {"front": 5, "back": 12}
     assert len(record.front_images) == len(cache.local_features["front"]) == 5
     assert len(record.back_images) == len(cache.local_features["back"]) == 12
+
+
+@pytest.mark.parametrize("front_count,back_count", [(1, 1), (5, 10), (10, 15)])
+def test_register_accepts_requested_template_count_pairs(tmp_path, front_count, back_count):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, cache = library.register(
+        "M7",
+        image_set(tmp_path, "front", 10, front_count),
+        image_set(tmp_path, "back", 200, back_count),
+        False,
+        fake_builder,
+    )
+
+    assert (len(record.front_images), len(record.back_images)) == (front_count, back_count)
+    assert (len(cache.local_features["front"]), len(cache.local_features["back"])) == (front_count, back_count)
 
 
 def test_register_allows_more_than_thirty_templates_without_truncation(tmp_path):
@@ -271,3 +334,86 @@ def test_register_reports_progress_without_affecting_cache_result(tmp_path):
     assert record.name == "M7"
     assert len(cache.local_features["front"]) == 1
     assert any(event["phase"] == "committing" for event in events)
+
+
+def test_annotation_document_reads_legacy_groups_and_only_safe_groups_as_active(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, _ = library.register(
+        "M7", image_set(tmp_path, "front", 10, 1), image_set(tmp_path, "back", 20, 1), False, fake_builder
+    )
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["interference_groups"] = [
+        {"group_id": "active", "enabled": True,
+         "propagation": {"state": "active"}, "annotations": []},
+        {"group_id": "review", "enabled": True,
+         "propagation": {"state": "needs_review"}, "annotations": []},
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    document = library.get_annotation_document(record.id)
+
+    assert [item["group_id"] for item in document["draft_groups"]] == ["active", "review"]
+    assert [item["group_id"] for item in document["active_groups"]] == ["active"]
+    assert document["active_annotation_revision"] == document["annotation_revision"]
+
+
+def test_annotation_document_rejects_stale_replace_without_mutating_manifest(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, _ = library.register(
+        "M7", image_set(tmp_path, "front", 10, 1), image_set(tmp_path, "back", 20, 1), False, fake_builder
+    )
+    manifest_path = record.root / "manifest.json"
+    before = manifest_path.read_bytes()
+
+    with pytest.raises(StaleWorkpieceRevisionError):
+        library.replace_annotation_document(
+            record.id,
+            [{"group_id": "glare", "name": "反光", "annotations": []}],
+            expected_revision=record.revision - 1,
+            active_groups=[],
+        )
+
+    assert manifest_path.read_bytes() == before
+    assert library.get(record.id).revision == record.revision
+
+
+def test_replace_geometry_profile_pointers_updates_manifest_and_record_revision(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, _ = library.register(
+        "M7", image_set(tmp_path, "front", 10, 1), image_set(tmp_path, "back", 20, 1), False, fake_builder
+    )
+
+    updated = library.replace_geometry_profile_pointers(
+        record.id,
+        expected_revision=record.revision,
+        active_revision=3,
+        previous_active_revision=2,
+    )
+
+    manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
+    assert updated.revision == record.revision + 1
+    assert library.get(record.id).revision == updated.revision
+    assert manifest["geometry_mask_active_revision"] == 3
+    assert manifest["geometry_mask_previous_active_revision"] == 2
+    assert manifest["revision"] == updated.revision
+
+
+def test_annotation_document_replaces_draft_and_explicit_active_groups(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, _ = library.register(
+        "M7", image_set(tmp_path, "front", 10, 1), image_set(tmp_path, "back", 20, 1), False, fake_builder
+    )
+
+    updated = library.replace_annotation_document(
+        record.id,
+        [{"group_id": "draft", "name": "待复核", "propagation": {"state": "needs_review"}, "annotations": []}],
+        expected_revision=record.revision,
+        active_groups=[],
+    )
+    document = library.get_annotation_document(record.id)
+
+    assert updated.revision == record.revision + 1
+    assert document["draft_groups"][0]["group_id"] == "draft"
+    assert document["active_groups"] == []
+    assert document["active_annotation_revision"] == document["annotation_revision"]
