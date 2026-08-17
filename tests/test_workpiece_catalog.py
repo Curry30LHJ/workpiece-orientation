@@ -1,10 +1,12 @@
 from pathlib import Path
+import json
 
 import cv2
 import numpy as np
 import pytest
 
 from src.orientation_classifier import OrientationClassifier, TemplateCache
+from src.geometry_mask_profiles import GeometryMaskProfiles
 from src.workpiece_catalog import RestoreConflictError, WorkpieceCatalog
 from src.workpiece_library import WorkpieceLibrary
 
@@ -36,6 +38,19 @@ class FakeClassifier:
 
     def get_template_cache(self, workpiece_id):
         return self.caches.get(workpiece_id)
+
+    def prepare_geometry_cache(self, workpiece_id, record, profile, calibrator=None, progress_callback=None):
+        base = self.caches[workpiece_id]
+        candidate = TemplateCache(
+            global_vectors=base.global_vectors,
+            local_features=base.local_features,
+            raw_global_vectors=base.raw_global_vectors or base.global_vectors,
+            raw_local_features=base.raw_local_features or base.local_features,
+            geometry_profile=profile,
+            geometry_profile_revision=profile.get("profile_revision"),
+            geometry_template_report={"front": [], "back": []},
+        )
+        return candidate, {"front": [], "back": []}
 
     def build_template_cache(self, front, back, progress_callback=None):
         return builder(front, back, progress_callback)
@@ -200,3 +215,58 @@ def test_catalog_persists_cache_after_register_append_and_restore(tmp_path):
     catalog.restore(record.id, operation_id="restore-1")
 
     assert [item[0] for item in classifier.save_calls] == [record.id, record.id, record.id]
+
+
+def _geometry_profile():
+    return {
+        "directions": {
+            "front": {
+                "anchor": {"shape": "ellipse", "coarse": {"cx": 0.5, "cy": 0.5, "rx": 0.4, "ry": 0.4}},
+                "rules": [{"rule_id": "glare", "name": "反光", "shape": "circle",
+                           "geometry": {"r": 0.5}, "mode": "inside", "margin_ratio": 0.02,
+                           "enabled": True}],
+            },
+            "back": {"anchor": None, "rules": []},
+        }
+    }
+
+
+def test_recover_rebuilds_active_geometry_cache_and_archives_legacy_masks(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "library")
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False
+    )
+    profiles = GeometryMaskProfiles(catalog, start_worker=False, storage_dir=tmp_path / "geometry-jobs")
+    catalog.set_geometry_profiles(profiles)
+    draft = profiles.save_draft(
+        record.id, _geometry_profile(), expected_library_revision=record.revision,
+        expected_draft_revision=0, operation_id="draft-1"
+    )
+    job = profiles.start_validation(
+        record.id, expected_library_revision=record.revision,
+        expected_draft_revision=draft["draft_revision"], operation_id="validate-1"
+    )
+    profiles.run_next(force=True)
+    profiles.publish(
+        record.id, job["job_id"], expected_library_revision=record.revision,
+        expected_draft_revision=draft["draft_revision"], operation_id="publish-1"
+    )
+    manifest_path = catalog.get(record.id).root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["interference_groups"] = [{"group_id": "legacy", "annotations": []}]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    restarted_classifier = FakeClassifier()
+    restarted_catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), restarted_classifier)
+    restarted_profiles = GeometryMaskProfiles(
+        restarted_catalog, start_worker=False, storage_dir=tmp_path / "geometry-jobs-restarted"
+    )
+    restarted_catalog.set_geometry_profiles(restarted_profiles)
+    restarted_catalog.recover()
+
+    cache = restarted_classifier.get_template_cache(record.id)
+    assert cache.geometry_profile_revision == 1
+    assert cache.ignored_regions in ({}, None)
+    assert restarted_catalog.get_annotation_snapshot(record.id)["legacy_archived"] is True

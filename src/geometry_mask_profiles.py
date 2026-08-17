@@ -19,6 +19,7 @@ import uuid
 from typing import Any, Mapping
 
 from src.geometry_calibration import SUPPORTED_MODES, SUPPORTED_SHAPES
+from src.image_io import read_color_image
 from src.workpiece_library import StaleWorkpieceRevisionError
 
 
@@ -410,6 +411,65 @@ class GeometryMaskProfiles:
             _atomic_write_json(root / "profile.json", document)
             result = self._snapshot_for_record(record)
             self._operations[operation_key] = deepcopy(result)
+            return result
+
+    def sync_library_revision(self, record: Any) -> None:
+        """Keep a profile document's library pointer current after template changes."""
+        with self._lock:
+            document, status, _ = self._load_document(record)
+            if status != "ok" or document["library_revision"] == record.revision:
+                return
+            document["library_revision"] = int(record.revision)
+            _atomic_write_json(self._profile_root(record) / "profile.json", document)
+
+    def rebuild_active_cache(self, workpiece_id: str, record: Any | None = None) -> Any | None:
+        """Build the active geometry view from its immutable revision file."""
+        with self._lock:
+            record = record or self._record(workpiece_id)
+            manifest = self._manifest(record)
+            active_revision = manifest.get("geometry_mask_active_revision")
+            if active_revision is None:
+                active_revision = self._load_document(record)[0].get("active_revision")
+            if type(active_revision) is not int or active_revision <= 0:
+                return None
+            path = self._profile_root(record) / "revisions" / f"{active_revision}.json"
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                profile = payload["profile"]
+            except Exception as exc:
+                LOGGER.warning("Unable to load active geometry profile %s: %s", path, exc)
+                return None
+            classifier = getattr(self.catalog, "classifier", None)
+            prepare = getattr(classifier, "prepare_geometry_cache", None)
+            if not callable(prepare):
+                return None
+            candidate, _ = prepare(workpiece_id, record, profile, self.calibrator, None)
+            return candidate
+
+    def validate_new_template(self, workpiece_id: str, orientation: str, image_path: Path) -> dict[str, Any]:
+        """Fit the active profile to one newly confirmed template."""
+        if orientation not in {"front", "back"}:
+            raise GeometryValidationError("orientation must be front or back")
+        with self._lock:
+            record = self._record(workpiece_id)
+            snapshot = self._snapshot_for_record(record)
+            if snapshot.get("active_revision") is None:
+                return {"status": "not_configured", "needs_review": False}
+            profile = snapshot.get("active") or {}
+            directions = profile.get("directions", {}) if isinstance(profile, Mapping) else {}
+            direction = directions.get(orientation) if isinstance(directions, Mapping) else None
+            if not isinstance(direction, Mapping) or direction.get("anchor") is None or not direction.get("rules"):
+                return {"status": "not_configured", "needs_review": False}
+            image = read_color_image(Path(image_path))
+            if image is None:
+                return {"status": "unreadable", "needs_review": True}
+            if self.calibrator is None:
+                return {"status": "unavailable", "needs_review": True}
+            fit = self.calibrator.fit(image, direction)
+            result = {key: value for key, value in fit.items() if key != "ignore_mask"}
+            result["status"] = fit.get("status", "low_confidence")
+            result["needs_review"] = result["status"] != "active"
+            result["profile_revision"] = snapshot["active_revision"]
             return result
 
     # ------------------------------------------------------------------

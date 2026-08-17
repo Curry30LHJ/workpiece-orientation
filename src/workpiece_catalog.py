@@ -26,11 +26,16 @@ class RestoreConflictError(WorkpieceCatalogError):
 class WorkpieceCatalog:
     """Own persistent lifecycle transitions and classifier cache publication."""
 
-    def __init__(self, library: WorkpieceLibrary, classifier: Any):
+    def __init__(self, library: WorkpieceLibrary, classifier: Any, geometry_profiles: Any | None = None):
         self.library = library
         self.classifier = classifier
+        self.geometry_profiles = geometry_profiles
         self._lock = threading.RLock()
         self._operations: dict[str, Any] = {}
+
+    def set_geometry_profiles(self, geometry_profiles: Any | None) -> None:
+        with self._lock:
+            self.geometry_profiles = geometry_profiles
 
     def _idempotent(self, operation_id: str, action):
         if not isinstance(operation_id, str) or not operation_id:
@@ -200,6 +205,9 @@ class WorkpieceCatalog:
                 "revision": document["revision"],
                 "annotation_revision": document["annotation_revision"],
                 "active_annotation_revision": document["active_annotation_revision"],
+                "legacy_archived": bool(
+                    document["draft_groups"] or document["active_groups"]
+                ),
                 "templates": templates,
                 "groups": groups,
             }
@@ -217,7 +225,7 @@ class WorkpieceCatalog:
             with self._lock:
                 record = self.library.get(workpiece_id)
                 candidate_cache = None
-                if active_groups is not None:
+                if active_groups is not None and self.geometry_profiles is None:
                     masks = build_active_mask_map(
                         len(record.front_images), len(record.back_images), active_groups
                     )
@@ -230,7 +238,7 @@ class WorkpieceCatalog:
                     expected_revision=expected_revision,
                     active_groups=active_groups,
                 )
-                if candidate_cache is not None:
+                if candidate_cache is not None and self.geometry_profiles is None:
                     self.classifier.set_template_cache(workpiece_id, candidate_cache)
                 return self.get_annotation_snapshot(workpiece_id)
 
@@ -245,13 +253,22 @@ class WorkpieceCatalog:
             )
             for record, cache in recovered:
                 self.classifier.set_template_cache(record.id, cache)
-                document = self.library.get_annotation_document(record.id)
-                if document["active_groups"] and hasattr(self.classifier, "prepare_template_masks"):
-                    masks = build_active_mask_map(
-                        len(record.front_images), len(record.back_images), document["active_groups"]
-                    )
-                    filtered, _ = self.classifier.prepare_template_masks(record.id, masks)
-                    self.classifier.set_template_cache(record.id, filtered)
+                if self.geometry_profiles is not None:
+                    try:
+                        candidate = self.geometry_profiles.rebuild_active_cache(record.id, record)
+                        if candidate is not None:
+                            self.classifier.set_template_cache(record.id, candidate)
+                            self.geometry_profiles.sync_library_revision(record)
+                    except Exception as exc:
+                        LOGGER.warning("Unable to restore active geometry profile for %s: %s", record.id, exc)
+                else:
+                    document = self.library.get_annotation_document(record.id)
+                    if document["active_groups"] and hasattr(self.classifier, "prepare_template_masks"):
+                        masks = build_active_mask_map(
+                            len(record.front_images), len(record.back_images), document["active_groups"]
+                        )
+                        filtered, _ = self.classifier.prepare_template_masks(record.id, masks)
+                        self.classifier.set_template_cache(record.id, filtered)
             return recovered
 
     def predict(self, workpiece_id: str, image_path: Path):
@@ -271,7 +288,15 @@ class WorkpieceCatalog:
                 progress_callback=progress_callback,
             )
             self.classifier.set_template_cache(record.id, cache)
-            if previous is not None and previous.ignored_regions and hasattr(self.classifier, "set_template_masks"):
+            if self.geometry_profiles is not None:
+                try:
+                    candidate = self.geometry_profiles.rebuild_active_cache(record.id, record)
+                    if candidate is not None:
+                        self.classifier.set_template_cache(record.id, candidate)
+                    self.geometry_profiles.sync_library_revision(record)
+                except Exception as exc:
+                    LOGGER.warning("Unable to rebuild active geometry profile for appended templates: %s", exc)
+            elif previous is not None and previous.ignored_regions and hasattr(self.classifier, "set_template_masks"):
                 self.classifier.set_template_masks(record.id, previous.ignored_regions)
             current = self.classifier.get_template_cache(record.id) if hasattr(self.classifier, "get_template_cache") else cache
             self._save_template_cache(record, current or cache)
@@ -332,6 +357,14 @@ class WorkpieceCatalog:
                         raise RestoreConflictError(str(exc)) from exc
                     raise
                 self.classifier.set_template_cache(record.id, cache)
+                if self.geometry_profiles is not None:
+                    try:
+                        candidate = self.geometry_profiles.rebuild_active_cache(record.id, record)
+                        if candidate is not None:
+                            self.classifier.set_template_cache(record.id, candidate)
+                        self.geometry_profiles.sync_library_revision(record)
+                    except Exception as exc:
+                        LOGGER.warning("Unable to restore active geometry profile for %s: %s", record.id, exc)
                 self._save_template_cache(record, cache)
                 return record
 
@@ -352,6 +385,13 @@ class WorkpieceCatalog:
                 record = self.library.save_annotation_groups(workpiece_id, groups)
                 manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
                 effective_groups = manifest.get("interference_groups", [])
+                if self.geometry_profiles is not None:
+                    return {
+                        "workpiece_id": workpiece_id,
+                        "revision": record.revision,
+                        "groups": effective_groups,
+                        "archived": True,
+                    }
                 masks = {
                     "front": [[] for _ in record.front_images],
                     "back": [[] for _ in record.back_images],
