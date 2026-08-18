@@ -72,7 +72,7 @@
 - 验证报告的每张模板项增加 `candidates`、`selected_candidate_index`、`fit_duration_ms`、`review_state` 和 `review_reason`。
 - 活动版本继续由 `active_revision` 指向不可变 revision；编辑器历史只存在当前 Qt 草稿内，不写入生产预测路径。
 
-旧版 5+5 工件库、没有几何规则的工件库以及带有旧 `interference_groups` 的工件库必须继续恢复。旧位置标注仅以归档/只读方式显示，不参与新的自动几何拟合，也不被转换成圆、椭圆或旋转矩形。
+旧版 5+5 工件库、没有几何规则的工件库以及带有旧 `interference_groups` 的工件库必须继续恢复。旧位置标注仅以归档/只读方式显示，不参与新的自动几何拟合，也不被转换成圆、椭圆或旋转矩形。在新几何版本发布前，旧库继续使用原先已经生效的预测缓存；发布新几何版本后，新版本原子取代旧位置遮罩成为该工件的活动规则。回退必须能够恢复发布前的稳定预测缓存。
 
 ## 5. 模块边界与接口变化
 
@@ -117,13 +117,22 @@
 
 ### 5.4 TCP 与后台任务
 
-沿用现有 `get_geometry_mask_profile`、`save_geometry_mask_draft`、`validate_geometry_mask_draft`、`get_geometry_mask_validation_job`、`geometry_mask_validation_job_action`、`publish_geometry_mask_profile` 和 `rollback_geometry_mask_profile` 命令。只扩充 snapshot/report 的可选字段，不改变旧客户端必需字段。验证任务按模板粒度更新进度，后端重启中的任务变为 `interrupted`。
+新增一个只读命令 `preview_geometry_mask_rule`，解决取消独立基准绘制后的坐标转换问题。请求包含 `workpiece_id`、`base_library_revision`、`direction`、`template_id`、原图像素坐标的 `seed_shape`、`mode`、`margin_ratio`，以及可选的 `anchor_candidate_index`/`rule_candidate_index`。响应返回：
+
+- 自动基准的候选、选中编号和最终基准；
+- 当前规则的候选、选中编号和拟合边界；
+- 可直接写入草稿的对象相对 `geometry`/`seed_geometry`；
+- 置信度、边缘支持、可见比例、残差和拟合耗时。
+
+画布只在完成一次手势或切换候选时请求预览，不在每个鼠标移动事件上发送 TCP 请求。该命令不写 profile、不构建模板缓存、不分配 `operation_id`；库 revision 或模板标识不匹配时拒绝预览。
+
+其余流程沿用现有 `get_geometry_mask_profile`、`save_geometry_mask_draft`、`validate_geometry_mask_draft`、`get_geometry_mask_validation_job`、`geometry_mask_validation_job_action`、`publish_geometry_mask_profile` 和 `rollback_geometry_mask_profile` 命令。只扩充 snapshot/report 的可选字段，不改变旧客户端必需字段。验证任务按模板粒度更新进度，后端重启中的任务变为 `interrupted`。
 
 ## 6. 错误处理与安全策略
 
 - 图片不可读、尺寸过小或候选不足：当前模板标为 `unreadable`/`low_confidence`，不给出活动遮罩。
 - 候选置信度低：默认不可发布；覆盖必须有原因并记录 `operation_id`、操作者和时间。
-- 任何方向存在失败启用规则：预测回退到该方向未使用几何遮罩的基线特征，不混用部分遮罩。
+- 正面或反面任一方向存在失败启用规则：整张查询都不应用几何遮罩，正反两个方向同时回退到原始基线特征，不混用单边或部分遮罩，并返回 `needs_review: true`。
 - 草稿、工件库 revision 或验证任务指纹陈旧：拒绝保存/发布并要求刷新，不覆盖较新的状态。
 - 自动基准失败：保留草稿，提示“自动基准未找到”，允许显式手动备用操作。
 - 发布原子替换失败：活动 revision、manifest 和运行时缓存保持原状。
@@ -143,9 +152,10 @@
 
 - 圆形内腔在工件平移、旋转、尺度变化以及中心反光位置变化时重新拟合；不使用上一次图片坐标。
 - 外部圆规则忽略外部侵入但保留安全边距内工件区域；椭圆和旋转矩形在旋转图上保持正确。
+- `preview_geometry_mask_rule` 把参考模板像素种子转换成对象相对几何，切换候选不修改持久化档案，陈旧库 revision 被拒绝。
 - 每张模板返回候选和选中编号；低置信度、不可读图、可见弧不足时不产生部分遮罩。
 - 1+1、5+10、10+15 及超过 30 张模板的验证任务能完成并按模板报告进度。
-- 旧 5+5 工件库和带旧位置递推数据的库能恢复；旧位置数据不进入新的几何预测。
+- 旧 5+5 工件库和带旧位置递推数据的库能恢复；发布新几何版本前继续使用旧稳定预测缓存，发布后由新几何版本原子取代。
 - 后台验证可取消、重启后状态为 `interrupted`，陈旧 revision/重复操作号被拒绝。
 - 现有全量 Python 测试、Qt Release 构建和 offscreen Qt 测试全部通过。
 
