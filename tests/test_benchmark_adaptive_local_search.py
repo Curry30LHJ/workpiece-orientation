@@ -536,6 +536,27 @@ def test_markdown_reports_environment_stage_counts_latency_and_gate():
     assert "模板/查询重叠" in markdown
 
 
+def test_compare_and_markdown_render_do_not_load_model_runtimes(monkeypatch):
+    from types import ModuleType
+
+    preloaded = {"torch.task6_preloaded", "paddle.task6_preloaded"}
+    for module_name in preloaded:
+        monkeypatch.setitem(sys.modules, module_name, ModuleType(module_name))
+
+    rows = release_rows()
+    exhaustive = payload("exhaustive", rows)
+    adaptive = payload("adaptive", rows)
+    before = loaded_model_runtime_modules()
+    assert preloaded <= before
+
+    report = _compare_worker_payloads(exhaustive, adaptive)
+    markdown = _render_markdown(report)
+
+    assert report["release_gate_passed"] is True
+    assert "正式默认模式：`adaptive`" in markdown
+    assert loaded_model_runtime_modules() == before
+
+
 def test_environment_collection_does_not_load_model_runtimes(tmp_path):
     before = loaded_model_runtime_modules()
 
