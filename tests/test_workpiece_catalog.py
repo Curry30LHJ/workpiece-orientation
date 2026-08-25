@@ -545,6 +545,53 @@ def test_append_build_does_not_block_prediction_and_swaps_revision_after_commit(
     assert catalog.predict(record.id, tmp_path / "query-after.png")["library_revision"] == record.revision + 1
 
 
+def test_append_reports_committing_before_atomic_snapshot_swap(tmp_path):
+    catalog, _, record = create_catalog(tmp_path)
+    events = []
+
+    def capture_progress(event):
+        events.append({
+            **event,
+            "active_revision": catalog.capture_snapshot(record.id).record.revision,
+        })
+
+    appended, _ = catalog.append_templates(
+        record.id,
+        [image(tmp_path / "commit-progress.png", 11)],
+        [],
+        operation_id="commit-progress",
+        progress_callback=capture_progress,
+    )
+
+    committing = [event for event in events if event["phase"] == "committing"]
+    assert len(committing) == 1
+    assert committing[0]["completed"] == 3
+    assert committing[0]["total"] == 3
+    assert committing[0]["active_revision"] == record.revision
+    assert appended.revision == record.revision + 1
+
+
+def test_committing_progress_observer_failure_does_not_abort_append(tmp_path):
+    catalog, _, record = create_catalog(tmp_path)
+    phases = []
+
+    def failing_observer(event):
+        phases.append(event["phase"])
+        if event["phase"] == "committing":
+            raise RuntimeError("observer failed")
+
+    appended, _ = catalog.append_templates(
+        record.id,
+        [image(tmp_path / "observer-failure.png", 12)],
+        [],
+        operation_id="observer-failure",
+        progress_callback=failing_observer,
+    )
+
+    assert "committing" in phases
+    assert appended.revision == record.revision + 1
+
+
 @pytest.mark.parametrize("front_count,back_count", [(1, 1), (5, 10), (10, 15), (35, 35)])
 def test_prediction_stays_available_during_sized_background_append(
     tmp_path, front_count, back_count

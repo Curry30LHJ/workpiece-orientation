@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import threading
 
 import cv2
 import numpy as np
@@ -43,8 +44,48 @@ class FakeClassifier:
         return dict(region)
 
 
-def setup_catalog(tmp_path, front_count=1):
-    classifier = FakeClassifier()
+class BlockingProgressClassifier(FakeClassifier):
+    def __init__(self):
+        super().__init__()
+        self.block_appends = False
+        self.feature_started = threading.Event()
+        self.release_feature = threading.Event()
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.block_appends:
+            if progress_callback is not None:
+                progress_callback("front", 0, len(front))
+            self.feature_started.set()
+            assert self.release_feature.wait(2.0)
+        return super().build_template_cache(front, back, progress_callback)
+
+
+class FailingProgressClassifier(FakeClassifier):
+    def __init__(self):
+        super().__init__()
+        self.fail_appends = False
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.fail_appends:
+            if progress_callback is not None:
+                progress_callback("front", 0, len(front))
+            raise RuntimeError("synthetic feature failure")
+        return super().build_template_cache(front, back, progress_callback)
+
+
+class BlockingGeometryProfiles:
+    def __init__(self):
+        self.validation_started = threading.Event()
+        self.release_validation = threading.Event()
+
+    def validate_new_template(self, workpiece_id, orientation, image_path):
+        self.validation_started.set()
+        assert self.release_validation.wait(2.0)
+        return {"status": "active", "needs_review": False}
+
+
+def setup_catalog(tmp_path, front_count=1, classifier=None):
+    classifier = classifier or FakeClassifier()
     library = WorkpieceLibrary(tmp_path / "library")
     catalog = WorkpieceCatalog(library, classifier)
     front = [image(tmp_path / f"front-{index}.png", 10 + index) for index in range(front_count)]
@@ -73,6 +114,227 @@ def test_confirmations_for_same_workpiece_coalesce_and_append(tmp_path):
     assert len(updated.front_images) == 2
     assert len(updated.back_images) == 2
     assert evolution.get_job(job1["job_id"])["state"] == "completed"
+
+
+def test_submitted_job_reports_queued_progress_for_all_coalesced_items(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "queued-progress", start_worker=False)
+
+    first = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "queued-front.png", 31),
+        operation_id="queued-progress-front",
+    )
+    second = evolution.submit_confirmation(
+        record.id,
+        "back",
+        image(tmp_path / "queued-back.png", 41),
+        operation_id="queued-progress-back",
+    )
+
+    assert second["job_id"] == first["job_id"]
+    assert second["state"] == "queued"
+    assert second["phase"] == "queued"
+    assert second["completed"] == 0
+    assert second["total"] == 2
+    assert second["progress"] == 0
+
+
+def test_build_reports_features_without_publishing_candidate_early(tmp_path):
+    classifier = BlockingProgressClassifier()
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    original = catalog.capture_snapshot(record.id)
+    evolution = TemplateEvolution(catalog, tmp_path / "blocking-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "blocking-confirmed.png", 32),
+        operation_id="blocking-progress",
+    )
+    classifier.block_appends = True
+    results = []
+    worker = threading.Thread(target=lambda: results.append(evolution.run_next(force=True)))
+
+    worker.start()
+    assert classifier.feature_started.wait(1.0)
+    try:
+        active = catalog.capture_snapshot(record.id)
+        progress = evolution.get_job(job["job_id"])
+        assert progress["state"] == "building"
+        assert progress["phase"] == "features"
+        assert active.record.revision == original.record.revision
+        assert active.cache is original.cache
+        persisted = json.loads(evolution.jobs_path.read_text(encoding="utf-8"))
+        persisted_job = next(item for item in persisted["jobs"] if item["job_id"] == job["job_id"])
+        assert persisted_job["phase"] == "features"
+    finally:
+        classifier.release_feature.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert results[0]["state"] == "completed"
+    assert results[0]["phase"] == "active"
+    assert results[0]["progress"] == 100
+    assert catalog.capture_snapshot(record.id).record.revision == original.record.revision + 1
+
+
+def test_feature_failure_keeps_previous_active_snapshot(tmp_path):
+    classifier = FailingProgressClassifier()
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    original = catalog.capture_snapshot(record.id)
+    evolution = TemplateEvolution(catalog, tmp_path / "failing-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "failing-confirmed.png", 33),
+        operation_id="failing-progress",
+    )
+    classifier.fail_appends = True
+
+    result = evolution.run_next(force=True)
+
+    active = catalog.capture_snapshot(record.id)
+    assert result["job_id"] == job["job_id"]
+    assert result["state"] == "failed"
+    assert result["phase"] == "features"
+    assert "synthetic feature failure" in result["error"]
+    assert active.record.revision == original.record.revision
+    assert active.cache is original.cache
+
+
+def test_build_reports_validating_while_geometry_check_is_running(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    profiles = BlockingGeometryProfiles()
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / "validating-progress",
+        start_worker=False,
+        geometry_profiles=profiles,
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "validating-confirmed.png", 38),
+        operation_id="validating-progress",
+    )
+    worker = threading.Thread(target=lambda: evolution.run_next(force=True))
+
+    worker.start()
+    assert profiles.validation_started.wait(1.0)
+    try:
+        progress = evolution.get_job(job["job_id"])
+        assert progress["state"] == "building"
+        assert progress["phase"] == "validating"
+    finally:
+        profiles.release_validation.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+
+
+def test_restart_requeues_interrupted_build_with_recovery_detail(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    storage = tmp_path / "interrupted-progress"
+    evolution = TemplateEvolution(catalog, storage, start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "interrupted-confirmed.png", 34),
+        operation_id="interrupted-progress",
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            state="building", phase="features", completed=1, total=3, progress=33
+        )
+        evolution._persist()
+
+    restarted = TemplateEvolution(catalog, storage, start_worker=False)
+    recovered = restarted.get_job(job["job_id"])
+
+    assert recovered["job_id"] == job["job_id"]
+    assert recovered["state"] == "queued"
+    assert recovered["phase"] == "queued"
+    assert recovered["recovery_detail"]
+
+
+def test_retry_requeues_same_job_and_clears_failure_detail(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "retry-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id, "front", image(tmp_path / "retry.png", 35), operation_id="retry-progress"
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            state="failed",
+            phase="features",
+            completed=2,
+            total=4,
+            progress=50,
+            error="failed",
+            recovery_detail="old recovery",
+        )
+
+    retried = evolution.action(job["job_id"], "retry")
+
+    assert retried["job_id"] == job["job_id"]
+    assert retried["state"] == "queued"
+    assert retried["phase"] == "queued"
+    assert retried["completed"] == 0
+    assert retried["total"] == 1
+    assert retried["progress"] == 0
+    assert retried["error"] is None
+    assert not retried.get("recovery_detail")
+
+
+def test_resolve_review_requeues_same_job_and_clears_review_detail(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "review-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id, "front", image(tmp_path / "review.png", 36), operation_id="review-progress"
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            state="needs_review",
+            phase="validating",
+            completed=1,
+            total=3,
+            progress=33,
+            error="review required",
+            recovery_detail="old recovery",
+        )
+
+    resolved = evolution.action(job["job_id"], "resolve-review")
+
+    assert resolved["job_id"] == job["job_id"]
+    assert resolved["state"] == "queued"
+    assert resolved["phase"] == "queued"
+    assert resolved["completed"] == 0
+    assert resolved["total"] == 1
+    assert resolved["progress"] == 0
+    assert resolved["error"] is None
+    assert not resolved.get("recovery_detail")
+
+
+def test_cancel_preserves_last_phase_and_incomplete_progress(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "cancel-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id, "front", image(tmp_path / "cancel.png", 37), operation_id="cancel-progress"
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            phase="copying", completed=1, total=4, progress=25
+        )
+
+    cancelled = evolution.action(job["job_id"], "cancel")
+
+    assert cancelled["job_id"] == job["job_id"]
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["phase"] == "copying"
+    assert cancelled["completed"] == 1
+    assert cancelled["total"] == 4
+    assert cancelled["progress"] == 25
 
 
 def test_restart_reconciles_manifest_commit_without_appending_twice(tmp_path):
@@ -167,6 +429,7 @@ def test_completed_job_records_its_job_id_in_template_manifest(tmp_path):
     )
     assert result["state"] == "completed"
     assert manifest["last_template_update"]["operation_id"] == job["job_id"]
+    assert manifest["template_inventory"][-1]["source"] == "confirmed_inspection"
 
 
 class LowConfidenceGeometryProfiles:

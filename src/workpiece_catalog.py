@@ -648,6 +648,12 @@ class WorkpieceCatalog:
             saver = getattr(self.classifier, "save_template_cache", None)
             if callable(saver):
                 saver(prepared.staged_record, effective)
+            total = len(prepared.staged_record.front_images) + len(prepared.staged_record.back_images)
+            if progress_callback is not None:
+                try:
+                    progress_callback({"phase": "committing", "completed": total, "total": total})
+                except Exception:
+                    LOGGER.debug("Ignoring append progress callback failure", exc_info=True)
             record = self.commit_prepared_append(prepared, effective)
             return record, effective
         except Exception:
