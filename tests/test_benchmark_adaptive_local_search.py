@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import importlib
+from pathlib import Path
 import pytest
 import sys
 
 from scripts.benchmark_adaptive_local_search import (
     _collect_environment,
     _compare_worker_payloads,
+    _ensure_project_import_path,
     _render_markdown,
 )
 
@@ -216,3 +219,20 @@ def test_environment_collection_does_not_load_model_runtimes(tmp_path):
     assert environment["torch"]
     assert "paddle" not in sys.modules
     assert "torch" not in sys.modules
+
+
+def test_worker_makes_project_sources_importable(monkeypatch):
+    project_root = Path(__file__).resolve().parents[1]
+    filtered = [
+        value
+        for value in sys.path
+        if Path(value or ".").resolve() != project_root
+    ]
+    monkeypatch.setattr(sys, "path", filtered)
+    monkeypatch.delitem(sys.modules, "src", raising=False)
+    monkeypatch.delitem(sys.modules, "src.shitu_baseline", raising=False)
+
+    _ensure_project_import_path(project_root)
+
+    module = importlib.import_module("src.shitu_baseline")
+    assert module.split_labels.__module__ == "src.shitu_baseline"

@@ -46,6 +46,16 @@ class CaseSpec:
     cache_id: str
 
 
+def _ensure_project_import_path(project_root: Path) -> None:
+    root = str(Path(project_root).resolve())
+    resolved = {
+        str(Path(value or ".").resolve())
+        for value in sys.path
+    }
+    if root not in resolved:
+        sys.path.insert(0, root)
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -481,6 +491,7 @@ def _predict_row(
 def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
     process_started = time.perf_counter()
     project_root = Path(args.project_root).resolve()
+    _ensure_project_import_path(project_root)
     model_dir = Path(args.model_dir).resolve()
     library_dir = Path(args.library_dir).resolve()
     if not model_dir.is_dir():
