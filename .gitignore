@@ -8,6 +8,12 @@ third_party/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+tmp-run-batch/
+pytest-assets/
+pytest-current/
+.pytest-run-catalog/
+pytest-debug-evo/
+runtime_library/
 .coverage
 htmlcov/
 
@@ -20,11 +26,13 @@ htmlcov/
 *.onnx
 *.npy
 *.npz
+*.template_cache.pkl
 
 # Qt/qmake build outputs
 build*/
 debug/
 release/
+qt_app/app_config.json
 *.obj
 *.o
 *.exe
@@ -42,4 +50,3 @@ Makefile.Release
 .idea/
 Thumbs.db
 Desktop.ini
-

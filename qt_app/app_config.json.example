@@ -4,8 +4,9 @@
   "project_root": "E:/Project/wang/pp_813",
   "model_dir": "E:/Project/wang/pp_813/third_party/models/shiru_rec/general_PPLCNetV2_base_pretrained_v1.0_infer",
   "library_dir": "E:/Project/wang/pp_813/runtime_library",
+  "local_search_mode": "adaptive",
   "host": "127.0.0.1",
   "port": 37651,
-  "startup_timeout_ms": 120000,
+  "startup_timeout_ms": 600000,
   "request_timeout_ms": 120000
 }

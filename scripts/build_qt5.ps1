@@ -8,6 +8,7 @@ param(
 $qmake = Join-Path $QtBin 'qmake.exe'
 $projectFile = Join-Path $ProjectRoot 'qt_app\workpiece_orientation.pro'
 $buildDir = Join-Path $ProjectRoot 'qt_app\build-release'
+$runtimeConfig = Join-Path $ProjectRoot 'qt_app\app_config.json'
 
 foreach ($requiredPath in @($qmake, $Jom, $VcVars, $projectFile)) {
     if (-not (Test-Path -LiteralPath $requiredPath)) {
@@ -17,9 +18,31 @@ foreach ($requiredPath in @($qmake, $Jom, $VcVars, $projectFile)) {
 
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 Set-Location -LiteralPath $buildDir
-$line = 'call "' + $VcVars + '" && "' + $qmake + '" "' + $projectFile + '" CONFIG+=release && "' + $Jom + '"'
-cmd.exe /d /s /c $line
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+$qmakeLine = 'call "' + $VcVars + '" && "' + $qmake + '" "' + $projectFile + '" CONFIG+=release'
+cmd.exe /d /s /c $qmakeLine
+$buildExitCode = $LASTEXITCODE
+if ($buildExitCode -ne 0) {
+    exit $buildExitCode
 }
-Write-Output ("Qt build succeeded: " + (Join-Path $buildDir 'release\workpiece_orientation.exe'))
+
+$makeLine = 'call "' + $VcVars + '" && "' + $Jom + '"'
+cmd.exe /d /s /c $makeLine
+$buildExitCode = $LASTEXITCODE
+if ($buildExitCode -ne 0) {
+    Write-Warning ("jom failed with exit code $buildExitCode; retrying with Visual Studio nmake")
+    $fallbackLine = 'call "' + $VcVars + '" && nmake /f Makefile.Release /NOLOGO'
+    cmd.exe /d /s /c $fallbackLine
+    $buildExitCode = $LASTEXITCODE
+}
+if ($buildExitCode -ne 0) {
+    exit $buildExitCode
+}
+$releaseDir = Join-Path $buildDir 'release'
+$releaseConfig = Join-Path $releaseDir 'app_config.json'
+if (Test-Path -LiteralPath $runtimeConfig) {
+    Copy-Item -LiteralPath $runtimeConfig -Destination $releaseConfig -Force
+    Write-Output ("Runtime config copied: " + $releaseConfig)
+} else {
+    Write-Warning ("Runtime config not found; create it from qt_app\app_config.json.example: " + $runtimeConfig)
+}
+Write-Output ("Qt build succeeded: " + (Join-Path $releaseDir 'workpiece_orientation.exe'))

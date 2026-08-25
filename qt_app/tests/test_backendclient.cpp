@@ -80,6 +80,12 @@ private:
         return {{"version", 1}, {"request_id", requestId}, {"ok", true}, {"service", service}, {"ready", true}};
     }
 
+    static QJsonObject loadingHelloResponse(const QString &requestId) {
+        return {{"version", 1}, {"request_id", requestId}, {"ok", true},
+                {"service", "workpiece-orientation"}, {"ready", false},
+                {"status", "loading"}, {"message", "模型加载中"}};
+    }
+
     static void connectWithHello(FakeTcpServer &server, BackendClient &client) {
         QObject::connect(&server, &FakeTcpServer::requestReceived, &server, [&](const QJsonObject &request) {
             if (request.value(QStringLiteral("command")).toString() == QStringLiteral("hello")) {
@@ -163,6 +169,24 @@ private slots:
         QCOMPARE(failureSpy.at(0).at(0).toString(), QStringLiteral("SERVER_BUSY"));
     }
 
+    void reportsModelLoadingAsRetryableFailure() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy failureSpy(&client, &BackendClient::requestFailed);
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server, [&](const QJsonObject &request) {
+            if (request.value(QStringLiteral("command")).toString() == QStringLiteral("hello")) {
+                server.sendJson(loadingHelloResponse(request.value(QStringLiteral("request_id")).toString()));
+            }
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000);
+
+        QTRY_VERIFY_WITH_TIMEOUT(failureSpy.count() == 1, 1000);
+        QCOMPARE(failureSpy.at(0).at(0).toString(), QStringLiteral("MODEL_LOADING"));
+        QCOMPARE(failureSpy.at(0).at(1).toString(), QStringLiteral("模型加载中"));
+    }
+
     void timesOutOneOutstandingRequest() {
         FakeTcpServer server;
         QVERIFY(server.start());
@@ -176,6 +200,65 @@ private slots:
 
         QTRY_VERIFY_WITH_TIMEOUT(failureSpy.count() == 1, 1500);
         QCOMPARE(failureSpy.at(0).at(0).toString(), QStringLiteral("TIMEOUT"));
+    }
+
+    void progressEventKeepsRequestBusyAndCompletesNormally() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        connectWithHello(server, client);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QSignalSpy progressSpy(&client, &BackendClient::progressReceived);
+        QSignalSpy responseSpy(&client, &BackendClient::responseReceived);
+
+        const QString requestId = client.sendRequest(QStringLiteral("register"));
+        QVERIFY(!requestId.isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(server.requests().size() == 2, 1000);
+        server.sendJson({
+            {"version", 1}, {"request_id", requestId}, {"event", "progress"},
+            {"command", "register"},
+            {"progress", QJsonObject{{"phase", "features"}, {"completed", 1}, {"total", 2}}},
+        });
+
+        QTRY_COMPARE_WITH_TIMEOUT(progressSpy.count(), 1, 1000);
+        QCOMPARE(client.state(), BackendClient::State::Busy);
+        QCOMPARE(progressSpy.at(0).at(0).toString(), QStringLiteral("register"));
+        server.sendJson({
+            {"version", 1}, {"request_id", requestId}, {"ok", true},
+            {"template_counts", QJsonObject{{"front", 1}, {"back", 1}}},
+        });
+
+        QTRY_COMPARE_WITH_TIMEOUT(responseSpy.count(), 1, 1000);
+        QCOMPARE(client.state(), BackendClient::State::Ready);
+    }
+
+    void progressEventRefreshesInactivityTimeout() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server, [&](const QJsonObject &request) {
+            if (request.value(QStringLiteral("command")).toString() == QStringLiteral("hello")) {
+                server.sendJson(helloResponse(request.value(QStringLiteral("request_id")).toString()));
+            }
+        });
+        client.connectToService(QHostAddress::LocalHost, server.port(), 200);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QSignalSpy failureSpy(&client, &BackendClient::requestFailed);
+        const QString requestId = client.sendRequest(QStringLiteral("register"));
+        QTRY_VERIFY_WITH_TIMEOUT(server.requests().size() == 2, 1000);
+        QTest::qWait(120);
+        server.sendJson({
+            {"version", 1}, {"request_id", requestId}, {"event", "progress"},
+            {"command", "register"},
+            {"progress", QJsonObject{{"phase", "features"}, {"completed", 1}, {"total", 2}}},
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(failureSpy.count() == 0, 150);
+        QTest::qWait(100);
+        QVERIFY(failureSpy.isEmpty());
+        server.sendJson({{"version", 1}, {"request_id", requestId}, {"ok", true}});
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
     }
 
     void disconnectClearsPendingRequest() {
@@ -192,6 +275,63 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(lostSpy.count(), 1, 1000);
         QCOMPARE(client.state(), BackendClient::State::Disconnected);
+    }
+
+    void domainErrorKeepsReadyAndUsesCommandFailureChannel() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        connectWithHello(server, client);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QSignalSpy commandSpy(&client, &BackendClient::commandFailed);
+        QSignalSpy transportSpy(&client, &BackendClient::transportFailed);
+
+        const QString requestId = client.sendRequest(QStringLiteral("publish_geometry_mask_profile"));
+        QTRY_VERIFY_WITH_TIMEOUT(server.requests().size() == 2, 1000);
+        server.sendJson({
+            {"version", 1}, {"request_id", requestId}, {"ok", false},
+            {"error", QJsonObject{{"code", "GEOMETRY_VALIDATION_FAILED"},
+                                  {"message", "validation rejected"}}},
+        });
+
+        QTRY_COMPARE_WITH_TIMEOUT(commandSpy.count(), 1, 1000);
+        QCOMPARE(commandSpy.at(0).at(0).toString(), QStringLiteral("publish_geometry_mask_profile"));
+        QCOMPARE(commandSpy.at(0).at(1).toString(), QStringLiteral("GEOMETRY_VALIDATION_FAILED"));
+        QCOMPARE(transportSpy.count(), 0);
+        QCOMPARE(client.state(), BackendClient::State::Ready);
+        QVERIFY(!client.sendRequest(QStringLiteral("list_workpieces")).isEmpty());
+    }
+
+    void localRejectionIncludesAttemptedCommand() {
+        BackendClient client;
+        QSignalSpy commandSpy(&client, &BackendClient::commandFailed);
+
+        QVERIFY(client.sendRequest(QStringLiteral("predict")).isEmpty());
+
+        QCOMPARE(commandSpy.count(), 1);
+        QCOMPARE(commandSpy.at(0).at(0).toString(), QStringLiteral("predict"));
+        QCOMPARE(commandSpy.at(0).at(1).toString(), QStringLiteral("NOT_READY"));
+    }
+
+    void malformedResponseUsesTransportFailureChannel() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        connectWithHello(server, client);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QSignalSpy commandSpy(&client, &BackendClient::commandFailed);
+        QSignalSpy transportSpy(&client, &BackendClient::transportFailed);
+
+        QVERIFY(!client.sendRequest(QStringLiteral("predict")).isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(server.requests().size() == 2, 1000);
+        server.sendFragments({QByteArray("{bad-json}\n")});
+
+        QTRY_COMPARE_WITH_TIMEOUT(transportSpy.count(), 1, 1000);
+        QCOMPARE(transportSpy.at(0).at(0).toString(), QStringLiteral("PROTOCOL_ERROR"));
+        QCOMPARE(commandSpy.count(), 0);
+        QVERIFY(client.state() != BackendClient::State::Ready);
     }
 };
 

@@ -25,23 +25,28 @@ public:
 
 signals:
     void backendReady();
+    void backendLoading(const QString &message);
     void backendUnavailable(const QString &reason);
     void serviceOwnershipChanged(bool owned);
 
 private slots:
     void tryConnect();
     void onHandshakeSucceeded();
-    void onRequestFailed(const QString &code, const QString &message);
-    void onConnectionLost(const QString &reason);
+    void onTransportFailed(const QString &code, const QString &message);
     void onResponseReceived(const QString &command, const QJsonObject &response);
     void onStartupTimeout();
+    void onStopEscalationTimeout();
     void onProcessFailed(const QString &message);
     void onProcessFinished(int exitCode);
 
 private:
+    enum class RestartPhase { Idle, GracefulStop, TerminateWait, KillWait };
+
     void launchBackend();
+    void relaunchAfterRestartExit();
     void markUnavailable(const QString &reason);
     QStringList backendArguments() const;
+    int stopEscalationIntervalMs() const;
 
     AppConfig config_;
     BackendClient *client_;
@@ -51,6 +56,8 @@ private:
     bool launchRequested_ = false;
     bool shuttingDown_ = false;
     bool stoppingOwnedProcess_ = false;
+    RestartPhase restartPhase_ = RestartPhase::Idle;
     QTimer *retryTimer_;
     QTimer *startupTimer_;
+    QTimer *stopEscalationTimer_;
 };

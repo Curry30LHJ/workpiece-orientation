@@ -20,16 +20,19 @@ pytestmark = pytest.mark.integration
 
 class JsonClient:
     def __init__(self, host: str, port: int):
-        self.sock = socket.create_connection((host, port), timeout=10)
+        self.sock = socket.create_connection((host, port), timeout=30)
         self.file = self.sock.makefile("rwb")
 
     def request(self, command: str, **fields):
         request = {"version": 1, "request_id": str(uuid.uuid4()), "command": command, **fields}
         self.file.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
         self.file.flush()
-        response = json.loads(self.file.readline().decode("utf-8"))
-        assert response["request_id"] == request["request_id"]
-        return response
+        while True:
+            response = json.loads(self.file.readline().decode("utf-8"))
+            assert response["request_id"] == request["request_id"]
+            if response.get("event") == "progress":
+                continue
+            return response
 
     def close(self):
         self.file.close()
@@ -69,9 +72,10 @@ def integration_settings() -> dict[str, Path | str]:
     return {"root": root, "model_dir": model_dir, "python": python_executable}
 
 
-@pytest.fixture
-def running_service(integration_settings, tmp_path: Path):
+@pytest.fixture(scope="session")
+def running_service(integration_settings, tmp_path_factory):
     root = Path(integration_settings["root"])
+    tmp_path = tmp_path_factory.mktemp("orientation-service-integration")
     port = _free_port()
     library_dir = tmp_path / "运行时工件库"
     command = [
@@ -91,16 +95,27 @@ def running_service(integration_settings, tmp_path: Path):
     ]
     process = subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     client = None
-    deadline = time.monotonic() + 120
+    # The production model stack can take several minutes to initialize. The
+    # service binds first and reports status=loading during that time, so keep
+    # the connection and continue the hello handshake on the same socket.
+    deadline = time.monotonic() + 600
     try:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(f"orientation service exited with code {process.returncode}")
             try:
                 client = JsonClient("127.0.0.1", port)
-                hello = client.request("hello")
-                if hello.get("ok") is True:
-                    break
+                while time.monotonic() < deadline:
+                    hello = client.request("hello")
+                    if hello.get("ok") is True and hello.get("ready") is True:
+                        break
+                    if hello.get("ok") is True and hello.get("status") == "loading":
+                        time.sleep(0.25)
+                        continue
+                    raise RuntimeError(f"orientation service handshake failed: {hello}")
+                else:
+                    raise TimeoutError("orientation service did not become ready")
+                break
             except OSError:
                 if client is not None:
                     client.close()
@@ -138,6 +153,7 @@ def test_service_label_matches_dataset_orientation(dataset_name: str, running_se
         replace=False,
         front_images=front[:5],
         back_images=back[:5],
+        progress_events=True,
     )
     assert response["ok"] is True, response
     workpiece_id = response["workpiece"]["id"]

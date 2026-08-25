@@ -9,10 +9,20 @@ SOURCES += test_mainwindow.cpp \
            ../backendclient.cpp \
            ../backendprocessmanager.cpp \
            ../processlauncher.cpp \
-           ../mainwindow.cpp
+           ../mainwindow.cpp \
+           ../geometryrulecanvas.cpp \
+           ../geometrymaskmanager.cpp \
+           ../annotationcanvas.cpp \
+           ../annotationmanager.cpp \
+           ../annotationeditor.cpp
 HEADERS += ../appconfig.h \
            ../backendclient.h \
            ../backendprocessmanager.h \
            ../processlauncher.h \
-           ../mainwindow.h
+           ../mainwindow.h \
+           ../geometryrulecanvas.h \
+           ../geometrymaskmanager.h \
+           ../annotationcanvas.h \
+           ../annotationmanager.h \
+           ../annotationeditor.h
 FORMS += ../mainwindow.ui

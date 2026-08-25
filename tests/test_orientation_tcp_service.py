@@ -1,29 +1,75 @@
 import json
+from dataclasses import replace
+import logging
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
+import src.orientation_tcp_service as service_module
 
 from src.orientation_tcp_service import (
     OrientationCommandDispatcher,
     OrientationTcpServer,
+    ServiceRuntime,
     ServiceStartupError,
+    configure_diagnostic_logging,
+)
+from src.orientation_classifier import PropagationModelError
+from src.geometry_mask_profiles import (
+    DuplicateLogicalRuleError,
+    FittedGeometryMissingError,
+    GeometryCacheRevisionMismatchError,
+    GeometryContextMismatchError,
+    GeometryProfileMigrationConflictError,
+    MissingDirectionCalibrationError,
+    StaleGeometryProfileError,
 )
 
 
 class FakeLibrary:
     def __init__(self):
         self.register_calls = []
+        self.recycled = []
 
     def list_workpieces(self):
-        return [{"id": "m7", "name": "M7"}]
+        return [] if self.recycled else [{"id": "m7", "name": "M7"}]
 
-    def register(self, name, front_images, back_images, replace, build_cache):
+    def list_recycled(self):
+        return list(self.recycled)
+
+    def recycle(self, workpiece_id):
+        value = {"id": workpiece_id, "name": "M7", "revision": 2}
+        self.recycled.append(value)
+        return SimpleNamespace(**value)
+
+    def restore(self, workpiece_id):
+        value = self.recycled.pop(0)
+        return SimpleNamespace(id=value["id"], name=value["name"], revision=3,
+                               front_images=(), back_images=())
+
+    def purge(self, workpiece_id):
+        self.recycled = [item for item in self.recycled if item["id"] != workpiece_id]
+        return {"id": workpiece_id}
+
+    def register(self, name, front_images, back_images, replace, build_cache, *, progress_callback=None):
         self.register_calls.append((name, front_images, back_images, replace))
-        return SimpleNamespace(id="m7", name=name), {"fake": "cache"}
+        if progress_callback is not None:
+            progress_callback({"phase": "features", "completed": 1, "total": len(front_images) + len(back_images)})
+        return (
+            SimpleNamespace(
+                id="m7",
+                name=name,
+                front_images=tuple(front_images),
+                back_images=tuple(back_images),
+                revision=1,
+            ),
+            {"fake": "cache"},
+        )
 
 
 class FakeClassifier:
@@ -33,8 +79,12 @@ class FakeClassifier:
 
     def set_template_cache(self, workpiece_id, cache):
         assert workpiece_id == "m7"
+        self.active_workpiece_id = workpiece_id
 
-    def build_template_cache(self, front_images, back_images):
+    def remove_template_cache(self, workpiece_id):
+        assert workpiece_id == "m7"
+
+    def build_template_cache(self, front_images, back_images, progress_callback=None):
         return {"front": list(front_images), "back": list(back_images)}
 
     def predict(self, workpiece_id, image_path):
@@ -54,6 +104,155 @@ class FakeClassifier:
             "elapsed_ms": 1.0,
         }
 
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        result = self.predict(self.active_workpiece_id, image_path)
+        if library_revision is not None:
+            result["library_revision"] = library_revision
+        return result
+
+
+class FakeEvolution:
+    def __init__(self):
+        self.jobs = []
+        self.snapshot = {
+            "workpiece_id": "m7",
+            "revision": 3,
+            "annotation_revision": 2,
+            "active_annotation_revision": 1,
+            "templates": [],
+            "groups": [],
+        }
+        self.delete_calls = []
+        self.enable_calls = []
+        self.save_calls = []
+        self.propagation_error = None
+
+    def submit_confirmation(self, workpiece_id, orientation, image_path, *, operation_id):
+        job = {"job_id": operation_id, "workpiece_id": workpiece_id, "orientation": orientation, "state": "queued"}
+        self.jobs.append(job)
+        return job
+
+    def list_jobs(self):
+        return list(self.jobs)
+
+    def action(self, job_id, action):
+        for job in self.jobs:
+            if job["job_id"] == job_id:
+                job["state"] = action
+                return job
+        raise KeyError(job_id)
+
+    def get_annotations(self, workpiece_id):
+        return self.snapshot
+
+    def save_annotations(self, workpiece_id, groups, *, expected_revision=None, operation_id,
+                         progress_callback=None):
+        self.save_calls.append((workpiece_id, groups, expected_revision, operation_id))
+        if self.propagation_error is not None:
+            raise self.propagation_error
+        if progress_callback is not None:
+            progress_callback({"phase": "propagating_annotations", "completed": 0, "total": 2})
+            progress_callback({"phase": "propagating_annotations", "completed": 2, "total": 2})
+        return self.snapshot
+
+    def set_group_enabled(self, workpiece_id, group_id, enabled, *, expected_revision, operation_id):
+        self.enable_calls.append((workpiece_id, group_id, enabled, expected_revision, operation_id))
+        return self.snapshot
+
+    def delete_group(self, workpiece_id, group_id, *, expected_revision, operation_id):
+        self.delete_calls.append((workpiece_id, group_id, expected_revision, operation_id))
+        return self.snapshot
+
+
+class FakeGeometryProfiles:
+    def __init__(self):
+        self.profile = {
+            "workpiece_id": "m7", "library_revision": 1, "draft_revision": 0,
+            "active_revision": None, "previous_active_revision": None,
+            "draft": {"schema_version": 1, "directions": {"front": {"anchor": None, "rules": []},
+                                                              "back": {"anchor": None, "rules": []}}},
+            "active": None,
+        }
+        self.jobs = {}
+        self.preview_calls = []
+        self.last_resolution = None
+        self.publish_error = None
+
+    def preview_rule(self, workpiece_id, *, expected_library_revision, rule_id, direction, template_id,
+                     seed_shape, mode, margin_ratio, anchor_candidate_index=None,
+                     rule_candidate_index=None):
+        self.preview_calls.append({
+            "workpiece_id": workpiece_id,
+            "expected_library_revision": expected_library_revision,
+            "rule_id": rule_id,
+            "direction": direction,
+            "template_id": template_id,
+            "seed_shape": seed_shape,
+            "mode": mode,
+            "margin_ratio": margin_ratio,
+            "anchor_candidate_index": anchor_candidate_index,
+            "rule_candidate_index": rule_candidate_index,
+        })
+        return {
+            "rule_id": rule_id,
+            "template_id": template_id,
+            "direction": direction,
+            "margin_ratio": margin_ratio,
+            "rule_fit": {"effective_shape": {"shape": "ellipse", "cx": 1.0, "cy": 1.0,
+                                                "rx": 1.0, "ry": 1.0, "angle_deg": 0.0}},
+            "profile_patch": {
+                "reference_template": {"direction": direction},
+                "margin_ratio": margin_ratio,
+                "margin_semantics": "signed_boundary_v2",
+            },
+        }
+
+    def resolve_migration(self, workpiece_id, conflict_id, resolution, *,
+                          expected_library_revision, expected_draft_revision, operation_id):
+        self.last_resolution = {
+            "workpiece_id": workpiece_id,
+            "conflict_id": conflict_id,
+            "resolution": resolution,
+            "expected_library_revision": expected_library_revision,
+            "expected_draft_revision": expected_draft_revision,
+            "operation_id": operation_id,
+        }
+        return self.snapshot(workpiece_id)
+
+    def snapshot(self, workpiece_id):
+        return dict(self.profile)
+
+    def save_draft(self, workpiece_id, draft, *, expected_library_revision, expected_draft_revision, operation_id):
+        if expected_draft_revision != self.profile["draft_revision"]:
+            raise StaleGeometryProfileError("stale draft")
+        self.profile["draft_revision"] += 1
+        self.profile["draft"] = draft
+        return self.snapshot(workpiece_id)
+
+    def start_validation(self, workpiece_id, *, expected_library_revision, expected_draft_revision, operation_id):
+        job = {"job_id": operation_id, "state": "queued", "base_library_revision": expected_library_revision,
+               "base_draft_revision": expected_draft_revision}
+        self.jobs[operation_id] = job
+        return dict(job)
+
+    def get_job(self, job_id):
+        return dict(self.jobs[job_id])
+
+    def action(self, job_id, action):
+        self.jobs[job_id]["state"] = "cancelled"
+        return dict(self.jobs[job_id])
+
+    def publish(self, workpiece_id, job_id, *, expected_library_revision, expected_draft_revision,
+                operation_id, override_reason=""):
+        if self.publish_error is not None:
+            raise self.publish_error
+        if expected_draft_revision != 99:
+            raise StaleGeometryProfileError("stale publish")
+        self.profile["active_revision"] = expected_draft_revision
+        return self.snapshot(workpiece_id)
+
+    def rollback(self, workpiece_id, *, expected_library_revision, operation_id):
+        return self.snapshot(workpiece_id)
 
 class TcpTestClient:
     def __init__(self, address):
@@ -94,6 +293,11 @@ class RunningServer:
         self.library = FakeLibrary()
         self.classifier = FakeClassifier()
         dispatcher = OrientationCommandDispatcher(self.classifier, self.library)
+        snapshot = dispatcher.runtime.snapshot()
+        dispatcher.runtime._snapshot = replace(
+            snapshot, evolution=FakeEvolution(), geometry_profiles=FakeGeometryProfiles()
+        )
+        self.dispatcher = dispatcher
         self.server = OrientationTcpServer(dispatcher, host="127.0.0.1", port=0)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -152,6 +356,32 @@ def test_second_client_receives_server_busy(running_server):
         second.close()
 
 
+def test_silent_handshake_times_out_and_releases_server_slot():
+    dispatcher = OrientationCommandDispatcher(FakeClassifier(), FakeLibrary())
+    server = OrientationTcpServer(
+        dispatcher,
+        host="127.0.0.1",
+        port=0,
+        handshake_timeout_seconds=0.1,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    silent = socket.create_connection(server.address, timeout=1)
+    try:
+        time.sleep(0.25)
+        replacement = TcpTestClient(server.address)
+        try:
+            response = replacement.request("hello")
+            assert response["ok"] is True
+            assert response["ready"] is True
+        finally:
+            replacement.close()
+    finally:
+        silent.close()
+        server.request_shutdown()
+        thread.join(timeout=2)
+
+
 def test_register_and_predict_responses_preserve_request_id(client, running_server):
     assert client.request("hello")["ok"] is True
     registered = client.request(
@@ -170,6 +400,59 @@ def test_register_and_predict_responses_preserve_request_id(client, running_serv
     assert response["request_id"] == "predict-8"
     assert response["label"] == "front"
     assert running_server.classifier.predict_calls == [("m7", Path("测试图.png"))]
+
+
+def test_register_rejects_non_string_template_item(client, running_server):
+    assert client.request("hello")["ok"] is True
+
+    response = client.request(
+        "register",
+        name="M7",
+        front_images=["front.png", 7],
+        back_images=["back.png"],
+    )
+
+    assert response["error"]["code"] == "INVALID_REQUEST"
+    assert running_server.library.register_calls == []
+
+
+def test_register_without_progress_flag_returns_one_final_response(client):
+    assert client.request("hello")["ok"] is True
+
+    response = client.request(
+        "register",
+        name="M7",
+        front_images=["front.png"],
+        back_images=["back.png"],
+    )
+
+    assert response["ok"] is True
+    assert "event" not in response
+    assert response["template_counts"] == {"front": 1, "back": 1}
+
+
+def test_register_with_progress_flag_streams_before_final_response(client):
+    assert client.request("hello")["ok"] is True
+    payload = {
+        "version": 1,
+        "request_id": "register-progress",
+        "command": "register",
+        "name": "M7",
+        "front_images": ["front-1.png", "front-2.png"],
+        "back_images": ["back-1.png"],
+        "progress_events": True,
+    }
+    client.send_raw(json.dumps(payload).encode("utf-8") + b"\n")
+
+    messages = []
+    while True:
+        messages.append(client.read())
+        if messages[-1].get("ok") is True:
+            break
+
+    assert any(message.get("event") == "progress" for message in messages)
+    assert messages[0]["request_id"] == "register-progress"
+    assert messages[-1]["template_counts"] == {"front": 2, "back": 1}
 
 
 def test_message_over_one_mib_returns_message_too_large_and_closes(client):
@@ -232,3 +515,466 @@ def test_reports_port_in_use(running_server):
         )
 
     assert error.value.code == "PORT_IN_USE"
+
+
+def test_recycle_command_is_idempotent(client, running_server):
+    assert client.request("hello")["ok"] is True
+
+    first = client.request(
+        "recycle_workpiece", request_id="recycle-request", operation_id="delete-1", workpiece_id="m7"
+    )
+    assert first["ok"] is True
+    assert first["workpiece"]["id"] == "m7"
+    replay = client.request(
+        "recycle_workpiece", request_id="recycle-retry", operation_id="delete-1", workpiece_id="m7"
+    )
+    assert replay["ok"] is True
+    assert replay["workpiece"] == first["workpiece"]
+
+
+def test_list_recycled_command_is_additive(client):
+    assert client.request("hello")["ok"] is True
+    response = client.request("list_recycled_workpieces")
+    assert response["ok"] is True
+    assert isinstance(response["workpieces"], list)
+
+
+def test_confirmation_and_job_commands_are_additive(client):
+    assert client.request("hello")["ok"] is True
+    submitted = client.request(
+        "submit_confirmation", operation_id="confirm-1", workpiece_id="m7", orientation="front", image_path="q.png"
+    )
+    assert submitted["ok"] is True
+    jobs = client.request("list_evolution_jobs")
+    assert jobs["ok"] is True
+    assert jobs["jobs"][0]["job_id"] == "confirm-1"
+    action = client.request("evolution_job_action", job_id="confirm-1", action="cancel")
+    assert action["ok"] is True
+
+
+def test_annotation_snapshot_and_group_mutations_use_revision_and_operation_ids(client, running_server):
+    assert client.request("hello")["ok"] is True
+
+    snapshot = client.request("get_workpiece_annotations", workpiece_id="m7")
+    assert snapshot["ok"] is True
+    assert snapshot["annotations"]["active_annotation_revision"] == 1
+
+    saved = client.request(
+        "save_workpiece_annotations",
+        workpiece_id="m7",
+        groups=[{"group_id": "glare", "annotations": []}],
+        base_revision=2,
+        operation_id="annotation-save-1",
+    )
+    assert saved["ok"] is True
+    assert running_server.dispatcher.runtime.snapshot().evolution.save_calls[-1] == (
+        "m7", [{"group_id": "glare", "annotations": []}], 2, "annotation-save-1"
+    )
+
+    enabled = client.request(
+        "set_workpiece_annotation_group_enabled",
+        workpiece_id="m7", group_id="glare", enabled=False,
+        base_revision=2, operation_id="annotation-enable-1",
+    )
+    assert enabled["ok"] is True
+    assert running_server.dispatcher.runtime.snapshot().evolution.enable_calls[-1] == (
+        "m7", "glare", False, 2, "annotation-enable-1"
+    )
+
+    deleted = client.request(
+        "delete_workpiece_annotation_group",
+        workpiece_id="m7", group_id="glare", base_revision=2,
+        operation_id="annotation-delete-1",
+    )
+    assert deleted["ok"] is True
+    assert running_server.dispatcher.runtime.snapshot().evolution.delete_calls[-1] == (
+        "m7", "glare", 2, "annotation-delete-1"
+    )
+
+
+def test_annotation_save_progress_is_streamed_when_requested(client):
+    assert client.request("hello")["ok"] is True
+    client.send_raw(json.dumps({
+        "version": 1,
+        "request_id": "annotation-progress",
+        "command": "save_workpiece_annotations",
+        "workpiece_id": "m7",
+        "groups": [{"group_id": "glare", "annotations": []}],
+        "base_revision": 2,
+        "operation_id": "annotation-progress-1",
+        "progress_events": True,
+    }).encode("utf-8") + b"\n")
+
+    first = client.read()
+    second = client.read()
+    final = client.read()
+    assert first["event"] == "progress"
+    assert first["command"] == "save_workpiece_annotations"
+    assert second["progress"]["completed"] == 2
+    assert final["ok"] is True
+
+
+def test_propagation_model_failure_returns_stable_model_error(client, running_server):
+    assert client.request("hello")["ok"] is True
+    running_server.dispatcher.runtime.snapshot().evolution.propagation_error = PropagationModelError(
+        "递推失败次数过多，已中止本次保存，请检查后端日志"
+    )
+
+    response = client.request(
+        "save_workpiece_annotations",
+        workpiece_id="m7",
+        groups=[{"group_id": "glare", "annotations": []}],
+        base_revision=2,
+        operation_id="annotation-model-failure-1",
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "MODEL_ERROR"
+    assert "递推失败次数过多" in response["error"]["message"]
+
+
+def test_diagnostic_logging_persists_propagation_context(tmp_path):
+    handler = configure_diagnostic_logging(tmp_path)
+    try:
+        logging.getLogger("src.template_evolution").warning(
+            "annotation propagation pair failed operation_id=%s workpiece_id=%s group_id=%s source=%s target=%s",
+            "op-1", "m7", "glare", "front:00.png", "front:02.png",
+        )
+        handler.flush()
+        log_path = tmp_path / "diagnostics" / "orientation-service.log"
+        content = log_path.read_text(encoding="utf-8")
+        assert "operation_id=op-1" in content
+        assert "workpiece_id=m7" in content
+        assert "target=front:02.png" in content
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+
+def test_annotation_commands_reject_missing_or_wrong_revision_fields(client):
+    assert client.request("hello")["ok"] is True
+    missing = client.request(
+        "delete_workpiece_annotation_group", workpiece_id="m7", group_id="glare",
+        operation_id="annotation-delete-missing-revision",
+    )
+    assert missing["error"]["code"] == "INVALID_REQUEST"
+    wrong_type = client.request(
+        "set_workpiece_annotation_group_enabled", workpiece_id="m7", group_id="glare",
+        enabled="false", base_revision=True, operation_id="annotation-enable-wrong-type",
+    )
+    assert wrong_type["error"]["code"] == "INVALID_REQUEST"
+
+
+def test_geometry_profile_commands_round_trip_and_return_job_without_streaming(client):
+    profile = client.request("get_geometry_mask_profile", workpiece_id="m7")
+    assert profile["ok"] is True
+    saved = client.request(
+        "save_geometry_mask_draft",
+        workpiece_id="m7",
+        base_library_revision=1,
+        base_draft_revision=0,
+        draft=profile["profile"]["draft"],
+        operation_id="geometry-draft-1",
+    )
+    assert saved["ok"] is True
+    job = client.request(
+        "validate_geometry_mask_draft",
+        workpiece_id="m7",
+        base_library_revision=1,
+        base_draft_revision=1,
+        operation_id="geometry-validate-1",
+    )
+    assert job["ok"] is True
+    assert job["job"]["state"] == "queued"
+    polled = client.request("get_geometry_mask_validation_job", job_id="geometry-validate-1")
+    assert polled["ok"] is True
+    assert polled["job"]["job_id"] == "geometry-validate-1"
+    cancelled = client.request(
+        "geometry_mask_validation_job_action", job_id="geometry-validate-1", action="cancel"
+    )
+    assert cancelled["job"]["state"] == "cancelled"
+
+
+def test_preview_geometry_mask_rule_dispatches_without_operation_id(client, running_server):
+    response = client.request(
+        "preview_geometry_mask_rule",
+        workpiece_id="m7",
+        base_library_revision=4,
+        rule_id="glare",
+        direction="front",
+        template_id="front:00.png",
+        seed_shape={"shape": "circle", "cx": 120.0, "cy": 130.0, "r": 44.0},
+        mode="inside",
+        margin_ratio=-0.02,
+    )
+
+    assert response["ok"] is True
+    assert response["preview"]["template_id"] == "front:00.png"
+    assert response["preview"]["rule_id"] == "glare"
+    assert response["preview"]["direction"] == "front"
+    assert response["preview"]["margin_ratio"] == pytest.approx(-0.02)
+    assert "effective_shape" in response["preview"]["rule_fit"]
+    assert running_server.dispatcher.runtime.snapshot().geometry_profiles.preview_calls
+
+
+def test_preview_geometry_rule_requires_rule_id(client):
+    response = client.request(
+        "preview_geometry_mask_rule",
+        workpiece_id="m7",
+        base_library_revision=1,
+        direction="front",
+        template_id="front:00.png",
+        seed_shape={"shape": "circle", "cx": 100.0, "cy": 100.0, "r": 60.0},
+        mode="inside",
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "NO_SELECTED_RULE"
+
+
+def test_resolve_geometry_migration_forwards_revisioned_resolution(client, running_server):
+    response = client.request(
+        "resolve_geometry_mask_migration",
+        workpiece_id="m7",
+        base_library_revision=1,
+        base_draft_revision=3,
+        operation_id="resolve-op-1",
+        conflict_id="duplicate-back-glare",
+        resolution={"action": "keep_only", "survivor_rule_id": "back-glare-a"},
+    )
+
+    assert response["ok"] is True
+    profiles = running_server.dispatcher.runtime.snapshot().geometry_profiles
+    assert profiles.last_resolution["conflict_id"] == "duplicate-back-glare"
+    assert profiles.last_resolution["expected_draft_revision"] == 3
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"base_library_revision": True},
+        {"base_library_revision": 4, "direction": "side"},
+        {"base_library_revision": 4, "direction": "front", "template_id": ""},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "triangle"}},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "sideways"},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "inside", "margin_ratio": 1.0},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "inside", "margin_ratio": -0.95},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "inside", "margin_ratio": 0.95},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "inside", "rule_candidate_index": "1"},
+    ],
+)
+def test_preview_geometry_mask_rule_rejects_invalid_request(client, fields):
+    defaults = {
+        "workpiece_id": "m7",
+        "base_library_revision": 4,
+        "rule_id": "glare",
+        "direction": "front",
+        "template_id": "front:00.png",
+        "seed_shape": {"shape": "circle", "cx": 120.0, "cy": 130.0, "r": 44.0},
+        "mode": "inside",
+        "margin_ratio": 0.02,
+    }
+    defaults.update(fields)
+    response = client.request("preview_geometry_mask_rule", **defaults)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_REQUEST"
+
+
+def test_geometry_profile_maps_stale_publish_to_stable_error_code(client):
+    response = client.request(
+        "publish_geometry_mask_profile",
+        workpiece_id="m7",
+        job_id="geometry-validate-1",
+        base_library_revision=1,
+        base_draft_revision=1,
+        operation_id="geometry-publish-stale",
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "STALE_GEOMETRY_PROFILE"
+
+
+@pytest.mark.parametrize(
+    ("error_type", "code"),
+    [
+        (MissingDirectionCalibrationError, "MISSING_DIRECTION_CALIBRATION"),
+        (FittedGeometryMissingError, "FITTED_GEOMETRY_MISSING"),
+        (GeometryProfileMigrationConflictError, "MIGRATION_CONFLICT"),
+        (DuplicateLogicalRuleError, "DUPLICATE_LOGICAL_RULE"),
+        (GeometryContextMismatchError, "GEOMETRY_CONTEXT_MISMATCH"),
+        (GeometryCacheRevisionMismatchError, "PROFILE_CACHE_REVISION_MISMATCH"),
+    ],
+)
+def test_geometry_profile_maps_typed_errors_to_stable_codes(
+    client, running_server, error_type, code,
+):
+    profiles = running_server.dispatcher.runtime.snapshot().geometry_profiles
+    profiles.publish_error = error_type("typed geometry failure")
+
+    response = client.request(
+        "publish_geometry_mask_profile",
+        workpiece_id="m7",
+        job_id="geometry-validate-typed",
+        base_library_revision=1,
+        base_draft_revision=99,
+        operation_id=f"publish-{code}",
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == code
+
+
+def test_listener_reports_loading_then_accepts_ready_handshake():
+    runtime = ServiceRuntime()
+    dispatcher = OrientationCommandDispatcher(runtime)
+    server = OrientationTcpServer(dispatcher, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = TcpTestClient(server.address)
+    try:
+        loading = client.request("hello")
+        assert loading["ok"] is True
+        assert loading["ready"] is False
+        assert loading["status"] == "loading"
+        assert client.request("list_workpieces")["error"]["code"] == "MODEL_LOADING"
+
+        runtime.set_ready(FakeClassifier(), FakeLibrary())
+        ready = client.request("hello")
+        assert ready["ok"] is True
+        assert ready["ready"] is True
+    finally:
+        client.close()
+        server.request_shutdown()
+        thread.join(timeout=2)
+
+
+def test_local_search_mode_argument_defaults_to_adaptive(tmp_path):
+    parser = service_module._build_argument_parser()
+    args = parser.parse_args([
+        "--project-root", str(tmp_path),
+        "--model-dir", str(tmp_path / "models"),
+        "--library-dir", str(tmp_path / "library"),
+    ])
+
+    assert args.local_search_mode == "adaptive"
+
+
+def test_local_search_mode_argument_rejects_unknown_value(tmp_path):
+    parser = service_module._build_argument_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "--project-root", str(tmp_path),
+            "--model-dir", str(tmp_path / "models"),
+            "--library-dir", str(tmp_path / "library"),
+            "--local-search-mode", "fast",
+        ])
+
+
+def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication(monkeypatch, tmp_path):
+    runtime = ServiceRuntime()
+    events = []
+
+    class LoadedClassifier:
+        geometry_calibrator = None
+
+        @classmethod
+        def load(cls, project_root, model_dir, *, local_search_mode):
+            events.append(f"model-loaded:{local_search_mode}")
+            return cls()
+
+    class LoadedLibrary:
+        def __init__(self, library_dir):
+            self.library_dir = Path(library_dir)
+
+    class LoadedCatalog:
+        def __init__(self, library, classifier):
+            self.library = library
+            self.classifier = classifier
+            self.geometry_profiles = None
+
+        def set_geometry_profiles(self, profiles):
+            self.geometry_profiles = profiles
+
+        def recover(self):
+            assert runtime.snapshot().status == "loading"
+            events.append("recovered")
+
+    class LoadedProfiles:
+        def __init__(self, catalog, calibrator, *, storage_dir, start_worker=True):
+            assert start_worker is False
+            events.append("profiles-created")
+
+        def start(self):
+            assert runtime.snapshot().status == "ready"
+            assert "recovered" in events
+            events.append("profiles-started")
+
+    class LoadedEvolution:
+        def __init__(self, catalog, storage_dir, *, geometry_profiles, start_worker=True):
+            assert start_worker is False
+            events.append("evolution-created")
+
+        def start(self):
+            assert runtime.snapshot().status == "ready"
+            assert "recovered" in events
+            events.append("evolution-started")
+
+    monkeypatch.setattr(service_module, "OrientationClassifier", LoadedClassifier)
+    monkeypatch.setattr(service_module, "WorkpieceLibrary", LoadedLibrary)
+    monkeypatch.setattr(service_module, "WorkpieceCatalog", LoadedCatalog)
+    monkeypatch.setattr(service_module, "GeometryMaskProfiles", LoadedProfiles)
+    monkeypatch.setattr(service_module, "TemplateEvolution", LoadedEvolution)
+
+    service_module._load_runtime(
+        runtime,
+        tmp_path,
+        tmp_path / "models",
+        tmp_path / "library",
+        local_search_mode="exhaustive",
+    )
+
+    assert runtime.snapshot().status == "ready"
+    assert events == [
+        "model-loaded:exhaustive",
+        "profiles-created",
+        "recovered",
+        "evolution-created",
+        "profiles-started",
+        "evolution-started",
+    ]
+
+
+def test_loading_runtime_accepts_shutdown_before_model_ready():
+    runtime = ServiceRuntime()
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = TcpTestClient(server.address)
+    try:
+        assert client.request("shutdown")["ok"] is True
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    finally:
+        client.close()
+
+
+def test_script_entrypoint_resolves_src_package():
+    project_root = Path(__file__).resolve().parents[1]
+    script = project_root / "src" / "orientation_tcp_service.py"
+
+    result = subprocess.run(
+        [sys.executable, "-u", str(script), "--help"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout

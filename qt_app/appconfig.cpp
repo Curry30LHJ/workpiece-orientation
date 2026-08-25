@@ -62,6 +62,24 @@ std::optional<AppConfig> AppConfig::load(const QString &path, QString *error) {
         || !readString(object, QStringLiteral("library_dir"), &config.libraryDir, error)) {
         return std::nullopt;
     }
+    const QJsonValue searchModeValue = object.value(QStringLiteral("local_search_mode"));
+    if (!searchModeValue.isUndefined()) {
+        if (!searchModeValue.isString()) {
+            setError(error, QStringLiteral(
+                "local_search_mode must be adaptive or exhaustive"
+            ));
+            return std::nullopt;
+        }
+        const QString mode = searchModeValue.toString().trimmed().toLower();
+        if (mode != QStringLiteral("adaptive")
+            && mode != QStringLiteral("exhaustive")) {
+            setError(error, QStringLiteral(
+                "local_search_mode must be adaptive or exhaustive"
+            ));
+            return std::nullopt;
+        }
+        config.localSearchMode = mode;
+    }
     const QString hostText = object.value(QStringLiteral("host")).toString();
     if (hostText != QStringLiteral("127.0.0.1")) {
         setError(error, QStringLiteral("host must be 127.0.0.1"));
