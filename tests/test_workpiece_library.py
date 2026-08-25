@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -36,6 +37,107 @@ def fake_builder(front: list[Path], back: list[Path], progress_callback=None) ->
         },
         local_features={"front": [{} for _ in front], "back": [{} for _ in back]},
     )
+
+
+def _tree_hashes(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _registered_library(tmp_path: Path) -> tuple[WorkpieceLibrary, object]:
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, _ = library.register(
+        "M7",
+        image_set(tmp_path, "base-front", 10, 2),
+        image_set(tmp_path, "base-back", 20, 2),
+        False,
+        fake_builder,
+    )
+    return library, record
+
+
+def _write_geometry_sidecars(root: Path) -> dict[str, str]:
+    revisions = root / "geometry_masks" / "revisions"
+    previews = root / "geometry_masks" / "previews"
+    revisions.mkdir(parents=True)
+    previews.mkdir(parents=True)
+    (root / "geometry_masks" / "profile.json").write_text(
+        json.dumps({"library_revision": 1, "active_revision": 1}), encoding="utf-8"
+    )
+    (revisions / "1.json").write_text('{"revision": 1}', encoding="utf-8")
+    (previews / "front-00.png").write_bytes(b"immutable-preview")
+    (root / ".template_cache.pkl").write_bytes(b"stale-cache")
+    return _tree_hashes(root)
+
+
+def test_prepared_append_preserves_geometry_sidecars_until_commit(tmp_path):
+    library, record = _registered_library(tmp_path)
+    before = _write_geometry_sidecars(record.root)
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "confirmed.png", 31)],
+        [],
+        fake_builder,
+        operation_id="job-append-1",
+    )
+
+    assert _tree_hashes(record.root) == before
+    assert library.get(record.id) == record
+    assert not (prepared.staging_root / ".template_cache.pkl").exists()
+    committed, backup = library.commit_prepared(prepared)
+    assert (committed.root / "geometry_masks" / "revisions" / "1.json").read_bytes() == b'{"revision": 1}'
+    assert (committed.root / "geometry_masks" / "previews" / "front-00.png").read_bytes() == b"immutable-preview"
+    assert len(committed.front_images) == len(record.front_images) + 1
+    manifest = json.loads((committed.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 3
+    assert manifest["last_template_update"]["operation_id"] == "job-append-1"
+    assert manifest["last_template_update"]["base_revision"] == record.revision
+    assert manifest["last_template_update"]["target_revision"] == committed.revision
+    assert len(manifest["last_template_update"]["item_digests"]) == 1
+    library.remove_retired(backup)
+
+
+def test_prepared_append_builder_failure_leaves_active_tree_unchanged(tmp_path):
+    library, record = _registered_library(tmp_path)
+    before = _write_geometry_sidecars(record.root)
+
+    def raising_builder(front, back, progress_callback=None):
+        raise FeatureBuildError("feature extraction failed")
+
+    with pytest.raises(FeatureBuildError):
+        library.prepare_append(
+            record,
+            [write_image(tmp_path / "failed-confirmed.png", 32)],
+            [],
+            raising_builder,
+            operation_id="job-append-failed",
+        )
+
+    assert _tree_hashes(record.root) == before
+    assert not list(record.root.parent.glob(".staging-*"))
+
+
+def test_abort_prepared_is_idempotent_and_stale_owner_cannot_commit(tmp_path):
+    library, record = _registered_library(tmp_path)
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "stale-confirmed.png", 33)],
+        [],
+        fake_builder,
+        operation_id="job-append-stale",
+    )
+    library.recycle(record.id)
+
+    with pytest.raises(StaleWorkpieceRevisionError):
+        library.commit_prepared(prepared)
+
+    library.abort_prepared(prepared)
+    library.abort_prepared(prepared)
+    assert not prepared.staging_root.exists()
 
 
 def test_register_creates_uuid_manifest_and_label_folders(tmp_path: Path):

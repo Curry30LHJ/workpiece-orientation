@@ -84,7 +84,7 @@ Python TcpJsonServer
   "library_dir": "E:/Project/wang/pp_813/runtime_library",
   "host": "127.0.0.1",
   "port": 37651,
-  "startup_timeout_ms": 120000,
+  "startup_timeout_ms": 600000,
   "request_timeout_ms": 120000
 }
 ```
@@ -102,7 +102,7 @@ Python 启动参数由 Qt 逐项传给 QProcess，不通过 shell 拼接，避�
 3. 连接成功后发送 `hello`；服务身份和协议版本正确才进入 `Ready`。
 4. 初次连接失败时，`BackendProcessManager` 启动 Python 服务并设置 `ownedByThisSession=true`。
 5. Python 加载模型、扫描模板库、恢复缓存，然后绑定端口。
-6. Qt 在 120 秒内定期重连；握手成功后刷新工件列表。
+6. Qt 在 `startup_timeout_ms` 配置的时限内定期重连；握手成功后刷新工件列表。首次模型加载可使用 600000 毫秒示例值。
 7. 超时、QProcess 提前退出或握手错误进入 `Error`，建库和检测保持禁用。
 
 若端口上存在非本服务程序，TCP 连接可能成功但 `hello` 失败。此时 Qt 报告端口冲突，不启动第二个服务。

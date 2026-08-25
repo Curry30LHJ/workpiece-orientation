@@ -12,7 +12,12 @@ private slots:
     void draggedCircleUsesNativeImageCoordinates();
     void draggedEllipseUsesNativeImageCoordinates();
     void rotatedRectangleUsesConfiguredAngle();
+    void noToolDoesNotDraw();
+    void escapeCancelsIncompleteGesture();
+    void numericShapeAndResetViewRemainStable();
     void overlaysAndResizeRemainSafe();
+    void changingImageClearsPreviousFitOverlay();
+    void effectiveShapeIsPreferredOverRawShape();
 };
 
 void TestGeometryRuleCanvas::draggedCircleUsesNativeImageCoordinates() {
@@ -20,14 +25,14 @@ void TestGeometryRuleCanvas::draggedCircleUsesNativeImageCoordinates() {
     canvas.resize(600, 400);
     canvas.setImage(QImage(300, 300, QImage::Format_RGB32));
     canvas.setTool(GeometryRuleCanvas::Circle);
-    QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(200, 100));
-    QTest::mouseMove(&canvas, QPoint(400, 300));
-    QTest::mouseRelease(&canvas, Qt::LeftButton, {}, QPoint(400, 300));
+    QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(300, 200));
+    QTest::mouseMove(&canvas, QPoint(367, 200));
+    QTest::mouseRelease(&canvas, Qt::LeftButton, {}, QPoint(367, 200));
     const QJsonObject shape = canvas.coarseShape();
     QCOMPARE(shape.value("shape").toString(), QStringLiteral("circle"));
     QVERIFY(qAbs(shape.value("cx").toDouble() - 150.0) < 1.0);
     QVERIFY(qAbs(shape.value("cy").toDouble() - 150.0) < 1.0);
-    QVERIFY(qAbs(shape.value("r").toDouble() - 75.0) < 1.0);
+    QVERIFY(qAbs(shape.value("r").toDouble() - 50.0) < 1.0);
 }
 
 void TestGeometryRuleCanvas::draggedEllipseUsesNativeImageCoordinates() {
@@ -35,7 +40,7 @@ void TestGeometryRuleCanvas::draggedEllipseUsesNativeImageCoordinates() {
     canvas.resize(600, 400);
     canvas.setImage(QImage(300, 200, QImage::Format_RGB32));
     canvas.setTool(GeometryRuleCanvas::Ellipse);
-    QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(150, 100));
+    QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(300, 200));
     QTest::mouseRelease(&canvas, Qt::LeftButton, {}, QPoint(450, 300));
     const QJsonObject shape = canvas.coarseShape();
     QCOMPARE(shape.value("shape").toString(), QStringLiteral("ellipse"));
@@ -59,6 +64,36 @@ void TestGeometryRuleCanvas::rotatedRectangleUsesConfiguredAngle() {
     QVERIFY(shape.value("half_width").toDouble() > 45.0);
 }
 
+void TestGeometryRuleCanvas::noToolDoesNotDraw() {
+    GeometryRuleCanvas canvas;
+    canvas.resize(400, 400);
+    canvas.setImage(QImage(200, 200, QImage::Format_RGB32));
+    canvas.setTool(GeometryRuleCanvas::None);
+    QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(200, 200));
+    QTest::mouseRelease(&canvas, Qt::LeftButton, {}, QPoint(300, 200));
+    QVERIFY(canvas.coarseShape().isEmpty());
+}
+
+void TestGeometryRuleCanvas::escapeCancelsIncompleteGesture() {
+    GeometryRuleCanvas canvas;
+    canvas.resize(400, 400);
+    canvas.setImage(QImage(200, 200, QImage::Format_RGB32));
+    canvas.setTool(GeometryRuleCanvas::Circle);
+    QTest::mousePress(&canvas, Qt::LeftButton, {}, QPoint(200, 200));
+    QTest::keyClick(&canvas, Qt::Key_Escape);
+    QVERIFY(canvas.coarseShape().value("r").toDouble() == 0.0);
+}
+
+void TestGeometryRuleCanvas::numericShapeAndResetViewRemainStable() {
+    GeometryRuleCanvas canvas;
+    canvas.resize(400, 400);
+    canvas.setImage(QImage(200, 200, QImage::Format_RGB32));
+    canvas.setNumericShape(QJsonObject{{"shape", "circle"}, {"cx", 100}, {"cy", 100}, {"r", 30}});
+    QCOMPARE(canvas.coarseShape().value("cx").toDouble(), 100.0);
+    canvas.resetView();
+    QVERIFY(qAbs(canvas.imageTarget().size().width() - 400.0) < 0.01);
+}
+
 void TestGeometryRuleCanvas::overlaysAndResizeRemainSafe() {
     GeometryRuleCanvas canvas;
     canvas.resize(320, 240);
@@ -71,6 +106,28 @@ void TestGeometryRuleCanvas::overlaysAndResizeRemainSafe() {
     rendered.fill(Qt::transparent);
     canvas.render(&rendered);
     QVERIFY(canvas.coarseShape().isEmpty());
+}
+
+void TestGeometryRuleCanvas::changingImageClearsPreviousFitOverlay() {
+    GeometryRuleCanvas canvas;
+    canvas.setImage(QImage(120, 120, QImage::Format_RGB32));
+    canvas.setFitOverlay(QJsonObject{{"shape", "circle"}, {"cx", 60}, {"cy", 60}, {"r", 45}});
+    QVERIFY(!canvas.fitShape().isEmpty());
+
+    canvas.setImage(QImage(120, 120, QImage::Format_RGB32));
+
+    QVERIFY(canvas.fitShape().isEmpty());
+}
+
+void TestGeometryRuleCanvas::effectiveShapeIsPreferredOverRawShape() {
+    GeometryRuleCanvas canvas;
+    canvas.setImage(QImage(120, 120, QImage::Format_RGB32));
+    canvas.setFitOverlay(QJsonObject{
+        {"fitted_shape", QJsonObject{{"shape", "circle"}, {"cx", 60}, {"cy", 60}, {"r", 45}}},
+        {"effective_shape", QJsonObject{{"shape", "circle"}, {"cx", 60}, {"cy", 60}, {"r", 40}}},
+    });
+
+    QCOMPARE(canvas.fitShape().value("r").toDouble(), 40.0);
 }
 
 QTEST_MAIN(TestGeometryRuleCanvas)

@@ -20,7 +20,15 @@ from src.orientation_tcp_service import (
     configure_diagnostic_logging,
 )
 from src.orientation_classifier import PropagationModelError
-from src.geometry_mask_profiles import StaleGeometryProfileError
+from src.geometry_mask_profiles import (
+    DuplicateLogicalRuleError,
+    FittedGeometryMissingError,
+    GeometryCacheRevisionMismatchError,
+    GeometryContextMismatchError,
+    GeometryProfileMigrationConflictError,
+    MissingDirectionCalibrationError,
+    StaleGeometryProfileError,
+)
 
 
 class FakeLibrary:
@@ -53,7 +61,13 @@ class FakeLibrary:
         if progress_callback is not None:
             progress_callback({"phase": "features", "completed": 1, "total": len(front_images) + len(back_images)})
         return (
-            SimpleNamespace(id="m7", name=name, front_images=tuple(front_images), back_images=tuple(back_images)),
+            SimpleNamespace(
+                id="m7",
+                name=name,
+                front_images=tuple(front_images),
+                back_images=tuple(back_images),
+                revision=1,
+            ),
             {"fake": "cache"},
         )
 
@@ -65,6 +79,7 @@ class FakeClassifier:
 
     def set_template_cache(self, workpiece_id, cache):
         assert workpiece_id == "m7"
+        self.active_workpiece_id = workpiece_id
 
     def remove_template_cache(self, workpiece_id):
         assert workpiece_id == "m7"
@@ -88,6 +103,12 @@ class FakeClassifier:
             "needs_review": False,
             "elapsed_ms": 1.0,
         }
+
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        result = self.predict(self.active_workpiece_id, image_path)
+        if library_revision is not None:
+            result["library_revision"] = library_revision
+        return result
 
 
 class FakeEvolution:
@@ -153,6 +174,50 @@ class FakeGeometryProfiles:
             "active": None,
         }
         self.jobs = {}
+        self.preview_calls = []
+        self.last_resolution = None
+        self.publish_error = None
+
+    def preview_rule(self, workpiece_id, *, expected_library_revision, rule_id, direction, template_id,
+                     seed_shape, mode, margin_ratio, anchor_candidate_index=None,
+                     rule_candidate_index=None):
+        self.preview_calls.append({
+            "workpiece_id": workpiece_id,
+            "expected_library_revision": expected_library_revision,
+            "rule_id": rule_id,
+            "direction": direction,
+            "template_id": template_id,
+            "seed_shape": seed_shape,
+            "mode": mode,
+            "margin_ratio": margin_ratio,
+            "anchor_candidate_index": anchor_candidate_index,
+            "rule_candidate_index": rule_candidate_index,
+        })
+        return {
+            "rule_id": rule_id,
+            "template_id": template_id,
+            "direction": direction,
+            "margin_ratio": margin_ratio,
+            "rule_fit": {"effective_shape": {"shape": "ellipse", "cx": 1.0, "cy": 1.0,
+                                                "rx": 1.0, "ry": 1.0, "angle_deg": 0.0}},
+            "profile_patch": {
+                "reference_template": {"direction": direction},
+                "margin_ratio": margin_ratio,
+                "margin_semantics": "signed_boundary_v2",
+            },
+        }
+
+    def resolve_migration(self, workpiece_id, conflict_id, resolution, *,
+                          expected_library_revision, expected_draft_revision, operation_id):
+        self.last_resolution = {
+            "workpiece_id": workpiece_id,
+            "conflict_id": conflict_id,
+            "resolution": resolution,
+            "expected_library_revision": expected_library_revision,
+            "expected_draft_revision": expected_draft_revision,
+            "operation_id": operation_id,
+        }
+        return self.snapshot(workpiece_id)
 
     def snapshot(self, workpiece_id):
         return dict(self.profile)
@@ -179,6 +244,8 @@ class FakeGeometryProfiles:
 
     def publish(self, workpiece_id, job_id, *, expected_library_revision, expected_draft_revision,
                 operation_id, override_reason=""):
+        if self.publish_error is not None:
+            raise self.publish_error
         if expected_draft_revision != 99:
             raise StaleGeometryProfileError("stale publish")
         self.profile["active_revision"] = expected_draft_revision
@@ -287,6 +354,32 @@ def test_second_client_receives_server_busy(running_server):
     finally:
         active.close()
         second.close()
+
+
+def test_silent_handshake_times_out_and_releases_server_slot():
+    dispatcher = OrientationCommandDispatcher(FakeClassifier(), FakeLibrary())
+    server = OrientationTcpServer(
+        dispatcher,
+        host="127.0.0.1",
+        port=0,
+        handshake_timeout_seconds=0.1,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    silent = socket.create_connection(server.address, timeout=1)
+    try:
+        time.sleep(0.25)
+        replacement = TcpTestClient(server.address)
+        try:
+            response = replacement.request("hello")
+            assert response["ok"] is True
+            assert response["ready"] is True
+        finally:
+            replacement.close()
+    finally:
+        silent.close()
+        server.request_shutdown()
+        thread.join(timeout=2)
 
 
 def test_register_and_predict_responses_preserve_request_id(client, running_server):
@@ -602,6 +695,97 @@ def test_geometry_profile_commands_round_trip_and_return_job_without_streaming(c
     assert cancelled["job"]["state"] == "cancelled"
 
 
+def test_preview_geometry_mask_rule_dispatches_without_operation_id(client, running_server):
+    response = client.request(
+        "preview_geometry_mask_rule",
+        workpiece_id="m7",
+        base_library_revision=4,
+        rule_id="glare",
+        direction="front",
+        template_id="front:00.png",
+        seed_shape={"shape": "circle", "cx": 120.0, "cy": 130.0, "r": 44.0},
+        mode="inside",
+        margin_ratio=-0.02,
+    )
+
+    assert response["ok"] is True
+    assert response["preview"]["template_id"] == "front:00.png"
+    assert response["preview"]["rule_id"] == "glare"
+    assert response["preview"]["direction"] == "front"
+    assert response["preview"]["margin_ratio"] == pytest.approx(-0.02)
+    assert "effective_shape" in response["preview"]["rule_fit"]
+    assert running_server.dispatcher.runtime.snapshot().geometry_profiles.preview_calls
+
+
+def test_preview_geometry_rule_requires_rule_id(client):
+    response = client.request(
+        "preview_geometry_mask_rule",
+        workpiece_id="m7",
+        base_library_revision=1,
+        direction="front",
+        template_id="front:00.png",
+        seed_shape={"shape": "circle", "cx": 100.0, "cy": 100.0, "r": 60.0},
+        mode="inside",
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "NO_SELECTED_RULE"
+
+
+def test_resolve_geometry_migration_forwards_revisioned_resolution(client, running_server):
+    response = client.request(
+        "resolve_geometry_mask_migration",
+        workpiece_id="m7",
+        base_library_revision=1,
+        base_draft_revision=3,
+        operation_id="resolve-op-1",
+        conflict_id="duplicate-back-glare",
+        resolution={"action": "keep_only", "survivor_rule_id": "back-glare-a"},
+    )
+
+    assert response["ok"] is True
+    profiles = running_server.dispatcher.runtime.snapshot().geometry_profiles
+    assert profiles.last_resolution["conflict_id"] == "duplicate-back-glare"
+    assert profiles.last_resolution["expected_draft_revision"] == 3
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"base_library_revision": True},
+        {"base_library_revision": 4, "direction": "side"},
+        {"base_library_revision": 4, "direction": "front", "template_id": ""},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "triangle"}},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "sideways"},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "inside", "margin_ratio": 1.0},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "inside", "margin_ratio": -0.95},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "inside", "margin_ratio": 0.95},
+        {"base_library_revision": 4, "direction": "front", "template_id": "front:00.png",
+         "seed_shape": {"shape": "circle"}, "mode": "inside", "rule_candidate_index": "1"},
+    ],
+)
+def test_preview_geometry_mask_rule_rejects_invalid_request(client, fields):
+    defaults = {
+        "workpiece_id": "m7",
+        "base_library_revision": 4,
+        "rule_id": "glare",
+        "direction": "front",
+        "template_id": "front:00.png",
+        "seed_shape": {"shape": "circle", "cx": 120.0, "cy": 130.0, "r": 44.0},
+        "mode": "inside",
+        "margin_ratio": 0.02,
+    }
+    defaults.update(fields)
+    response = client.request("preview_geometry_mask_rule", **defaults)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_REQUEST"
+
+
 def test_geometry_profile_maps_stale_publish_to_stable_error_code(client):
     response = client.request(
         "publish_geometry_mask_profile",
@@ -613,6 +797,36 @@ def test_geometry_profile_maps_stale_publish_to_stable_error_code(client):
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "STALE_GEOMETRY_PROFILE"
+
+
+@pytest.mark.parametrize(
+    ("error_type", "code"),
+    [
+        (MissingDirectionCalibrationError, "MISSING_DIRECTION_CALIBRATION"),
+        (FittedGeometryMissingError, "FITTED_GEOMETRY_MISSING"),
+        (GeometryProfileMigrationConflictError, "MIGRATION_CONFLICT"),
+        (DuplicateLogicalRuleError, "DUPLICATE_LOGICAL_RULE"),
+        (GeometryContextMismatchError, "GEOMETRY_CONTEXT_MISMATCH"),
+        (GeometryCacheRevisionMismatchError, "PROFILE_CACHE_REVISION_MISMATCH"),
+    ],
+)
+def test_geometry_profile_maps_typed_errors_to_stable_codes(
+    client, running_server, error_type, code,
+):
+    profiles = running_server.dispatcher.runtime.snapshot().geometry_profiles
+    profiles.publish_error = error_type("typed geometry failure")
+
+    response = client.request(
+        "publish_geometry_mask_profile",
+        workpiece_id="m7",
+        job_id="geometry-validate-typed",
+        base_library_revision=1,
+        base_draft_revision=99,
+        operation_id=f"publish-{code}",
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == code
 
 
 def test_listener_reports_loading_then_accepts_ready_handshake():
@@ -662,7 +876,7 @@ def test_local_search_mode_argument_rejects_unknown_value(tmp_path):
         ])
 
 
-def test_runtime_loader_forwards_local_search_mode(monkeypatch, tmp_path):
+def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication(monkeypatch, tmp_path):
     runtime = ServiceRuntime()
     events = []
 
@@ -680,21 +894,36 @@ def test_runtime_loader_forwards_local_search_mode(monkeypatch, tmp_path):
 
     class LoadedCatalog:
         def __init__(self, library, classifier):
+            self.library = library
+            self.classifier = classifier
             self.geometry_profiles = None
 
         def set_geometry_profiles(self, profiles):
             self.geometry_profiles = profiles
 
         def recover(self):
+            assert runtime.snapshot().status == "loading"
             events.append("recovered")
 
     class LoadedProfiles:
-        def __init__(self, catalog, calibrator, *, storage_dir):
+        def __init__(self, catalog, calibrator, *, storage_dir, start_worker=True):
+            assert start_worker is False
             events.append("profiles-created")
 
+        def start(self):
+            assert runtime.snapshot().status == "ready"
+            assert "recovered" in events
+            events.append("profiles-started")
+
     class LoadedEvolution:
-        def __init__(self, catalog, storage_dir, *, geometry_profiles):
+        def __init__(self, catalog, storage_dir, *, geometry_profiles, start_worker=True):
+            assert start_worker is False
             events.append("evolution-created")
+
+        def start(self):
+            assert runtime.snapshot().status == "ready"
+            assert "recovered" in events
+            events.append("evolution-started")
 
     monkeypatch.setattr(service_module, "OrientationClassifier", LoadedClassifier)
     monkeypatch.setattr(service_module, "WorkpieceLibrary", LoadedLibrary)
@@ -711,7 +940,14 @@ def test_runtime_loader_forwards_local_search_mode(monkeypatch, tmp_path):
     )
 
     assert runtime.snapshot().status == "ready"
-    assert events[0] == "model-loaded:exhaustive"
+    assert events == [
+        "model-loaded:exhaustive",
+        "profiles-created",
+        "recovered",
+        "evolution-created",
+        "profiles-started",
+        "evolution-started",
+    ]
 
 
 def test_loading_runtime_accepts_shutdown_before_model_ready():

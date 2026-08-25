@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import cv2
 import numpy as np
@@ -72,6 +73,100 @@ def test_confirmations_for_same_workpiece_coalesce_and_append(tmp_path):
     assert len(updated.front_images) == 2
     assert len(updated.back_images) == 2
     assert evolution.get_job(job1["job_id"])["state"] == "completed"
+
+
+def test_restart_reconciles_manifest_commit_without_appending_twice(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    storage = tmp_path / "restart-jobs"
+    evolution = TemplateEvolution(catalog, storage, start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "restart-confirmed.png", 31),
+        operation_id="restart-confirmation",
+    )
+    staged = Path(evolution.get_job(job["job_id"])["items"][0]["path"])
+    committed, _ = catalog.append_templates(
+        record.id,
+        [staged],
+        [],
+        operation_id=job["job_id"],
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]]["state"] = "building"
+        evolution._persist()
+
+    restarted = TemplateEvolution(catalog, storage, start_worker=False)
+    result = restarted.run_next(force=True)
+
+    assert result["state"] == "completed"
+    assert result["revision"] == committed.revision
+    assert len(catalog.get(record.id).front_images) == 2
+    assert not staged.exists()
+
+
+def test_restart_rejects_unrelated_revision_instead_of_reappending(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    storage = tmp_path / "unrelated-jobs"
+    evolution = TemplateEvolution(catalog, storage, start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "queued-confirmed.png", 32),
+        operation_id="queued-confirmation",
+    )
+    catalog.append_templates(
+        record.id,
+        [image(tmp_path / "unrelated-confirmed.png", 33)],
+        [],
+        operation_id="different-operation",
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]]["state"] = "building"
+        evolution._persist()
+
+    restarted = TemplateEvolution(catalog, storage, start_worker=False)
+    result = restarted.run_next(force=True)
+
+    assert result["state"] == "failed"
+    assert result["error"] == "workpiece revision changed without a matching template operation"
+    assert len(catalog.get(record.id).front_images) == 2
+
+
+def test_corrupt_jobs_document_is_quarantined_without_disabling_catalog(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    storage = tmp_path / "corrupt-jobs"
+    storage.mkdir()
+    jobs_path = storage / "jobs.json"
+    jobs_path.write_text("{not-json", encoding="utf-8")
+
+    evolution = TemplateEvolution(catalog, storage, start_worker=False)
+
+    quarantined = list(storage.glob("jobs.corrupt-*.json"))
+    assert evolution.list_jobs() == []
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "{not-json"
+    assert not jobs_path.exists()
+    assert catalog.get(record.id).id == record.id
+
+
+def test_completed_job_records_its_job_id_in_template_manifest(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "operation-jobs", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "operation-confirmed.png", 34),
+        operation_id="operation-confirmation",
+    )
+
+    result = evolution.run_next(force=True)
+
+    manifest = json.loads(
+        (catalog.get(record.id).root / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert result["state"] == "completed"
+    assert manifest["last_template_update"]["operation_id"] == job["job_id"]
 
 
 class LowConfidenceGeometryProfiles:

@@ -48,6 +48,7 @@
         <property name="title"><string>待测图片</string></property>
         <layout class="QVBoxLayout" name="imageLayout">
          <item><widget class="QLabel" name="imagePreviewLabel"><property name="minimumSize"><size><width>480</width><height>360</height></size></property><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string>请选择待测图片</string></property></widget></item>
+         <item><widget class="QLabel" name="currentImageLabel"><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string/></property></widget></item>
          <item><widget class="QPushButton" name="chooseImageButton"><property name="text"><string>选择待测图片</string></property></widget></item>
          <item><widget class="QPushButton" name="predictButton"><property name="text"><string>开始检测</string></property></widget></item>
          <item>
@@ -68,6 +69,7 @@
          <item><widget class="QLabel" name="batchSummaryLabel"><property name="text"><string/></property></widget></item>
          <item><widget class="QTableWidget" name="batchResultsTableWidget"/></item>
          <item><widget class="QTextEdit" name="evidenceTextEdit"><property name="readOnly"><bool>true</bool></property></widget></item>
+         <item><widget class="QLabel" name="currentResultTargetLabel"><property name="text"><string/></property></widget></item>
         </layout>
        </widget>
       </item>

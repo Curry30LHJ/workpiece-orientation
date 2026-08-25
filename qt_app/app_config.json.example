@@ -7,6 +7,6 @@
   "local_search_mode": "adaptive",
   "host": "127.0.0.1",
   "port": 37651,
-  "startup_timeout_ms": 120000,
+  "startup_timeout_ms": 600000,
   "request_timeout_ms": 120000
 }

@@ -22,8 +22,12 @@ from src.image_io import read_color_image
 from src.shitu_baseline import classify_embedding
 from src.interference_masks import filter_template_features
 from src.interference_masks import project_region
+from src.geometry_calibration import apply_geometry_fit
 from src.geometry_calibration import apply_ignore_mask
 from src.geometry_calibration import filter_features_by_mask
+from src.geometry_calibration import geometry_feature_mask
+from src.geometry_profile_schema import materialize_runtime_profile
+from src.model_execution_gate import PriorityModelGate
 
 
 ROI_RATIO = 1.0
@@ -75,6 +79,9 @@ class TemplateCache:
     geometry_profile: dict[str, Any] | None = None
     geometry_profile_revision: int | None = None
     geometry_template_report: dict[str, Any] | None = None
+    geometry_template_indices: dict[str, list[int]] | None = None
+    geometry_unsafe: bool = False
+
 
 @dataclass(frozen=True)
 class LocalSearchResult:
@@ -167,6 +174,7 @@ class OrientationClassifier:
         extract_features_fn: Callable[..., dict] | None = None,
         score_feature_pair_fn: Callable[..., dict] | None = None,
         geometry_calibrator: Any | None = None,
+        model_gate: PriorityModelGate | None = None,
         local_search_mode: str = DEFAULT_LOCAL_SEARCH_MODE,
     ) -> None:
         self.global_predictor = global_predictor
@@ -176,6 +184,7 @@ class OrientationClassifier:
         self._extract_features = extract_features_fn or _default_extract_features
         self._score_feature_pair = score_feature_pair_fn or _default_score_feature_pair
         self.geometry_calibrator = geometry_calibrator
+        self.model_gate = model_gate or PriorityModelGate()
         self.local_search_mode = _validate_local_search_mode(local_search_mode)
         self._inference_lock = threading.RLock()
         self._template_caches: dict[str, TemplateCache] = {}
@@ -210,15 +219,29 @@ class OrientationClassifier:
                    geometry_calibrator=GeometryCalibrator(),
                    local_search_mode=local_search_mode)
 
-    def _global_embedding(self, image: np.ndarray) -> np.ndarray:
+    def _global_embeddings(self, images: Sequence[np.ndarray]) -> list[np.ndarray]:
+        if not images:
+            return []
+        rgb_images = [image[:, :, ::-1] for image in images]
         with self._inference_lock:
-            embedding = self.global_predictor.predict([image[:, :, ::-1]])[0]
-        return np.asarray(embedding, dtype=np.float32)
+            embeddings = self.global_predictor.predict(rgb_images)
+        if len(embeddings) != len(images):
+            raise OrientationClassifierError("global predictor returned unexpected batch size")
+        return [np.asarray(embedding, dtype=np.float32) for embedding in embeddings]
+
+    def _global_embedding(self, image: np.ndarray) -> np.ndarray:
+        return self._global_embeddings([image])[0]
 
     def _extract_local(self, image: np.ndarray) -> dict:
         with self._inference_lock:
             features = self._extract_features(image, self.extractor, self.device, roi_ratio=ROI_RATIO)
         return _to_cpu(features)
+
+    def _extract_template_features(self, image: np.ndarray) -> tuple[np.ndarray, dict]:
+        """Extract one template as a bounded, low-priority model step."""
+        return self.model_gate.run_background_step(
+            lambda: (self._global_embedding(image), self._extract_local(image))
+        )
 
     def build_template_cache(
         self,
@@ -236,8 +259,9 @@ class OrientationClassifier:
             total = len(paths)
             for completed, path in enumerate(paths, start=1):
                 image = _read_image(Path(path))
-                embeddings.append(self._global_embedding(image))
-                features.append(self._extract_local(image))
+                embedding, local = self._extract_template_features(image)
+                embeddings.append(embedding)
+                features.append(local)
                 if progress_callback is not None:
                     progress_callback(label, completed, total)
             global_vectors[label] = np.stack(embeddings).astype(np.float32)
@@ -387,9 +411,11 @@ class OrientationClassifier:
         profile: dict[str, Any],
         calibrator: Any | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
+        *,
+        base_cache: TemplateCache | None = None,
     ) -> tuple[TemplateCache, dict[str, list[dict[str, Any]]]]:
         """Build a geometry-masked candidate cache without publishing it."""
-        base = self._template_caches.get(workpiece_id)
+        base = base_cache if base_cache is not None else self._template_caches.get(workpiece_id)
         if base is None:
             raise WorkpieceNotFoundError(f"Unknown workpiece: {workpiece_id}")
         calibrator = calibrator or self.geometry_calibrator
@@ -397,36 +423,88 @@ class OrientationClassifier:
             raise ValueError("geometry calibrator is not configured")
         raw_global = getattr(base, "raw_global_vectors", None) or base.global_vectors
         raw_local = getattr(base, "raw_local_features", None) or base.local_features
+        runtime_profile = materialize_runtime_profile(profile)
         candidate_profile = deepcopy(profile)
         candidate_globals: dict[str, np.ndarray] = {}
         candidate_locals: dict[str, list[dict[str, Any]]] = {}
         report: dict[str, list[dict[str, Any]]] = {}
 
+        geometry_indices: dict[str, list[int]] = {}
+        geometry_unsafe = False
         for label, paths in (("front", record.front_images), ("back", record.back_images)):
-            direction = self._geometry_direction(profile, label)
+            direction = self._geometry_direction(runtime_profile, label)
             candidate_direction = self._geometry_direction(candidate_profile, label)
             if direction is None or direction.get("anchor") is None or not direction.get("rules"):
                 candidate_globals[label] = raw_global[label]
                 candidate_locals[label] = raw_local[label]
+                geometry_indices[label] = list(range(len(paths)))
                 report[label] = [{"status": "not_configured", "index": index}
                                  for index in range(len(paths))]
                 continue
-            fits: list[tuple[np.ndarray, dict[str, Any]]] = []
+            # A copied rule has no trustworthy object-relative geometry until
+            # it has been previewed on this direction.  Keep the raw feature
+            # cache active instead of silently applying a stale mask from the
+            # source direction/template.
+            if any(rule.get("editor_state") == "needs_reseed"
+                   for rule in direction.get("rules", [])
+                   if isinstance(rule, Mapping)):
+                geometry_unsafe = True
+                candidate_globals[label] = raw_global[label]
+                candidate_locals[label] = raw_local[label]
+                geometry_indices[label] = list(range(len(paths)))
+                report[label] = [
+                    {"index": index,
+                     "template_id": f"{label}:{Path(path).name}",
+                     "status": "needs_reseed",
+                     "review_state": "included"}
+                    for index, path in enumerate(paths)
+                ]
+                if progress_callback is not None:
+                    for index in range(len(paths)):
+                        progress_callback(label, index + 1, len(paths))
+                continue
+            reviews = direction.get("template_reviews", {})
+            fits: list[tuple[int, np.ndarray, dict[str, Any], dict[str, Any]]] = []
             fills: list[list[int]] = []
             label_report: list[dict[str, Any]] = []
             for index, path in enumerate(paths):
+                template_id = f"{label}:{Path(path).name}"
+                review = reviews.get(template_id, {}) if isinstance(reviews, dict) else {}
+                review_state = review.get("state", "included") if isinstance(review, dict) else "included"
+                review_reason = str(review.get("reason", "")) if isinstance(review, dict) else ""
+                if review_state == "excluded":
+                    label_report.append({
+                        "index": index,
+                        "template_id": template_id,
+                        "status": "excluded",
+                        "review_state": review_state,
+                        "review_reason": review_reason,
+                    })
+                    if progress_callback is not None:
+                        progress_callback(label, index + 1, len(paths))
+                    continue
                 image = _read_image(Path(path))
                 fit = calibrator.fit(image, direction)
-                fits.append((image, fit))
-                item = {"index": index, "status": fit.get("status", "low_confidence")}
+                item = {
+                    "index": index,
+                    "template_id": template_id,
+                    "status": fit.get("status", "low_confidence"),
+                    "review_state": review_state,
+                    "review_reason": review_reason,
+                }
+                item.update(self._serializable_geometry_fit(fit))
                 if fit.get("status") == "active":
                     mask = fit["ignore_mask"]
                     fills.append(direction.get("fill_bgr") or self._neutral_fill(image, mask))
                     item.update({
                         "ignored_ratio": float(fit.get("ignored_ratio", np.count_nonzero(mask) / mask.size)),
                     })
+                    if float(item["ignored_ratio"]) >= 0.55:
+                        geometry_unsafe = True
                 else:
                     item["reason_code"] = fit.get("reason_code", "boundary_not_found")
+                    geometry_unsafe = True
+                fits.append((index, image, fit, item))
                 label_report.append(item)
             fill_bgr = direction.get("fill_bgr")
             if fill_bgr is None:
@@ -435,7 +513,9 @@ class OrientationClassifier:
                 candidate_direction["fill_bgr"] = list(fill_bgr)
             embeddings: list[np.ndarray] = []
             features: list[dict[str, Any]] = []
-            for index, ((image, fit), item) in enumerate(zip(fits, label_report), start=0):
+            included_indices: list[int] = []
+            for index, image, fit, item in fits:
+                included_indices.append(index)
                 if fit.get("status") != "active":
                     embeddings.append(raw_global[label][index])
                     features.append(raw_local[label][index])
@@ -443,19 +523,30 @@ class OrientationClassifier:
                     item.update({"keypoints_before": before, "keypoints_after": before, "remaining_ratio": 1.0})
                 else:
                     mask = fit["ignore_mask"]
-                    masked = apply_ignore_mask(image, mask, fill_bgr)
-                    embeddings.append(self._global_embedding(masked))
-                    extracted = self._extract_local(masked)
+                    masked = apply_geometry_fit(image, fit, fill_bgr)
+                    embedding = self.model_gate.run_background_step(
+                        lambda: self._global_embedding(masked)
+                    )
+                    embeddings.append(embedding)
+                    extracted = raw_local[label][index]
                     before = self._feature_keypoint_count(extracted)
-                    filtered = filter_features_by_mask(extracted, mask)
+                    feature_mask = geometry_feature_mask(fit)
+                    filtered = (
+                        filter_features_by_mask(extracted, feature_mask)
+                        if np.any(feature_mask) else extracted
+                    )
                     after = self._feature_keypoint_count(filtered)
                     features.append(filtered)
                     item.update({"keypoints_before": before, "keypoints_after": after,
-                                 "remaining_ratio": float(after / before) if before else 1.0})
+                                 "remaining_ratio": float(after / before) if before else 1.0,
+                                 "feature_mask_mode": "all_ignored_regions" if np.any(feature_mask) else "none"})
                 if progress_callback is not None:
                     progress_callback(label, index + 1, len(paths))
+            if not embeddings:
+                raise ValueError(f"{label} has no included templates")
             candidate_globals[label] = np.stack(embeddings).astype(np.float32)
             candidate_locals[label] = features
+            geometry_indices[label] = included_indices
             report[label] = label_report
         return TemplateCache(
             global_vectors=candidate_globals,
@@ -465,73 +556,209 @@ class OrientationClassifier:
             geometry_profile=candidate_profile,
             geometry_profile_revision=profile.get("profile_revision"),
             geometry_template_report=report,
+            geometry_template_indices=geometry_indices,
             ignored_regions={},
+            geometry_unsafe=geometry_unsafe,
         ), report
 
-    def leave_one_out_report(self, record: Any, cache: TemplateCache) -> dict[str, Any]:
-        """Score each template against the other templates without re-extraction.
+    @staticmethod
+    def _serializable_geometry_fit(fit: dict[str, Any]) -> dict[str, Any]:
+        def clean(value: Any, key: str = "") -> Any:
+            if key in {"ignore_mask", "contour"} or isinstance(value, np.ndarray):
+                return None
+            if isinstance(value, dict):
+                return {
+                    child_key: clean(child_value, str(child_key))
+                    for child_key, child_value in value.items()
+                    if child_key not in {"ignore_mask", "contour"}
+                }
+            if isinstance(value, list):
+                return [clean(item) for item in value]
+            return deepcopy(value)
 
-        This is intentionally a small validation pass over the already-built
-        candidate cache.  It never calls Paddle, ALIKED, or LightGlue feature
-        extraction; only the cached vectors/features are compared.  A side
-        with one template cannot provide a leave-one-out same-side reference,
-        so that sample is reported as skipped instead of being called a
-        regression.
-        """
-        wrong = 0
+        return clean(fit)
+
+    @staticmethod
+    def _cache_without_template(cache: TemplateCache, label: str, position: int) -> TemplateCache:
+        """Return a validation-only cache with one candidate removed."""
+        geometry_indices = deepcopy(cache.geometry_template_indices)
+        if geometry_indices is None:
+            geometry_indices = {
+                side: list(range(len(cache.global_vectors.get(side, []))))
+                for side in ("front", "back")
+            }
+        original_index = geometry_indices.get(label, [])[position]
+        updated_indices = {side: list(indices) for side, indices in geometry_indices.items()}
+        updated_indices[label].pop(position)
+
+        vectors: dict[str, np.ndarray] = {}
+        for side, values in cache.global_vectors.items():
+            array = np.asarray(values)
+            vectors[side] = np.delete(array, position, axis=0) if side == label else array
+        features = {
+            side: ([item for item_index, item in enumerate(values) if item_index != position]
+                   if side == label else list(values))
+            for side, values in cache.local_features.items()
+        }
+
+        raw_vectors = None
+        if cache.raw_global_vectors is not None:
+            raw_vectors = {}
+            for side, values in cache.raw_global_vectors.items():
+                array = np.asarray(values)
+                raw_vectors[side] = (
+                    np.delete(array, original_index, axis=0)
+                    if side == label else array
+                )
+        raw_features = None
+        if cache.raw_local_features is not None:
+            raw_features = {
+                side: ([item for item_index, item in enumerate(values)
+                        if not (side == label and item_index == original_index)])
+                for side, values in cache.raw_local_features.items()
+            }
+        return TemplateCache(
+            global_vectors=vectors,
+            local_features=features,
+            raw_global_vectors=raw_vectors,
+            raw_local_features=raw_features,
+            ignored_regions=deepcopy(cache.ignored_regions),
+            geometry_profile=deepcopy(cache.geometry_profile),
+            geometry_profile_revision=cache.geometry_profile_revision,
+            geometry_template_report=deepcopy(cache.geometry_template_report),
+            geometry_template_indices=updated_indices,
+            geometry_unsafe=getattr(cache, "geometry_unsafe", False),
+        )
+
+    def leave_one_out_report(self, record: Any, cache: TemplateCache) -> dict[str, Any]:
+        """Re-extract every held-out template against a cache without itself."""
+        correct_to_correct = 0
+        correct_to_wrong = 0
+        wrong_to_correct = 0
+        wrong_to_wrong = 0
         evaluated = 0
         skipped = 0
-        vectors = cache.global_vectors
-        features = cache.local_features
+        excluded = 0
+        fit_failures: list[dict[str, Any]] = []
+        excluded_templates: list[str] = []
+        changed_predictions: list[dict[str, Any]] = []
+        geometry_indices = cache.geometry_template_indices or {
+            label: list(range(len(getattr(record, f"{label}_images"))))
+            for label in ("front", "back")
+        }
         for label, paths in (("front", record.front_images), ("back", record.back_images)):
-            side_vectors = vectors.get(label)
-            side_features = features.get(label)
+            side_vectors = cache.global_vectors.get(label)
+            side_features = cache.local_features.get(label)
             if side_vectors is None or not isinstance(side_features, list):
                 skipped += len(paths)
                 continue
+            side_indices = geometry_indices.get(label, list(range(len(paths))))
+            report_items = ((cache.geometry_template_report or {}).get(label, [])
+                            if isinstance(cache.geometry_template_report, dict) else [])
+            excluded_indices = {
+                int(item.get("index"))
+                for item in report_items
+                if isinstance(item, dict)
+                and item.get("index") is not None
+                and (item.get("status") == "excluded" or item.get("review_state") == "excluded")
+            }
             for index, path in enumerate(paths):
-                if index >= len(side_features) or len(side_features) <= 1:
+                template_id = f"{label}:{Path(path).name}"
+                if index not in side_indices:
+                    if index in excluded_indices:
+                        excluded += 1
+                        excluded_templates.append(template_id)
+                    else:
+                        skipped += 1
+                        fit_failures.append({"template_id": template_id, "reason": "template_excluded"})
+                    continue
+                candidate_index = side_indices.index(index)
+                if candidate_index >= len(side_features) or len(side_features) <= 1:
                     skipped += 1
+                    fit_failures.append({"template_id": template_id, "reason": "insufficient_same_side_templates"})
                     continue
                 try:
-                    image = read_color_image(Path(path))
-                    if image is None:
-                        skipped += 1
-                        continue
-                    query_vector = np.asarray(side_vectors[index], dtype=np.float32)
-                    global_scores: dict[str, float] = {}
-                    local_scores: dict[str, float] = {}
-                    for candidate_label, candidate_vectors in vectors.items():
-                        candidate_array = np.asarray(candidate_vectors, dtype=np.float32)
-                        if candidate_label == label:
-                            candidate_array = np.delete(candidate_array, index, axis=0)
-                        if candidate_array.size == 0:
+                    image = _read_image(Path(path))
+                    candidate_cache = self._cache_without_template(cache, label, candidate_index)
+                    started = time.perf_counter()
+                    if cache.geometry_profile is not None:
+                        baseline_result, result = self.model_gate.run_background_step(
+                            lambda: (
+                                self._predict_baseline(image, candidate_cache, started),
+                                self._predict_geometry(image, candidate_cache, started),
+                            )
+                        )
+                    else:
+                        result = self.model_gate.run_background_step(
+                            lambda: self._predict_baseline(image, candidate_cache, started)
+                        )
+                        baseline_result = result
+                    if cache.geometry_profile is not None:
+                        geometry_mask = result.get("geometry_mask", {})
+                        if geometry_mask.get("status") != "active":
+                            skipped += 1
+                            fit_failures.append({
+                                "template_id": template_id,
+                                "reason": geometry_mask.get("status", "geometry_fit_failed"),
+                                "geometry_mask": geometry_mask,
+                            })
                             continue
-                        global_scores[candidate_label] = float(np.max(candidate_array @ query_vector))
-
-                        candidate_features = features.get(candidate_label, [])
-                        if candidate_label == label:
-                            candidate_features = [
-                                item for item_index, item in enumerate(candidate_features)
-                                if item_index != index
-                            ]
-                        local_scores[candidate_label] = self._score_local(
-                            side_features[index], candidate_features, image.shape[:2]
-                        ) if candidate_features else 0.0
-                    if len(global_scores) < 2:
-                        skipped += 1
-                        continue
-                    fused = self._fuse_scores(global_scores, local_scores, time.perf_counter())
                     evaluated += 1
-                    if fused.get("label") != label:
-                        wrong += 1
-                except (ImageUnreadableError, AttributeError, IndexError, KeyError, TypeError, ValueError):
+                    baseline_predicted = baseline_result.get("label")
+                    candidate_predicted = result.get("label")
+                    baseline_correct = baseline_predicted == label
+                    candidate_correct = candidate_predicted == label
+                    if baseline_correct and candidate_correct:
+                        correct_to_correct += 1
+                    elif baseline_correct:
+                        correct_to_wrong += 1
+                        candidate_global = result.get("global_prediction")
+                        candidate_local = result.get("local_prediction")
+                        decision_source = result.get("decision_source")
+                        cause = (
+                            "geometry_local_override"
+                            if decision_source == "local_override"
+                            and candidate_global == label
+                            and candidate_local != label
+                            else "geometry_global_shift"
+                            if candidate_global != baseline_result.get("global_prediction")
+                            else "geometry_fusion_change"
+                        )
+                        changed_predictions.append({
+                            "template_id": template_id,
+                            "expected": label,
+                            "predicted": candidate_predicted,
+                            "baseline_predicted": baseline_predicted,
+                            "candidate_predicted": candidate_predicted,
+                            "baseline_global_prediction": baseline_result.get("global_prediction"),
+                            "baseline_local_prediction": baseline_result.get("local_prediction"),
+                            "candidate_global_prediction": candidate_global,
+                            "candidate_local_prediction": candidate_local,
+                            "candidate_decision_source": decision_source,
+                            "candidate_global_margin": float(result.get("global_margin", 0.0) or 0.0),
+                            "candidate_local_margin": float(result.get("local_margin", 0.0) or 0.0),
+                            "cause": cause,
+                        })
+                    elif candidate_correct:
+                        wrong_to_correct += 1
+                    else:
+                        wrong_to_wrong += 1
+                except (ImageUnreadableError, AttributeError, IndexError, KeyError,
+                        TypeError, ValueError, RuntimeError) as exc:
                     skipped += 1
+                    fit_failures.append({"template_id": template_id, "reason": str(exc)})
         return {
-            "status": "completed",
-            "correct_to_wrong": int(wrong),
+            "status": "completed" if skipped == 0 else "incomplete",
+            "correct_to_correct": int(correct_to_correct),
+            "correct_to_wrong": int(correct_to_wrong),
+            "wrong_to_correct": int(wrong_to_correct),
+            "wrong_to_wrong": int(wrong_to_wrong),
             "evaluated": int(evaluated),
             "skipped": int(skipped),
+            "excluded": int(excluded),
+            "excluded_templates": excluded_templates,
+            "fit_failures": fit_failures,
+            "changed_predictions": changed_predictions,
         }
 
     @staticmethod
@@ -550,9 +777,11 @@ class OrientationClassifier:
         self,
         workpiece_id: str,
         ignored_regions: dict[str, Any],
+        *,
+        base_cache: TemplateCache | None = None,
     ) -> tuple[TemplateCache, dict[str, list[dict[str, float | int]]]]:
         """Build a filtered candidate cache without publishing it."""
-        cache = self._template_caches.get(workpiece_id)
+        cache = base_cache if base_cache is not None else self._template_caches.get(workpiece_id)
         if cache is None:
             raise WorkpieceNotFoundError(f"Unknown workpiece: {workpiece_id}")
         raw = cache.raw_local_features or cache.local_features
@@ -590,23 +819,30 @@ class OrientationClassifier:
                                          region: dict[str, float]) -> dict[str, float] | None:
         """Project one template-native region through existing ALIKED/LightGlue matches."""
         try:
-            import torch
+            def project():
+                import torch
 
-            # ALIKED returns inference tensors. LightGlue must run in the same
-            # inference context, otherwise PyTorch rejects its Linear layers
-            # for attempting to save inference tensors for backward.
-            with torch.inference_mode():
-                source_image = _read_image(Path(source_path))
-                target_image = _read_image(Path(target_path))
-                source_features = self._extract_features(source_image, self.extractor, self.device, roi_ratio=ROI_RATIO)
-                target_features = self._extract_features(target_image, self.extractor, self.device, roi_ratio=ROI_RATIO)
-                match_data = self.matcher({"image0": source_features, "image1": target_features})
-                matches = match_data["matches"][0].detach().cpu().numpy()
-                if len(matches) < 4:
-                    return None
-                source_points = source_features["keypoints"][0][matches[:, 0]].detach().cpu().numpy()
-                target_points = target_features["keypoints"][0][matches[:, 1]].detach().cpu().numpy()
-                return project_region(region, source_points, target_points)
+                # ALIKED returns inference tensors. LightGlue must run in the same
+                # inference context, otherwise PyTorch rejects its Linear layers
+                # for attempting to save inference tensors for backward.
+                with torch.inference_mode():
+                    source_image = _read_image(Path(source_path))
+                    target_image = _read_image(Path(target_path))
+                    source_features = self._extract_features(
+                        source_image, self.extractor, self.device, roi_ratio=ROI_RATIO
+                    )
+                    target_features = self._extract_features(
+                        target_image, self.extractor, self.device, roi_ratio=ROI_RATIO
+                    )
+                    match_data = self.matcher({"image0": source_features, "image1": target_features})
+                    matches = match_data["matches"][0].detach().cpu().numpy()
+                    if len(matches) < 4:
+                        return None
+                    source_points = source_features["keypoints"][0][matches[:, 0]].detach().cpu().numpy()
+                    target_points = target_features["keypoints"][0][matches[:, 1]].detach().cpu().numpy()
+                    return project_region(region, source_points, target_points)
+
+            return self.model_gate.run_background_step(project)
         except PropagationModelError:
             raise
         except RuntimeError as exc:
@@ -826,20 +1062,6 @@ class OrientationClassifier:
         }
         return LocalSearchResult(current_scores, diagnostics, matching_ms, trace)
 
-    def _score_local(self, query_features: dict[str, Any], candidates: Sequence[dict[str, Any]],
-                     image_shape: tuple[int, int]) -> float:
-        if not candidates:
-            return 0.0
-        return max(
-            float(self._score_feature_pair(
-                _move_tensors(query_features, self.device),
-                _move_tensors(features, self.device),
-                image_shape,
-                self.matcher,
-            )["score"])
-            for features in candidates
-        )
-
     @staticmethod
     def _fuse_scores(global_scores: dict[str, float], local_scores: dict[str, float],
                      started: float, *, geometry_mask: dict[str, Any] | None = None) -> dict[str, object]:
@@ -942,72 +1164,183 @@ class OrientationClassifier:
             "fusion": 0.0,
         }
 
-    def _predict_geometry(self, image: np.ndarray, cache: TemplateCache,
-                          started: float) -> dict[str, object]:
-        profile = cache.geometry_profile or {}
+    def _prepare_geometry_queries(
+        self,
+        image: np.ndarray,
+        profile: Mapping[str, Any],
+    ) -> tuple[list[np.ndarray], dict[str, Any]]:
+        """Build front/back query variants while fitting image contours once."""
         calibrator = self.geometry_calibrator
-        timings = self._geometry_timings()
         if calibrator is None:
-            return self._predict_baseline(image, cache, started, {
-                "status": "unavailable", "needs_review": True, "profile_revision": cache.geometry_profile_revision,
-            }, timings)
-        query_features: dict[str, dict[str, Any]] = {}
-        query_embeddings: dict[str, np.ndarray] = {}
+            return [], {
+                "status": "unavailable",
+                "fallback_reason": "geometry_calibrator_unavailable",
+                "directions": {},
+                "timings_ms": self._geometry_timings(),
+            }
+        timings = self._geometry_timings()
+        directions = profile.get("directions", {}) if isinstance(profile, Mapping) else {}
+        configured = [
+            label for label in ("front", "back")
+            if isinstance(directions.get(label), Mapping)
+            and directions[label].get("anchor") is not None
+            and directions[label].get("rules")
+        ]
+        context = None
+        if configured:
+            context_started = time.perf_counter()
+            context = calibrator.prepare_context(image)
+            timings["fit_context"] = (time.perf_counter() - context_started) * 1000.0
+
+        processed: list[np.ndarray] = []
         reports: dict[str, Any] = {}
-        raw_globals = getattr(cache, "raw_global_vectors", None) or cache.global_vectors
-        raw_locals = getattr(cache, "raw_local_features", None) or cache.local_features
-        directions: dict[str, dict[str, Any] | None] = {}
-        fits: dict[str, dict[str, Any]] = {}
+        fits: dict[str, Any] = {}
         for label in ("front", "back"):
-            direction = self._geometry_direction(profile, label)
-            directions[label] = direction
-            if direction is None or direction.get("anchor") is None or not direction.get("rules"):
+            direction = directions.get(label) if isinstance(directions, Mapping) else None
+            if not isinstance(direction, Mapping) or label not in configured:
+                processed.append(image.copy())
                 reports[label] = {"status": "not_configured"}
                 continue
             fit_started = time.perf_counter()
-            fit = calibrator.fit(image, direction)
-            fits[label] = fit
+            fit = calibrator.fit(image, direction, context=context)
             timings["fit_directions"] += (time.perf_counter() - fit_started) * 1000.0
             reports[label] = self._geometry_report(fit)
+            fits[label] = fit
             if fit.get("status") != "active":
-                geometry_mask = {
+                return [], {
                     "status": fit.get("status", "low_confidence"),
-                    "needs_review": True,
-                    "profile_revision": cache.geometry_profile_revision,
+                    "fallback_reason": fit.get("reason_code", "boundary_not_found"),
                     "directions": reports,
+                    "timings_ms": timings,
                 }
-                return self._predict_baseline(image, TemplateCache(
-                    global_vectors=raw_globals,
-                    local_features=raw_locals,
-                    raw_global_vectors=raw_globals,
-                    raw_local_features=raw_locals,
-                ), started, geometry_mask, timings)
+            if float(fit.get("ignored_ratio", 0.0) or 0.0) >= 0.55:
+                reports[label]["reason_code"] = "geometry_mask_too_large"
+                return [], {
+                    "status": "low_confidence",
+                    "fallback_reason": "geometry_mask_too_large",
+                    "directions": reports,
+                    "timings_ms": timings,
+                }
+            mask_started = time.perf_counter()
+            mask = fit["ignore_mask"]
+            fill = direction.get("fill_bgr") or self._neutral_fill(image, mask)
+            processed.append(apply_geometry_fit(image, fit, fill))
+            timings["mask_build"] += (time.perf_counter() - mask_started) * 1000.0
+        return processed, {
+            "status": "active",
+            "directions": reports,
+            "fits": fits,
+            "timings_ms": timings,
+        }
+
+    def _predict_geometry(self, image: np.ndarray, cache: TemplateCache,
+                          started: float) -> dict[str, object]:
+        profile = materialize_runtime_profile(cache.geometry_profile or {})
+        calibrator = self.geometry_calibrator
+        raw_globals = getattr(cache, "raw_global_vectors", None) or cache.global_vectors
+        raw_locals = getattr(cache, "raw_local_features", None) or cache.local_features
+        if calibrator is None:
+            timings = self._geometry_timings()
+            return self._predict_baseline(image, cache, started, {
+                "status": "unavailable", "needs_review": True,
+                "profile_revision": cache.geometry_profile_revision,
+                "reason_code": "GEOMETRY_FALLBACK_TO_BASELINE",
+                "fallback_reason": "geometry_calibrator_unavailable",
+                "fallback": "raw_baseline",
+            }, timings)
+        directions = profile.get("directions", {}) if isinstance(profile, Mapping) else {}
+        needs_reseed = [
+            label for label in ("front", "back")
+            if isinstance(directions.get(label), Mapping)
+            and any(rule.get("editor_state") == "needs_reseed"
+                    for rule in directions[label].get("rules", [])
+                    if isinstance(rule, Mapping))
+        ]
+        if needs_reseed:
+            reports = {
+                label: {
+                    "status": "needs_reseed" if label in needs_reseed else "not_configured",
+                    "needs_review": label in needs_reseed,
+                    "reason_code": "preview_required" if label in needs_reseed else None,
+                }
+                for label in ("front", "back")
+            }
+            timings = self._geometry_timings()
+            return self._predict_baseline(image, TemplateCache(
+                global_vectors=raw_globals,
+                local_features=raw_locals,
+                raw_global_vectors=raw_globals,
+                raw_local_features=raw_locals,
+            ), started, {
+                "status": "needs_reseed",
+                "needs_review": True,
+                "profile_revision": cache.geometry_profile_revision,
+                "directions": reports,
+                "reason_code": "GEOMETRY_FALLBACK_TO_BASELINE",
+                "fallback_reason": "preview_required",
+                "fallback": "raw_baseline",
+            }, timings)
+        if getattr(cache, "geometry_unsafe", False):
+            timings = self._geometry_timings()
+            return self._predict_baseline(image, TemplateCache(
+                global_vectors=raw_globals,
+                local_features=raw_locals,
+                raw_global_vectors=raw_globals,
+                raw_local_features=raw_locals,
+            ), started, {
+                "status": "unsafe_template_geometry",
+                "needs_review": True,
+                "profile_revision": cache.geometry_profile_revision,
+                "reason_code": "GEOMETRY_FALLBACK_TO_BASELINE",
+                "fallback_reason": "template_geometry_validation_failed",
+                "fallback": "raw_baseline",
+            }, timings)
+
+        processed, prepared = self._prepare_geometry_queries(image, profile)
+        timings = prepared["timings_ms"]
+        reports = prepared.get("directions", {})
+        if prepared.get("status") != "active":
+            geometry_mask = {
+                "status": prepared.get("status", "low_confidence"),
+                "needs_review": True,
+                "profile_revision": cache.geometry_profile_revision,
+                "directions": reports,
+                "reason_code": "GEOMETRY_FALLBACK_TO_BASELINE",
+                "fallback_reason": prepared.get("fallback_reason", "geometry_fit_failed"),
+                "fallback": "raw_baseline",
+            }
+            return self._predict_baseline(image, TemplateCache(
+                global_vectors=raw_globals,
+                local_features=raw_locals,
+                raw_global_vectors=raw_globals,
+                raw_local_features=raw_locals,
+            ), started, geometry_mask, timings)
 
         self._validate_local_cache_alignment(
             cache.global_vectors, cache.local_features
         )
+        global_started = time.perf_counter()
+        batch_embeddings = self._global_embeddings(processed)
+        timings["global_batch"] = (time.perf_counter() - global_started) * 1000.0
+        query_embeddings = dict(zip(("front", "back"), batch_embeddings))
+        local_started = time.perf_counter()
+        fits = prepared.get("fits", {})
+        extracted = self._extract_local(image)
+        query_features: dict[str, dict[str, Any]] = {}
         for label in ("front", "back"):
-            direction = directions[label]
-            if direction is None or direction.get("anchor") is None or not direction.get("rules"):
-                local_started = time.perf_counter()
-                query_features[label] = self._extract_local(image)
-                timings["local_features"] += (time.perf_counter() - local_started) * 1000.0
-                global_started = time.perf_counter()
-                query_embeddings[label] = self._global_embedding(image)
-                timings["global_batch"] += (time.perf_counter() - global_started) * 1000.0
+            fit = fits.get(label)
+            if not isinstance(fit, Mapping):
+                query_features[label] = extracted
                 continue
-            fit = fits[label]
-            mask = fit["ignore_mask"]
-            fill = direction.get("fill_bgr") or self._neutral_fill(image, mask)
-            mask_started = time.perf_counter()
-            masked = apply_ignore_mask(image, mask, fill)
-            timings["mask_build"] += (time.perf_counter() - mask_started) * 1000.0
-            global_started = time.perf_counter()
-            query_embeddings[label] = self._global_embedding(masked)
-            timings["global_batch"] += (time.perf_counter() - global_started) * 1000.0
-            local_started = time.perf_counter()
-            query_features[label] = filter_features_by_mask(self._extract_local(masked), mask)
-            timings["local_features"] += (time.perf_counter() - local_started) * 1000.0
+            feature_mask = geometry_feature_mask(fit)
+            query_features[label] = (
+                filter_features_by_mask(extracted, feature_mask)
+                if np.any(feature_mask) else extracted
+            )
+            reports[label]["feature_mask_mode"] = (
+                "all_ignored_regions" if np.any(feature_mask) else "none"
+            )
+        timings["local_features"] = (time.perf_counter() - local_started) * 1000.0
         global_scores = {
             label: float(np.max(cache.global_vectors[label] @ query_embeddings[label]))
             for label in ("front", "back")
@@ -1046,17 +1379,20 @@ class OrientationClassifier:
         *,
         library_revision: int | None = None,
     ) -> dict[str, object]:
-        """Predict exclusively from a caller-owned cache snapshot."""
-        started = time.perf_counter()
-        image = _read_image(Path(image_path))
-        result = (
-            self._predict_geometry(image, cache, started)
-            if getattr(cache, "geometry_profile", None) is not None
-            else self._predict_baseline(image, cache, started)
-        )
-        if library_revision is not None:
-            result["library_revision"] = int(library_revision)
-        return result
+        """Predict exclusively from a caller-owned immutable cache snapshot."""
+        def run() -> dict[str, object]:
+            started = time.perf_counter()
+            image = _read_image(Path(image_path))
+            result = (
+                self._predict_geometry(image, cache, started)
+                if getattr(cache, "geometry_profile", None) is not None
+                else self._predict_baseline(image, cache, started)
+            )
+            if library_revision is not None:
+                result["library_revision"] = int(library_revision)
+            return result
+
+        return self.model_gate.run_online(run)
 
     def predict(self, workpiece_id: str, image_path: Path) -> dict[str, object]:
         cache = self._template_caches.get(workpiece_id)

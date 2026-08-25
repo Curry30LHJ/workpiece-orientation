@@ -3,8 +3,11 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QComboBox>
 #include <QLabel>
 #include <QPushButton>
+#include <QQueue>
+#include <QSet>
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QTemporaryDir>
@@ -99,6 +102,20 @@ public:
     bool listen() { return server_.listen(QHostAddress::LocalHost, 0); }
     quint16 port() const { return server_.serverPort(); }
     int predictionCount() const { return predictionCount_; }
+    int confirmationCount() const { return confirmationCount_; }
+    QList<QJsonObject> requests() const { return requests_; }
+    void setReviewRows(const QSet<int> &rows) { reviewRows_ = rows; }
+    void setHoldPredictions(bool hold) { holdPredictions_ = hold; }
+    void setHoldConfirmations(bool hold) { holdConfirmations_ = hold; }
+    void failPredictionRow(int zeroBasedRow) { failedPredictionRow_ = zeroBasedRow; }
+    void failNextConfirmation() { failNextConfirmation_ = true; }
+    void replyNextPrediction() {
+        if (pendingPredictions_.isEmpty()) {
+            return;
+        }
+        const PendingPrediction pending = pendingPredictions_.dequeue();
+        sendPrediction(pending.requestId, pending.oneBasedIndex);
+    }
 
 private slots:
     void acceptConnection() {
@@ -116,6 +133,7 @@ private slots:
                 continue;
             }
             const QJsonObject request = document.object();
+            requests_.append(request);
             const QString command = request.value(QStringLiteral("command")).toString();
             const QString requestId = request.value(QStringLiteral("request_id")).toString();
             if (command == QStringLiteral("hello")) {
@@ -126,20 +144,58 @@ private slots:
                       {"workpieces", QJsonArray{QJsonObject{{"id", "m1"}, {"name", "M1"}}}}});
             } else if (command == QStringLiteral("predict")) {
                 ++predictionCount_;
-                send({
-                    {"version", 1}, {"request_id", requestId}, {"ok", true},
-                    {"label", predictionCount_ % 2 == 0 ? "back" : "front"},
-                    {"global_scores", QJsonObject{{"front", 0.9}, {"back", 0.1}}},
-                    {"global_margin", 0.8}, {"local_prediction", "front"},
-                    {"local_scores", QJsonObject{{"front", 8.0}, {"back", 1.0}}},
-                    {"local_margin", 7.0}, {"decision_source", "global"},
-                    {"needs_review", false}, {"elapsed_ms", 12.5},
-                });
+                const int zeroBasedRow = predictionCount_ - 1;
+                if (zeroBasedRow == failedPredictionRow_) {
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", false},
+                          {"error", QJsonObject{{"code", "MODEL_ERROR"},
+                                                {"message", "predict failed"}}}});
+                    continue;
+                }
+                if (holdPredictions_) {
+                    pendingPredictions_.enqueue(PendingPrediction{requestId, predictionCount_});
+                } else {
+                    sendPrediction(requestId, predictionCount_);
+                }
+            } else if (command == QStringLiteral("submit_confirmation")) {
+                ++confirmationCount_;
+                if (holdConfirmations_) {
+                    continue;
+                }
+                if (failNextConfirmation_) {
+                    failNextConfirmation_ = false;
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", false},
+                          {"error", QJsonObject{{"code", "MODEL_ERROR"},
+                                                {"message", "queue failed"}}}});
+                } else {
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", true},
+                          {"job", QJsonObject{{"job_id",
+                                               QStringLiteral("job-%1").arg(confirmationCount_)}}}});
+                }
             }
         }
     }
 
 private:
+    struct PendingPrediction {
+        QString requestId;
+        int oneBasedIndex = 0;
+    };
+
+    void sendPrediction(const QString &requestId, int oneBasedIndex) {
+        const double frontScore = 0.95 - 0.10 * oneBasedIndex;
+        send({
+            {"version", 1}, {"request_id", requestId}, {"ok", true},
+            {"label", oneBasedIndex % 2 == 0 ? "back" : "front"},
+            {"global_scores", QJsonObject{{"front", frontScore}, {"back", 1.0 - frontScore}}},
+            {"global_margin", qAbs(frontScore - (1.0 - frontScore))},
+            {"local_prediction", "front"},
+            {"local_scores", QJsonObject{{"front", 8.0 + oneBasedIndex}, {"back", 1.0}}},
+            {"local_margin", 7.0 + oneBasedIndex}, {"decision_source", "global"},
+            {"needs_review", reviewRows_.contains(oneBasedIndex - 1)},
+            {"elapsed_ms", 12.5 + oneBasedIndex},
+        });
+    }
+
     void send(const QJsonObject &object) {
         socket_->write(QJsonDocument(object).toJson(QJsonDocument::Compact) + "\n");
         socket_->flush();
@@ -148,7 +204,136 @@ private:
     QTcpServer server_;
     QTcpSocket *socket_ = nullptr;
     QByteArray buffer_;
+    QList<QJsonObject> requests_;
+    QQueue<PendingPrediction> pendingPredictions_;
+    QSet<int> reviewRows_;
+    bool holdPredictions_ = false;
+    bool holdConfirmations_ = false;
+    bool failNextConfirmation_ = false;
+    int failedPredictionRow_ = -1;
     int predictionCount_ = 0;
+    int confirmationCount_ = 0;
+};
+
+class GeometryWorkflowServer : public QObject {
+    Q_OBJECT
+
+public:
+    explicit GeometryWorkflowServer(QObject *parent = nullptr) : QObject(parent) {
+        connect(&server_, &QTcpServer::newConnection, this, &GeometryWorkflowServer::acceptConnection);
+    }
+
+    bool listen() { return server_.listen(QHostAddress::LocalHost, 0); }
+    quint16 port() const { return server_.serverPort(); }
+    QStringList workflowCommands() const { return workflowCommands_; }
+
+private slots:
+    void acceptConnection() {
+        socket_ = server_.nextPendingConnection();
+        connect(socket_, &QTcpSocket::readyRead, this, &GeometryWorkflowServer::readRequests);
+    }
+
+    void readRequests() {
+        buffer_ += socket_->readAll();
+        while (buffer_.contains('\n')) {
+            const int newline = buffer_.indexOf('\n');
+            const QJsonDocument document = QJsonDocument::fromJson(buffer_.left(newline));
+            buffer_.remove(0, newline + 1);
+            if (!document.isObject()) continue;
+            const QJsonObject request = document.object();
+            const QString command = request.value(QStringLiteral("command")).toString();
+            const QString requestId = request.value(QStringLiteral("request_id")).toString();
+            if (command == QStringLiteral("hello")) {
+                send(QJsonObject{{QStringLiteral("version"), 1}, {QStringLiteral("request_id"), requestId},
+                                 {QStringLiteral("ok"), true}, {QStringLiteral("service"), QStringLiteral("workpiece-orientation")},
+                                 {QStringLiteral("ready"), true}});
+            } else if (command == QStringLiteral("list_workpieces")) {
+                const QJsonArray workpieces{QJsonObject{
+                    {QStringLiteral("id"), QStringLiteral("m1")},
+                    {QStringLiteral("name"), QStringLiteral("M1")}}};
+                send(QJsonObject{{QStringLiteral("version"), 1},
+                                 {QStringLiteral("request_id"), requestId},
+                                 {QStringLiteral("ok"), true},
+                                 {QStringLiteral("workpieces"), workpieces}});
+            } else if (command == QStringLiteral("get_geometry_mask_profile")) {
+                sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"), profile(1, 1, 0)}});
+            } else if (command == QStringLiteral("save_geometry_mask_draft")) {
+                workflowCommands_.append(command);
+                sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"), profile(1, 2, 0)}});
+            } else if (command == QStringLiteral("validate_geometry_mask_draft")) {
+                workflowCommands_.append(command);
+                sendSuccess(requestId, QJsonObject{{QStringLiteral("job"), QJsonObject{
+                    {QStringLiteral("job_id"), QStringLiteral("job-1")},
+                    {QStringLiteral("state"), QStringLiteral("completed")},
+                    {QStringLiteral("base_library_revision"), 1},
+                    {QStringLiteral("base_draft_revision"), 2},
+                    {QStringLiteral("blocking_issues"), QJsonArray()},
+                    {QStringLiteral("warnings"), QJsonArray()}}}});
+            } else if (command == QStringLiteral("publish_geometry_mask_profile")) {
+                workflowCommands_.append(command);
+                sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"), profile(1, 2, 1)}});
+            }
+        }
+    }
+
+private:
+    static QJsonObject profile(int libraryRevision, int draftRevision, int activeRevision) {
+        const QJsonObject geometry{{QStringLiteral("cx"), 0.0}, {QStringLiteral("cy"), 0.0},
+                                   {QStringLiteral("r"), 0.7}, {QStringLiteral("angle_deg"), 0.0}};
+        const QJsonObject calibration{{QStringLiteral("state"), QStringLiteral("ready")},
+                                      {QStringLiteral("geometry"), geometry},
+                                      {QStringLiteral("seed_geometry"), geometry},
+                                      {QStringLiteral("reference_template"), QJsonObject{
+                                          {QStringLiteral("template_id"), QStringLiteral("front:00.png")},
+                                          {QStringLiteral("direction"), QStringLiteral("front")},
+                                          {QStringLiteral("width"), 120}, {QStringLiteral("height"), 120}}}};
+        QJsonObject backCalibration = calibration;
+        backCalibration.insert(QStringLiteral("reference_template"), QJsonObject{
+            {QStringLiteral("template_id"), QStringLiteral("back:00.png")},
+            {QStringLiteral("direction"), QStringLiteral("back")},
+            {QStringLiteral("width"), 120}, {QStringLiteral("height"), 120}});
+        const QJsonObject draft{
+            {QStringLiteral("schema_version"), 2},
+            {QStringLiteral("rules"), QJsonArray{QJsonObject{
+                {QStringLiteral("rule_id"), QStringLiteral("glare")},
+                {QStringLiteral("name"), QStringLiteral("中心反光")},
+                {QStringLiteral("shape"), QStringLiteral("circle")},
+                {QStringLiteral("mode"), QStringLiteral("inside")},
+                {QStringLiteral("margin_ratio"), 0.0},
+                {QStringLiteral("enabled"), true}}}},
+            {QStringLiteral("directions"), QJsonObject{
+                {QStringLiteral("front"), QJsonObject{{QStringLiteral("anchor"), QJsonValue()},
+                    {QStringLiteral("calibrations"), QJsonObject{{QStringLiteral("glare"), calibration}}},
+                    {QStringLiteral("template_reviews"), QJsonObject()}}},
+                {QStringLiteral("back"), QJsonObject{{QStringLiteral("anchor"), QJsonValue()},
+                    {QStringLiteral("calibrations"), QJsonObject{{QStringLiteral("glare"), backCalibration}}},
+                    {QStringLiteral("template_reviews"), QJsonObject()}}}}},
+            {QStringLiteral("migration"), QJsonObject{{QStringLiteral("conflicts"), QJsonArray()},
+                                                        {QStringLiteral("resolutions"), QJsonArray()}}}};
+        return QJsonObject{{QStringLiteral("workpiece_id"), QStringLiteral("m1")},
+                           {QStringLiteral("library_revision"), libraryRevision},
+                           {QStringLiteral("draft_revision"), draftRevision},
+                           {QStringLiteral("active_revision"), activeRevision},
+                           {QStringLiteral("draft"), draft}, {QStringLiteral("templates"), QJsonArray()}};
+    }
+
+    void sendSuccess(const QString &requestId, const QJsonObject &fields) {
+        QJsonObject response = fields;
+        response.insert(QStringLiteral("version"), 1);
+        response.insert(QStringLiteral("request_id"), requestId);
+        response.insert(QStringLiteral("ok"), true);
+        send(response);
+    }
+
+    void send(const QJsonObject &object) {
+        socket_->write(QJsonDocument(object).toJson(QJsonDocument::Compact) + "\n");
+        socket_->flush();
+    }
+
+    QTcpServer server_;
+    QTcpSocket *socket_ = nullptr;
+    QByteArray buffer_;
+    QStringList workflowCommands_;
 };
 
 class TestMainWindow : public QObject {
@@ -179,6 +364,19 @@ private:
             paths.append(path);
         }
         return paths;
+    }
+
+    static void startBatch(BatchPredictionServer &server, BackendClient &client,
+                           MainWindow &window, const QStringList &paths,
+                           const QJsonArray &workpieces = QJsonArray{
+                               QJsonObject{{"id", "m1"}, {"name", "M1"}}}) {
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        emit client.responseReceived(QStringLiteral("list_workpieces"),
+                                     QJsonObject{{"workpieces", workpieces}});
+        window.setBatchImagePaths(paths);
+        QVERIFY(QMetaObject::invokeMethod(&window, "submitBatchPrediction",
+                                          Qt::DirectConnection));
     }
 
 private slots:
@@ -315,7 +513,7 @@ private slots:
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("predictButton"))->isEnabled());
     }
 
-    void disconnectClearsPreviousPredictionAndEnablesRestart() {
+    void transportFailurePreservesPreviousPredictionAndMarksOutcomeUnknown() {
         BackendClient client;
         MainWindow window(&client, nullptr);
         emit client.handshakeSucceeded();
@@ -323,9 +521,10 @@ private slots:
         emit client.responseReceived(QStringLiteral("predict"),
                                      QJsonObject{{"label", "front"}, {"needs_review", false}});
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("resultLabel"))->text().contains(QStringLiteral("正面")));
-        emit client.connectionLost(QStringLiteral("lost"));
-        QCOMPARE(window.findChild<QLabel *>(QStringLiteral("resultLabel"))->text(), QStringLiteral("尚未检测"));
-        QCOMPARE(window.findChild<QLabel *>(QStringLiteral("imagePreviewLabel"))->text(), QStringLiteral("请选择待测图片"));
+        emit client.transportFailed(QStringLiteral("CONNECTION_LOST"), QStringLiteral("lost"));
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("resultLabel"))->text().contains(QStringLiteral("正面")));
+        QVERIFY(!window.findChild<QLabel *>(QStringLiteral("imagePreviewLabel"))->text().contains(QStringLiteral("请选择")));
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))->text().contains(QStringLiteral("未知")));
         QVERIFY(window.findChild<QPushButton *>(QStringLiteral("restartBackendButton"))->isEnabled());
     }
 
@@ -373,6 +572,362 @@ private slots:
         QVERIFY(table != nullptr);
         QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 3, 1500);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text().contains(QStringLiteral("3")));
+
+        emit client.commandFailed(QStringLiteral("predict"), QStringLiteral("MODEL_ERROR"),
+                                  QStringLiteral("synthetic failure"));
+        QCOMPARE(table->rowCount(), 3);
+    }
+
+    void selectingBatchRowShowsItsImageAndEvidence() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        const QStringList paths = writeImages(dir, QStringLiteral("select"), 3);
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        emit client.responseReceived(QStringLiteral("list_workpieces"), QJsonObject{
+            {"workpieces", QJsonArray{QJsonObject{{"id", "m1"}, {"name", "M1"}}}},
+        });
+        window.setBatchImagePaths(paths);
+        QVERIFY(QMetaObject::invokeMethod(&window, "submitBatchPrediction", Qt::DirectConnection));
+
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 3, 1500);
+        QCOMPARE(table->columnCount(), 5);
+        table->setCurrentCell(1, 0);
+
+        QTRY_VERIFY(window.findChild<QLabel *>(QStringLiteral("currentImageLabel"))
+                        ->text().contains(QStringLiteral("select-1.png")));
+        QVERIFY(window.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))
+                    ->toPlainText().contains(QStringLiteral("0.75")));
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))
+                    ->text().contains(QStringLiteral("select-1.png")));
+    }
+
+    void laterBatchResponsesDoNotReplaceManualSelection() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setHoldPredictions(true);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("held"), 4));
+
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_VERIFY(server.predictionCount() >= 1);
+        server.replyNextPrediction();
+        QTRY_COMPARE(table->rowCount(), 1);
+        QTRY_VERIFY(server.predictionCount() >= 2);
+        server.replyNextPrediction();
+        QTRY_COMPARE(table->rowCount(), 2);
+        table->setCurrentCell(0, 0);
+        QTRY_VERIFY(server.predictionCount() >= 3);
+        server.replyNextPrediction();
+        QTRY_COMPARE(table->rowCount(), 3);
+
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentImageLabel"))
+                    ->text().contains(QStringLiteral("held-0.png")));
+        QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
+    }
+
+    void batchCompletionSelectsFirstReviewResult() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setReviewRows(QSet<int>{1, 2});
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("review"), 3));
+
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 3, 1500);
+        QTRY_COMPARE(table->currentRow(), 1);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))
+                    ->text().contains(QStringLiteral("review-1.png")));
+    }
+
+    void batchWithoutReviewSelectsFirstResult() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("normal"), 3));
+
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 3, 1500);
+        QTRY_COMPARE(table->currentRow(), 0);
+    }
+
+    void confirmingBatchResultUpdatesStatusAndAdvances() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setReviewRows(QSet<int>{0, 1});
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("confirm"), 3));
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE(table->rowCount(), 3);
+        QTRY_COMPARE(table->currentRow(), 0);
+
+        window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
+        QTRY_COMPARE(server.confirmationCount(), 1);
+        QTRY_COMPARE(table->item(0, 4)->text(), QStringLiteral("正面已排队"));
+        QTRY_COMPARE(table->currentRow(), 1);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))
+                    ->text().contains(QStringLiteral("已处理 1")));
+        table->setCurrentCell(0, 0);
+        auto *frontButton = window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
+        QTRY_VERIFY(!frontButton->isEnabled());
+        frontButton->click();
+        QCOMPARE(server.confirmationCount(), 1);
+    }
+
+    void rejectingBatchResultIsLocalAndAdvances() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setReviewRows(QSet<int>{0, 1});
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("reject"), 3));
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE(table->rowCount(), 3);
+        const int before = server.confirmationCount();
+
+        window.findChild<QPushButton *>(QStringLiteral("rejectConfirmationButton"))->click();
+        QCOMPARE(server.confirmationCount(), before);
+        QCOMPARE(table->item(0, 4)->text(), QStringLiteral("不入库"));
+        QCOMPARE(table->currentRow(), 1);
+    }
+
+    void failedBatchConfirmationStaysSelectedAndCanRetry() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setReviewRows(QSet<int>{0});
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("failed"), 2));
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE(table->rowCount(), 2);
+        server.failNextConfirmation();
+
+        window.findChild<QPushButton *>(QStringLiteral("confirmBackButton"))->click();
+        QTRY_COMPARE(table->item(0, 4)->text(), QStringLiteral("提交失败"));
+        QCOMPARE(table->currentRow(), 0);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
+                    ->text().contains(QStringLiteral("queue failed")));
+        QTRY_VERIFY(window.findChild<QPushButton *>(QStringLiteral("confirmBackButton"))->isEnabled());
+    }
+
+    void workpieceSwitchPreservesBatchButBlocksConfirmationUntilSwitchedBack() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        const QJsonArray workpieces{
+            QJsonObject{{"id", "m1"}, {"name", "M1"}},
+            QJsonObject{{"id", "m2"}, {"name", "M2"}}};
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("switch"), 2),
+                   workpieces);
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *front = window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
+        QTRY_COMPARE(table->rowCount(), 2);
+        QTRY_VERIFY(front->isEnabled());
+
+        combo->setCurrentIndex(1);
+        QCOMPARE(table->rowCount(), 2);
+        QVERIFY(!front->isEnabled());
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))
+                    ->text().contains(QStringLiteral("其他工件")));
+        combo->setCurrentIndex(0);
+        QTRY_VERIFY(front->isEnabled());
+    }
+
+    void switchingWorkpieceDuringBatchDoesNotRetargetPendingRequests() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setHoldPredictions(true);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        const QJsonArray workpieces{
+            QJsonObject{{"id", "m1"}, {"name", "M1"}},
+            QJsonObject{{"id", "m2"}, {"name", "M2"}}};
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("fixed-workpiece"), 2),
+                   workpieces);
+        QTRY_COMPARE(server.predictionCount(), 1);
+
+        window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"))->setCurrentIndex(1);
+        server.replyNextPrediction();
+        QTRY_COMPARE(server.predictionCount(), 2);
+
+        QList<QJsonObject> predictionRequests;
+        for (const QJsonObject &request : server.requests()) {
+            if (request.value(QStringLiteral("command")).toString() == QStringLiteral("predict")) {
+                predictionRequests.append(request);
+            }
+        }
+        QCOMPARE(predictionRequests.size(), 2);
+        QCOMPARE(predictionRequests.at(0).value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m1"));
+        QCOMPARE(predictionRequests.at(1).value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m1"));
+    }
+
+    void disconnectPreservesBatchEvidenceAndDisablesConfirmation() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("disconnect"), 2));
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE(table->rowCount(), 2);
+        table->setCurrentCell(1, 0);
+        const QString evidence = window.findChild<QTextEdit *>(
+            QStringLiteral("evidenceTextEdit"))->toPlainText();
+
+        emit client.transportFailed(QStringLiteral("CONNECTION_LOST"), QStringLiteral("lost"));
+        QCOMPARE(table->rowCount(), 2);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentImageLabel"))
+                    ->text().contains(QStringLiteral("disconnect-1.png")));
+        QCOMPARE(window.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))
+                     ->toPlainText(), evidence);
+        QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
+    }
+
+    void disconnectDuringBatchConfirmationMarksOutcomeUnknown() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setHoldConfirmations(true);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("confirm-lost"), 2));
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE(table->rowCount(), 2);
+
+        window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
+        QTRY_COMPARE(server.confirmationCount(), 1);
+        emit client.transportFailed(QStringLiteral("CONNECTION_LOST"), QStringLiteral("lost"));
+
+        QCOMPARE(table->item(0, 4)->text(), QStringLiteral("提交失败"));
+        QCOMPARE(table->currentRow(), 0);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
+                    ->text().contains(QStringLiteral("结果未知")));
+        QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
+    }
+
+    void replacingBatchSelectionClearsOldRowsAndContext() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("old"), 2));
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE(table->rowCount(), 2);
+        QVERIFY(!window.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))
+                     ->toPlainText().isEmpty());
+
+        window.setBatchImagePaths(writeImages(dir, QStringLiteral("new"), 3));
+        QCOMPARE(table->rowCount(), 0);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))->text().isEmpty());
+        QVERIFY(window.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))
+                    ->toPlainText().isEmpty());
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("imagePreviewLabel"))
+                    ->text().contains(QStringLiteral("请选择")));
+        QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
+    }
+
+    void midBatchFailureKeepsCompletedRowsAndShowsExactProgress() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.failPredictionRow(2);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(dir, QStringLiteral("partial"), 4));
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 2, 1500);
+        const QString summary = window.findChild<QLabel *>(
+            QStringLiteral("batchSummaryLabel"))->text();
+        QTRY_VERIFY(summary.contains(QStringLiteral("已完成 2/4")));
+        QVERIFY(summary.contains(QStringLiteral("partial-2.png")));
+    }
+
+    void unreadablePreviewClearsPreviousPixmapAndNamesFile() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        QTemporaryDir dir;
+        const QString validPath = writeImages(dir, QStringLiteral("preview"), 1).first();
+        auto *preview = window.findChild<QLabel *>(QStringLiteral("imagePreviewLabel"));
+        window.setInspectionImagePath(validPath);
+        QVERIFY(preview->pixmap() != nullptr && !preview->pixmap()->isNull());
+
+        window.setInspectionImagePath(dir.filePath(QStringLiteral("broken.png")));
+        QVERIFY(preview->pixmap() == nullptr || preview->pixmap()->isNull());
+        QVERIFY(preview->text().contains(QStringLiteral("broken.png")));
+    }
+
+    void geometryPublishWorkflowSendsSaveValidatePublishInOrder() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QObject::connect(&client, &BackendClient::handshakeSucceeded, &manager, [&manager]() {
+            emit manager.backendReady();
+        });
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *geometryButton = window.findChild<QPushButton *>(QStringLiteral("annotationEditorButton"));
+        QTRY_VERIFY_WITH_TIMEOUT(geometryButton != nullptr && geometryButton->isEnabled(), 1000);
+        geometryButton->click();
+        auto *workflowButton = window.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+        QTRY_VERIFY_WITH_TIMEOUT(workflowButton != nullptr && workflowButton->isEnabled(), 1000);
+        workflowButton->click();
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 2000);
+        QCOMPARE(server.workflowCommands(), QStringList({
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft"),
+            QStringLiteral("publish_geometry_mask_profile")}));
     }
 };
 

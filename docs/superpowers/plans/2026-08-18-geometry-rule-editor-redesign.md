@@ -1,5 +1,9 @@
 # Geometry Rule Editor Redesign Implementation Plan
 
+## Execution status (2026-08-18)
+
+Implementation is complete in the working tree. Python geometry/profile/TCP checks and the Qt 5.14.2 MSVC release build are verified; full-suite and GUI runtime limitations are recorded in [the verification report](../../verification/geometry-rule-editor-redesign-results.md). The granular checkboxes below remain as the original TDD traceability checklist.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the inaccurate bounding-box drawing workflow with shape-specific gestures, stateless automatic reference fitting, per-template validation, and safe draft/publish behavior while preserving the existing recognition models and thresholds.

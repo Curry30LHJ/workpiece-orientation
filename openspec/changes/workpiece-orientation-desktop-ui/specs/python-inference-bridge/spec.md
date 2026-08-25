@@ -1,7 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: Python 后端提供仅限回环地址的 TCP JSON 服务
-Python 后端 SHALL 使用标准库 socket，仅绑定配置的 `127.0.0.1` 地址和端口，并在模型加载、模板扫描及缓存恢复完成后开始监听。服务 SHALL 按行接收和返回 UTF-8 JSON；每个请求 SHALL 包含 `version=1`、唯一 `request_id` 和 `command`，响应 SHALL 回传相同请求标识。日志不得写入 TCP JSON 响应。
+Python 后端 SHALL 使用标准库 socket，仅绑定配置的 `127.0.0.1` 地址和端口，并在模型加载线程运行期间先开始监听。服务 SHALL 按行接收和返回 UTF-8 JSON；每个请求 SHALL 包含 `version=1`、唯一 `request_id` 和 `command`，响应 SHALL 回传相同请求标识。日志不得写入 TCP JSON 响应。
+
+#### Scenario: 模型加载期间服务可握手
+- **WHEN** 客户端在模型、模板扫描或缓存恢复完成前连接并发送 `hello`
+- **THEN** 后端返回相同请求标识、`service=workpiece-orientation`、`ready=false`、`status=loading` 和“模型加载中”，并继续接受后续 `hello` 或 `shutdown`
 
 #### Scenario: 服务握手成功
 - **WHEN** 客户端连接后发送版本 1 的 `hello` 请求
@@ -31,17 +35,17 @@ Python 后端 SHALL 同一时间只允许一个完成握手的客户端处理业
 - **THEN** 服务向新连接返回 `SERVER_BUSY` 并关闭该连接，不影响当前客户端
 
 ### Requirement: Python 后端列出可用工件
-Python 后端 SHALL 实现 `list_workpieces` 命令，并只返回目录完整、正反各有 5 张有效模板的工件。
+Python 后端 SHALL 实现 `list_workpieces` 命令，并只返回目录完整、正反均至少有 1 张有效模板的工件；正反模板数量可以不同。
 
 #### Scenario: 服务重启后恢复工件列表
 - **WHEN** 后端启动时模板目录中存在完整工件库
 - **THEN** `list_workpieces` 返回这些工件，且后端已为其重建模板特征缓存
 
 ### Requirement: Python 后端事务式持久化和校验模板
-Python 后端 SHALL 在收到 `register` 请求时验证工件显示名称及两组模板。系统 SHALL 拒绝空名称、路径分隔符、控制字符、同组重复文件及任一面不是 5 张有效图片的请求，并使用安全内部标识保存工件，通过 `manifest.json` 记录显示名称，固定 `0=front/正面`、`1=back/反面`。
+Python 后端 SHALL 在收到 `register` 请求时验证工件显示名称及两组模板。系统 SHALL 拒绝空名称、路径分隔符、控制字符、任一面为空、路径或解码内容重复、以及无法读取的图片；不得静默截断用户选择。系统使用安全内部标识保存工件，通过 `manifest.json` 记录显示名称和正反实际模板数量，固定 `0=front/正面`、`1=back/反面`。
 
 #### Scenario: 拒绝无效模板集
-- **WHEN** `register` 请求中任一面模板不足、超过或包含不可读取图片
+- **WHEN** `register` 请求中任一面模板为空、存在重复图片或包含不可读取图片
 - **THEN** 后端返回 `ok=false`，且不得创建不完整的持久化模板库
 
 #### Scenario: 默认拒绝同名工件
@@ -49,7 +53,7 @@ Python 后端 SHALL 在收到 `register` 请求时验证工件显示名称及两
 - **THEN** 后端返回 `WORKPIECE_EXISTS`，并保持现有模板和缓存不变
 
 #### Scenario: 事务式覆盖同名工件
-- **WHEN** 同名工件请求包含 `replace=true`，且新的 5+5 模板全部有效并成功提取特征
+- **WHEN** 同名工件请求包含 `replace=true`，且新的正反模板列表均非空、全部有效并成功提取特征
 - **THEN** 后端先把旧库改名为备份，再把已完成验证和特征提取的临时库改名为正式库，成功后刷新缓存并删除备份
 
 #### Scenario: 覆盖建库中途失败
@@ -57,7 +61,7 @@ Python 后端 SHALL 在收到 `register` 请求时验证工件显示名称及两
 - **THEN** 后端删除临时建库结果并保留旧模板库和旧缓存
 
 ### Requirement: Python 后端缓存模板特征
-Python 后端 SHALL 在建库成功或服务启动恢复工件时计算并缓存 10 张模板的 PP-ShiTuV2 全局向量及 ALIKED 局部特征。单张预测 SHALL 复用缓存，不得重复提取模板特征。
+Python 后端 SHALL 在建库成功或服务启动恢复工件时，按请求的正反模板数量计算并缓存全部模板的 PP-ShiTuV2 全局向量及 ALIKED 局部特征。单张预测 SHALL 复用缓存，不得重复提取模板特征。
 
 #### Scenario: 连续预测同一工件
 - **WHEN** 后端对同一已建库工件连续处理多张待测图片

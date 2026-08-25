@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import os
 from pathlib import Path
 import socket
@@ -40,14 +41,21 @@ from src.workpiece_library import (
 from src.workpiece_catalog import RestoreConflictError, WorkpieceCatalog
 from src.geometry_mask_profiles import (
     CorruptGeometryProfileError,
+    DuplicateLogicalRuleError,
+    FittedGeometryMissingError,
+    GeometryCacheRevisionMismatchError,
+    GeometryContextMismatchError,
     GeometryMaskProfiles,
+    GeometryProfileMigrationConflictError,
     GeometryProfileNotReadyError,
     GeometryProfilePublishError,
     GeometryValidationError,
     GeometryValidationJobNotFoundError,
     InvalidGeometryProfileError,
+    MissingDirectionCalibrationError,
     StaleGeometryProfileError,
 )
+from src.geometry_calibration import GeometryCalibrationError
 from src.template_evolution import (
     AnnotationGroupNotFoundError,
     DuplicateTemplateError,
@@ -62,6 +70,14 @@ LOGGER = logging.getLogger(__name__)
 PROTOCOL_VERSION = 1
 SERVICE_NAME = "workpiece-orientation"
 MAX_MESSAGE_BYTES = 1024 * 1024
+GEOMETRY_ERROR_CODES = {
+    MissingDirectionCalibrationError: "MISSING_DIRECTION_CALIBRATION",
+    FittedGeometryMissingError: "FITTED_GEOMETRY_MISSING",
+    GeometryProfileMigrationConflictError: "MIGRATION_CONFLICT",
+    DuplicateLogicalRuleError: "DUPLICATE_LOGICAL_RULE",
+    GeometryContextMismatchError: "GEOMETRY_CONTEXT_MISMATCH",
+    GeometryCacheRevisionMismatchError: "PROFILE_CACHE_REVISION_MISMATCH",
+}
 
 
 def configure_diagnostic_logging(library_dir: Path) -> logging.Handler:
@@ -146,30 +162,36 @@ class ServiceRuntime:
             return self._snapshot
 
     def set_ready(self, classifier: Any, library: Any, catalog: Any | None = None) -> None:
+        resolved_catalog = catalog or WorkpieceCatalog(library, classifier)
+        evolution = None
+        library_dir = getattr(library, "library_dir", None)
+        geometry_profiles = getattr(resolved_catalog, "geometry_profiles", None)
+        if geometry_profiles is None and library_dir is not None:
+            geometry_profiles = GeometryMaskProfiles(
+                resolved_catalog,
+                getattr(classifier, "geometry_calibrator", None),
+                storage_dir=Path(library_dir) / ".geometry-mask-jobs",
+                start_worker=False,
+            )
+            setter = getattr(resolved_catalog, "set_geometry_profiles", None)
+            if callable(setter):
+                setter(geometry_profiles)
+        if library_dir is not None:
+            evolution = TemplateEvolution(
+                resolved_catalog,
+                Path(library_dir) / ".evolution",
+                geometry_profiles=geometry_profiles,
+                start_worker=False,
+            )
         with self._lock:
-            resolved_catalog = catalog or WorkpieceCatalog(library, classifier)
-            evolution = None
-            library_dir = getattr(library, "library_dir", None)
-            geometry_profiles = getattr(resolved_catalog, "geometry_profiles", None)
-            if geometry_profiles is None and library_dir is not None:
-                geometry_profiles = GeometryMaskProfiles(
-                    resolved_catalog,
-                    getattr(classifier, "geometry_calibrator", None),
-                    storage_dir=Path(library_dir) / ".geometry-mask-jobs",
-                )
-                setter = getattr(resolved_catalog, "set_geometry_profiles", None)
-                if callable(setter):
-                    setter(geometry_profiles)
-            if library_dir is not None:
-                evolution = TemplateEvolution(
-                    resolved_catalog,
-                    Path(library_dir) / ".evolution",
-                    geometry_profiles=geometry_profiles,
-                )
             self._snapshot = RuntimeSnapshot(
                 status="ready", classifier=classifier, library=library,
                 catalog=resolved_catalog, evolution=evolution, geometry_profiles=geometry_profiles,
             )
+        for worker in (geometry_profiles, evolution):
+            start = getattr(worker, "start", None)
+            if callable(start):
+                start()
 
     def set_failed(self, code: str, message: str) -> None:
         with self._lock:
@@ -411,10 +433,12 @@ class OrientationCommandDispatcher:
                 return self._response(request_id, ok=True, annotations=annotations)
             if command in {
                 "get_geometry_mask_profile",
+                "preview_geometry_mask_rule",
                 "save_geometry_mask_draft",
                 "validate_geometry_mask_draft",
                 "get_geometry_mask_validation_job",
                 "geometry_mask_validation_job_action",
+                "resolve_geometry_mask_migration",
                 "publish_geometry_mask_profile",
                 "rollback_geometry_mask_profile",
             }:
@@ -438,11 +462,85 @@ class OrientationCommandDispatcher:
                         return self._error(request_id, "INVALID_REQUEST", "geometry_mask_validation_job_action requires job_id and action")
                     return self._response(request_id, ok=True, job=profiles.action(job_id, action))
                 workpiece_id = request.get("workpiece_id")
+                if command == "preview_geometry_mask_rule":
+                    base_library_revision = request.get("base_library_revision")
+                    rule_id = request.get("rule_id")
+                    direction = request.get("direction")
+                    template_id = request.get("template_id")
+                    seed_shape = request.get("seed_shape")
+                    mode = request.get("mode")
+                    margin_ratio = request.get("margin_ratio", 0.02)
+                    anchor_candidate_index = request.get("anchor_candidate_index")
+                    rule_candidate_index = request.get("rule_candidate_index")
+                    if not isinstance(rule_id, str) or not rule_id.strip():
+                        return self._error(
+                            request_id, "NO_SELECTED_RULE",
+                            "preview_geometry_mask_rule requires a selected rule_id",
+                        )
+                    if (
+                        not isinstance(workpiece_id, str) or not workpiece_id
+                        or type(base_library_revision) is not int or base_library_revision <= 0
+                        or direction not in {"front", "back"}
+                        or not isinstance(template_id, str) or not template_id
+                        or not template_id.startswith(f"{direction}:")
+                        or not isinstance(seed_shape, Mapping)
+                        or seed_shape.get("shape") not in {"circle", "ellipse", "rotated_rectangle"}
+                        or mode not in {"inside", "outside"}
+                    ):
+                        return self._error(request_id, "INVALID_REQUEST", "preview_geometry_mask_rule has invalid workpiece, direction, template, shape or mode")
+                    try:
+                        margin_value = float(margin_ratio)
+                    except (TypeError, ValueError):
+                        return self._error(request_id, "INVALID_REQUEST", "margin_ratio must be numeric")
+                    if not math.isfinite(margin_value) or margin_value < -0.94 or margin_value > 0.94:
+                        return self._error(request_id, "INVALID_REQUEST", "margin_ratio must be in [-0.94, 0.94]")
+                    for name, value in (("anchor_candidate_index", anchor_candidate_index),
+                                        ("rule_candidate_index", rule_candidate_index)):
+                        if value is not None and type(value) is not int:
+                            return self._error(request_id, "INVALID_REQUEST", f"{name} must be an integer")
+                    preview = profiles.preview_rule(
+                        workpiece_id,
+                        expected_library_revision=base_library_revision,
+                        rule_id=rule_id,
+                        direction=direction,
+                        template_id=template_id,
+                        seed_shape=seed_shape,
+                        mode=mode,
+                        margin_ratio=margin_value,
+                        anchor_candidate_index=anchor_candidate_index,
+                        rule_candidate_index=rule_candidate_index,
+                    )
+                    return self._response(request_id, ok=True, preview=preview)
                 operation_id = request.get("operation_id")
                 if not isinstance(workpiece_id, str) or not workpiece_id:
                     return self._error(request_id, "INVALID_REQUEST", f"{command} requires workpiece_id")
                 if not isinstance(operation_id, str) or not operation_id:
                     return self._error(request_id, "INVALID_REQUEST", f"{command} requires operation_id")
+                if command == "resolve_geometry_mask_migration":
+                    base_library_revision = request.get("base_library_revision")
+                    base_draft_revision = request.get("base_draft_revision")
+                    conflict_id = request.get("conflict_id")
+                    resolution = request.get("resolution")
+                    if (
+                        type(base_library_revision) is not int or base_library_revision <= 0
+                        or type(base_draft_revision) is not int or base_draft_revision < 0
+                        or not isinstance(conflict_id, str) or not conflict_id.strip()
+                        or not isinstance(resolution, Mapping)
+                    ):
+                        return self._error(
+                            request_id,
+                            "INVALID_REQUEST",
+                            "resolve_geometry_mask_migration requires base revisions, conflict_id and resolution",
+                        )
+                    resolved = profiles.resolve_migration(
+                        workpiece_id,
+                        conflict_id,
+                        resolution,
+                        expected_library_revision=base_library_revision,
+                        expected_draft_revision=base_draft_revision,
+                        operation_id=operation_id,
+                    )
+                    return self._response(request_id, ok=True, profile=resolved)
                 if command == "save_geometry_mask_draft":
                     base_library_revision = request.get("base_library_revision")
                     base_draft_revision = request.get("base_draft_revision")
@@ -564,6 +662,12 @@ class OrientationCommandDispatcher:
             return self._error(request_id, "WORKPIECE_NOT_FOUND", str(exc))
         except RestoreConflictError as exc:
             return self._error(request_id, "RESTORE_CONFLICT", str(exc))
+        except tuple(GEOMETRY_ERROR_CODES) as exc:
+            code = next(
+                value for error_type, value in GEOMETRY_ERROR_CODES.items()
+                if isinstance(exc, error_type)
+            )
+            return self._error(request_id, code, str(exc))
         except (InvalidGeometryProfileError, CorruptGeometryProfileError) as exc:
             return self._error(request_id, "INVALID_GEOMETRY_PROFILE", str(exc))
         except StaleGeometryProfileError as exc:
@@ -577,6 +681,8 @@ class OrientationCommandDispatcher:
             return self._error(request_id, code, str(exc))
         except GeometryValidationError as exc:
             return self._error(request_id, "GEOMETRY_VALIDATION_FAILED", str(exc))
+        except GeometryCalibrationError as exc:
+            return self._error(request_id, "INVALID_GEOMETRY", str(exc))
         except StaleWorkpieceRevisionError as exc:
             return self._error(request_id, "STALE_WORKPIECE_REVISION", str(exc))
         except DuplicateTemplateError as exc:
@@ -622,10 +728,20 @@ class OrientationCommandDispatcher:
 class OrientationTcpServer:
     """Single-client loopback TCP server with serial business command handling."""
 
-    def __init__(self, dispatcher: OrientationCommandDispatcher, *, host: str = "127.0.0.1", port: int = 37651):
+    def __init__(
+        self,
+        dispatcher: OrientationCommandDispatcher,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 37651,
+        handshake_timeout_seconds: float = 5.0,
+    ):
         if host != "127.0.0.1":
             raise ServiceStartupError("INVALID_BIND_ADDRESS", "only 127.0.0.1 is allowed")
+        if not math.isfinite(float(handshake_timeout_seconds)) or float(handshake_timeout_seconds) <= 0:
+            raise ServiceStartupError("INVALID_HANDSHAKE_TIMEOUT", "handshake timeout must be positive")
         self.dispatcher = dispatcher
+        self.handshake_timeout_seconds = float(handshake_timeout_seconds)
         self._stop_event = threading.Event()
         self._client_state_lock = threading.Lock()
         self._handshake_in_progress = False
@@ -700,6 +816,7 @@ class OrientationTcpServer:
             return
         handshake_ok = False
         try:
+            sock.settimeout(self.handshake_timeout_seconds)
             while True:
                 try:
                     first = connection.read_message()
@@ -717,6 +834,7 @@ class OrientationTcpServer:
                 if first.get("command") == "shutdown" and response.get("ok"):
                     self.request_shutdown()
                     return
+            sock.settimeout(None)
             self._finish_handshake(True)
             handshake_ok = True
             connection.send(response)
@@ -808,6 +926,7 @@ def _load_runtime(
             catalog,
             getattr(classifier, "geometry_calibrator", None),
             storage_dir=Path(library_dir) / ".geometry-mask-jobs",
+            start_worker=False,
         )
         catalog.set_geometry_profiles(profiles)
         catalog.recover()

@@ -19,13 +19,24 @@ import uuid
 from typing import Any, Mapping
 
 from src.geometry_calibration import SUPPORTED_MODES, SUPPORTED_SHAPES
+from src.geometry_profile_schema import GeometryProfileSchemaError
+from src.geometry_profile_schema import DuplicateLogicalRuleSchemaError
+from src.geometry_profile_schema import materialize_direction_profile
+from src.geometry_profile_schema import materialize_runtime_profile
+from src.geometry_profile_schema import migrate_profile_v1 as _migrate_profile_v1
+from src.geometry_profile_schema import normalize_profile_v2 as _normalize_profile_v2
+from src.geometry_profile_schema import resolve_migration_conflict as _resolve_migration_conflict
 from src.image_io import read_color_image
 from src.workpiece_library import StaleWorkpieceRevisionError
 
 
 LOGGER = logging.getLogger(__name__)
 PROFILE_SCHEMA_VERSION = 1
+PROFILE_DOCUMENT_SCHEMA_VERSION = 2
 PROFILE_DIRECTORY = "geometry_masks"
+SUPPORTED_REVIEW_STATES = {"included", "review", "excluded"}
+SUPPORTED_EDITOR_STATES = {"ready", "needs_reseed"}
+SIGNED_MARGIN_SEMANTICS = "signed_boundary_v2"
 
 
 class GeometryProfileError(RuntimeError):
@@ -34,6 +45,10 @@ class GeometryProfileError(RuntimeError):
 
 class InvalidGeometryProfileError(GeometryProfileError):
     """Raised when a draft cannot be represented by the profile schema."""
+
+
+class DuplicateLogicalRuleError(InvalidGeometryProfileError):
+    """Raised when two user-visible rules share one logical identifier."""
 
 
 class StaleGeometryProfileError(GeometryProfileError):
@@ -52,12 +67,57 @@ class GeometryValidationJobNotFoundError(GeometryValidationError):
     """Raised when a validation job id is unknown."""
 
 
+class GeometryContextMismatchError(GeometryValidationError):
+    """Raised when a preview request does not identify one exact editor context."""
+
+
 class GeometryProfilePublishError(GeometryProfileError):
     """Raised when an explicit geometry profile publish cannot complete."""
 
 
 class GeometryProfileNotReadyError(GeometryProfilePublishError):
     """Raised when a caller attempts to publish before validation completes."""
+
+
+class GeometryProfileMigrationConflictError(GeometryProfilePublishError):
+    """Raised when a v2 draft still contains unresolved legacy rules."""
+
+
+class MissingDirectionCalibrationError(GeometryProfilePublishError):
+    """Raised when an enabled logical rule lacks a ready direction calibration."""
+
+
+class FittedGeometryMissingError(GeometryProfilePublishError):
+    """Raised when a direction calibration has no program-fitted geometry."""
+
+
+class GeometryCacheRevisionMismatchError(GeometryProfilePublishError):
+    """Raised when validation cache and draft revisions are not identical."""
+
+
+def normalize_profile_v2(profile: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        return _normalize_profile_v2(profile)
+    except DuplicateLogicalRuleSchemaError as exc:
+        raise DuplicateLogicalRuleError(str(exc)) from exc
+    except GeometryProfileSchemaError as exc:
+        raise InvalidGeometryProfileError(str(exc)) from exc
+
+
+def migrate_profile_v1(profile: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        return _migrate_profile_v1(profile)
+    except GeometryProfileSchemaError as exc:
+        raise InvalidGeometryProfileError(str(exc)) from exc
+
+
+def resolve_migration_conflict(
+    profile: Mapping[str, Any], conflict_id: str, resolution: Mapping[str, Any]
+) -> dict[str, Any]:
+    try:
+        return _resolve_migration_conflict(profile, conflict_id, resolution)
+    except GeometryProfileSchemaError as exc:
+        raise InvalidGeometryProfileError(str(exc)) from exc
 
 
 def _finite(value: Any, field: str) -> float:
@@ -89,12 +149,15 @@ def _canonical_anchor(value: Any, field: str) -> dict[str, Any] | None:
         raise InvalidGeometryProfileError(f"{field}.coarse must be an object")
     result: dict[str, Any] = {
         "shape": shape,
+        "mode": value.get("mode", "manual"),
         "coarse": {
             "cx": _finite(coarse.get("cx"), f"{field}.coarse.cx"),
             "cy": _finite(coarse.get("cy"), f"{field}.coarse.cy"),
             "angle_deg": _finite(coarse.get("angle_deg", 0.0), f"{field}.coarse.angle_deg"),
         },
     }
+    if result["mode"] not in {"manual", "auto"}:
+        raise InvalidGeometryProfileError(f"{field}.mode is unsupported")
     if shape == "circle":
         radius = coarse.get("r", coarse.get("rx"))
         radius = _finite(radius, f"{field}.coarse.r")
@@ -116,6 +179,74 @@ def _canonical_anchor(value: Any, field: str) -> dict[str, Any] | None:
     return result
 
 
+def _canonical_geometry(value: Any, shape: str, field: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise InvalidGeometryProfileError(f"{field} must be an object")
+    normalized: dict[str, Any] = {
+        "cx": _finite(value.get("cx", 0.0), f"{field}.cx"),
+        "cy": _finite(value.get("cy", 0.0), f"{field}.cy"),
+        "angle_deg": _finite(value.get("angle_deg", 0.0), f"{field}.angle_deg"),
+    }
+    if shape == "circle":
+        radius = _finite(value.get("r"), f"{field}.r")
+        if radius <= 0:
+            raise InvalidGeometryProfileError(f"{field}.r must be positive")
+        normalized["r"] = radius
+    elif shape == "ellipse":
+        rx = _finite(value.get("rx"), f"{field}.rx")
+        ry = _finite(value.get("ry"), f"{field}.ry")
+        if rx <= 0 or ry <= 0:
+            raise InvalidGeometryProfileError(f"{field} radii must be positive")
+        normalized.update({"rx": rx, "ry": ry})
+    else:
+        half_width = _finite(value.get("half_width"), f"{field}.half_width")
+        half_height = _finite(value.get("half_height"), f"{field}.half_height")
+        if half_width <= 0 or half_height <= 0:
+            raise InvalidGeometryProfileError(f"{field} rectangle dimensions must be positive")
+        normalized.update({"half_width": half_width, "half_height": half_height})
+    return normalized
+
+
+def _canonical_template_reviews(value: Any, direction: str, field: str) -> dict[str, dict[str, str]]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise InvalidGeometryProfileError(f"{field} must be an object")
+    result: dict[str, dict[str, str]] = {}
+    for template_id_value, review_value in value.items():
+        template_id = _non_empty_text(template_id_value, f"{field}.template_id")
+        if not template_id.startswith(f"{direction}:"):
+            raise InvalidGeometryProfileError(f"{field} contains a template from another direction")
+        if not isinstance(review_value, Mapping):
+            raise InvalidGeometryProfileError(f"{field}.{template_id} must be an object")
+        state = _non_empty_text(review_value.get("state"), f"{field}.{template_id}.state")
+        reason = str(review_value.get("reason", "")).strip()
+        if state not in SUPPORTED_REVIEW_STATES:
+            raise InvalidGeometryProfileError(f"unsupported review state: {state}")
+        if state != "included" and not reason:
+            raise InvalidGeometryProfileError("review and excluded templates require a reason")
+        result[template_id] = {"state": state, "reason": reason}
+    return result
+
+
+def _canonical_reference_template(value: Any, direction: str, field: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise InvalidGeometryProfileError(f"{field} must be an object or null")
+    template_id = _non_empty_text(value.get("template_id"), f"{field}.template_id")
+    if not template_id.startswith(f"{direction}:"):
+        raise InvalidGeometryProfileError(f"{field} contains a template from another direction")
+    template_direction = value.get("direction", direction)
+    if template_direction != direction:
+        raise InvalidGeometryProfileError(f"{field}.direction does not match direction")
+    width = value.get("width")
+    height = value.get("height")
+    if type(width) is not int or width <= 0 or type(height) is not int or height <= 0:
+        raise InvalidGeometryProfileError(f"{field}.width and height must be positive integers")
+    return {"template_id": template_id, "direction": direction, "width": width, "height": height}
+
+
 def _canonical_rule(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise InvalidGeometryProfileError(f"{field} must be an object")
@@ -127,37 +258,31 @@ def _canonical_rule(value: Any, field: str) -> dict[str, Any]:
     mode = value.get("mode")
     if mode not in SUPPORTED_MODES:
         raise InvalidGeometryProfileError(f"{field}.mode is unsupported: {mode}")
-    geometry = value.get("geometry")
-    if not isinstance(geometry, Mapping):
-        raise InvalidGeometryProfileError(f"{field}.geometry must be an object")
-    normalized_geometry: dict[str, Any] = {
-        "cx": _finite(geometry.get("cx", 0.0), f"{field}.geometry.cx"),
-        "cy": _finite(geometry.get("cy", 0.0), f"{field}.geometry.cy"),
-        "angle_deg": _finite(geometry.get("angle_deg", 0.0), f"{field}.geometry.angle_deg"),
-    }
-    if shape == "circle":
-        radius = _finite(geometry.get("r"), f"{field}.geometry.r")
-        if radius <= 0:
-            raise InvalidGeometryProfileError(f"{field}.geometry.r must be positive")
-        normalized_geometry["r"] = radius
-    elif shape == "ellipse":
-        rx = _finite(geometry.get("rx"), f"{field}.geometry.rx")
-        ry = _finite(geometry.get("ry"), f"{field}.geometry.ry")
-        if rx <= 0 or ry <= 0:
-            raise InvalidGeometryProfileError(f"{field}.geometry radii must be positive")
-        normalized_geometry.update({"rx": rx, "ry": ry})
+    normalized_geometry = _canonical_geometry(value.get("geometry"), shape, f"{field}.geometry")
+    marker = value.get("margin_semantics")
+    if marker is None:
+        raw_margin = _finite(value.get("margin_ratio", 0.02), f"{field}.margin_ratio")
+        if raw_margin < 0 or raw_margin >= 0.95:
+            raise InvalidGeometryProfileError(
+                f"{field}.margin_ratio must be in [0, 0.95) for legacy rules"
+            )
+        margin_ratio = raw_margin if mode == "inside" else -raw_margin
+    elif marker == SIGNED_MARGIN_SEMANTICS:
+        margin_ratio = _finite(value.get("margin_ratio", 0.0), f"{field}.margin_ratio")
+        if margin_ratio < -0.94 or margin_ratio > 0.94:
+            raise InvalidGeometryProfileError(f"{field}.margin_ratio must be in [-0.94, 0.94]")
     else:
-        half_width = _finite(geometry.get("half_width"), f"{field}.geometry.half_width")
-        half_height = _finite(geometry.get("half_height"), f"{field}.geometry.half_height")
-        if half_width <= 0 or half_height <= 0:
-            raise InvalidGeometryProfileError(f"{field}.geometry rectangle dimensions must be positive")
-        normalized_geometry.update({"half_width": half_width, "half_height": half_height})
-    margin_ratio = _finite(value.get("margin_ratio", 0.02), f"{field}.margin_ratio")
-    if margin_ratio < 0 or margin_ratio >= 0.95:
-        raise InvalidGeometryProfileError(f"{field}.margin_ratio must be in [0, 0.95)")
+        raise InvalidGeometryProfileError(f"{field}.margin_semantics is unsupported")
     enabled = value.get("enabled", True)
     if type(enabled) is not bool:
         raise InvalidGeometryProfileError(f"{field}.enabled must be boolean")
+    editor_state = value.get("editor_state", "ready")
+    if editor_state not in SUPPORTED_EDITOR_STATES:
+        raise InvalidGeometryProfileError(f"{field}.editor_state is unsupported")
+    if editor_state == "needs_reseed" and enabled:
+        raise InvalidGeometryProfileError(f"{field}.needs_reseed must be disabled until reseeded")
+    seed_geometry = value.get("seed_geometry", normalized_geometry)
+    normalized_seed = _canonical_geometry(seed_geometry, shape, f"{field}.seed_geometry")
     return {
         "rule_id": rule_id,
         "name": name,
@@ -165,7 +290,10 @@ def _canonical_rule(value: Any, field: str) -> dict[str, Any]:
         "geometry": normalized_geometry,
         "mode": mode,
         "margin_ratio": margin_ratio,
+        "margin_semantics": SIGNED_MARGIN_SEMANTICS,
         "enabled": enabled,
+        "seed_geometry": normalized_seed,
+        "editor_state": editor_state,
     }
 
 
@@ -201,6 +329,14 @@ def normalize_geometry_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
                 f"directions.{direction}.anchor is required when an enabled rule exists"
             )
         side: dict[str, Any] = {"anchor": anchor, "rules": rules}
+        reference_template = _canonical_reference_template(
+            source.get("reference_template"), direction, f"directions.{direction}.reference_template"
+        )
+        if reference_template is not None:
+            side["reference_template"] = reference_template
+        side["template_reviews"] = _canonical_template_reviews(
+            source.get("template_reviews"), direction, f"directions.{direction}.template_reviews"
+        )
         if "fill_bgr" in source:
             fill = source["fill_bgr"]
             if not isinstance(fill, (list, tuple)) or len(fill) != 3:
@@ -280,7 +416,20 @@ class GeometryMaskProfiles:
         self._stop = False
         self._worker: threading.Thread | None = None
         if self.start_worker:
-            self._worker = threading.Thread(target=self._worker_loop, name="geometry-mask-validation", daemon=True)
+            self.start()
+
+    def start(self) -> None:
+        """Start the validation worker once, after runtime recovery is complete."""
+        with self._condition:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            if self._stop:
+                return
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="geometry-mask-validation",
+                daemon=True,
+            )
             self._worker.start()
 
     def _record(self, workpiece_id: str):
@@ -302,13 +451,27 @@ class GeometryMaskProfiles:
             return {}
         return value if isinstance(value, dict) else {}
 
+    def _has_active_legacy_groups(self, workpiece_id: str) -> bool:
+        getter = getattr(self.catalog, "get_annotation_document", None)
+        if not callable(getter):
+            return False
+        try:
+            document = getter(workpiece_id)
+        except Exception:
+            return False
+        return bool(document.get("active_groups")) if isinstance(document, Mapping) else False
+
     def _load_document(self, record: Any) -> tuple[dict[str, Any], str, str | None]:
         path = self._profile_root(record) / "profile.json"
         if not path.exists():
-            return _empty_document(record.revision), "empty", None
+            document = _empty_document(record.revision)
+            document["draft"] = migrate_profile_v1(document["draft"])
+            return document, "empty", None
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping) or raw.get("schema_version") != PROFILE_SCHEMA_VERSION:
+            if not isinstance(raw, Mapping) or raw.get("schema_version") not in {
+                PROFILE_SCHEMA_VERSION, PROFILE_DOCUMENT_SCHEMA_VERSION,
+            }:
                 raise ValueError("unsupported geometry profile schema")
             library_revision = raw.get("library_revision")
             draft_revision = raw.get("draft_revision")
@@ -316,16 +479,31 @@ class GeometryMaskProfiles:
                 raise ValueError("invalid library_revision")
             if type(draft_revision) is not int or draft_revision < 0:
                 raise ValueError("invalid draft_revision")
-            normalized_draft = normalize_geometry_profile(raw.get("draft", _empty_profile()))
+            raw_draft = raw.get("draft", _empty_profile())
+            if not isinstance(raw_draft, Mapping):
+                raise ValueError("invalid geometry profile draft")
+            normalized_draft = (
+                normalize_profile_v2(raw_draft)
+                if raw_draft.get("schema_version") == PROFILE_DOCUMENT_SCHEMA_VERSION
+                else migrate_profile_v1(raw_draft)
+            )
             active_raw = raw.get("active")
-            normalized_active = None if active_raw is None else normalize_geometry_profile(active_raw)
+            if active_raw is None:
+                normalized_active = None
+            elif not isinstance(active_raw, Mapping):
+                raise ValueError("invalid active geometry profile")
+            elif active_raw.get("schema_version") == PROFILE_DOCUMENT_SCHEMA_VERSION:
+                normalized_active = normalize_profile_v2(active_raw)
+            else:
+                normalize_geometry_profile(active_raw)
+                normalized_active = deepcopy(dict(active_raw))
             active_revision = raw.get("active_revision")
             previous_active_revision = raw.get("previous_active_revision")
             for value, field in ((active_revision, "active_revision"), (previous_active_revision, "previous_active_revision")):
                 if value is not None and (type(value) is not int or value <= 0):
                     raise ValueError(f"invalid {field}")
             document = {
-                "schema_version": PROFILE_SCHEMA_VERSION,
+                "schema_version": int(raw.get("schema_version")),
                 "library_revision": library_revision,
                 "draft_revision": draft_revision,
                 "active_revision": active_revision,
@@ -410,8 +588,14 @@ class GeometryMaskProfiles:
                 raise StaleGeometryProfileError(
                     f"draft revision changed: expected {expected_draft_revision}, current {document['draft_revision']}"
                 )
-            normalized = normalize_geometry_profile(draft)
+            normalized = (
+                normalize_profile_v2(draft)
+                if draft.get("schema_version") == PROFILE_DOCUMENT_SCHEMA_VERSION
+                else normalize_geometry_profile(draft)
+            )
             next_revision = expected_draft_revision + 1
+            if normalized.get("schema_version") == PROFILE_DOCUMENT_SCHEMA_VERSION:
+                document["schema_version"] = PROFILE_DOCUMENT_SCHEMA_VERSION
             document["draft_revision"] = next_revision
             document["draft"] = normalized
             root = self._profile_root(record)
@@ -420,6 +604,42 @@ class GeometryMaskProfiles:
             (root / "previews").mkdir(exist_ok=True)
             _atomic_write_json(root / "profile.json", document)
             result = self._snapshot_for_record(record)
+            self._operations[operation_key] = deepcopy(result)
+            return result
+
+    def resolve_migration(
+        self,
+        workpiece_id: str,
+        conflict_id: str,
+        resolution: Mapping[str, Any],
+        *,
+        expected_library_revision: int,
+        expected_draft_revision: int,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id must be a non-empty string")
+        operation_key = f"resolve:{workpiece_id}:{operation_id}"
+        with self._lock:
+            cached = self._operations.get(operation_key)
+            if cached is not None:
+                return deepcopy(cached)
+            snapshot = self._snapshot_for_record(self._record(workpiece_id))
+            if snapshot["library_revision"] != expected_library_revision:
+                raise StaleGeometryProfileError("workpiece revision changed before migration resolution")
+            if snapshot["draft_revision"] != expected_draft_revision:
+                raise StaleGeometryProfileError("draft revision changed before migration resolution")
+            draft = snapshot.get("draft")
+            if not isinstance(draft, Mapping) or draft.get("schema_version") != PROFILE_DOCUMENT_SCHEMA_VERSION:
+                raise InvalidGeometryProfileError("migration resolution requires a schema v2 draft")
+            resolved = resolve_migration_conflict(draft, conflict_id, resolution)
+            result = self.save_draft(
+                workpiece_id,
+                resolved,
+                expected_library_revision=expected_library_revision,
+                expected_draft_revision=expected_draft_revision,
+                operation_id=f"migration:{operation_id}",
+            )
             self._operations[operation_key] = deepcopy(result)
             return result
 
@@ -456,6 +676,41 @@ class GeometryMaskProfiles:
             candidate, _ = prepare(workpiece_id, record, profile, self.calibrator, None)
             return candidate
 
+    def prepare_staged_active_cache(self, record: Any, base_cache: Any) -> Any | None:
+        """Prepare a staged geometry view without consulting the mutable cache map."""
+        with self._lock:
+            manifest = self._manifest(record)
+            document, status, _ = self._load_document(record)
+            active_revision = manifest.get("geometry_mask_active_revision")
+            if active_revision is None:
+                active_revision = document.get("active_revision")
+            if type(active_revision) is not int or active_revision <= 0:
+                return None
+            revision_path = self._profile_root(record) / "revisions" / f"{active_revision}.json"
+            try:
+                payload = json.loads(revision_path.read_text(encoding="utf-8"))
+                profile = deepcopy(payload["profile"])
+            except Exception as exc:
+                LOGGER.warning("Unable to load staged geometry profile %s: %s", revision_path, exc)
+                return None
+            if status == "ok" and document["library_revision"] != record.revision:
+                document["library_revision"] = int(record.revision)
+                _atomic_write_json(self._profile_root(record) / "profile.json", document)
+            classifier = getattr(self.catalog, "classifier", None)
+            prepare = getattr(classifier, "prepare_geometry_cache", None)
+            calibrator = self.calibrator
+        if not callable(prepare):
+            return None
+        candidate, _ = prepare(
+            record.id,
+            record,
+            profile,
+            calibrator,
+            None,
+            base_cache=base_cache,
+        )
+        return candidate
+
     def validate_new_template(self, workpiece_id: str, orientation: str, image_path: Path) -> dict[str, Any]:
         """Fit the active profile to one newly confirmed template."""
         if orientation not in {"front", "back"}:
@@ -480,6 +735,76 @@ class GeometryMaskProfiles:
             result["status"] = fit.get("status", "low_confidence")
             result["needs_review"] = result["status"] != "active"
             result["profile_revision"] = snapshot["active_revision"]
+            return result
+
+    def preview_rule(
+        self,
+        workpiece_id: str,
+        *,
+        expected_library_revision: int,
+        rule_id: str,
+        direction: str,
+        template_id: str,
+        seed_shape: Mapping[str, Any],
+        mode: str,
+        margin_ratio: float = 0.02,
+        anchor_candidate_index: int | None = None,
+        rule_candidate_index: int | None = None,
+    ) -> dict[str, Any]:
+        """Fit one editor gesture on one saved template without mutation."""
+        if not isinstance(rule_id, str) or not rule_id.strip():
+            raise GeometryContextMismatchError("rule_id must be a non-empty string")
+        if direction not in {"front", "back"}:
+            raise GeometryContextMismatchError("direction must be front or back")
+        if not isinstance(template_id, str) or not template_id.startswith(f"{direction}:"):
+            raise GeometryContextMismatchError("template_id does not match direction")
+        with self._lock:
+            record = self._record(workpiece_id)
+            if record.revision != expected_library_revision:
+                raise StaleGeometryProfileError(
+                    f"workpiece revision changed: expected {expected_library_revision}, current {record.revision}"
+                )
+            paths = record.front_images if direction == "front" else record.back_images
+            path = next((candidate for candidate in paths if candidate.name == template_id.split(":", 1)[1]), None)
+            if path is None:
+                raise GeometryValidationError(f"unknown template_id: {template_id}")
+            image = read_color_image(Path(path))
+            if image is None:
+                raise GeometryValidationError(f"unable to read template image: {template_id}")
+            calibrator = self.calibrator
+            fit_reference = getattr(calibrator, "fit_reference", None) if calibrator is not None else None
+            if not callable(fit_reference):
+                raise GeometryValidationError("geometry reference fitting is unavailable")
+            preview = fit_reference(
+                image,
+                seed_shape,
+                mode=mode,
+                margin_ratio=margin_ratio,
+                anchor_candidate_index=anchor_candidate_index,
+                rule_candidate_index=rule_candidate_index,
+            )
+            result = deepcopy(dict(preview))
+            patch = result.get("profile_patch")
+            if patch is None and result.get("status") == "low_confidence":
+                pass
+            elif not isinstance(patch, Mapping):
+                raise GeometryValidationError("geometry calibrator returned no profile patch")
+            else:
+                patch = deepcopy(dict(patch))
+                patch["reference_template"] = {
+                    "template_id": template_id,
+                    "direction": direction,
+                    "width": int(image.shape[1]),
+                    "height": int(image.shape[0]),
+                }
+                result["profile_patch"] = patch
+            result.update({
+                "workpiece_id": workpiece_id,
+                "rule_id": rule_id,
+                "direction": direction,
+                "template_id": template_id,
+                "base_library_revision": int(expected_library_revision),
+            })
             return result
 
     # ------------------------------------------------------------------
@@ -523,7 +848,7 @@ class GeometryMaskProfiles:
     @staticmethod
     def _profile_for_revision(profile: Mapping[str, Any], revision: int) -> dict[str, Any]:
         candidate = deepcopy(dict(profile))
-        candidate["schema_version"] = PROFILE_SCHEMA_VERSION
+        candidate.setdefault("schema_version", PROFILE_SCHEMA_VERSION)
         candidate["profile_revision"] = int(revision)
         return candidate
 
@@ -569,6 +894,7 @@ class GeometryMaskProfiles:
                 "state": "queued",
                 "progress": {"completed": 0, "total": total, "phase": "queued"},
                 "warnings": [],
+                "blocking_issues": [],
                 "regression": {"status": "not_run", "correct_to_wrong": 0},
                 "error": None,
                 "cancel_requested": False,
@@ -660,6 +986,8 @@ class GeometryMaskProfiles:
                         "remaining_ratio": remaining_ratio,
                     })
                 if item.get("status") not in {"active", "not_configured"}:
+                    if item.get("review_state") == "excluded":
+                        continue
                     warnings.append({
                         "orientation": label,
                         "index": index,
@@ -667,6 +995,108 @@ class GeometryMaskProfiles:
                         "status": item.get("status"),
                     })
         return warnings
+
+    @staticmethod
+    def _validation_blocking_issues(
+        report: Mapping[str, Any], regression: Mapping[str, Any] | None
+    ) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        for label, items in report.items():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                ignored_ratio = float(item.get("ignored_ratio", 0.0) or 0.0)
+                remaining_ratio = float(item.get("remaining_ratio", 1.0) or 0.0)
+                if ignored_ratio >= 0.55:
+                    issues.append({
+                        "orientation": label,
+                        "index": item.get("index"),
+                        "code": "geometry_mask_too_large",
+                        "ignored_ratio": ignored_ratio,
+                    })
+                if remaining_ratio <= 0.20:
+                    issues.append({
+                        "orientation": label,
+                        "index": item.get("index"),
+                        "code": "keypoint_retention_critical",
+                        "remaining_ratio": remaining_ratio,
+                    })
+        regression = regression if isinstance(regression, Mapping) else {}
+        if regression.get("status") != "completed" or int(regression.get("skipped", 0) or 0) > 0:
+            fit_failures = regression.get("fit_failures", [])
+            skipped_templates = [
+                str(item.get("template_id"))
+                for item in fit_failures
+                if isinstance(item, Mapping) and item.get("template_id")
+            ] if isinstance(fit_failures, list) else []
+            issues.append({
+                "code": "leave_one_out_incomplete",
+                "status": regression.get("status", "missing"),
+                "skipped": int(regression.get("skipped", 0) or 0),
+                "templates": skipped_templates,
+            })
+        if int(regression.get("correct_to_wrong", 0) or 0) > 0:
+            changed_predictions = deepcopy(regression.get("changed_predictions", []))
+            paired = any(
+                isinstance(item, Mapping) and "baseline_predicted" in item
+                for item in changed_predictions
+            ) if isinstance(changed_predictions, list) else False
+            templates = list(dict.fromkeys(
+                str(item.get("template_id"))
+                for item in changed_predictions
+                if isinstance(item, Mapping) and item.get("template_id")
+            )) if isinstance(changed_predictions, list) else []
+            issues.append({
+                "code": "geometry_fusion_regression" if paired else "geometry_regression",
+                "correct_to_wrong": int(regression.get("correct_to_wrong", 0) or 0),
+                "templates": templates,
+                "changed_predictions": changed_predictions,
+            })
+        return issues
+
+    @staticmethod
+    def _profile_blocking_issues(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Return schema-v2 publication blockers before any cache can be activated."""
+        if profile.get("schema_version") != PROFILE_DOCUMENT_SCHEMA_VERSION:
+            return []
+        issues: list[dict[str, Any]] = []
+        migration = profile.get("migration", {})
+        conflicts = migration.get("conflicts", []) if isinstance(migration, Mapping) else []
+        if conflicts:
+            issues.append({"code": "MIGRATION_CONFLICT", "count": len(conflicts)})
+        directions = profile.get("directions", {})
+        for rule in profile.get("rules", []):
+            if not isinstance(rule, Mapping) or not rule.get("enabled", True):
+                continue
+            rule_id = str(rule.get("rule_id", ""))
+            for direction in ("front", "back"):
+                side = directions.get(direction, {}) if isinstance(directions, Mapping) else {}
+                calibrations = side.get("calibrations", {}) if isinstance(side, Mapping) else {}
+                calibration = calibrations.get(rule_id) if isinstance(calibrations, Mapping) else None
+                if not isinstance(calibration, Mapping):
+                    issues.append({
+                        "code": "MISSING_DIRECTION_CALIBRATION",
+                        "rule_id": rule_id,
+                        "direction": direction,
+                    })
+                    continue
+                if not isinstance(calibration.get("geometry"), Mapping):
+                    issues.append({
+                        "code": "FITTED_GEOMETRY_MISSING",
+                        "rule_id": rule_id,
+                        "direction": direction,
+                    })
+                    continue
+                if calibration.get("state") != "ready":
+                    issues.append({
+                        "code": "MISSING_DIRECTION_CALIBRATION",
+                        "rule_id": rule_id,
+                        "direction": direction,
+                        "state": calibration.get("state"),
+                    })
+        return issues
 
     def _run_validation(self, job_id: str) -> None:
         with self._condition:
@@ -701,6 +1131,25 @@ class GeometryMaskProfiles:
                 self.calibrator,
                 progress,
             )
+            leave_one_out = getattr(classifier, "leave_one_out_report", None)
+            if callable(leave_one_out):
+                try:
+                    regression = deepcopy(leave_one_out(record, candidate))
+                except Exception as exc:
+                    LOGGER.warning("Geometry leave-one-out validation failed: %s", exc)
+                    regression = {
+                        "status": "failed",
+                        "correct_to_wrong": 0,
+                        "skipped": 0,
+                        "fit_failures": [{"reason": str(exc)}],
+                        "error": str(exc),
+                    }
+            else:
+                regression = {
+                    "status": "not_run",
+                    "correct_to_wrong": 0,
+                    "skipped": 0,
+                }
             with self._condition:
                 job = self._jobs.get(job_id)
                 if job is None:
@@ -711,6 +1160,36 @@ class GeometryMaskProfiles:
                     self._candidate_caches.pop(job_id, None)
                 else:
                     warnings = self._validation_warnings(report)
+                    blocking_issues = self._profile_blocking_issues(profile)
+                    for label, items in report.items():
+                        if not isinstance(items, list):
+                            continue
+                        for item in items:
+                            if not isinstance(item, Mapping):
+                                continue
+                            review_state = item.get("review_state")
+                            if review_state == "review":
+                                blocking_issues.append({
+                                    "code": "template_needs_review",
+                                    "orientation": label,
+                                    "template_id": item.get("template_id"),
+                                    "reason": item.get("review_reason", ""),
+                                })
+                            elif review_state == "excluded":
+                                warnings.append({
+                                    "code": "template_excluded",
+                                    "orientation": label,
+                                    "template_id": item.get("template_id"),
+                                    "reason": item.get("review_reason", ""),
+                                })
+                    blocking_issues.extend(self._validation_blocking_issues(report, regression))
+                    candidate_revision = getattr(candidate, "geometry_profile_revision", None)
+                    if candidate_revision != job.get("base_draft_revision"):
+                        blocking_issues.append({
+                            "code": "PROFILE_CACHE_REVISION_MISMATCH",
+                            "expected_revision": job.get("base_draft_revision"),
+                            "cache_revision": candidate_revision,
+                        })
                     job["state"] = "completed"
                     job["progress"] = {
                         "completed": self._total_templates(record),
@@ -719,27 +1198,13 @@ class GeometryMaskProfiles:
                     }
                     job["report"] = deepcopy(report)
                     job["warnings"] = warnings
+                    job["blocking_issues"] = blocking_issues
                     job["candidate_profile"] = deepcopy(getattr(candidate, "geometry_profile", profile))
-                    leave_one_out = getattr(classifier, "leave_one_out_report", None)
-                    if callable(leave_one_out):
-                        try:
-                            job["regression"] = deepcopy(leave_one_out(record, candidate))
-                        except Exception as exc:
-                            LOGGER.warning("Geometry leave-one-out validation failed: %s", exc)
-                            job["regression"] = {
-                                "status": "failed",
-                                "correct_to_wrong": 0,
-                                "error": str(exc),
-                            }
-                    else:
-                        job["regression"] = {
-                            "status": "not_run",
-                            "correct_to_wrong": 0,
-                        }
-                    if job["regression"].get("status") == "failed":
+                    job["regression"] = regression
+                    if regression.get("status") == "failed":
                         job["warnings"].append({
                             "code": "leave_one_out_failed",
-                            "message": job["regression"].get("error", "留一验证失败"),
+                            "message": regression.get("error", "留一验证失败"),
                         })
                     self._candidate_caches[job_id] = candidate
                 job["updated_at"] = time.time()
@@ -867,6 +1332,33 @@ class GeometryMaskProfiles:
             record, snapshot, job = self._require_publish_job(
                 workpiece_id, job_id, expected_library_revision, expected_draft_revision
             )
+            draft = snapshot.get("draft")
+            migration = draft.get("migration", {}) if isinstance(draft, Mapping) else {}
+            conflicts = migration.get("conflicts", []) if isinstance(migration, Mapping) else []
+            if conflicts:
+                raise GeometryProfileMigrationConflictError(
+                    "MIGRATION_CONFLICT: resolve legacy geometry rule conflicts before publish"
+                )
+            blocking_issues = job.get("blocking_issues") or []
+            blocking_codes = {
+                str(item.get("code"))
+                for item in blocking_issues
+                if isinstance(item, Mapping)
+            }
+            if "PROFILE_CACHE_REVISION_MISMATCH" in blocking_codes:
+                raise GeometryCacheRevisionMismatchError(
+                    "PROFILE_CACHE_REVISION_MISMATCH: validate the current draft again"
+                )
+            if "MISSING_DIRECTION_CALIBRATION" in blocking_codes:
+                raise MissingDirectionCalibrationError(
+                    "MISSING_DIRECTION_CALIBRATION: complete both direction calibrations before publish"
+                )
+            if "FITTED_GEOMETRY_MISSING" in blocking_codes:
+                raise FittedGeometryMissingError(
+                    "FITTED_GEOMETRY_MISSING: select a fitted boundary before publish"
+                )
+            if blocking_issues:
+                raise GeometryProfilePublishError("blocking issues require template review before publish")
             if (job.get("warnings") or job.get("regression", {}).get("correct_to_wrong", 0)) and not str(override_reason).strip():
                 raise GeometryProfilePublishError("validation warnings or regressions require override_reason")
             candidate = self._candidate_caches[job_id]
@@ -882,11 +1374,16 @@ class GeometryMaskProfiles:
                 getattr(candidate, "geometry_profile", None) or job.get("candidate_profile") or job["profile"],
                 profile_revision,
             )
+            previous_source = (
+                "geometry" if previous_revision is not None else
+                ("legacy" if self._has_active_legacy_groups(workpiece_id) else None)
+            )
             revision_payload = {
                 "schema_version": PROFILE_SCHEMA_VERSION,
                 "profile_revision": profile_revision,
                 "library_revision": expected_library_revision + 1,
                 "previous_active_revision": previous_revision,
+                "previous_source": previous_source,
                 "profile": deepcopy(candidate_profile),
                 "report": deepcopy(job.get("report") or {}),
                 "warnings": deepcopy(job.get("warnings") or []),
@@ -948,6 +1445,39 @@ class GeometryMaskProfiles:
             if record.revision != expected_library_revision:
                 raise StaleGeometryProfileError("workpiece revision changed before rollback")
             if previous_revision is None:
+                current_revision = snapshot.get("active_revision")
+                current_payload: Mapping[str, Any] = {}
+                if current_revision is not None:
+                    current_path = self._profile_root(record) / "revisions" / f"{current_revision}.json"
+                    try:
+                        loaded = json.loads(current_path.read_text(encoding="utf-8"))
+                        current_payload = loaded if isinstance(loaded, Mapping) else {}
+                    except Exception:
+                        current_payload = {}
+                if current_payload.get("previous_source") == "legacy":
+                    restore = getattr(self.catalog, "restore_legacy_annotation_cache", None)
+                    if not callable(restore):
+                        raise GeometryProfilePublishError("legacy cache restore is unavailable")
+                    restored_record = restore(
+                        workpiece_id,
+                        expected_revision=expected_library_revision,
+                        operation_id=operation_id,
+                    )
+                    document, status, error = self._load_document(record)
+                    if status == "corrupt":
+                        raise CorruptGeometryProfileError(error or "geometry profile is corrupt")
+                    document.update({
+                        "library_revision": restored_record.revision,
+                        "active_revision": None,
+                        "previous_active_revision": None,
+                        "active": None,
+                    })
+                    _atomic_write_json(self._profile_root(record) / "profile.json", document)
+                    result = self._snapshot_for_record(restored_record)
+                    result["rollback_source"] = "legacy"
+                    self._operations[operation_key] = deepcopy(result)
+                    self._persist_jobs()
+                    return result
                 raise GeometryProfilePublishError("no previous geometry profile revision is available")
             revision_path = self._profile_root(record) / "revisions" / f"{previous_revision}.json"
             try:

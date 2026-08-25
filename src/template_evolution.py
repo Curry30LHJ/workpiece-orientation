@@ -71,7 +71,20 @@ class TemplateEvolution:
         self._stop = False
         self._worker = None
         if start_worker:
-            self._worker = threading.Thread(target=self._worker_loop, name="template-evolution", daemon=True)
+            self.start()
+
+    def start(self) -> None:
+        """Start the queue worker once, after the runtime snapshot is ready."""
+        with self._condition:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            if self._stop:
+                return
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="template-evolution",
+                daemon=True,
+            )
             self._worker.start()
 
     @staticmethod
@@ -88,9 +101,30 @@ class TemplateEvolution:
     def _load(self) -> None:
         if not self.jobs_path.exists():
             return
-        payload = json.loads(self.jobs_path.read_text(encoding="utf-8"))
-        self._operation_results = dict(payload.get("operations", {}))
-        self._jobs = {item["job_id"]: item for item in payload.get("jobs", [])}
+        try:
+            payload = json.loads(self.jobs_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("jobs document must be an object")
+            operations = payload.get("operations", {})
+            jobs = payload.get("jobs", [])
+            if not isinstance(operations, dict) or not isinstance(jobs, list):
+                raise ValueError("jobs document has an invalid schema")
+            loaded_jobs: dict[str, dict] = {}
+            for item in jobs:
+                if not isinstance(item, dict) or not isinstance(item.get("job_id"), str) or not item["job_id"]:
+                    raise ValueError("jobs document contains an invalid job")
+                if item["job_id"] in loaded_jobs:
+                    raise ValueError("jobs document contains duplicate job ids")
+                loaded_jobs[item["job_id"]] = item
+            self._operation_results = {str(key): str(value) for key, value in operations.items()}
+            self._jobs = loaded_jobs
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+            quarantine = self.storage_dir / f"jobs.corrupt-{uuid.uuid4().hex}.json"
+            self.jobs_path.replace(quarantine)
+            self._operation_results = {}
+            self._jobs = {}
+            LOGGER.error("Quarantined invalid template evolution jobs at %s: %s", quarantine, exc)
+            return
         for job in self._jobs.values():
             if job.get("state") == "building":
                 job["state"] = "queued"
@@ -620,11 +654,22 @@ class TemplateEvolution:
             self._persist()
         try:
             current = self.catalog.get(job["workpiece_id"])
+            if self._matches_committed_template_update(job, current):
+                with self._condition:
+                    job["state"] = "completed"
+                    job["progress"] = 100
+                    job["revision"] = current.revision
+                    job["error"] = None
+                    self._cleanup_payload(job)
+                    self._persist()
+                    return self._snapshot(job)
             if current.revision != job["base_revision"]:
                 predecessor_id = job.get("predecessor_job_id")
                 predecessor = self._jobs.get(predecessor_id) if predecessor_id else None
                 if predecessor is None or predecessor.get("state") not in {"completed", "failed", "cancelled"}:
-                    raise StaleEvolutionError("workpiece revision changed after confirmation")
+                    raise StaleEvolutionError(
+                        "workpiece revision changed without a matching template operation"
+                    )
                 job["base_revision"] = current.revision
             geometry_review = self._requires_geometry_review(job, current)
             if geometry_review is not None:
@@ -637,7 +682,12 @@ class TemplateEvolution:
                     return self._snapshot(job)
             front = [Path(item["path"]) for item in job["items"] if item["orientation"] == "front"]
             back = [Path(item["path"]) for item in job["items"] if item["orientation"] == "back"]
-            record, _ = self.catalog.append_templates(job["workpiece_id"], front, back)
+            record, _ = self.catalog.append_templates(
+                job["workpiece_id"],
+                front,
+                back,
+                operation_id=job["job_id"],
+            )
             with self._condition:
                 job["state"] = "completed"
                 job["progress"] = 100
@@ -651,6 +701,31 @@ class TemplateEvolution:
                 job["error"] = str(exc)
                 self._persist()
                 return self._snapshot(job)
+
+    @staticmethod
+    def _matches_committed_template_update(job: dict, record) -> bool:
+        """Recognize a disk commit that happened before job completion persisted."""
+        try:
+            manifest = json.loads((Path(record.root) / "manifest.json").read_text(encoding="utf-8"))
+            update = manifest.get("last_template_update")
+            if not isinstance(update, dict):
+                return False
+            expected_digests = {
+                str(item["digest"])
+                for item in job.get("items", [])
+                if isinstance(item, dict) and item.get("digest")
+            }
+            stored_digests = update.get("item_digests")
+            return (
+                update.get("operation_id") == job.get("job_id")
+                and update.get("base_revision") == job.get("base_revision")
+                and update.get("target_revision") == record.revision
+                and isinstance(stored_digests, list)
+                and set(map(str, stored_digests)) == expected_digests
+                and bool(expected_digests)
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
 
     def _requires_geometry_review(self, job: dict, record) -> dict | None:
         if self.geometry_profiles is not None:

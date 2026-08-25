@@ -31,22 +31,25 @@ BackendClient::State BackendClient::state() const {
 }
 
 void BackendClient::connectToService(const QHostAddress &host, quint16 port, int requestTimeoutMs) {
+    suppressConnectionLost_ = true;
     socket_->abort();
     readBuffer_.clear();
     handshakeRequestId_.clear();
     clearPending();
+    suppressConnectionLost_ = false;
+    transportFailureReported_ = false;
     requestTimeoutMs_ = requestTimeoutMs > 0 ? requestTimeoutMs : 120000;
     setState(State::Connecting, QStringLiteral("正在连接后端"));
     socket_->connectToHost(host, port);
 }
 
 QString BackendClient::sendRequest(const QString &command, const QJsonObject &fields) {
-    if (state_ != State::Ready) {
-        emit requestFailed(QStringLiteral("NOT_READY"), QStringLiteral("后端尚未就绪"));
+    if (pending_ != nullptr || state_ == State::Busy) {
+        emitCommandFailure(command, QStringLiteral("BUSY"), QStringLiteral("已有请求正在执行"));
         return QString();
     }
-    if (pending_ != nullptr) {
-        emit requestFailed(QStringLiteral("BUSY"), QStringLiteral("已有请求正在执行"));
+    if (state_ != State::Ready) {
+        emitCommandFailure(command, QStringLiteral("NOT_READY"), QStringLiteral("后端尚未就绪"));
         return QString();
     }
     const QString requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -65,6 +68,7 @@ void BackendClient::disconnectFromService() {
     requestTimer_->stop();
     clearPending();
     handshakeRequestId_.clear();
+    suppressConnectionLost_ = true;
     socket_->abort();
     setState(State::Disconnected, QStringLiteral("已断开后端"));
 }
@@ -83,7 +87,7 @@ void BackendClient::onConnected() {
 void BackendClient::onReadyRead() {
     readBuffer_ += socket_->readAll();
     if (readBuffer_.size() > kMaxMessageBytes && !readBuffer_.contains('\n')) {
-        fail(QStringLiteral("MESSAGE_TOO_LARGE"), QStringLiteral("后端响应超过 1 MiB"));
+        failTransport(QStringLiteral("MESSAGE_TOO_LARGE"), QStringLiteral("后端响应超过 1 MiB"));
         return;
     }
     while (readBuffer_.contains('\n')) {
@@ -91,13 +95,13 @@ void BackendClient::onReadyRead() {
         const QByteArray line = readBuffer_.left(newline);
         readBuffer_.remove(0, newline + 1);
         if (line.size() > kMaxMessageBytes) {
-            fail(QStringLiteral("MESSAGE_TOO_LARGE"), QStringLiteral("后端响应超过 1 MiB"));
+            failTransport(QStringLiteral("MESSAGE_TOO_LARGE"), QStringLiteral("后端响应超过 1 MiB"));
             return;
         }
         QJsonParseError parseError;
         const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
         if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-            fail(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("后端返回了无效 JSON"));
+            failTransport(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("后端返回了无效 JSON"));
             return;
         }
         handleResponse(document.object());
@@ -109,11 +113,17 @@ void BackendClient::onReadyRead() {
 
 void BackendClient::onDisconnected() {
     const bool wasConnected = state_ != State::Disconnected;
+    const bool reportConnectionLost = !suppressConnectionLost_;
+    suppressConnectionLost_ = false;
     requestTimer_->stop();
     clearPending();
     handshakeRequestId_.clear();
     setState(State::Disconnected, QStringLiteral("后端连接已断开"));
-    if (wasConnected) {
+    if (wasConnected && reportConnectionLost) {
+        if (!transportFailureReported_) {
+            transportFailureReported_ = true;
+            emit transportFailed(QStringLiteral("CONNECTION_LOST"), QStringLiteral("后端连接已断开"));
+        }
         emit connectionLost(QStringLiteral("后端连接已断开"));
     }
 }
@@ -123,14 +133,14 @@ void BackendClient::onSocketError(QAbstractSocket::SocketError error) {
     if (state_ == State::Disconnected) {
         return;
     }
-    fail(QStringLiteral("CONNECTION_ERROR"), socket_->errorString());
+    failTransport(QStringLiteral("CONNECTION_ERROR"), socket_->errorString());
 }
 
 void BackendClient::onRequestTimeout() {
     if (!handshakeRequestId_.isEmpty()) {
-        fail(QStringLiteral("TIMEOUT"), QStringLiteral("后端握手超时"));
+        failTransport(QStringLiteral("TIMEOUT"), QStringLiteral("后端握手超时"));
     } else if (pending_ != nullptr) {
-        fail(QStringLiteral("TIMEOUT"), QStringLiteral("后端请求超时"));
+        failTransport(QStringLiteral("TIMEOUT"), QStringLiteral("后端请求超时"));
     }
 }
 
@@ -149,24 +159,36 @@ void BackendClient::sendJson(const QJsonObject &object) {
 
 void BackendClient::handleResponse(const QJsonObject &response) {
     if (response.value(QStringLiteral("version")).toInt(-1) != kProtocolVersion) {
-        fail(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("后端协议版本不匹配"));
+        failTransport(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("后端协议版本不匹配"));
         return;
     }
     const QString responseId = response.value(QStringLiteral("request_id")).toString();
     if (!handshakeRequestId_.isEmpty()) {
         if (responseId != handshakeRequestId_) {
-            fail(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("握手请求标识不匹配"));
+            failTransport(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("握手请求标识不匹配"));
             return;
         }
         requestTimer_->stop();
         handshakeRequestId_.clear();
-        if (!response.value(QStringLiteral("ok")).toBool()
-            || response.value(QStringLiteral("service")).toString() != kServiceName
-            || !response.value(QStringLiteral("ready")).toBool()) {
+        if (!response.value(QStringLiteral("ok")).toBool()) {
             const QJsonObject error = response.value(QStringLiteral("error")).toObject();
             const QString code = error.value(QStringLiteral("code")).toString(QStringLiteral("HANDSHAKE_FAILED"));
-            fail(code == QStringLiteral("SERVER_BUSY") ? code : QStringLiteral("HANDSHAKE_FAILED"),
-                 error.value(QStringLiteral("message")).toString(QStringLiteral("后端身份验证失败")));
+            failTransport(code, error.value(QStringLiteral("message")).toString(QStringLiteral("后端身份验证失败")));
+            return;
+        }
+        if (response.value(QStringLiteral("service")).toString() != kServiceName) {
+            failTransport(QStringLiteral("HANDSHAKE_FAILED"), QStringLiteral("后端身份验证失败"));
+            return;
+        }
+        if (response.value(QStringLiteral("ok")).toBool()
+            && !response.value(QStringLiteral("ready")).toBool()
+            && response.value(QStringLiteral("status")).toString() == QStringLiteral("loading")) {
+            failTransport(QStringLiteral("MODEL_LOADING"),
+                          response.value(QStringLiteral("message")).toString(QStringLiteral("模型加载中")));
+            return;
+        }
+        if (!response.value(QStringLiteral("ready")).toBool()) {
+            failTransport(QStringLiteral("HANDSHAKE_FAILED"), QStringLiteral("后端身份验证失败"));
             return;
         }
         setState(State::Ready, QStringLiteral("后端已就绪"));
@@ -174,15 +196,34 @@ void BackendClient::handleResponse(const QJsonObject &response) {
         return;
     }
     if (pending_ == nullptr || responseId != pending_->id) {
-        fail(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("业务请求标识不匹配"));
+        failTransport(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("业务请求标识不匹配"));
         return;
     }
     const QString command = pending_->command;
+    if (response.value(QStringLiteral("event")).toString() == QStringLiteral("progress")) {
+        if (response.value(QStringLiteral("command")).toString() != command
+            || !response.value(QStringLiteral("progress")).isObject()) {
+            failTransport(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("后端进度事件无效"));
+            return;
+        }
+        const QJsonObject progress = response.value(QStringLiteral("progress")).toObject();
+        const int total = progress.value(QStringLiteral("total")).toInt(-1);
+        const int completed = progress.value(QStringLiteral("completed")).toInt(-1);
+        if (progress.value(QStringLiteral("phase")).toString().isEmpty()
+            || total <= 0 || completed < 0 || completed > total) {
+            failTransport(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("后端进度数据无效"));
+            return;
+        }
+        emit progressReceived(command, progress);
+        requestTimer_->start(requestTimeoutMs_);
+        return;
+    }
     requestTimer_->stop();
     clearPending();
     if (!response.value(QStringLiteral("ok")).toBool()) {
         const QJsonObject error = response.value(QStringLiteral("error")).toObject();
-        emit requestFailed(error.value(QStringLiteral("code")).toString(QStringLiteral("INTERNAL_ERROR")),
+        emitCommandFailure(command,
+                           error.value(QStringLiteral("code")).toString(QStringLiteral("INTERNAL_ERROR")),
                            error.value(QStringLiteral("message")).toString(QStringLiteral("后端请求失败")));
     } else {
         emit responseReceived(command, response);
@@ -190,13 +231,25 @@ void BackendClient::handleResponse(const QJsonObject &response) {
     setState(State::Ready, QStringLiteral("后端已就绪"));
 }
 
-void BackendClient::fail(const QString &code, const QString &message, bool closeSocket) {
+void BackendClient::emitCommandFailure(const QString &command, const QString &code,
+                                       const QString &message) {
+    emit commandFailed(command, code, message);
+    emit requestFailed(code, message);
+}
+
+void BackendClient::failTransport(const QString &code, const QString &message, bool closeSocket) {
+    if (transportFailureReported_) {
+        return;
+    }
+    transportFailureReported_ = true;
     requestTimer_->stop();
     clearPending();
     handshakeRequestId_.clear();
-    emit requestFailed(code, message);
     setState(State::Error, message);
+    emit transportFailed(code, message);
+    emit requestFailed(code, message);
     if (closeSocket) {
+        suppressConnectionLost_ = code == QStringLiteral("MODEL_LOADING");
         socket_->abort();
     }
 }

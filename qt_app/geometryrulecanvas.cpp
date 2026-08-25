@@ -3,6 +3,8 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPen>
+#include <QWheelEvent>
+#include <QKeyEvent>
 
 #include <QtMath>
 
@@ -32,27 +34,42 @@ GeometryRuleCanvas::GeometryRuleCanvas(QWidget *parent) : QWidget(parent) {
     setMinimumSize(240, 160);
     setMouseTracking(true);
     setAutoFillBackground(true);
+    setFocusPolicy(Qt::StrongFocus);
 }
 
 void GeometryRuleCanvas::setImage(const QImage &image) {
     image_ = image;
+    // A fitted contour belongs to the previous image and must never be
+    // displayed on a newly selected template.
+    fitShape_ = QJsonObject();
+    maskOverlay_ = QImage();
     dragging_ = false;
+    panning_ = false;
+    resetView();
     update();
 }
 
 void GeometryRuleCanvas::setTool(Tool tool) {
     tool_ = tool;
     if (!coarseShape_.isEmpty()) {
-        coarseShape_.insert(QStringLiteral("shape"),
-                            tool_ == Circle ? QStringLiteral("circle")
-                                            : tool_ == Ellipse ? QStringLiteral("ellipse")
-                                                               : QStringLiteral("rotated_rectangle"));
+        if (tool_ != None) {
+            coarseShape_.insert(QStringLiteral("shape"),
+                                tool_ == Circle ? QStringLiteral("circle")
+                                                : tool_ == Ellipse ? QStringLiteral("ellipse")
+                                                                   : QStringLiteral("rotated_rectangle"));
+        }
         update();
     }
 }
 
 void GeometryRuleCanvas::setCoarseShape(const QJsonObject &shape) {
     coarseShape_ = shape;
+    if (shape.isEmpty()) {
+        tool_ = None;
+        dragging_ = false;
+        update();
+        return;
+    }
     const QString value = shape.value(QStringLiteral("shape")).toString();
     if (value == QStringLiteral("ellipse")) {
         tool_ = Ellipse;
@@ -66,7 +83,13 @@ void GeometryRuleCanvas::setCoarseShape(const QJsonObject &shape) {
 }
 
 void GeometryRuleCanvas::setFitOverlay(const QJsonObject &fit, const QImage &maskOverlay) {
-    fitShape_ = fit.value(QStringLiteral("fitted_shape")).toObject();
+    // The effective shape is the boundary actually used by the mask after
+    // applying the signed offset. Prefer it over the raw fitted contour so
+    // the preview matches the production mask semantics.
+    fitShape_ = fit.value(QStringLiteral("effective_shape")).toObject();
+    if (fitShape_.isEmpty()) {
+        fitShape_ = fit.value(QStringLiteral("fitted_shape")).toObject();
+    }
     if (fitShape_.isEmpty() && fit.contains(QStringLiteral("shape"))) {
         fitShape_ = fit;
     }
@@ -84,15 +107,58 @@ void GeometryRuleCanvas::setRotationDegrees(qreal degrees) {
     update();
 }
 
+void GeometryRuleCanvas::resetView() {
+    zoom_ = 1.0;
+    pan_ = QPointF();
+    update();
+}
+
+void GeometryRuleCanvas::cancelGesture() {
+    dragging_ = false;
+    panning_ = false;
+    update();
+}
+
+void GeometryRuleCanvas::setNumericShape(const QJsonObject &shape) {
+    const QString type = shape.value(QStringLiteral("shape")).toString();
+    bool valid = !type.isEmpty() && shape.contains(QStringLiteral("cx")) && shape.contains(QStringLiteral("cy"));
+    if (type == QStringLiteral("circle")) {
+        valid = valid && shape.value(QStringLiteral("r")).toDouble() > 0.0;
+        tool_ = Circle;
+    } else if (type == QStringLiteral("ellipse")) {
+        valid = valid && shape.value(QStringLiteral("rx")).toDouble() > 0.0
+                && shape.value(QStringLiteral("ry")).toDouble() > 0.0;
+        tool_ = Ellipse;
+    } else if (type == QStringLiteral("rotated_rectangle")) {
+        valid = valid && shape.value(QStringLiteral("half_width")).toDouble() > 0.0
+                && shape.value(QStringLiteral("half_height")).toDouble() > 0.0;
+        tool_ = RotatedRectangle;
+    } else {
+        valid = false;
+    }
+    if (!valid) {
+        return;
+    }
+    coarseShape_ = shape;
+    rotationDegrees_ = shape.value(QStringLiteral("angle_deg")).toDouble(rotationDegrees_);
+    emit shapeChanged(coarseShape_);
+    update();
+}
+
 QRectF GeometryRuleCanvas::imageTarget() const {
     if (image_.isNull() || width() <= 0 || height() <= 0) {
         return {};
     }
     const qreal scale = qMin(width() / static_cast<qreal>(image_.width()),
-                             height() / static_cast<qreal>(image_.height()));
+                             height() / static_cast<qreal>(image_.height())) * zoom_;
     const QSizeF rendered = QSizeF(image_.size()) * scale;
-    return QRectF((width() - rendered.width()) / 2.0,
-                  (height() - rendered.height()) / 2.0,
+    const qreal baseScale = qMin(width() / static_cast<qreal>(image_.width()),
+                                 height() / static_cast<qreal>(image_.height()));
+    const QSizeF baseRendered = QSizeF(image_.size()) * baseScale;
+    const QPointF center((width() - baseRendered.width()) / 2.0 + baseRendered.width() / 2.0,
+                         (height() - baseRendered.height()) / 2.0 + baseRendered.height() / 2.0);
+    return QRectF(center.x() - rendered.width() / 2.0 + pan_.x(),
+                  center.y() - rendered.height() / 2.0 + pan_.y(),
                   rendered.width(), rendered.height());
 }
 
@@ -107,24 +173,23 @@ QPointF GeometryRuleCanvas::imagePoint(const QPoint &point) const {
 }
 
 QJsonObject GeometryRuleCanvas::shapeFromDrag(const QPointF &start, const QPointF &end) const {
-    const QRectF rect(start, end);
-    const QRectF normalized = rect.normalized();
-    const QPointF center = normalized.center();
+    const qreal dx = end.x() - start.x();
+    const qreal dy = end.y() - start.y();
     QJsonObject result;
-    result.insert(QStringLiteral("cx"), center.x());
-    result.insert(QStringLiteral("cy"), center.y());
+    result.insert(QStringLiteral("cx"), start.x());
+    result.insert(QStringLiteral("cy"), start.y());
     if (tool_ == Circle) {
         result.insert(QStringLiteral("shape"), QStringLiteral("circle"));
-        result.insert(QStringLiteral("r"), qMin(normalized.width(), normalized.height()) / 2.0);
+        result.insert(QStringLiteral("r"), qSqrt(dx * dx + dy * dy));
     } else if (tool_ == Ellipse) {
         result.insert(QStringLiteral("shape"), QStringLiteral("ellipse"));
-        result.insert(QStringLiteral("rx"), normalized.width() / 2.0);
-        result.insert(QStringLiteral("ry"), normalized.height() / 2.0);
+        result.insert(QStringLiteral("rx"), qAbs(dx));
+        result.insert(QStringLiteral("ry"), qAbs(dy));
         result.insert(QStringLiteral("angle_deg"), 0.0);
     } else {
         result.insert(QStringLiteral("shape"), QStringLiteral("rotated_rectangle"));
-        result.insert(QStringLiteral("half_width"), normalized.width() / 2.0);
-        result.insert(QStringLiteral("half_height"), normalized.height() / 2.0);
+        result.insert(QStringLiteral("half_width"), qAbs(dx));
+        result.insert(QStringLiteral("half_height"), qAbs(dy));
         result.insert(QStringLiteral("angle_deg"), rotationDegrees_);
     }
     return result;
@@ -150,7 +215,14 @@ void GeometryRuleCanvas::drawShape(QPainter *painter, const QJsonObject &shape, 
     painter->translate(target.left(), target.top());
     painter->scale(scale, scale);
     if (type == QStringLiteral("circle")) {
-        const qreal radius = shape.value(QStringLiteral("r")).toDouble();
+        const qreal radius = shape.contains(QStringLiteral("r"))
+            ? shape.value(QStringLiteral("r")).toDouble()
+            : qMin(shape.value(QStringLiteral("rx")).toDouble(),
+                   shape.value(QStringLiteral("ry")).toDouble());
+        if (radius <= 0.0) {
+            painter->restore();
+            return;
+        }
         painter->drawEllipse(center, radius, radius);
     } else if (type == QStringLiteral("ellipse")) {
         const qreal rx = shape.value(QStringLiteral("rx")).toDouble();
@@ -172,6 +244,26 @@ void GeometryRuleCanvas::drawShape(QPainter *painter, const QJsonObject &shape, 
     painter->restore();
 }
 
+void GeometryRuleCanvas::drawHandles(QPainter *painter, const QJsonObject &shape) const {
+    if (painter == nullptr || shape.isEmpty()) {
+        return;
+    }
+    const QRectF target = imageTarget();
+    if (target.isNull()) {
+        return;
+    }
+    const qreal scale = target.width() / static_cast<qreal>(image_.width());
+    const QPointF center = jsonPoint(shape, "cx", "cy");
+    painter->save();
+    painter->setPen(QPen(QColor(250, 190, 40), 1.5));
+    painter->setBrush(QColor(250, 190, 40));
+    painter->translate(target.left(), target.top());
+    painter->scale(scale, scale);
+    const qreal handleRadius = 4.0 / qMax(scale, 0.1);
+    painter->drawEllipse(center, handleRadius, handleRadius);
+    painter->restore();
+}
+
 void GeometryRuleCanvas::paintEvent(QPaintEvent *event) {
     Q_UNUSED(event)
     QPainter painter(this);
@@ -190,18 +282,37 @@ void GeometryRuleCanvas::paintEvent(QPaintEvent *event) {
     drawShape(&painter, fitShape_, fitPen);
     QPen coarsePen(QColor(0, 170, 200), 2.0, Qt::DashLine);
     drawShape(&painter, coarseShape_, coarsePen);
+    drawHandles(&painter, coarseShape_);
 }
 
 void GeometryRuleCanvas::mousePressEvent(QMouseEvent *event) {
-    if (event->button() != Qt::LeftButton || image_.isNull()) {
+    if (image_.isNull()) {
         return;
     }
+    if (event->button() == Qt::MiddleButton) {
+        panning_ = true;
+        lastPanPoint_ = event->pos();
+        return;
+    }
+    if (event->button() != Qt::LeftButton || tool_ == None) {
+        return;
+    }
+    setFocus();
+    fitShape_ = QJsonObject();
+    maskOverlay_ = QImage();
     dragStart_ = imagePoint(event->pos());
     dragging_ = true;
     updateShapeFromDrag(dragStart_);
 }
 
 void GeometryRuleCanvas::mouseMoveEvent(QMouseEvent *event) {
+    if (panning_) {
+        const QPoint delta = event->pos() - lastPanPoint_;
+        pan_ += QPointF(delta);
+        lastPanPoint_ = event->pos();
+        update();
+        return;
+    }
     if (!dragging_ || image_.isNull()) {
         return;
     }
@@ -209,9 +320,62 @@ void GeometryRuleCanvas::mouseMoveEvent(QMouseEvent *event) {
 }
 
 void GeometryRuleCanvas::mouseReleaseEvent(QMouseEvent *event) {
+    if (panning_ && event->button() == Qt::MiddleButton) {
+        panning_ = false;
+        return;
+    }
     if (!dragging_ || event->button() != Qt::LeftButton) {
         return;
     }
     dragging_ = false;
     updateShapeFromDrag(imagePoint(event->pos()));
+    const QString type = coarseShape_.value(QStringLiteral("shape")).toString();
+    const bool valid = (type == QStringLiteral("circle") && coarseShape_.value(QStringLiteral("r")).toDouble() > 0.0)
+            || (type == QStringLiteral("ellipse") && coarseShape_.value(QStringLiteral("rx")).toDouble() > 0.0
+                && coarseShape_.value(QStringLiteral("ry")).toDouble() > 0.0)
+            || (type == QStringLiteral("rotated_rectangle")
+                && coarseShape_.value(QStringLiteral("half_width")).toDouble() > 0.0
+                && coarseShape_.value(QStringLiteral("half_height")).toDouble() > 0.0);
+    if (valid) {
+        emit shapeCommitted(coarseShape_);
+    }
+}
+
+void GeometryRuleCanvas::wheelEvent(QWheelEvent *event) {
+    if (image_.isNull() || event == nullptr) {
+        return;
+    }
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    const QPointF eventPosition = event->position();
+#else
+    const QPointF eventPosition = event->posF();
+#endif
+    const QPointF before = imagePoint(eventPosition.toPoint());
+    const qreal factor = event->angleDelta().y() >= 0 ? 1.15 : (1.0 / 1.15);
+    zoom_ = qBound(0.25, zoom_ * factor, 8.0);
+    const QRectF target = imageTarget();
+    if (!target.isNull()) {
+        const qreal scale = target.width() / static_cast<qreal>(image_.width());
+        const QPointF after(target.left() + before.x() * scale, target.top() + before.y() * scale);
+        pan_ += eventPosition - after;
+    }
+    event->accept();
+    update();
+}
+
+void GeometryRuleCanvas::keyPressEvent(QKeyEvent *event) {
+    if (event == nullptr) {
+        return;
+    }
+    if (event->key() == Qt::Key_Escape) {
+        cancelGesture();
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_R) {
+        resetView();
+        event->accept();
+        return;
+    }
+    QWidget::keyPressEvent(event);
 }

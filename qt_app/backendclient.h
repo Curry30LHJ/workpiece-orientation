@@ -29,7 +29,12 @@ public:
 signals:
     void stateChanged(BackendClient::State state, const QString &detail);
     void handshakeSucceeded();
+    void progressReceived(const QString &command, const QJsonObject &progress);
     void responseReceived(const QString &command, const QJsonObject &response);
+    void commandFailed(const QString &command, const QString &code, const QString &message);
+    void transportFailed(const QString &code, const QString &message);
+    // Compatibility signals for older integrations. New production code uses the
+    // command/transport-specific channels above.
     void requestFailed(const QString &code, const QString &message);
     void connectionLost(const QString &reason);
 
@@ -49,7 +54,8 @@ private:
     void setState(State state, const QString &detail);
     void sendJson(const QJsonObject &object);
     void handleResponse(const QJsonObject &response);
-    void fail(const QString &code, const QString &message, bool closeSocket = true);
+    void emitCommandFailure(const QString &command, const QString &code, const QString &message);
+    void failTransport(const QString &code, const QString &message, bool closeSocket = true);
     void clearPending();
 
     QTcpSocket *socket_;
@@ -58,5 +64,7 @@ private:
     QByteArray readBuffer_;
     QString handshakeRequestId_;
     std::unique_ptr<PendingRequest> pending_;
+    bool suppressConnectionLost_ = false;
+    bool transportFailureReported_ = false;
     int requestTimeoutMs_ = 120000;
 };

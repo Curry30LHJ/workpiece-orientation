@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 from contextlib import contextmanager
+from dataclasses import replace
 import sys
 
 import cv2
@@ -22,11 +23,13 @@ class FakeGlobalPredictor:
     def __init__(self):
         self.calls = 0
         self.markers = []
+        self.batch_sizes = []
 
     def predict(self, images):
         self.calls += 1
-        marker = int(images[0][0, 0, 0])
-        self.markers.append(marker)
+        markers = [int(image[0, 0, 0]) for image in images]
+        self.markers.append(markers)
+        self.batch_sizes.append(len(images))
         vectors = {
             1: np.array([1.0, 0.0], dtype=np.float32),
             2: np.array([0.0, 1.0], dtype=np.float32),
@@ -34,7 +37,7 @@ class FakeGlobalPredictor:
             4: np.array([0.90, 0.70], dtype=np.float32),
             7: np.array([0.95, 0.05], dtype=np.float32),
         }
-        return [vectors[marker]]
+        return [vectors[marker] for marker in markers]
 
 
 class FakeExtractor:
@@ -72,8 +75,8 @@ def fake_extract_features(image, extractor, device, roi_ratio=1.0):
 
 def fake_score_feature_pair(query_features, template_features, image_shape, matcher):
     scores = {
-        3: {1: 12.4, 2: 5.1},
-        4: {1: 4.0, 2: 9.0},
+        3: {1: 12.4, 2: 5.1, 3: 12.4, 4: 5.1},
+        4: {1: 4.0, 2: 9.0, 3: 4.0, 4: 9.0},
         7: {1: 12.4, 2: 5.1, 7: 12.4},
     }
     return {"score": scores[query_features["marker"]][template_features["marker"]]}
@@ -106,17 +109,54 @@ def registered_classifier(classifier, tmp_path):
     return classifier
 
 
+def test_predict_with_cache_uses_supplied_snapshot_not_mutable_map(classifier, tmp_path):
+    requested = TemplateCache(
+        global_vectors={
+            "front": np.asarray([[1.0, 0.0]], dtype=np.float32),
+            "back": np.asarray([[0.0, 1.0]], dtype=np.float32),
+        },
+        local_features={"front": [{"marker": 1}], "back": [{"marker": 2}]},
+    )
+    mapped = TemplateCache(
+        global_vectors={
+            "front": np.asarray([[0.0, 1.0]], dtype=np.float32),
+            "back": np.asarray([[1.0, 0.0]], dtype=np.float32),
+        },
+        local_features={"front": [{"marker": 2}], "back": [{"marker": 1}]},
+    )
+    classifier.set_template_cache("m7", mapped)
+
+    result = classifier.predict_with_cache(
+        requested,
+        write_marker(tmp_path / "snapshot-query.png", 3),
+        library_revision=7,
+    )
+
+    assert result["label"] == "front"
+    assert result["library_revision"] == 7
+
+
 class FakeGeometryCalibrator:
-    def fit(self, image, direction_profile):
+    def prepare_context(self, image):
+        return {"image_shape": image.shape[:2]}
+
+    def fit(self, image, direction_profile, *, context=None):
         if direction_profile.get("fail_marker") == int(image[0, 0, 0]):
             return {"status": "low_confidence", "reason_code": "boundary_not_found", "rules": []}
         mask = np.zeros(image.shape[:2], dtype=np.uint8)
         mask[0, 0] = 255
+        rules = direction_profile.get("rules", [])
         return {
             "status": "active",
             "ignore_mask": mask,
             "ignored_ratio": 1.0 / mask.size,
-            "rules": [{"status": "active", "edge_support": 1.0, "visible_ratio": 1.0}],
+            "rules": [
+                {
+                    "rule_id": rule.get("rule_id"),
+                    "status": "active", "edge_support": 1.0, "visible_ratio": 1.0,
+                }
+                for rule in rules
+            ],
         }
 
 
@@ -136,6 +176,135 @@ def geometry_profile(*, fail_marker=None):
     return {"profile_revision": 3, "directions": directions}
 
 
+def v2_geometry_profile(*, front_r=0.70, back_r=0.64):
+    rule = {
+        "rule_id": "glare", "name": "中心反光", "shape": "circle",
+        "mode": "inside", "margin_ratio": -0.04,
+        "margin_semantics": "signed_boundary_v2", "enabled": True,
+    }
+    anchor = {
+        "shape": "circle", "mode": "auto",
+        "coarse": {"cx": 0.5, "cy": 0.5, "r": 0.45, "angle_deg": 0.0},
+    }
+
+    def direction(side, radius):
+        return {
+            "anchor": anchor,
+            "calibrations": {
+                "glare": {
+                    "state": "ready",
+                    "geometry": {"cx": 0.0, "cy": 0.0, "r": radius, "angle_deg": 0.0},
+                    "seed_geometry": {"cx": 0.0, "cy": 0.0, "r": radius + 0.1, "angle_deg": 0.0},
+                    "reference_template": {
+                        "template_id": f"{side}:00.png", "direction": side,
+                        "width": 360, "height": 360,
+                    },
+                    "diagnostics": {},
+                }
+            },
+            "template_reviews": {},
+            "fill_bgr": [3, 3, 3] if side == "front" else [4, 4, 4],
+        }
+
+    return {
+        "schema_version": 2,
+        "profile_revision": 7,
+        "rules": [rule],
+        "directions": {
+            "front": direction("front", front_r),
+            "back": direction("back", back_r),
+        },
+        "migration": {"source_schema_version": None, "conflicts": [], "resolutions": []},
+    }
+
+
+def test_v2_cache_materializes_same_rule_for_unequal_direction_counts(classifier, tmp_path):
+    front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(5)]
+    back = [write_marker(tmp_path / f"back-{index}.png", 2) for index in range(12)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+
+    cache, report = classifier.prepare_geometry_cache(
+        "m7", record, v2_geometry_profile(), FakeGeometryCalibrator()
+    )
+
+    assert cache.global_vectors["front"].shape[0] == 5
+    assert cache.global_vectors["back"].shape[0] == 12
+    assert {item["rules"][0]["rule_id"] for item in report["front"]} == {"glare"}
+    assert {item["rules"][0]["rule_id"] for item in report["back"]} == {"glare"}
+    assert cache.geometry_profile["schema_version"] == 2
+    assert cache.geometry_profile_revision == 7
+
+
+def test_geometry_prediction_batches_front_and_back_global_embeddings(classifier, tmp_path, monkeypatch):
+    import src.orientation_classifier as classifier_module
+
+    def apply_marker_fill(image, fit, fill_bgr):
+        result = image.copy()
+        result[0, 0] = np.asarray(fill_bgr, dtype=np.uint8)
+        return result
+
+    monkeypatch.setattr(classifier_module, "apply_geometry_fit", apply_marker_fill)
+    front = [write_marker(tmp_path / "front.png", 1)]
+    back = [write_marker(tmp_path / "back.png", 2)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+    cache, _ = classifier.prepare_geometry_cache(
+        "m7", record, v2_geometry_profile(), FakeGeometryCalibrator()
+    )
+    classifier.geometry_calibrator = FakeGeometryCalibrator()
+    classifier.global_predictor.calls = 0
+    classifier.global_predictor.markers.clear()
+    classifier.global_predictor.batch_sizes.clear()
+
+    result = classifier.predict_with_cache(cache, write_marker(tmp_path / "query.png", 3))
+
+    assert result["geometry_mask"]["status"] == "active"
+    assert classifier.global_predictor.calls == 1
+    assert classifier.global_predictor.batch_sizes == [2]
+    assert classifier.global_predictor.markers == [[3, 4]]
+    assert set(result["geometry_mask"]["timings_ms"]) == {
+        "fit_context", "fit_directions", "mask_build",
+        "global_batch", "local_features", "local_matching", "fusion",
+    }
+    assert all(value >= 0.0 for value in result["geometry_mask"]["timings_ms"].values())
+    assert result["local_search"]["mode"] == "adaptive"
+
+
+def test_one_direction_fit_failure_uses_single_raw_baseline(classifier, tmp_path):
+    class BackFailureCalibrator(FakeGeometryCalibrator):
+        def fit(self, image, direction_profile, *, context=None):
+            if direction_profile.get("fill_bgr") == [4, 4, 4]:
+                return {
+                    "status": "low_confidence",
+                    "reason_code": "boundary_not_found",
+                    "rules": [],
+                }
+            return super().fit(image, direction_profile, context=context)
+
+    front = [write_marker(tmp_path / "front.png", 1)]
+    back = [write_marker(tmp_path / "back.png", 2)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+    cache, _ = classifier.prepare_geometry_cache(
+        "m7", record, v2_geometry_profile(), FakeGeometryCalibrator()
+    )
+    classifier.geometry_calibrator = BackFailureCalibrator()
+    classifier.extractor.markers.clear()
+
+    result = classifier.predict_with_cache(cache, write_marker(tmp_path / "query.png", 3))
+
+    assert result["geometry_mask"]["status"] == "low_confidence"
+    assert result["geometry_mask"]["needs_review"] is True
+    assert result["geometry_mask"]["fallback"] == "raw_baseline"
+    assert result["geometry_mask"]["reason_code"] == "GEOMETRY_FALLBACK_TO_BASELINE"
+    assert result["geometry_mask"]["fallback_reason"] == "boundary_not_found"
+    assert result["local_search"]["available_counts"] == {
+        label: len(cache.raw_local_features[label]) for label in ("front", "back")
+    }
+    assert classifier.extractor.markers == [3]
+
+
 def test_active_geometry_profile_builds_directional_template_cache_and_query_features(classifier, tmp_path):
     front = [write_marker(tmp_path / "front-0.png", 1)]
     back = [write_marker(tmp_path / "back-0.png", 2)]
@@ -147,23 +316,79 @@ def test_active_geometry_profile_builds_directional_template_cache_and_query_fea
         "m7", record, geometry_profile(), FakeGeometryCalibrator()
     )
     classifier.set_template_cache("m7", candidate)
+    before_query_local_calls = classifier.extractor.calls
     result = classifier.predict("m7", write_marker(tmp_path / "query.png", 3))
 
     assert candidate.geometry_profile_revision == 3
     assert report["front"][0]["status"] == "active"
     assert report["back"][0]["status"] == "active"
-    assert classifier.global_predictor.markers[-2:] == [7, 7]
-    assert classifier.extractor.markers[-2:] == [7, 7]
+    assert classifier.global_predictor.markers[-1] == [3, 3]
+    assert classifier.extractor.calls == before_query_local_calls + 1
+    assert classifier.extractor.markers[-1] == 3
     assert result["geometry_mask"]["status"] == "active"
     assert result["geometry_mask"]["profile_revision"] == 3
-    assert set(result["geometry_mask"]["timings_ms"]) == {
-        "fit_context", "fit_directions", "mask_build", "global_batch",
-        "local_features", "local_matching", "fusion",
+
+
+def test_geometry_cache_excludes_template_only_from_candidate_side(classifier, tmp_path):
+    front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(2)]
+    back = [write_marker(tmp_path / "back-0.png", 2)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+    profile = geometry_profile()
+    profile["directions"]["front"]["template_reviews"] = {
+        "front:front-1.png": {"state": "excluded", "reason": "轮廓被遮挡"}
     }
-    assert result["local_search"]["mode"] == "adaptive"
+
+    candidate, report = classifier.prepare_geometry_cache(
+        "m7", record, profile, FakeGeometryCalibrator(), None
+    )
+
+    assert candidate.global_vectors["front"].shape[0] == len(record.front_images) - 1
+    assert candidate.raw_global_vectors["front"].shape[0] == len(record.front_images)
+    assert report["front"][1]["review_state"] == "excluded"
 
 
-def test_leave_one_out_scores_cached_candidate_without_feature_reextraction(classifier, tmp_path):
+def test_geometry_cache_rejects_a_side_with_no_included_templates(classifier, tmp_path):
+    front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(2)]
+    back = [write_marker(tmp_path / "back-0.png", 2)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+    profile = geometry_profile()
+    profile["directions"]["front"]["template_reviews"] = {
+        f"front:front-{index}.png": {"state": "excluded", "reason": "不可见"}
+        for index in range(2)
+    }
+
+    with pytest.raises(ValueError, match="front has no included templates"):
+        classifier.prepare_geometry_cache("m7", record, profile, FakeGeometryCalibrator(), None)
+
+
+def test_unsafe_geometry_cache_falls_back_to_raw_baseline(classifier, tmp_path):
+    class UnsafeGeometryCalibrator(FakeGeometryCalibrator):
+        def fit(self, image, direction_profile):
+            result = super().fit(image, direction_profile)
+            result["ignored_ratio"] = 0.60
+            return result
+
+    front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(2)]
+    back = [write_marker(tmp_path / f"back-{index}.png", 2) for index in range(2)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+
+    candidate, _ = classifier.prepare_geometry_cache(
+        "m7", record, geometry_profile(), UnsafeGeometryCalibrator(), None
+    )
+    assert candidate.geometry_unsafe is True
+    classifier.geometry_calibrator = UnsafeGeometryCalibrator()
+    classifier.set_template_cache("m7", candidate)
+
+    result = classifier.predict("m7", write_marker(tmp_path / "query.png", 3))
+
+    assert result["geometry_mask"]["status"] == "unsafe_template_geometry"
+    assert result["needs_review"] is True
+
+
+def test_leave_one_out_reextracts_query_features(classifier, tmp_path):
     front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(2)]
     back = [write_marker(tmp_path / f"back-{index}.png", 2) for index in range(2)]
     cache = classifier.build_template_cache(front, back)
@@ -177,8 +402,167 @@ def test_leave_one_out_scores_cached_candidate_without_feature_reextraction(clas
     assert report["status"] == "completed"
     assert report["evaluated"] == 4
     assert report["correct_to_wrong"] == 0
-    assert classifier.global_predictor.calls == before_global
-    assert classifier.extractor.calls == before_local
+    assert classifier.global_predictor.calls == before_global + 4
+    assert classifier.extractor.calls == before_local + 4
+
+
+def test_paired_leave_one_out_counts_only_baseline_correct_to_candidate_wrong(
+    classifier, tmp_path, monkeypatch
+):
+    front = [
+        write_marker(tmp_path / "front-preexisting-error.png", 4),
+        write_marker(tmp_path / "front-regression.png", 7),
+        write_marker(tmp_path / "front-correct.png", 1),
+    ]
+    back = [
+        write_marker(tmp_path / "back-0.png", 2),
+        write_marker(tmp_path / "back-1.png", 2),
+    ]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    cache = replace(classifier.build_template_cache(front, back), geometry_profile={"directions": {}})
+
+    def prediction(label, *, global_label=None, local_label=None, source="global", geometry=False):
+        result = {
+            "label": label,
+            "global_prediction": global_label or label,
+            "local_prediction": local_label or label,
+            "global_margin": 0.02,
+            "local_margin": 3.9,
+            "decision_source": source,
+            "needs_review": source != "global",
+        }
+        if geometry:
+            result["geometry_mask"] = {"status": "active"}
+        return result
+
+    def baseline(image, *_args, **_kwargs):
+        marker = int(image[0, 0, 0])
+        return prediction({4: "back", 7: "front", 1: "front", 2: "back"}[marker])
+
+    def candidate(image, *_args, **_kwargs):
+        marker = int(image[0, 0, 0])
+        if marker == 7:
+            return prediction(
+                "back", global_label="front", local_label="back",
+                source="local_override", geometry=True,
+            )
+        return prediction(
+            {4: "back", 1: "front", 2: "back"}[marker], geometry=True
+        )
+
+    monkeypatch.setattr(classifier, "_predict_baseline", baseline)
+    monkeypatch.setattr(classifier, "_predict_geometry", candidate)
+
+    report = classifier.leave_one_out_report(record, cache)
+
+    assert report["correct_to_wrong"] == 1
+    assert report["wrong_to_wrong"] == 1
+    assert report["correct_to_correct"] == 3
+    assert report["wrong_to_correct"] == 0
+    assert report["changed_predictions"] == [{
+        "template_id": "front:front-regression.png",
+        "expected": "front",
+        "predicted": "back",
+        "baseline_predicted": "front",
+        "candidate_predicted": "back",
+        "baseline_global_prediction": "front",
+        "baseline_local_prediction": "front",
+        "candidate_global_prediction": "front",
+        "candidate_local_prediction": "back",
+        "candidate_decision_source": "local_override",
+        "candidate_global_margin": 0.02,
+        "candidate_local_margin": 3.9,
+        "cause": "geometry_local_override",
+    }]
+
+
+def test_geometry_local_features_use_raw_image_and_filter_complete_ignore_mask(
+    classifier, tmp_path
+):
+    def features_with_keypoints(image, extractor, _device, roi_ratio=1.0):
+        extractor.calls += 1
+        marker = int(image[0, 0, 0])
+        extractor.markers.append(marker)
+        return {
+            "marker": marker,
+            "keypoints": np.asarray([[[0.0, 0.0], [4.0, 4.0]]], dtype=np.float32),
+            "descriptors": np.asarray([[[1.0], [2.0]]], dtype=np.float32),
+        }
+
+    classifier._extract_features = features_with_keypoints
+    front = [write_marker(tmp_path / "front.png", 1)]
+    back = [write_marker(tmp_path / "back.png", 2)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+
+    candidate, report = classifier.prepare_geometry_cache(
+        "m7", record, geometry_profile(), FakeGeometryCalibrator()
+    )
+
+    assert candidate.local_features["front"][0]["marker"] == 1
+    assert candidate.local_features["back"][0]["marker"] == 2
+    assert classifier._feature_keypoint_count(candidate.local_features["front"][0]) == 1
+    assert classifier._feature_keypoint_count(candidate.local_features["back"][0]) == 1
+    assert report["front"][0]["feature_mask_mode"] == "all_ignored_regions"
+    assert report["front"][0]["keypoints_before"] == 2
+    assert report["front"][0]["keypoints_after"] == 1
+
+
+def test_geometry_query_extracts_raw_local_features_once_then_filters_each_direction(
+    classifier, tmp_path
+):
+    def features_with_keypoints(image, extractor, _device, roi_ratio=1.0):
+        extractor.calls += 1
+        marker = int(image[0, 0, 0])
+        extractor.markers.append(marker)
+        return {
+            "marker": marker,
+            "keypoints": np.asarray([[[0.0, 0.0], [4.0, 4.0]]], dtype=np.float32),
+            "descriptors": np.asarray([[[1.0], [2.0]]], dtype=np.float32),
+        }
+
+    classifier._extract_features = features_with_keypoints
+    front = [write_marker(tmp_path / "front.png", 1)]
+    back = [write_marker(tmp_path / "back.png", 2)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+    candidate, _ = classifier.prepare_geometry_cache(
+        "m7", record, geometry_profile(), FakeGeometryCalibrator()
+    )
+    classifier.geometry_calibrator = FakeGeometryCalibrator()
+    classifier.extractor.markers.clear()
+
+    classifier.predict_with_cache(candidate, write_marker(tmp_path / "query.png", 3))
+
+    assert classifier.extractor.markers == [3]
+
+
+def test_leave_one_out_does_not_block_on_explicitly_excluded_templates(classifier, tmp_path):
+    front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(3)]
+    back = [write_marker(tmp_path / f"back-{index}.png", 2) for index in range(3)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    cache = classifier.build_template_cache(front, back)
+    cache = replace(
+        cache,
+        geometry_template_indices={"front": [1, 2], "back": [0, 1, 2]},
+        geometry_template_report={
+            "front": [
+                {"index": 0, "template_id": "front:front-0.png", "status": "excluded",
+                 "review_state": "excluded"},
+                {"index": 1, "template_id": "front:front-1.png", "status": "active"},
+                {"index": 2, "template_id": "front:front-2.png", "status": "active"},
+            ],
+            "back": [],
+        },
+    )
+    classifier._score_feature_pair = lambda *args: {"score": 1.0}
+
+    report = classifier.leave_one_out_report(record, cache)
+
+    assert report["status"] == "completed"
+    assert report["skipped"] == 0
+    assert report["excluded"] == 1
+    assert report["excluded_templates"] == ["front:front-0.png"]
 
 
 def test_geometry_fit_failure_uses_raw_cache_and_sets_review(classifier, tmp_path):
@@ -191,19 +575,53 @@ def test_geometry_fit_failure_uses_raw_cache_and_sets_review(classifier, tmp_pat
         geometry_profile(fail_marker=3), FakeGeometryCalibrator()
     )
     classifier.set_template_cache("m7", candidate)
-    classifier.extractor.markers.clear()
 
     result = classifier.predict("m7", write_marker(tmp_path / "query.png", 3))
 
     assert result["geometry_mask"]["status"] == "low_confidence"
     assert result["geometry_mask"]["needs_review"] is True
     assert result["needs_review"] is True
-    assert classifier.global_predictor.markers[-1] == 3
+    assert classifier.global_predictor.markers[-1] == [3]
     assert classifier.extractor.markers[-1] == 3
-    assert result["local_search"]["available_counts"] == {
-        label: len(candidate.raw_local_features[label]) for label in ("front", "back")
-    }
-    assert classifier.extractor.markers == [3]
+
+
+def test_needs_reseed_direction_uses_raw_cache_until_preview_succeeds(classifier, monkeypatch):
+    import src.orientation_classifier as classifier_module
+
+    monkeypatch.setattr(
+        classifier_module,
+        "_read_image",
+        lambda path: np.full(
+            (8, 8, 3),
+            1 if "front" in str(path) else (2 if "back" in str(path) else 3),
+            dtype=np.uint8,
+        ),
+    )
+    front = [Path(f"front-{index}.png") for index in range(2)]
+    back = [Path(f"back-{index}.png") for index in range(2)]
+    base = classifier.build_template_cache(front, back)
+    classifier.set_template_cache("m7", base)
+    profile = geometry_profile()
+    profile["directions"]["front"]["rules"][0].update({
+        "enabled": False,
+        "editor_state": "needs_reseed",
+    })
+
+    candidate, report = classifier.prepare_geometry_cache(
+        "m7", SimpleNamespace(front_images=tuple(front), back_images=tuple(back)),
+        profile, FakeGeometryCalibrator(), None
+    )
+
+    np.testing.assert_array_equal(candidate.global_vectors["front"], base.global_vectors["front"])
+    assert candidate.local_features["front"] is base.local_features["front"]
+    assert all(item["status"] == "needs_reseed" for item in report["front"])
+    assert report["back"][0]["status"] == "active"
+    classifier.geometry_calibrator = FakeGeometryCalibrator()
+    classifier.set_template_cache("m7", candidate)
+    result = classifier.predict("m7", Path("query.png"))
+    assert result["geometry_mask"]["status"] == "needs_reseed"
+    assert result["geometry_mask"]["needs_review"] is True
+    assert result["needs_review"] is True
 
 
 def test_low_global_margin_is_overridden_by_decisive_local_evidence(registered_classifier, tmp_path):
@@ -388,10 +806,9 @@ def test_baseline_prediction_exposes_adaptive_search_diagnostics(classifier, tmp
         calls.append((template["label"], template["index"]))
         or {"score": template["score"]}
     )
-    classifier.set_template_cache("m", cache)
 
-    result = classifier.predict(
-        "m", write_marker(tmp_path / "adaptive-query.png", 3)
+    result = classifier.predict_with_cache(
+        cache, write_marker(tmp_path / "adaptive-query.png", 3)
     )
 
     assert result["label"] == "back"
@@ -434,7 +851,6 @@ def test_baseline_exhaustive_search_matches_explicit_full_fusion(tmp_path):
         calls.append((template["label"], template["index"]))
         or {"score": template["score"]}
     )
-    classifier.set_template_cache("m", cache)
     global_scores = {
         "front": float(np.float32(0.9)),
         "back": float(np.float32(0.91)),
@@ -445,8 +861,8 @@ def test_baseline_exhaustive_search_matches_explicit_full_fusion(tmp_path):
         0.0,
     )
 
-    result = classifier.predict(
-        "m", write_marker(tmp_path / "exhaustive-query.png", 3)
+    result = classifier.predict_with_cache(
+        cache, write_marker(tmp_path / "exhaustive-query.png", 3)
     )
 
     assert len(calls) == 25
@@ -508,7 +924,7 @@ def test_geometry_timings_exclude_matching_from_local_features(
     record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
     classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
     cache, _ = classifier.prepare_geometry_cache(
-        "m7", record, geometry_profile(), FakeGeometryCalibrator()
+        "m7", record, v2_geometry_profile(), FakeGeometryCalibrator()
     )
     classifier.geometry_calibrator = FakeGeometryCalibrator()
     now = [100.0]
@@ -539,8 +955,8 @@ def test_geometry_timings_exclude_matching_from_local_features(
     )
     timings = result["geometry_mask"]["timings_ms"]
 
-    assert extraction_calls == [7, 7]
-    assert timings["local_features"] == pytest.approx(20.0)
+    assert extraction_calls == [3]
+    assert timings["local_features"] == pytest.approx(10.0)
     assert timings["local_matching"] == pytest.approx(37.0)
 
 
@@ -586,6 +1002,7 @@ def test_corrupt_template_cache_is_ignored(classifier, tmp_path):
     (record.root / ".template_cache.pkl").write_bytes(b"not a pickle")
 
     assert classifier.load_template_cache(record) is None
+
 
 def make_search_inputs(front_count, back_count, score_for):
     global_vectors = {}

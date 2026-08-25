@@ -1,5 +1,7 @@
 from pathlib import Path
 import json
+import threading
+import time
 
 import cv2
 import numpy as np
@@ -8,7 +10,7 @@ import pytest
 from src.orientation_classifier import OrientationClassifier, TemplateCache
 from src.geometry_mask_profiles import GeometryMaskProfiles
 from src.workpiece_catalog import RestoreConflictError, WorkpieceCatalog
-from src.workpiece_library import WorkpieceLibrary
+from src.workpiece_library import StaleWorkpieceRevisionError, WorkpieceLibrary
 
 
 def image(path: Path, marker: int) -> Path:
@@ -39,8 +41,10 @@ class FakeClassifier:
     def get_template_cache(self, workpiece_id):
         return self.caches.get(workpiece_id)
 
-    def prepare_geometry_cache(self, workpiece_id, record, profile, calibrator=None, progress_callback=None):
-        base = self.caches[workpiece_id]
+    def prepare_geometry_cache(
+        self, workpiece_id, record, profile, calibrator=None, progress_callback=None, *, base_cache=None
+    ):
+        base = base_cache or self.caches[workpiece_id]
         candidate = TemplateCache(
             global_vectors=base.global_vectors,
             local_features=base.local_features,
@@ -54,6 +58,48 @@ class FakeClassifier:
 
     def build_template_cache(self, front, back, progress_callback=None):
         return builder(front, back, progress_callback)
+
+    @staticmethod
+    def leave_one_out_report(record, cache):
+        return {
+            "status": "completed",
+            "correct_to_wrong": 0,
+            "evaluated": len(record.front_images) + len(record.back_images),
+            "skipped": 0,
+            "fit_failures": [],
+            "changed_predictions": [],
+        }
+
+    def prepare_template_masks(self, workpiece_id, ignored_regions, *, base_cache=None):
+        base = base_cache or self.caches[workpiece_id]
+        return TemplateCache(
+            global_vectors=base.global_vectors,
+            local_features=base.local_features,
+            raw_global_vectors=base.raw_global_vectors or base.global_vectors,
+            raw_local_features=base.raw_local_features or base.local_features,
+            ignored_regions=ignored_regions,
+        ), {}
+
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        return {"label": "front", "library_revision": library_revision}
+
+
+class BlockingPredictClassifier(FakeClassifier):
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def _block(self, library_revision=None):
+        self.started.set()
+        assert self.release.wait(2.0)
+        return {"label": "front", "library_revision": library_revision}
+
+    def predict(self, workpiece_id, image_path):
+        return self._block()
+
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        return self._block(library_revision)
 
 
 class CachingFakeClassifier(FakeClassifier):
@@ -76,6 +122,20 @@ class CachingFakeClassifier(FakeClassifier):
         self.save_calls.append((record.id, cache))
 
 
+class SlowAppendClassifier(FakeClassifier):
+    def __init__(self):
+        super().__init__()
+        self.block_appends = False
+        self.build_started = threading.Event()
+        self.release_build = threading.Event()
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.block_appends:
+            self.build_started.set()
+            assert self.release_build.wait(2.0)
+        return super().build_template_cache(front, back, progress_callback)
+
+
 def create_catalog(tmp_path):
     library = WorkpieceLibrary(tmp_path / "library")
     classifier = FakeClassifier()
@@ -84,6 +144,182 @@ def create_catalog(tmp_path):
     back = [image(tmp_path / "back.png", 20)]
     record, _ = catalog.register("M7", front, back, False)
     return catalog, classifier, record
+
+
+def test_predict_releases_catalog_lock_before_classifier_runs(tmp_path):
+    classifier = BlockingPredictClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7",
+        [image(tmp_path / "front-lock.png", 10)],
+        [image(tmp_path / "back-lock.png", 20)],
+        False,
+    )
+    prediction = threading.Thread(
+        target=catalog.predict,
+        args=(record.id, tmp_path / "query-lock.png"),
+    )
+    captured = []
+    reader = threading.Thread(target=lambda: captured.append(catalog.capture_snapshot(record.id)))
+
+    prediction.start()
+    assert classifier.started.wait(1.0)
+    reader.start()
+    reader.join(timeout=0.2)
+    try:
+        assert not reader.is_alive()
+        assert captured[0].record.revision == record.revision
+    finally:
+        classifier.release.set()
+        prediction.join(timeout=1.0)
+        reader.join(timeout=1.0)
+
+
+def test_append_build_does_not_block_prediction_and_swaps_revision_after_commit(tmp_path):
+    classifier = SlowAppendClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7",
+        [image(tmp_path / "front-slow.png", 10)],
+        [image(tmp_path / "back-slow.png", 20)],
+        False,
+    )
+    classifier.block_appends = True
+    appended = []
+    append_errors = []
+    def append():
+        try:
+            appended.append(catalog.append_templates(
+                record.id,
+                [image(tmp_path / "front-confirmed.png", 11)],
+                [],
+                operation_id="append-nonblocking",
+            ))
+        except Exception as exc:
+            append_errors.append(exc)
+
+    append_thread = threading.Thread(target=append)
+    prediction = []
+    prediction_thread = threading.Thread(
+        target=lambda: prediction.append(catalog.predict(record.id, tmp_path / "query.png"))
+    )
+
+    append_thread.start()
+    assert classifier.build_started.wait(1.0)
+    prediction_thread.start()
+    prediction_thread.join(timeout=0.2)
+    try:
+        assert not prediction_thread.is_alive()
+        assert prediction[0]["library_revision"] == record.revision
+    finally:
+        classifier.release_build.set()
+        append_thread.join(timeout=2.0)
+        prediction_thread.join(timeout=1.0)
+
+    assert not append_errors
+    assert appended
+    assert catalog.predict(record.id, tmp_path / "query-after.png")["library_revision"] == record.revision + 1
+
+
+@pytest.mark.parametrize("front_count,back_count", [(1, 1), (5, 10), (10, 15), (35, 35)])
+def test_prediction_stays_available_during_sized_background_append(
+    tmp_path, front_count, back_count
+):
+    classifier = SlowAppendClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    front = [
+        image(tmp_path / f"front-{index:02d}.png", index + 1)
+        for index in range(front_count)
+    ]
+    back = [
+        image(tmp_path / f"back-{index:02d}.png", index + 101)
+        for index in range(back_count)
+    ]
+    record, _ = catalog.register(f"M-{front_count}-{back_count}", front, back, False)
+
+    idle_started = time.perf_counter()
+    idle_result = catalog.predict(record.id, tmp_path / "idle-query.png")
+    idle_elapsed_ms = (time.perf_counter() - idle_started) * 1000.0
+
+    classifier.block_appends = True
+    append_errors = []
+    append_results = []
+    append_done = threading.Event()
+    background_started = time.perf_counter()
+
+    def append():
+        try:
+            append_results.append(
+                catalog.append_templates(
+                    record.id,
+                    [image(tmp_path / "confirmed.png", 240)],
+                    [],
+                    operation_id=f"append-{front_count}-{back_count}",
+                )
+            )
+        except Exception as exc:
+            append_errors.append(exc)
+        finally:
+            append_done.set()
+
+    append_thread = threading.Thread(target=append)
+    append_thread.start()
+    assert classifier.build_started.wait(10.0)
+
+    online_arrived = time.perf_counter()
+    concurrent_result = catalog.predict(record.id, tmp_path / "online-query.png")
+    concurrent_elapsed_ms = (time.perf_counter() - online_arrived) * 1000.0
+    assert append_thread.is_alive()
+    assert idle_result["library_revision"] == record.revision
+    assert concurrent_result["library_revision"] == record.revision
+
+    classifier.release_build.set()
+    assert append_done.wait(30.0)
+    append_thread.join(timeout=1.0)
+    background_elapsed_ms = (time.perf_counter() - background_started) * 1000.0
+
+    assert not append_thread.is_alive()
+    assert not append_errors
+    assert append_results
+    updated_revision = catalog.capture_snapshot(record.id).record.revision
+    assert updated_revision == record.revision + 1
+    print(
+        "snapshot_timing "
+        f"templates={front_count}+{back_count} "
+        f"idle_prediction_ms={idle_elapsed_ms:.3f} "
+        f"online_during_append_ms={concurrent_elapsed_ms:.3f} "
+        f"service_arrival_to_result_ms={concurrent_elapsed_ms:.3f} "
+        f"background_append_ms={background_elapsed_ms:.3f} "
+        f"revision={record.revision}->{updated_revision}"
+    )
+
+
+def test_catalog_rejects_second_prepared_append_from_same_base_revision(tmp_path):
+    catalog, _, record = create_catalog(tmp_path)
+    first = catalog.library.prepare_append(
+        record,
+        [image(tmp_path / "first-confirmed.png", 11)],
+        [],
+        catalog.classifier.build_template_cache,
+        operation_id="append-first",
+    )
+    second = catalog.library.prepare_append(
+        record,
+        [image(tmp_path / "second-confirmed.png", 12)],
+        [],
+        catalog.classifier.build_template_cache,
+        operation_id="append-second",
+    )
+    try:
+        committed = catalog.commit_prepared_append(first, first.candidate_cache)
+        with pytest.raises(StaleWorkpieceRevisionError, match="revision changed"):
+            catalog.commit_prepared_append(second, second.candidate_cache)
+        snapshot = catalog.capture_snapshot(record.id)
+        assert committed.revision == record.revision + 1
+        assert len(snapshot.record.front_images) == len(record.front_images) + 1
+    finally:
+        catalog.library.abort_prepared(first)
+        catalog.library.abort_prepared(second)
 
 
 def test_recycle_removes_prediction_and_restore_republishes_same_workpiece(tmp_path):
@@ -158,6 +394,39 @@ def test_annotation_snapshot_contains_template_metadata_and_revision(tmp_path):
     assert document["groups"] == []
 
 
+def test_annotation_commit_publishes_updated_runtime_snapshot_revision(tmp_path):
+    catalog, _, record = create_catalog(tmp_path)
+    original_cache = catalog.capture_snapshot(record.id).cache
+
+    result = catalog.commit_annotation_document(
+        record.id,
+        [],
+        expected_revision=record.revision,
+        operation_id="annotation-revision-snapshot",
+    )
+
+    snapshot = catalog.capture_snapshot(record.id)
+    assert snapshot.record.revision == result["revision"] == record.revision + 1
+    assert snapshot.cache is original_cache
+    assert catalog.predict(record.id, tmp_path / "query.png")["library_revision"] == result["revision"]
+
+
+def test_legacy_annotation_save_publishes_masked_runtime_snapshot(tmp_path):
+    catalog, classifier, record = create_catalog(tmp_path)
+    group = _active_legacy_group()
+
+    result = catalog.save_annotations(
+        record.id,
+        [group],
+        operation_id="legacy-save-snapshot",
+    )
+
+    snapshot = catalog.capture_snapshot(record.id)
+    assert snapshot.record.revision == result["revision"] == record.revision + 1
+    assert snapshot.cache.ignored_regions["front"][0]
+    assert classifier.get_template_cache(record.id) is snapshot.cache
+
+
 def test_prepare_template_masks_returns_unpublished_candidate_with_snapshot_statistics():
     classifier = OrientationClassifier.__new__(OrientationClassifier)
     original = TemplateCache(
@@ -171,13 +440,19 @@ def test_prepare_template_masks_returns_unpublished_candidate_with_snapshot_stat
             "back": [{}],
         },
     )
-    classifier._template_caches = {"m7": original}
+    mapped = TemplateCache(
+        global_vectors=original.global_vectors,
+        local_features={"front": [{"keypoints": np.empty((1, 0, 2), dtype=np.float32)}], "back": [{}]},
+    )
+    classifier._template_caches = {"m7": mapped}
     ignored_regions = {"front": [[{"x": 0, "y": 0, "width": 4, "height": 4}]], "back": [[]]}
 
-    candidate, statistics = classifier.prepare_template_masks("m7", ignored_regions)
+    candidate, statistics = classifier.prepare_template_masks(
+        "m7", ignored_regions, base_cache=original
+    )
     ignored_regions["front"][0][0]["x"] = 99
 
-    assert classifier.get_template_cache("m7") is original
+    assert classifier.get_template_cache("m7") is mapped
     assert candidate is not original
     assert candidate.local_features["front"][0]["keypoints"].shape == (1, 1, 2)
     assert statistics["front"][0] == {
@@ -203,6 +478,58 @@ def test_catalog_recover_uses_classifier_cache_before_rebuilding(tmp_path):
     assert classifier.build_calls == 0
 
 
+def test_recover_does_not_hold_catalog_lock_during_geometry_rebuild(tmp_path):
+    initial = WorkpieceLibrary(tmp_path / "library")
+    record, _ = initial.register(
+        "M7",
+        [image(tmp_path / "recover-front.png", 10)],
+        [image(tmp_path / "recover-back.png", 20)],
+        False,
+        builder,
+    )
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+
+    class BlockingProfiles:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def rebuild_active_cache(self, workpiece_id, candidate_record):
+            self.started.set()
+            assert self.release.wait(2.0)
+            return None
+
+        def sync_library_revision(self, candidate_record):
+            return None
+
+    profiles = BlockingProfiles()
+    catalog.set_geometry_profiles(profiles)
+    recover_errors = []
+
+    def recover():
+        try:
+            catalog.recover()
+        except Exception as exc:
+            recover_errors.append(exc)
+
+    recovery = threading.Thread(target=recover)
+    recovery.start()
+    assert profiles.started.wait(1.0)
+    captured = []
+    reader = threading.Thread(target=lambda: captured.append(catalog.capture_snapshot(record.id)))
+    reader.start()
+    reader.join(timeout=0.2)
+    try:
+        assert not reader.is_alive()
+        assert captured[0].record.revision == record.revision
+    finally:
+        profiles.release.set()
+        recovery.join(timeout=2.0)
+        reader.join(timeout=1.0)
+    assert not recover_errors
+
+
 def test_catalog_persists_cache_after_register_append_and_restore(tmp_path):
     classifier = CachingFakeClassifier()
     catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
@@ -218,16 +545,39 @@ def test_catalog_persists_cache_after_register_append_and_restore(tmp_path):
 
 
 def _geometry_profile():
+    anchor = {
+        "shape": "ellipse",
+        "mode": "auto",
+        "coarse": {
+            "cx": 0.5, "cy": 0.5, "rx": 0.4, "ry": 0.4, "angle_deg": 0.0,
+        },
+    }
+    calibration = {
+        "state": "ready",
+        "geometry": {"cx": 0.0, "cy": 0.0, "r": 0.5, "angle_deg": 0.0},
+        "seed_geometry": {"cx": 0.0, "cy": 0.0, "r": 0.5, "angle_deg": 0.0},
+        "diagnostics": {},
+    }
     return {
+        "schema_version": 2,
+        "rules": [{
+            "rule_id": "glare", "name": "反光", "shape": "circle",
+            "mode": "inside", "margin_ratio": 0.02,
+            "margin_semantics": "signed_boundary_v2", "enabled": True,
+        }],
         "directions": {
             "front": {
-                "anchor": {"shape": "ellipse", "coarse": {"cx": 0.5, "cy": 0.5, "rx": 0.4, "ry": 0.4}},
-                "rules": [{"rule_id": "glare", "name": "反光", "shape": "circle",
-                           "geometry": {"r": 0.5}, "mode": "inside", "margin_ratio": 0.02,
-                           "enabled": True}],
+                "anchor": anchor,
+                "calibrations": {"glare": calibration},
+                "template_reviews": {},
             },
-            "back": {"anchor": None, "rules": []},
-        }
+            "back": {
+                "anchor": anchor,
+                "calibrations": {"glare": calibration},
+                "template_reviews": {},
+            },
+        },
+        "migration": {"source_schema_version": None, "conflicts": [], "resolutions": []},
     }
 
 
@@ -270,3 +620,120 @@ def test_recover_rebuilds_active_geometry_cache_and_archives_legacy_masks(tmp_pa
     assert cache.geometry_profile_revision == 1
     assert cache.ignored_regions in ({}, None)
     assert restarted_catalog.get_annotation_snapshot(record.id)["legacy_archived"] is True
+
+
+def test_append_preserves_active_geometry_and_updates_staged_library_revision(tmp_path):
+    catalog, classifier, record = create_catalog(tmp_path)
+    profiles = GeometryMaskProfiles(
+        catalog,
+        calibrator=object(),
+        start_worker=False,
+        storage_dir=tmp_path / "geometry-append-jobs",
+    )
+    catalog.set_geometry_profiles(profiles)
+    draft = profiles.save_draft(
+        record.id,
+        _geometry_profile(),
+        expected_library_revision=record.revision,
+        expected_draft_revision=0,
+        operation_id="append-geometry-draft",
+    )
+    job = profiles.start_validation(
+        record.id,
+        expected_library_revision=record.revision,
+        expected_draft_revision=draft["draft_revision"],
+        operation_id="append-geometry-validate",
+    )
+    profiles.run_next(force=True)
+    profiles.publish(
+        record.id,
+        job["job_id"],
+        expected_library_revision=record.revision,
+        expected_draft_revision=draft["draft_revision"],
+        operation_id="append-geometry-publish",
+    )
+    published_record = catalog.get(record.id)
+    revision_path = published_record.root / "geometry_masks" / "revisions" / "1.json"
+    immutable_revision = revision_path.read_bytes()
+
+    appended, _ = catalog.append_templates(
+        record.id,
+        [image(tmp_path / "geometry-confirmed.png", 11)],
+        [],
+        operation_id="append-with-geometry",
+    )
+
+    snapshot = catalog.capture_snapshot(record.id)
+    profile_document = json.loads(
+        (appended.root / "geometry_masks" / "profile.json").read_text(encoding="utf-8")
+    )
+    assert snapshot.record.revision == published_record.revision + 1
+    assert snapshot.cache.geometry_profile_revision == 1
+    assert profile_document["library_revision"] == snapshot.record.revision
+    assert revision_path.read_bytes() == immutable_revision
+    assert classifier.get_template_cache(record.id) is snapshot.cache
+
+
+def _active_legacy_group():
+    return {
+        "group_id": "legacy", "name": "旧标注", "enabled": True,
+        "propagation": {"state": "active"},
+        "annotations": [{
+            "orientation": "front", "index": 0, "status": "active",
+            "regions": [{"x": 0, "y": 0, "width": 2, "height": 2}],
+        }],
+    }
+
+
+def test_recover_applies_active_legacy_groups_when_geometry_manager_exists(tmp_path):
+    catalog, _, record = create_catalog(tmp_path)
+    group = _active_legacy_group()
+    catalog.commit_annotation_document(
+        record.id, [group], expected_revision=record.revision,
+        operation_id="legacy-active", active_groups=[group],
+    )
+    restarted_classifier = FakeClassifier()
+    restarted_catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), restarted_classifier)
+    profiles = GeometryMaskProfiles(restarted_catalog, start_worker=False,
+                                    storage_dir=tmp_path / "geometry-jobs")
+    restarted_catalog.set_geometry_profiles(profiles)
+
+    restarted_catalog.recover()
+
+    cache = restarted_classifier.get_template_cache(record.id)
+    assert cache.ignored_regions
+    assert cache.geometry_profile is None
+
+
+def test_first_geometry_publish_can_rollback_to_legacy_cache(tmp_path):
+    catalog, classifier, record = create_catalog(tmp_path)
+    group = _active_legacy_group()
+    catalog.commit_annotation_document(
+        record.id, [group], expected_revision=record.revision,
+        operation_id="legacy-active", active_groups=[group],
+    )
+    record = catalog.get(record.id)
+    profiles = GeometryMaskProfiles(catalog, calibrator=object(), start_worker=False,
+                                    storage_dir=tmp_path / "jobs")
+    catalog.set_geometry_profiles(profiles)
+    draft = profiles.save_draft(
+        record.id, _geometry_profile(), expected_library_revision=record.revision,
+        expected_draft_revision=0, operation_id="draft-geometry",
+    )
+    job = profiles.start_validation(
+        record.id, expected_library_revision=record.revision,
+        expected_draft_revision=draft["draft_revision"], operation_id="validate-geometry",
+    )
+    profiles.run_next(force=True)
+    published = profiles.publish(
+        record.id, job["job_id"], expected_library_revision=record.revision,
+        expected_draft_revision=draft["draft_revision"], operation_id="publish-geometry",
+    )
+    assert published["active_revision"] == 1
+
+    rolled = profiles.rollback(
+        record.id, expected_library_revision=record.revision + 1,
+        operation_id="rollback-legacy",
+    )
+    assert rolled["active_revision"] is None
+    assert classifier.get_template_cache(record.id).ignored_regions

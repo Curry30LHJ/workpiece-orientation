@@ -27,9 +27,12 @@ class JsonClient:
         request = {"version": 1, "request_id": str(uuid.uuid4()), "command": command, **fields}
         self.file.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
         self.file.flush()
-        response = json.loads(self.file.readline().decode("utf-8"))
-        assert response["request_id"] == request["request_id"]
-        return response
+        while True:
+            response = json.loads(self.file.readline().decode("utf-8"))
+            assert response["request_id"] == request["request_id"]
+            if response.get("event") == "progress":
+                continue
+            return response
 
     def close(self):
         self.file.close()
@@ -69,9 +72,10 @@ def integration_settings() -> dict[str, Path | str]:
     return {"root": root, "model_dir": model_dir, "python": python_executable}
 
 
-@pytest.fixture
-def running_service(integration_settings, tmp_path: Path):
+@pytest.fixture(scope="session")
+def running_service(integration_settings, tmp_path_factory):
     root = Path(integration_settings["root"])
+    tmp_path = tmp_path_factory.mktemp("orientation-service-integration")
     port = _free_port()
     library_dir = tmp_path / "运行时工件库"
     command = [
@@ -149,6 +153,7 @@ def test_service_label_matches_dataset_orientation(dataset_name: str, running_se
         replace=False,
         front_images=front[:5],
         back_images=back[:5],
+        progress_events=True,
     )
     assert response["ok"] is True, response
     workpiece_id = response["workpiece"]["id"]

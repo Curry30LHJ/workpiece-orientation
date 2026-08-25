@@ -15,7 +15,7 @@ import uuid
 from typing import Any, Callable, Sequence
 
 from src.image_io import read_color_image
-from src.orientation_classifier import TemplateCache
+from src.orientation_classifier import TEMPLATE_CACHE_FILE_NAME, TemplateCache
 
 
 LOGGER = logging.getLogger(__name__)
@@ -55,6 +55,21 @@ class WorkpieceRecord:
     back_images: tuple[Path, ...]
     revision: int = 1
     state: str = "active"
+
+
+@dataclass
+class PreparedTemplateUpdate:
+    """Own a fully built template update until commit or abort."""
+
+    operation_id: str
+    workpiece_id: str
+    base_revision: int
+    base_root: Path
+    staging_root: Path
+    staged_record: WorkpieceRecord
+    candidate_cache: TemplateCache
+    item_digests: tuple[str, ...]
+    consumed: bool = False
 
 
 CacheProgressCallback = Callable[[str, int, int], None]
@@ -335,22 +350,47 @@ class WorkpieceLibrary:
                 shutil.rmtree(staging)
             raise
 
-    def append_templates(
+    def prepare_append(
         self,
-        workpiece_id: str,
+        base_record: WorkpieceRecord,
         front_images: Sequence[Path],
         back_images: Sequence[Path],
         build_cache: CacheBuilder,
         *,
+        operation_id: str,
         progress_callback: ProgressCallback | None = None,
-    ) -> tuple[WorkpieceRecord, TemplateCache]:
-        """Append confirmed templates while preserving the workpiece identity."""
-        existing = self._records[workpiece_id]
+    ) -> PreparedTemplateUpdate:
+        """Build a complete append candidate without mutating the active record."""
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a non-empty string")
+        existing = self._records.get(base_record.id)
+        if (
+            existing is None
+            or existing.revision != base_record.revision
+            or existing.root != base_record.root
+        ):
+            raise StaleWorkpieceRevisionError(
+                f"Workpiece revision changed: expected {base_record.revision}"
+            )
         if not front_images and not back_images:
             raise InvalidTemplateSetError("At least one confirmed template is required")
-        total = len(existing.front_images) + len(existing.back_images) + len(front_images) + len(back_images)
+        total = (
+            len(base_record.front_images)
+            + len(base_record.back_images)
+            + len(front_images)
+            + len(back_images)
+        )
+
+        def report(event: dict[str, Any]) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(event)
+            except Exception:
+                LOGGER.debug("Ignoring append progress callback failure", exc_info=True)
+
         seen_images: dict[str, Path] = {}
-        for path in (*existing.front_images, *existing.back_images):
+        for path in (*base_record.front_images, *base_record.back_images):
             image = read_color_image(path)
             if image is None:
                 raise InvalidTemplateSetError(f"Unreadable existing template: {path}")
@@ -359,54 +399,163 @@ class WorkpieceLibrary:
             seen_images[f"content:{_image_fingerprint(image)}"] = resolved
         new_front = _validate_images(front_images, "front", seen_images) if front_images else ()
         new_back = _validate_images(back_images, "back", seen_images) if back_images else ()
-        all_front = tuple(existing.front_images) + new_front
-        all_back = tuple(existing.back_images) + new_back
+        all_front = tuple(base_record.front_images) + new_front
+        all_back = tuple(base_record.back_images) + new_back
+        item_digests = tuple(
+            _image_fingerprint(read_color_image(path))
+            for path in (*new_front, *new_back)
+        )
         staging = self.library_dir / f".staging-{uuid.uuid4().hex}"
-        backup_root: Path | None = None
-        staging.mkdir(parents=True, exist_ok=False)
         try:
+            report({"phase": "copying", "completed": 0, "total": total})
+            shutil.copytree(base_record.root, staging)
+            shutil.rmtree(staging / "0")
+            shutil.rmtree(staging / "1")
+            (staging / TEMPLATE_CACHE_FILE_NAME).unlink(missing_ok=True)
             staged_front = self._copy_templates(all_front, staging / "0")
             staged_back = self._copy_templates(all_back, staging / "1")
-            manifest = json.loads((existing.root / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
             manifest.update(
                 {
-                    "schema_version": max(2, int(manifest.get("schema_version", 1))),
-                    "id": existing.id,
-                    "name": existing.name,
+                    "schema_version": max(3, int(manifest.get("schema_version", 1))),
+                    "id": base_record.id,
+                    "name": base_record.name,
                     "labels": {"0": "front", "1": "back"},
                     "template_counts": {"front": len(all_front), "back": len(all_back)},
-                    "revision": existing.revision + 1,
+                    "revision": base_record.revision + 1,
                     "state": "active",
                     "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "last_template_update": {
+                        "operation_id": operation_id,
+                        "base_revision": base_record.revision,
+                        "target_revision": base_record.revision + 1,
+                        "item_digests": list(item_digests),
+                    },
                 }
             )
             (staging / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            cache = build_cache(staged_front, staged_back, None)
-            backup_root = self.library_dir / f".backup-{uuid.uuid4().hex}"
-            os.replace(existing.root, backup_root)
-            os.replace(staging, existing.root)
-            record = WorkpieceRecord(
-                existing.id,
-                existing.name,
-                existing.root,
-                tuple(existing.root / "0" / path.name for path in staged_front),
-                tuple(existing.root / "1" / path.name for path in staged_back),
-                existing.revision + 1,
+            report({"phase": "features", "completed": 0, "total": total})
+
+            def cache_progress(label: str, completed: int, side_total: int) -> None:
+                offset = len(all_front) if label == "back" else 0
+                report({"phase": "features", "completed": offset + completed, "total": total})
+
+            cache = build_cache(staged_front, staged_back, cache_progress)
+            staged_record = WorkpieceRecord(
+                base_record.id,
+                base_record.name,
+                staging,
+                staged_front,
+                staged_back,
+                base_record.revision + 1,
                 "active",
             )
-            self._records[workpiece_id] = record
-            shutil.rmtree(backup_root)
-            return record, cache
+            return PreparedTemplateUpdate(
+                operation_id=operation_id,
+                workpiece_id=base_record.id,
+                base_revision=base_record.revision,
+                base_root=base_record.root,
+                staging_root=staging,
+                staged_record=staged_record,
+                candidate_cache=cache,
+                item_digests=item_digests,
+            )
         except Exception:
-            if existing.root.exists() and backup_root is not None and backup_root.exists():
-                shutil.rmtree(existing.root)
-            if backup_root is not None and backup_root.exists() and not existing.root.exists():
-                os.replace(backup_root, existing.root)
             if staging.exists():
                 shutil.rmtree(staging)
             raise
+
+    def commit_prepared(
+        self,
+        prepared: PreparedTemplateUpdate,
+    ) -> tuple[WorkpieceRecord, Path | None]:
+        """Commit a prepared directory using only checked atomic renames."""
+        if prepared.consumed:
+            raise StaleWorkpieceRevisionError("Prepared template update was already consumed")
+        current = self._records.get(prepared.workpiece_id)
+        if (
+            current is None
+            or current.revision != prepared.base_revision
+            or current.root != prepared.base_root
+            or not current.root.exists()
+        ):
+            raise StaleWorkpieceRevisionError(
+                f"Workpiece revision changed: expected {prepared.base_revision}"
+            )
+        if not prepared.staging_root.exists():
+            raise StaleWorkpieceRevisionError("Prepared template staging directory is missing")
+        backup_root = self.library_dir / f".backup-{uuid.uuid4().hex}"
+        final_root = current.root
+        committed = WorkpieceRecord(
+            current.id,
+            current.name,
+            final_root,
+            tuple(final_root / "0" / path.name for path in prepared.staged_record.front_images),
+            tuple(final_root / "1" / path.name for path in prepared.staged_record.back_images),
+            prepared.staged_record.revision,
+            "active",
+        )
+        os.replace(final_root, backup_root)
+        try:
+            os.replace(prepared.staging_root, final_root)
+        except Exception:
+            os.replace(backup_root, final_root)
+            raise
+        self._records[prepared.workpiece_id] = committed
+        prepared.consumed = True
+        return committed, backup_root
+
+    def abort_prepared(self, prepared: PreparedTemplateUpdate) -> None:
+        """Discard a prepared update; repeated calls are safe."""
+        if prepared.consumed:
+            return
+        staging = prepared.staging_root.resolve()
+        library_root = self.library_dir.resolve()
+        if staging.parent != library_root or not staging.name.startswith(".staging-"):
+            raise WorkpieceLibraryError(f"Invalid staging directory: {staging}")
+        if staging.exists():
+            shutil.rmtree(staging)
+        prepared.consumed = True
+
+    def remove_retired(self, retired_root: Path | None) -> None:
+        """Remove the exact backup returned by commit after publication unlocks."""
+        if retired_root is None:
+            return
+        retired = Path(retired_root).resolve()
+        library_root = self.library_dir.resolve()
+        if retired.parent != library_root or not retired.name.startswith(".backup-"):
+            raise WorkpieceLibraryError(f"Invalid retired directory: {retired}")
+        if retired.exists():
+            shutil.rmtree(retired)
+
+    def append_templates(
+        self,
+        workpiece_id: str,
+        front_images: Sequence[Path],
+        back_images: Sequence[Path],
+        build_cache: CacheBuilder,
+        *,
+        operation_id: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[WorkpieceRecord, TemplateCache]:
+        """Compatibility wrapper around prepare, commit, and retired cleanup."""
+        prepared = self.prepare_append(
+            self._records[workpiece_id],
+            front_images,
+            back_images,
+            build_cache,
+            operation_id=operation_id or uuid.uuid4().hex,
+            progress_callback=progress_callback,
+        )
+        try:
+            record, retired = self.commit_prepared(prepared)
+        except Exception:
+            self.abort_prepared(prepared)
+            raise
+        self.remove_retired(retired)
+        return record, prepared.candidate_cache
 
     def recover(
         self,
