@@ -2,12 +2,14 @@
 #include <QCoreApplication>
 
 #include "appconfig.h"
+#include "apptheme.h"
 #include "backendclient.h"
 #include "backendprocessmanager.h"
 #include "mainwindow.h"
 
 int main(int argc, char *argv[]) {
     QApplication application(argc, argv);
+    AppTheme::apply(&application);
     application.setApplicationName(QStringLiteral("工件正反面检测"));
     const QString configPath = QCoreApplication::applicationDirPath() + QStringLiteral("/app_config.json");
     QString configError;

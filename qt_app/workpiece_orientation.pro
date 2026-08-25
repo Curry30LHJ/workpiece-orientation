@@ -6,6 +6,7 @@ QMAKE_CXXFLAGS += /utf-8
 
 SOURCES += \
     main.cpp \
+    apptheme.cpp \
     appconfig.cpp \
     backendclient.cpp \
     backendprocessmanager.cpp \
@@ -15,10 +16,12 @@ SOURCES += \
     geometrymaskmanager.cpp \
     annotationcanvas.cpp \
     annotationmanager.cpp \
-    annotationeditor.cpp
+    annotationeditor.cpp \
+    taskstatuswidget.cpp
 
 HEADERS += \
     appconfig.h \
+    apptheme.h \
     backendclient.h \
     backendprocessmanager.h \
     processlauncher.h \
@@ -27,6 +30,9 @@ HEADERS += \
     geometrymaskmanager.h \
     annotationcanvas.h \
     annotationmanager.h \
-    annotationeditor.h
+    annotationeditor.h \
+    taskstatuswidget.h
 
 FORMS += mainwindow.ui
+
+RESOURCES += resources.qrc
