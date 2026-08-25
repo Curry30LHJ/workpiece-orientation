@@ -60,6 +60,7 @@ InspectionPage::InspectionPage(QWidget *parent)
             ui->rawEvidenceTextEdit, &QWidget::setVisible);
     connect(ui->inspectionImageView, &InspectionImageView::imageDropped,
             this, [this](const QString &path) {
+                if (batchRunning_) return;
                 setMode(InspectionMode::Single);
                 setSingleImagePath(path);
             });
@@ -133,6 +134,7 @@ const InspectionPage::ModeState &InspectionPage::activeState() const {
 
 void InspectionPage::setMode(InspectionMode mode) {
     if (mode_ == mode) return;
+    if (batchRunning_ && mode != InspectionMode::Batch) return;
     mode_ = mode;
     renderActiveState();
 }
@@ -167,6 +169,7 @@ void InspectionPage::setBackendAvailable(bool available, bool busy, const QStrin
 }
 
 void InspectionPage::setSingleImagePath(const QString &path) {
+    if (batchRunning_) return;
     ModeState &state = activeState();
     state.imagePath = QFileInfo(path).absoluteFilePath();
     state.hasRecord = false;
@@ -261,6 +264,10 @@ QStringList InspectionPage::batchRecordIds() const {
     return batchRecordOrder_;
 }
 
+InspectionRecord InspectionPage::recordForId(const QString &recordId) const {
+    return batchRecords_.value(recordId);
+}
+
 void InspectionPage::requestBatchStop() {
     if (!batchRunning_) return;
     stopRequested_ = true;
@@ -299,7 +306,6 @@ void InspectionPage::setRecordDisposition(const QString &recordId,
         InspectionRecord record = batchRecords_.value(recordId);
         record.disposition = disposition;
         if (!evolutionJobId.isEmpty()) record.evolutionJobId = evolutionJobId;
-        record.error = error;
         record.submissionError = error;
         batchRecords_.insert(recordId, record);
         if (selectedRecordId_ == recordId) {
@@ -308,7 +314,9 @@ void InspectionPage::setRecordDisposition(const QString &recordId,
         }
         rebuildBatchTable();
         updateBatchSummary();
-        if (selectedRecordId_ == recordId
+        if (disposition == BatchDisposition::SubmitFailed && matchesFilter(record)) {
+            selectBatchRecord(recordId, false);
+        } else if (selectedRecordId_ == recordId
             && (disposition == BatchDisposition::QueuedFront
                 || disposition == BatchDisposition::QueuedBack
                 || disposition == BatchDisposition::Rejected)) {
@@ -493,8 +501,7 @@ void InspectionPage::handleBackendResponse(const QString &command,
                 record.response.insert(QStringLiteral("evolution_state"), state);
                 if (state == QStringLiteral("failed")) {
                     record.disposition = BatchDisposition::SubmitFailed;
-                    record.error = job.value(QStringLiteral("error")).toString();
-                    record.submissionError = record.error;
+                    record.submissionError = job.value(QStringLiteral("error")).toString();
                 }
                 batchRecords_.insert(recordId, record);
                 if (selectedRecordId_ == recordId) batchState_.visibleRecord = record;
@@ -991,13 +998,13 @@ QString InspectionPage::dispositionText(const InspectionRecord &record) const {
             ? QStringLiteral("提交失败") : QStringLiteral("写入失败");
     }
     if (record.disposition == BatchDisposition::Rejected) return QStringLiteral("不入库");
-    if (record.disposition == BatchDisposition::QueuedFront) return QStringLiteral("正面已排队");
-    if (record.disposition == BatchDisposition::QueuedBack) return QStringLiteral("反面已排队");
     if (record.disposition == BatchDisposition::Submitting
         || evolutionState == QStringLiteral("running")) {
         return QStringLiteral("正在更新缓存");
     }
     if (evolutionState == QStringLiteral("completed")) return QStringLiteral("已参与预测");
+    if (record.disposition == BatchDisposition::QueuedFront) return QStringLiteral("正面已排队");
+    if (record.disposition == BatchDisposition::QueuedBack) return QStringLiteral("反面已排队");
     if (!record.completedAt.isValid()) return QStringLiteral("待检测");
     return QStringLiteral("等待写入");
 }

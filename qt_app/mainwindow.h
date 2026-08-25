@@ -2,6 +2,7 @@
 
 #include <QMainWindow>
 #include <QElapsedTimer>
+#include <QHash>
 #include <QJsonObject>
 #include <QPointer>
 #include <QJsonArray>
@@ -92,7 +93,7 @@ private slots:
     void onClientTransportFailed(const QString &code, const QString &message);
 
 private:
-    enum class CommandOwner { None, System, Inspection, Library, Geometry };
+    enum class CommandOwner { None, System, UserRefresh, Inspection, Library, Geometry };
 
     enum class ResultContext {
         None,
@@ -113,7 +114,9 @@ private:
     void clearBatchState();
     void clearBatchResults();
     void sendRegistration(bool replace);
-    void requestWorkpieceRefresh(bool preserveRegistrationSummary);
+    void requestWorkpieceRefresh(bool preserveRegistrationSummary,
+                                 CommandOwner owner = CommandOwner::System);
+    void dispatchDeferredUserRefresh();
     void submitTemplateConfirmation(const QString &workpieceId, const QString &imagePath,
                                     const QString &orientation);
     void startRegistrationProgress();
@@ -150,6 +153,7 @@ private:
     bool pendingReplace_ = false;
     bool registrationInFlight_ = false;
     bool registrationSummaryVisible_ = false;
+    bool deferredUserWorkpieceRefresh_ = false;
     bool batchInFlight_ = false;
     bool backendReady_ = false;
     bool backendReadyHandled_ = false;
@@ -182,6 +186,8 @@ private:
     QString pendingPredictionImagePath_;
     QString pendingConfirmationRecordId_;
     QString pendingConfirmationOrientation_;
+    QString pendingConfirmationOperationId_;
+    QHash<QString, QString> uncertainConfirmationOperationIds_;
     ResultContext resultContext_ = ResultContext::None;
     QPointer<AnnotationManagerDialog> annotationManagerDialog_;
     QString annotationWorkpieceId_;

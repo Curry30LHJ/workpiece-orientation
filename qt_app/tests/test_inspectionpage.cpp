@@ -106,6 +106,43 @@ private slots:
         QCOMPARE(table->item(0, 0)->data(Qt::UserRole).toString(), ids.at(1));
     }
 
+    void filteredSubmissionFailureRestoresOriginalSelection() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{
+            writeImage(directory, QStringLiteral("filtered-retry-0.png")),
+            writeImage(directory, QStringLiteral("filtered-retry-1.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        page.setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("M1"));
+        page.setBackendAvailable(true, false, QString());
+        page.beginBatch(paths, QStringLiteral("m1"));
+        const QStringList ids = page.batchRecordIds();
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("front")));
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("back")));
+        page.setBatchFilter(BatchFilter::Unprocessed);
+        auto *table = page.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        auto *front = page.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
+        QVERIFY(table != nullptr);
+        QVERIFY(front != nullptr);
+        table->setCurrentCell(1, 0);
+        QCOMPARE(page.selectedRecordId(), ids.at(1));
+        QSignalSpy confirmationSpy(&page, &InspectionPage::confirmationRequested);
+
+        front->click();
+        QCOMPARE(confirmationSpy.count(), 1);
+        page.handleBackendFailure(QStringLiteral("submit_confirmation"),
+                                  QStringLiteral("MODEL_ERROR"),
+                                  QStringLiteral("submission failed"));
+
+        QCOMPARE(page.selectedRecordId(), ids.at(1));
+        QCOMPARE(table->item(table->currentRow(), 0)->data(Qt::UserRole).toString(), ids.at(1));
+        QVERIFY(front->isEnabled());
+    }
+
     void failedFilterIncludesPredictionAndConfirmationFailures() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -141,6 +178,31 @@ private slots:
         QCOMPARE(page.failedBatchCount(), 2);
     }
 
+    void batchSubmissionFailurePreservesPredictionErrorChannel() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(directory, QStringLiteral("submission-error.png"));
+        QVERIFY(!path.isEmpty());
+        InspectionPage page;
+        page.beginBatch({path}, QStringLiteral("m1"));
+        const QString recordId = page.batchRecordIds().constFirst();
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("front")));
+
+        page.setRecordDisposition(recordId, BatchDisposition::SubmitFailed,
+                                  QStringLiteral("job-failed"),
+                                  QStringLiteral("submission failed"));
+
+        const InspectionRecord record = page.recordForId(recordId);
+        QCOMPARE(record.label, QStringLiteral("front"));
+        QVERIFY(record.error.isEmpty());
+        QCOMPARE(record.submissionError, QStringLiteral("submission failed"));
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("resultLabel"))->text()
+                    .contains(QStringLiteral("正面")));
+        QVERIFY(!page.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))
+                     ->toPlainText().isEmpty());
+    }
+
     void evolutionJobUpdateTargetsEveryMatchingRecord() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -174,6 +236,43 @@ private slots:
         QCOMPARE(page.failedBatchCount(), 2);
     }
 
+    void evolutionJobRunningAndCompletedUpdateEveryMatchingRow() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{
+            writeImage(directory, QStringLiteral("job-state-0.png")),
+            writeImage(directory, QStringLiteral("job-state-1.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        page.beginBatch(paths, QStringLiteral("m1"));
+        const QStringList ids = page.batchRecordIds();
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("front")));
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("back")));
+        page.setRecordDisposition(ids.at(0), BatchDisposition::QueuedFront,
+                                  QStringLiteral("shared-job"));
+        page.setRecordDisposition(ids.at(1), BatchDisposition::QueuedBack,
+                                  QStringLiteral("shared-job"));
+        auto *table = page.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        QVERIFY(table != nullptr);
+
+        page.handleBackendResponse(QStringLiteral("list_evolution_jobs"), QJsonObject{
+            {QStringLiteral("jobs"), QJsonArray{QJsonObject{
+                {QStringLiteral("job_id"), QStringLiteral("shared-job")},
+                {QStringLiteral("state"), QStringLiteral("running")}}}}});
+        QCOMPARE(table->item(0, 4)->text(), QStringLiteral("正在更新缓存"));
+        QCOMPARE(table->item(1, 4)->text(), QStringLiteral("正在更新缓存"));
+
+        page.handleBackendResponse(QStringLiteral("list_evolution_jobs"), QJsonObject{
+            {QStringLiteral("jobs"), QJsonArray{QJsonObject{
+                {QStringLiteral("job_id"), QStringLiteral("shared-job")},
+                {QStringLiteral("state"), QStringLiteral("completed")}}}}});
+        QCOMPARE(table->item(0, 4)->text(), QStringLiteral("已参与预测"));
+        QCOMPARE(table->item(1, 4)->text(), QStringLiteral("已参与预测"));
+    }
+
     void stopAfterCurrentLeavesUnsentRecordsPending() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -205,6 +304,61 @@ private slots:
         }
         QVERIFY(visibleIds.contains(ids.at(1)));
         QVERIFY(visibleIds.contains(ids.at(2)));
+    }
+
+    void inFlightBatchIgnoresDroppedSingleImage() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{
+            writeImage(directory, QStringLiteral("drop-batch-0.png")),
+            writeImage(directory, QStringLiteral("drop-batch-1.png"))};
+        const QString droppedPath = writeImage(directory, QStringLiteral("drop-single.png"));
+        QVERIFY(!paths.contains(QString()));
+        QVERIFY(!droppedPath.isEmpty());
+        InspectionPage page;
+        QSignalSpy commandSpy(&page, &InspectionPage::commandRequested);
+        page.beginBatch(paths, QStringLiteral("m1"));
+        auto *view = page.findChild<InspectionImageView *>(
+            QStringLiteral("inspectionImageView"));
+        QVERIFY(view != nullptr);
+        QMimeData mimeData;
+        mimeData.setUrls({QUrl::fromLocalFile(droppedPath)});
+        QDragEnterEvent dragEvent(QPoint(12, 12), Qt::CopyAction, &mimeData,
+                                  Qt::LeftButton, Qt::NoModifier);
+        QDropEvent dropEvent(QPointF(12.0, 12.0), Qt::CopyAction, &mimeData,
+                             Qt::LeftButton, Qt::NoModifier);
+
+        QApplication::sendEvent(view->viewport(), &dragEvent);
+        QApplication::sendEvent(view->viewport(), &dropEvent);
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("front")));
+
+        QCOMPARE(page.mode(), InspectionMode::Batch);
+        QCOMPARE(page.completedBatchCount(), 1);
+        QCOMPARE(commandSpy.count(), 2);
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("back")));
+        QCOMPARE(page.completedBatchCount(), 2);
+    }
+
+    void inFlightBatchRejectsModeSwitch() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{
+            writeImage(directory, QStringLiteral("mode-batch-0.png")),
+            writeImage(directory, QStringLiteral("mode-batch-1.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        QSignalSpy commandSpy(&page, &InspectionPage::commandRequested);
+        page.beginBatch(paths, QStringLiteral("m1"));
+
+        page.setMode(InspectionMode::Single);
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("front")));
+
+        QCOMPARE(page.mode(), InspectionMode::Batch);
+        QCOMPARE(page.completedBatchCount(), 1);
+        QCOMPARE(commandSpy.count(), 2);
     }
 
     void transportFailureMarksCurrentUnknownAndNeverResumesOldBatch() {

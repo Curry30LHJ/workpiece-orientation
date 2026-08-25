@@ -386,20 +386,43 @@ void MainWindow::chooseBatchImages() {
 }
 
 void MainWindow::refreshWorkpieces() {
-    requestWorkpieceRefresh(false);
+    if (client_ == nullptr || !backendReady_) {
+        return;
+    }
+    if (batchInFlight_ || clientBusy_ || !pendingCommand_.isEmpty()
+        || !queuedCommand_.isEmpty()
+        || client_->state() != BackendClient::State::Ready) {
+        registrationSummaryVisible_ = false;
+        deferredUserWorkpieceRefresh_ = true;
+        showLibraryMessage(QStringLiteral("批量检测完成后刷新工件列表…"));
+        return;
+    }
+    requestWorkpieceRefresh(false, CommandOwner::UserRefresh);
 }
 
-void MainWindow::requestWorkpieceRefresh(bool preserveRegistrationSummary) {
+void MainWindow::requestWorkpieceRefresh(bool preserveRegistrationSummary,
+                                         CommandOwner owner) {
     if (client_ == nullptr || !backendReady_) {
         return;
     }
     if (!preserveRegistrationSummary) {
         registrationSummaryVisible_ = false;
     }
-    sendPageCommand(CommandOwner::System, QStringLiteral("list_workpieces"), QJsonObject());
+    sendPageCommand(owner, QStringLiteral("list_workpieces"), QJsonObject());
     if (!preserveRegistrationSummary) {
         showLibraryMessage(QStringLiteral("正在刷新工件列表…"));
     }
+}
+
+void MainWindow::dispatchDeferredUserRefresh() {
+    if (!deferredUserWorkpieceRefresh_ || batchInFlight_ || client_ == nullptr
+        || !backendReady_ || clientBusy_ || !pendingCommand_.isEmpty()
+        || !queuedCommand_.isEmpty()
+        || client_->state() != BackendClient::State::Ready) {
+        return;
+    }
+    deferredUserWorkpieceRefresh_ = false;
+    requestWorkpieceRefresh(false, CommandOwner::UserRefresh);
 }
 
 void MainWindow::submitRegistration() {
@@ -769,11 +792,16 @@ void MainWindow::submitTemplateConfirmation(const QString &workpieceId, const QS
         || client_ == nullptr || clientBusy_ || !backendReady_) {
         return;
     }
+    pendingConfirmationOperationId_ = uncertainConfirmationOperationIds_.take(
+        pendingConfirmationRecordId_);
+    if (pendingConfirmationOperationId_.isEmpty()) {
+        pendingConfirmationOperationId_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    }
     sendPageCommand(CommandOwner::Inspection, QStringLiteral("submit_confirmation"), {
         {QStringLiteral("workpiece_id"), workpieceId},
         {QStringLiteral("orientation"), orientation},
         {QStringLiteral("image_path"), imagePath},
-        {QStringLiteral("operation_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+        {QStringLiteral("operation_id"), pendingConfirmationOperationId_},
     });
     confirmFrontButton_->setEnabled(false);
     confirmBackButton_->setEnabled(false);
@@ -855,11 +883,16 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
             QStringLiteral("后端连接中断，操作结果未知；请重连后刷新"));
     }
     if (!pendingConfirmationRecordId_.isEmpty()) {
+        if (!pendingConfirmationOperationId_.isEmpty()) {
+            uncertainConfirmationOperationIds_.insert(
+                pendingConfirmationRecordId_, pendingConfirmationOperationId_);
+        }
         inspectionPage_->setRecordDisposition(
             pendingConfirmationRecordId_, BatchDisposition::SubmitFailed, QString(),
             QStringLiteral("连接中断，入库结果未知；请刷新后确认"));
         pendingConfirmationRecordId_.clear();
         pendingConfirmationOrientation_.clear();
+        pendingConfirmationOperationId_.clear();
     }
     backendReadyHandled_ = false;
     backendReady_ = false;
@@ -938,6 +971,7 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
     updateButtonStates();
     if (state == BackendClient::State::Ready) {
         dispatchQueuedCommand();
+        dispatchDeferredUserRefresh();
     }
 }
 
@@ -1034,6 +1068,7 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
                 jobFailed ? jobError : QString());
             pendingConfirmationRecordId_.clear();
             pendingConfirmationOrientation_.clear();
+            pendingConfirmationOperationId_.clear();
         } else if (inspectionPage_ != nullptr
                    && (responseOwner == CommandOwner::Inspection
                        || responseOwner == CommandOwner::None)) {
@@ -1277,6 +1312,7 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
                 QString(), message);
             pendingConfirmationRecordId_.clear();
             pendingConfirmationOrientation_.clear();
+            pendingConfirmationOperationId_.clear();
         } else if (inspectionPage_ != nullptr
                    && (failureOwner == CommandOwner::Inspection
                        || failureOwner == CommandOwner::None)) {
@@ -1421,6 +1457,8 @@ void MainWindow::clearBatchResults() {
     const bool clearVisibleBatchResult = resultContext_ == ResultContext::Batch;
     pendingConfirmationRecordId_.clear();
     pendingConfirmationOrientation_.clear();
+    pendingConfirmationOperationId_.clear();
+    uncertainConfirmationOperationIds_.clear();
     if (inspectionPage_ != nullptr) {
         inspectionPage_->clearBatchState();
     }

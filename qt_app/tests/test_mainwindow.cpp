@@ -137,6 +137,9 @@ public:
     void failPredictionRow(int zeroBasedRow) { failedPredictionRow_ = zeroBasedRow; }
     void failNextConfirmation() { failNextConfirmation_ = true; }
     void failNextConfirmationJob() { failNextConfirmationJob_ = true; }
+    void disconnectClient() {
+        if (socket_ != nullptr) socket_->abort();
+    }
     void replyNextPrediction() {
         if (pendingPredictions_.isEmpty()) {
             return;
@@ -805,7 +808,7 @@ private slots:
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
     }
 
-    void queuedSystemRefreshDoesNotStrandBatchPrediction() {
+    void userRefreshWaitsForBatchAndStillRuns() {
         BatchPredictionServer server;
         QVERIFY(server.listen());
         server.setHoldPredictions(true);
@@ -819,9 +822,40 @@ private slots:
         auto *inspectionPage = window.findChild<InspectionPage *>();
         QVERIFY(inspectionPage != nullptr);
         QTRY_COMPARE(server.predictionCount(), 1);
+        const int refreshCountBeforeClick = server.listWorkpieceCount();
 
         QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
                                           Qt::DirectConnection));
+        server.replyNextPrediction();
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 2, 1000);
+        server.replyNextPrediction();
+        QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 3, 1000);
+        server.replyNextPrediction();
+        QTRY_COMPARE_WITH_TIMEOUT(inspectionPage->completedBatchCount(), 3, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(),
+                                  refreshCountBeforeClick + 1, 1000);
+    }
+
+    void queuedInternalRefreshDoesNotStrandBatchPrediction() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setHoldPredictions(true);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        const QStringList paths = writeImages(dir, QStringLiteral("queued-internal"), 3);
+        startBatch(server, client, window, paths);
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        QTRY_COMPARE(server.predictionCount(), 1);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientResponse", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("recycle_workpiece")),
+            Q_ARG(QJsonObject, QJsonObject())));
         server.replyNextPrediction();
 
         QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 2, 1000);
@@ -1126,6 +1160,50 @@ private slots:
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
                     ->text().contains(QStringLiteral("结果未知")));
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
+    }
+
+    void transportUnknownConfirmationRetryReusesOperationId() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setHoldConfirmations(true);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(
+            dir, QStringLiteral("confirm-idempotent"), 1));
+        waitForBatchCompletion(window, 1);
+        auto *frontButton = window.findChild<QPushButton *>(
+            QStringLiteral("confirmFrontButton"));
+        QVERIFY(frontButton != nullptr);
+        QTRY_VERIFY(frontButton->isEnabled());
+
+        frontButton->click();
+        QTRY_COMPARE(server.confirmationCount(), 1);
+        server.disconnectClient();
+        QTRY_VERIFY(client.state() == BackendClient::State::Disconnected
+                    || client.state() == BackendClient::State::Error);
+        server.setHoldConfirmations(false);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_VERIFY(frontButton->isEnabled());
+
+        frontButton->click();
+        QTRY_COMPARE(server.confirmationCount(), 2);
+        QList<QJsonObject> confirmations;
+        for (const QJsonObject &request : server.requests()) {
+            if (request.value(QStringLiteral("command")).toString()
+                == QStringLiteral("submit_confirmation")) {
+                confirmations.append(request);
+            }
+        }
+        QCOMPARE(confirmations.size(), 2);
+        const QString firstOperationId = confirmations.at(0)
+            .value(QStringLiteral("operation_id")).toString();
+        QVERIFY(!firstOperationId.isEmpty());
+        QCOMPARE(confirmations.at(1).value(QStringLiteral("operation_id")).toString(),
+                 firstOperationId);
     }
 
     void replacingBatchSelectionClearsOldRowsAndContext() {

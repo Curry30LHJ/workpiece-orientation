@@ -30,6 +30,7 @@ public:
     BatchFilter batchFilter() const;
     QString selectedRecordId() const;
     QStringList batchRecordIds() const;
+    InspectionRecord recordForId(const QString &recordId) const;
     void requestBatchStop();
     int completedBatchCount() const;
     int failedBatchCount() const;
