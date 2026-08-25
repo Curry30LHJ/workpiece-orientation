@@ -4,6 +4,7 @@
 #include <QHash>
 #include <QJsonObject>
 #include <QPointer>
+#include <QQueue>
 #include <QJsonArray>
 #include <QStringList>
 #include <QTimer>
@@ -92,6 +93,12 @@ private slots:
 private:
     enum class CommandOwner { None, System, UserRefresh, Inspection, Library, Geometry };
 
+    struct QueuedCommandIntent {
+        CommandOwner owner = CommandOwner::None;
+        QString command;
+        QJsonObject fields;
+    };
+
     enum class ResultContext {
         None,
         Single,
@@ -103,6 +110,9 @@ private:
     void sendPageCommand(CommandOwner owner, const QString &command,
                          const QJsonObject &fields = QJsonObject());
     void dispatchQueuedCommand();
+    void issuePageCommand(const QueuedCommandIntent &intent,
+                          bool includesMandatoryRefresh = false,
+                          bool includesUserRefresh = false);
     void clearPendingCommand();
     void updateButtonStates();
     void updatePreview();
@@ -138,10 +148,16 @@ private:
     CommandOwner pendingOwner_ = CommandOwner::None;
     QString pendingCommand_;
     QJsonObject pendingFields_;
-    CommandOwner queuedOwner_ = CommandOwner::None;
-    QString queuedCommand_;
-    QJsonObject queuedFields_;
+    QQueue<QueuedCommandIntent> queuedMutationCommands_;
+    QQueue<QueuedCommandIntent> queuedInternalCommands_;
+    bool hasReplaceRegistrationContinuation_ = false;
+    QJsonObject replaceRegistrationContinuationFields_;
+    bool hasLatestDetailsIntent_ = false;
+    QJsonObject latestDetailsFields_;
+    bool mandatoryWorkpieceRefresh_ = false;
     bool deferredUserWorkpieceRefresh_ = false;
+    bool pendingRefreshIncludesMandatory_ = false;
+    bool pendingRefreshIncludesUser_ = false;
     bool batchInFlight_ = false;
     bool backendReady_ = false;
     bool backendReadyHandled_ = false;

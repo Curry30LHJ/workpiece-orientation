@@ -291,6 +291,107 @@ private slots:
         QCOMPARE(table->item(0, 5)->text(), QStringLiteral("feature extraction failed"));
     }
 
+    void evolutionTaskChoosesNewestActiveBeforeTerminal() {
+        WorkpieceLibraryPage page;
+        QSignalSpy taskSpy(&page, &WorkpieceLibraryPage::taskStatusChanged);
+        page.setEvolutionJobs(QJsonArray{
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("building-new")},
+                        {QStringLiteral("state"), QStringLiteral("building")},
+                        {QStringLiteral("phase"), QStringLiteral("features")},
+                        {QStringLiteral("completed"), 4},
+                        {QStringLiteral("total"), 9},
+                        {QStringLiteral("last_submitted_at"),
+                         QStringLiteral("2026-08-25T11:00:00+00:00")}},
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("queued-old")},
+                        {QStringLiteral("state"), QStringLiteral("queued")},
+                        {QStringLiteral("phase"), QStringLiteral("queued")},
+                        {QStringLiteral("completed"), 0},
+                        {QStringLiteral("total"), 3},
+                        {QStringLiteral("last_submitted_at"),
+                         QStringLiteral("2026-08-25T09:00:00+00:00")}},
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("failed-newest")},
+                        {QStringLiteral("state"), QStringLiteral("failed")},
+                        {QStringLiteral("completed"), 8},
+                        {QStringLiteral("total"), 8},
+                        {QStringLiteral("last_submitted_at"),
+                         QStringLiteral("2026-08-25T12:00:00+00:00")}},
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("completed-mid")},
+                        {QStringLiteral("state"), QStringLiteral("completed")},
+                        {QStringLiteral("phase"), QStringLiteral("active")},
+                        {QStringLiteral("completed"), 7},
+                        {QStringLiteral("total"), 7},
+                        {QStringLiteral("last_submitted_at"),
+                         QStringLiteral("2026-08-25T10:00:00+00:00")}},
+        });
+
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> activeTask = taskSpy.takeFirst();
+        QCOMPARE(activeTask.at(1).toString(), QStringLiteral("features"));
+        QCOMPARE(activeTask.at(2).toInt(), 4);
+        QCOMPARE(activeTask.at(3).toInt(), 9);
+
+        page.setEvolutionJobs(QJsonArray{
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("completed-latest")},
+                        {QStringLiteral("state"), QStringLiteral("completed")},
+                        {QStringLiteral("phase"), QStringLiteral("active")},
+                        {QStringLiteral("completed"), 6},
+                        {QStringLiteral("total"), 6},
+                        {QStringLiteral("last_submitted_at"),
+                         QStringLiteral("2026-08-25T14:00:00+00:00")}},
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("failed-older")},
+                        {QStringLiteral("state"), QStringLiteral("failed")},
+                        {QStringLiteral("completed"), 2},
+                        {QStringLiteral("total"), 5},
+                        {QStringLiteral("last_submitted_at"),
+                         QStringLiteral("2026-08-25T13:00:00+00:00")}},
+        });
+
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> terminalTask = taskSpy.takeFirst();
+        QCOMPARE(terminalTask.at(1).toString(), QStringLiteral("active"));
+        QCOMPARE(terminalTask.at(2).toInt(), 6);
+        QCOMPARE(terminalTask.at(3).toInt(), 6);
+    }
+
+    void evolutionRetryClearsErrorOnlyWhenFieldIsPresent() {
+        WorkpieceLibraryPage page;
+        auto *table = page.findChild<QTableWidget *>(QStringLiteral("evolutionJobsTable"));
+        QVERIFY(table != nullptr);
+        page.setEvolutionJobs(QJsonArray{QJsonObject{
+            {QStringLiteral("job_id"), QStringLiteral("job-retry")},
+            {QStringLiteral("state"), QStringLiteral("failed")},
+            {QStringLiteral("error"), QStringLiteral("old failure")},
+        }});
+        QCOMPARE(table->item(0, 5)->text(), QStringLiteral("old failure"));
+
+        page.setEvolutionJobs(QJsonArray{QJsonObject{
+            {QStringLiteral("job_id"), QStringLiteral("job-retry")},
+            {QStringLiteral("state"), QStringLiteral("queued")},
+            {QStringLiteral("error"), QJsonValue(QJsonValue::Null)},
+        }});
+        QCOMPARE(table->item(0, 5)->text(), QString());
+
+        page.setEvolutionJobs(QJsonArray{QJsonObject{
+            {QStringLiteral("job_id"), QStringLiteral("job-retry")},
+            {QStringLiteral("state"), QStringLiteral("building")},
+            {QStringLiteral("error"), QStringLiteral("retry warning")},
+        }});
+        QCOMPARE(table->item(0, 5)->text(), QStringLiteral("retry warning"));
+
+        page.setEvolutionJobs(QJsonArray{QJsonObject{
+            {QStringLiteral("job_id"), QStringLiteral("job-retry")},
+            {QStringLiteral("state"), QStringLiteral("building")},
+        }});
+        QCOMPARE(table->item(0, 5)->text(), QStringLiteral("retry warning"));
+
+        page.setEvolutionJobs(QJsonArray{QJsonObject{
+            {QStringLiteral("job_id"), QStringLiteral("job-retry")},
+            {QStringLiteral("state"), QStringLiteral("completed")},
+            {QStringLiteral("error"), QString()},
+        }});
+        QCOMPARE(table->item(0, 5)->text(), QString());
+    }
+
     void backendUnavailableKeepsTheEditingDraft() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -321,6 +422,79 @@ private slots:
         QVERIFY(registerButton->isEnabled());
     }
 
+    void registrationTaskStatusKeepsLastProgressOnOrdinaryFailure() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M-status"));
+        page.setTemplatePaths(
+            writeImages(directory.path(), QStringLiteral("status-front"), 2, 10),
+            writeImages(directory.path(), QStringLiteral("status-back"), 3, 80));
+        QSignalSpy taskSpy(&page, &WorkpieceLibraryPage::taskStatusChanged);
+
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration",
+                                          Qt::DirectConnection));
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> queued = taskSpy.takeFirst();
+        QCOMPARE(queued.at(1).toString(), QStringLiteral("queued"));
+        QCOMPARE(queued.at(2).toInt(), 0);
+        QCOMPARE(queued.at(3).toInt(), 5);
+        QCOMPARE(queued.at(4).toLongLong(), qint64(0));
+
+        page.setRegistrationProgress(QJsonObject{
+            {QStringLiteral("phase"), QStringLiteral("features")},
+            {QStringLiteral("completed"), 3},
+            {QStringLiteral("total"), 5},
+        }, 246);
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> progress = taskSpy.takeFirst();
+        QCOMPARE(progress.at(1).toString(), QStringLiteral("features"));
+        QCOMPARE(progress.at(2).toInt(), 3);
+        QCOMPARE(progress.at(3).toInt(), 5);
+        QCOMPARE(progress.at(4).toLongLong(), qint64(246));
+
+        page.handleBackendFailure(QStringLiteral("register"),
+                                  QStringLiteral("MODEL_ERROR"),
+                                  QStringLiteral("feature failed"));
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> failed = taskSpy.takeFirst();
+        QCOMPARE(failed.at(1).toString(), QStringLiteral("failed"));
+        QCOMPARE(failed.at(2).toInt(), 3);
+        QCOMPARE(failed.at(3).toInt(), 5);
+        QCOMPARE(failed.at(4).toLongLong(), qint64(246));
+    }
+
+    void registrationTransportInterruptionEmitsFailedWithLastProgress() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M-interrupted"));
+        page.setTemplatePaths(
+            writeImages(directory.path(), QStringLiteral("interrupted-front"), 1, 10),
+            writeImages(directory.path(), QStringLiteral("interrupted-back"), 3, 80));
+        QSignalSpy taskSpy(&page, &WorkpieceLibraryPage::taskStatusChanged);
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration",
+                                          Qt::DirectConnection));
+        taskSpy.clear();
+        page.setRegistrationProgress(QJsonObject{
+            {QStringLiteral("phase"), QStringLiteral("copying")},
+            {QStringLiteral("completed"), 1},
+            {QStringLiteral("total"), 4},
+        }, 135);
+        taskSpy.clear();
+
+        page.setBackendState(BackendUiState::Error, QStringLiteral("connection lost"));
+
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> failed = taskSpy.takeFirst();
+        QCOMPARE(failed.at(1).toString(), QStringLiteral("failed"));
+        QCOMPARE(failed.at(2).toInt(), 1);
+        QCOMPARE(failed.at(3).toInt(), 4);
+        QCOMPARE(failed.at(4).toLongLong(), qint64(135));
+    }
+
     void overwriteConfirmationResendsAllPathsWithReplaceTrue() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -349,6 +523,41 @@ private slots:
                  original.value(QStringLiteral("back_images")));
         QCOMPARE(replacement.value(QStringLiteral("name")),
                  original.value(QStringLiteral("name")));
+    }
+
+    void discardingEditableDraftKeepsSubmittedOverwriteSnapshot() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        const QStringList submittedFront = writeImages(
+            directory.path(), QStringLiteral("submitted-front"), 2, 10);
+        const QStringList submittedBack = writeImages(
+            directory.path(), QStringLiteral("submitted-back"), 3, 80);
+        page.setWorkpieceName(QStringLiteral("M-submitted"));
+        page.setTemplatePaths(submittedFront, submittedBack);
+        page.setReplaceConfirmationHandler([](const QString &) { return true; });
+        QSignalSpy spy(&page, &WorkpieceLibraryPage::commandRequested);
+
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration",
+                                          Qt::DirectConnection));
+        QCOMPARE(spy.count(), 1);
+        page.discardEditingDraft();
+        QVERIFY(!page.hasUnsavedChanges());
+
+        page.handleBackendFailure(QStringLiteral("register"),
+                                  QStringLiteral("WORKPIECE_EXISTS"),
+                                  QStringLiteral("exists"));
+
+        QCOMPARE(spy.count(), 2);
+        const QJsonObject replacement = spy.at(1).at(1).toJsonObject();
+        QCOMPARE(replacement.value(QStringLiteral("replace")).toBool(), true);
+        QCOMPARE(replacement.value(QStringLiteral("name")).toString(),
+                 QStringLiteral("M-submitted"));
+        QCOMPARE(replacement.value(QStringLiteral("front_images")).toArray(),
+                 QJsonArray::fromStringList(submittedFront));
+        QCOMPARE(replacement.value(QStringLiteral("back_images")).toArray(),
+                 QJsonArray::fromStringList(submittedBack));
     }
 };
 

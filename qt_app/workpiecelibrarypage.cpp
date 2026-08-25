@@ -3,6 +3,7 @@
 #include "ui_workpiecelibrarypage.h"
 
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QImage>
@@ -45,6 +46,22 @@ QString phaseText(const QString &phase) {
     if (phase == QStringLiteral("committing")) return QStringLiteral("提交更新");
     if (phase == QStringLiteral("active")) return QStringLiteral("已生效");
     return phase;
+}
+
+QDateTime jobSubmittedAt(const QJsonObject &job) {
+    const QString value = job.value(QStringLiteral("last_submitted_at")).toString();
+    QDateTime submittedAt = QDateTime::fromString(value, Qt::ISODateWithMs);
+    if (!submittedAt.isValid()) submittedAt = QDateTime::fromString(value, Qt::ISODate);
+    return submittedAt;
+}
+
+bool shouldReplaceSelectedJob(const QJsonObject &selected,
+                              const QDateTime &selectedAt,
+                              const QDateTime &candidateAt) {
+    if (selected.isEmpty()) return true;
+    if (candidateAt.isValid() && !selectedAt.isValid()) return true;
+    if (!candidateAt.isValid() && !selectedAt.isValid()) return true;
+    return candidateAt.isValid() && selectedAt.isValid() && candidateAt > selectedAt;
 }
 
 } // namespace
@@ -162,23 +179,35 @@ void WorkpieceLibraryPage::setEvolutionJobs(const QJsonArray &jobs) {
         if (!evolutionJobsById_.contains(jobId)) evolutionJobOrder_.append(jobId);
         QJsonObject merged = evolutionJobsById_.value(jobId);
         for (auto it = incoming.begin(); it != incoming.end(); ++it) {
-            if (it.key() == QStringLiteral("error") && it.value().toString().isEmpty()
-                && !merged.value(it.key()).toString().isEmpty()) {
-                continue;
-            }
             merged.insert(it.key(), it.value());
         }
         evolutionJobsById_.insert(jobId, merged);
     }
     rebuildEvolutionTable();
 
-    for (int index = jobs.size() - 1; index >= 0; --index) {
-        const QJsonObject job = jobs.at(index).toObject();
+    QJsonObject selectedActive;
+    QJsonObject selectedTerminal;
+    QDateTime selectedActiveAt;
+    QDateTime selectedTerminalAt;
+    for (const QJsonValue &value : jobs) {
+        const QJsonObject job = value.toObject();
         const QString state = job.value(QStringLiteral("state")).toString();
-        if (state != QStringLiteral("queued") && state != QStringLiteral("building")
-            && state != QStringLiteral("completed") && state != QStringLiteral("failed")) {
-            continue;
+        const QDateTime submittedAt = jobSubmittedAt(job);
+        if (state == QStringLiteral("queued") || state == QStringLiteral("building")) {
+            if (shouldReplaceSelectedJob(selectedActive, selectedActiveAt, submittedAt)) {
+                selectedActive = job;
+                selectedActiveAt = submittedAt;
+            }
+        } else if (state == QStringLiteral("completed") || state == QStringLiteral("failed")) {
+            if (shouldReplaceSelectedJob(selectedTerminal, selectedTerminalAt, submittedAt)) {
+                selectedTerminal = job;
+                selectedTerminalAt = submittedAt;
+            }
         }
+    }
+    const QJsonObject job = selectedActive.isEmpty() ? selectedTerminal : selectedActive;
+    if (!job.isEmpty()) {
+        const QString state = job.value(QStringLiteral("state")).toString();
         const QString phase = state == QStringLiteral("failed")
             ? state : job.value(QStringLiteral("phase")).toString(
                           state == QStringLiteral("completed")
@@ -190,7 +219,6 @@ void WorkpieceLibraryPage::setEvolutionJobs(const QJsonArray &jobs) {
             job.value(QStringLiteral("total")).toInt(),
             job.value(QStringLiteral("elapsed_ms")).isDouble()
                 ? static_cast<qint64>(job.value(QStringLiteral("elapsed_ms")).toDouble()) : -1);
-        break;
     }
 }
 
@@ -200,6 +228,7 @@ void WorkpieceLibraryPage::setBackendState(BackendUiState state,
     if (state == BackendUiState::Error || state == BackendUiState::Disconnected) {
         const bool registrationInterrupted = registrationInFlight_;
         if (registrationInterrupted) {
+            publishRegistrationFailure();
             registrationInFlight_ = false;
             stopRegistrationProgress();
         }
@@ -226,8 +255,7 @@ void WorkpieceLibraryPage::setRegistrationProgress(const QJsonObject &progress,
             .arg(phaseText(phase)).arg(completed).arg(total));
     ui->registrationElapsedLabel->setText(
         QStringLiteral("耗时：%1 ms").arg(effectiveElapsed));
-    emit taskStatusChanged(QStringLiteral("建立工件库"), phase,
-                           completed, total, effectiveElapsed);
+    publishRegistrationTaskStatus(phase, completed, total, effectiveElapsed);
 }
 
 void WorkpieceLibraryPage::setRegistrationResult(const QJsonObject &response) {
@@ -245,8 +273,8 @@ void WorkpieceLibraryPage::setRegistrationResult(const QJsonObject &response) {
     ui->latestRegistrationResultLabel->setText(result);
     showMessage(result);
     if (draftMatchesSavedRegistration()) setDirty(false);
-    emit taskStatusChanged(QStringLiteral("建立工件库"), QStringLiteral("active"),
-                           frontCount + backCount, frontCount + backCount, elapsedMs);
+    publishRegistrationTaskStatus(QStringLiteral("active"), frontCount + backCount,
+                                  frontCount + backCount, elapsedMs);
     updateControlStates();
 }
 
@@ -289,6 +317,7 @@ void WorkpieceLibraryPage::handleBackendFailure(const QString &command,
         return;
     }
     if (command == QStringLiteral("register")) {
+        if (registrationInFlight_) publishRegistrationFailure();
         registrationInFlight_ = false;
         stopRegistrationProgress();
         updateControlStates();
@@ -329,9 +358,6 @@ void WorkpieceLibraryPage::discardEditingDraft() {
     ui->workpieceNameEdit->clear();
     frontTemplatePaths_.clear();
     backTemplatePaths_.clear();
-    savedRegistrationFields_ = QJsonObject();
-    registrationInFlight_ = false;
-    stopRegistrationProgress();
     updateTemplateUi();
     setDirty(false);
     showMessage(QStringLiteral("编辑草稿已放弃"));
@@ -375,6 +401,9 @@ void WorkpieceLibraryPage::submitRegistration() {
     savedRegistrationFields_ = registrationFields(false);
     registrationInFlight_ = true;
     startRegistrationProgress();
+    publishRegistrationTaskStatus(
+        QStringLiteral("queued"), 0,
+        frontTemplatePaths_.size() + backTemplatePaths_.size(), 0);
     updateControlStates();
     emit commandRequested(QStringLiteral("register"), savedRegistrationFields_);
     showMessage(QStringLiteral("正在建立工件库…"));
@@ -644,4 +673,21 @@ void WorkpieceLibraryPage::stopRegistrationProgress() {
         ui->registrationElapsedLabel->setText(
             QStringLiteral("耗时：%1 ms").arg(registrationElapsedClock_.elapsed()));
     }
+}
+
+void WorkpieceLibraryPage::publishRegistrationTaskStatus(
+    const QString &phase, int completed, int total, qint64 elapsedMs) {
+    registrationTaskPhase_ = phase;
+    registrationTaskCompleted_ = completed;
+    registrationTaskTotal_ = total;
+    registrationTaskElapsedMs_ = elapsedMs;
+    emit taskStatusChanged(QStringLiteral("建立工件库"), phase,
+                           completed, total, elapsedMs);
+}
+
+void WorkpieceLibraryPage::publishRegistrationFailure() {
+    publishRegistrationTaskStatus(QStringLiteral("failed"),
+                                  registrationTaskCompleted_,
+                                  registrationTaskTotal_,
+                                  registrationTaskElapsedMs_);
 }

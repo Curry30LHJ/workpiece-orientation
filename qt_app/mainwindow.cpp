@@ -163,8 +163,11 @@ void MainWindow::initializeUi() {
                 if (phase == QStringLiteral("failed")) {
                     globalTaskStatus_->setMessage(
                         TaskStatusWidget::MessageKind::Error,
-                        elapsedMs < 0 ? QStringLiteral("任务失败 · 耗时未知")
-                                      : QStringLiteral("任务失败"));
+                        elapsedMs < 0
+                            ? QStringLiteral("%1 · %2/%3 · 耗时未知 · 任务失败")
+                                  .arg(phase).arg(completed).arg(total)
+                            : QStringLiteral("%1 · %2/%3 · 耗时 %4 ms · 任务失败")
+                                  .arg(phase).arg(completed).arg(total).arg(elapsedMs));
                 } else if (elapsedMs < 0) {
                     globalTaskStatus_->setMessage(
                         TaskStatusWidget::MessageKind::Neutral,
@@ -271,58 +274,101 @@ void MainWindow::connectBackendSignals() {
 void MainWindow::sendPageCommand(CommandOwner owner, const QString &command,
                                  const QJsonObject &fields) {
     if (client_ == nullptr || command.isEmpty()) return;
-    if (clientBusy_ || !pendingCommand_.isEmpty()
-        || client_->state() != BackendClient::State::Ready) {
-        const bool replaceContinuation = owner == CommandOwner::Library
-            && command == QStringLiteral("register")
-            && fields.value(QStringLiteral("replace")).toBool();
-        const bool latestBrowseIntent = owner == CommandOwner::Library
-            && command == QStringLiteral("get_workpiece_details")
-            && queuedOwner_ == CommandOwner::Library
-            && queuedCommand_ == QStringLiteral("get_workpiece_details");
-        if (queuedCommand_.isEmpty() || replaceContinuation || latestBrowseIntent) {
-            queuedOwner_ = owner;
-            queuedCommand_ = command;
-            queuedFields_ = fields;
-        } else if (owner == CommandOwner::Inspection
-                   && command == QStringLiteral("predict")
-                   && queuedOwner_ == CommandOwner::System
-                   && (queuedCommand_ == QStringLiteral("list_evolution_jobs")
-                       || queuedCommand_ == QStringLiteral("list_workpieces"))) {
-            queuedOwner_ = owner;
-            queuedCommand_ = command;
-            queuedFields_ = fields;
+
+    const QueuedCommandIntent intent{owner, command, fields};
+    if (owner == CommandOwner::Library
+        && command == QStringLiteral("register")
+        && fields.value(QStringLiteral("replace")).toBool()) {
+        hasReplaceRegistrationContinuation_ = true;
+        replaceRegistrationContinuationFields_ = fields;
+    } else if (owner == CommandOwner::Library
+               && command == QStringLiteral("get_workpiece_details")) {
+        hasLatestDetailsIntent_ = true;
+        latestDetailsFields_ = fields;
+    } else if (command == QStringLiteral("list_workpieces")) {
+        if (owner == CommandOwner::UserRefresh) {
+            deferredUserWorkpieceRefresh_ = true;
         } else {
-            showLibraryMessage(
-                QStringLiteral("已有后续操作等待发送，请稍后重试：%1").arg(command), true);
+            mandatoryWorkpieceRefresh_ = true;
         }
-        return;
+    } else if (owner == CommandOwner::System) {
+        bool replaced = false;
+        for (int index = 0; index < queuedInternalCommands_.size(); ++index) {
+            if (queuedInternalCommands_.at(index).command == command) {
+                queuedInternalCommands_[index] = intent;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) queuedInternalCommands_.enqueue(intent);
+    } else {
+        queuedMutationCommands_.enqueue(intent);
     }
-    pendingOwner_ = owner;
-    pendingCommand_ = command;
-    pendingFields_ = fields;
-    client_->sendRequest(command, fields);
+    dispatchQueuedCommand();
 }
 
 void MainWindow::dispatchQueuedCommand() {
-    if (queuedCommand_.isEmpty() || client_ == nullptr || clientBusy_
-        || !pendingCommand_.isEmpty()
+    if (client_ == nullptr || clientBusy_ || !pendingCommand_.isEmpty()
         || client_->state() != BackendClient::State::Ready) {
         return;
     }
-    const CommandOwner owner = queuedOwner_;
-    const QString command = queuedCommand_;
-    const QJsonObject fields = queuedFields_;
-    queuedOwner_ = CommandOwner::None;
-    queuedCommand_.clear();
-    queuedFields_ = QJsonObject();
-    sendPageCommand(owner, command, fields);
+
+    if (hasReplaceRegistrationContinuation_) {
+        const QJsonObject fields = replaceRegistrationContinuationFields_;
+        hasReplaceRegistrationContinuation_ = false;
+        replaceRegistrationContinuationFields_ = QJsonObject();
+        issuePageCommand({CommandOwner::Library, QStringLiteral("register"), fields});
+        return;
+    }
+    if (mandatoryWorkpieceRefresh_ || deferredUserWorkpieceRefresh_) {
+        const bool includesMandatory = mandatoryWorkpieceRefresh_;
+        const bool includesUser = deferredUserWorkpieceRefresh_;
+        mandatoryWorkpieceRefresh_ = false;
+        deferredUserWorkpieceRefresh_ = false;
+        issuePageCommand({includesMandatory ? CommandOwner::System
+                                            : CommandOwner::UserRefresh,
+                          QStringLiteral("list_workpieces"), QJsonObject()},
+                         includesMandatory, includesUser);
+        return;
+    }
+    if (hasLatestDetailsIntent_) {
+        const QJsonObject fields = latestDetailsFields_;
+        hasLatestDetailsIntent_ = false;
+        latestDetailsFields_ = QJsonObject();
+        const QString workpieceId = fields.value(QStringLiteral("workpiece_id")).toString();
+        if (workpieceLibraryPage_ != nullptr
+            && workpieceId == workpieceLibraryPage_->browsedWorkpieceId()) {
+            issuePageCommand({CommandOwner::Library,
+                              QStringLiteral("get_workpiece_details"), fields});
+            return;
+        }
+    }
+    if (!queuedMutationCommands_.isEmpty()) {
+        issuePageCommand(queuedMutationCommands_.dequeue());
+        return;
+    }
+    if (!queuedInternalCommands_.isEmpty()) {
+        issuePageCommand(queuedInternalCommands_.dequeue());
+    }
+}
+
+void MainWindow::issuePageCommand(const QueuedCommandIntent &intent,
+                                  bool includesMandatoryRefresh,
+                                  bool includesUserRefresh) {
+    pendingOwner_ = intent.owner;
+    pendingCommand_ = intent.command;
+    pendingFields_ = intent.fields;
+    pendingRefreshIncludesMandatory_ = includesMandatoryRefresh;
+    pendingRefreshIncludesUser_ = includesUserRefresh;
+    client_->sendRequest(intent.command, intent.fields);
 }
 
 void MainWindow::clearPendingCommand() {
     pendingOwner_ = CommandOwner::None;
     pendingCommand_.clear();
     pendingFields_ = QJsonObject();
+    pendingRefreshIncludesMandatory_ = false;
+    pendingRefreshIncludesUser_ = false;
 }
 
 void MainWindow::setTemplatePaths(const QStringList &frontPaths, const QStringList &backPaths) {
@@ -366,9 +412,14 @@ void MainWindow::setBackendError(const QString &message) {
     backendReady_ = false;
     backendReadyHandled_ = false;
     clientBusy_ = false;
-    queuedOwner_ = CommandOwner::None;
-    queuedCommand_.clear();
-    queuedFields_ = QJsonObject();
+    queuedMutationCommands_.clear();
+    queuedInternalCommands_.clear();
+    hasReplaceRegistrationContinuation_ = false;
+    replaceRegistrationContinuationFields_ = QJsonObject();
+    hasLatestDetailsIntent_ = false;
+    latestDetailsFields_ = QJsonObject();
+    mandatoryWorkpieceRefresh_ = false;
+    deferredUserWorkpieceRefresh_ = false;
     BackendStatusDetails details;
     details.state = BackendUiState::Error;
     details.connectionDetail = QStringLiteral("配置错误");
@@ -403,10 +454,8 @@ void MainWindow::refreshWorkpieces() {
     }
     deferredUserWorkpieceRefresh_ = true;
     if (batchInFlight_ || clientBusy_ || !pendingCommand_.isEmpty()
-        || !queuedCommand_.isEmpty()
         || client_->state() != BackendClient::State::Ready) {
         showLibraryMessage(QStringLiteral("当前操作完成后刷新工件列表…"));
-        return;
     }
     dispatchDeferredUserRefresh();
 }
@@ -423,13 +472,8 @@ void MainWindow::requestWorkpieceRefresh(bool preserveRegistrationSummary,
 }
 
 void MainWindow::dispatchDeferredUserRefresh() {
-    if (!deferredUserWorkpieceRefresh_ || batchInFlight_ || client_ == nullptr
-        || !backendReady_ || clientBusy_ || !pendingCommand_.isEmpty()
-        || !queuedCommand_.isEmpty()
-        || client_->state() != BackendClient::State::Ready) {
-        return;
-    }
-    requestWorkpieceRefresh(false, CommandOwner::UserRefresh);
+    if (batchInFlight_ || client_ == nullptr || !backendReady_) return;
+    dispatchQueuedCommand();
 }
 
 void MainWindow::submitRegistration() {
@@ -866,13 +910,18 @@ void MainWindow::onBackendLoading(const QString &message) {
 void MainWindow::onBackendUnavailable(const QString &reason) {
     const CommandOwner interruptedOwner = pendingOwner_;
     const QString interruptedTask = pendingCommand_;
+    const bool interruptedMandatoryRefresh = pendingRefreshIncludesMandatory_;
+    const bool interruptedUserRefresh = pendingRefreshIncludesUser_;
     const bool hasPreservedWork = workpieceLibraryPage_->hasUnsavedChanges()
         || batchInFlight_ || clientBusy_
         || !pendingCommand_.isEmpty() || !inspectionImagePath_.isEmpty()
         || (batchResultsTableWidget_ != nullptr && batchResultsTableWidget_->rowCount() > 0)
         || annotationManagerDialog_ != nullptr || geometryMaskManagerDialog_ != nullptr;
-    if (interruptedOwner == CommandOwner::UserRefresh) {
-        deferredUserWorkpieceRefresh_ = true;
+    if (interruptedTask == QStringLiteral("list_workpieces")) {
+        mandatoryWorkpieceRefresh_ = mandatoryWorkpieceRefresh_
+            || interruptedMandatoryRefresh;
+        deferredUserWorkpieceRefresh_ = deferredUserWorkpieceRefresh_
+            || interruptedUserRefresh || interruptedOwner == CommandOwner::UserRefresh;
     }
     if (annotationManagerDialog_ != nullptr) {
         annotationManagerDialog_->setBusy(false);
@@ -902,9 +951,12 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     clientBusy_ = false;
     batchInFlight_ = false;
     clearPendingCommand();
-    queuedOwner_ = CommandOwner::None;
-    queuedCommand_.clear();
-    queuedFields_ = QJsonObject();
+    queuedMutationCommands_.clear();
+    queuedInternalCommands_.clear();
+    hasReplaceRegistrationContinuation_ = false;
+    replaceRegistrationContinuationFields_ = QJsonObject();
+    hasLatestDetailsIntent_ = false;
+    latestDetailsFields_ = QJsonObject();
     if (interruptedOwner == CommandOwner::Inspection
         && inspectionPage_ != nullptr && !interruptedTask.isEmpty()) {
         inspectionPage_->handleBackendFailure(interruptedTask,
@@ -974,7 +1026,6 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
     updateButtonStates();
     if (state == BackendClient::State::Ready) {
         dispatchQueuedCommand();
-        dispatchDeferredUserRefresh();
     }
 }
 
@@ -1019,9 +1070,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         }
         appHeader_->setWorkpieces(items, requestedId);
         workpieceLibraryPage_->setWorkpieces(workpieces, appHeader_->currentWorkpieceId());
-        if (responseOwner == CommandOwner::UserRefresh) {
-            deferredUserWorkpieceRefresh_ = false;
-        }
         showLibraryMessage(QStringLiteral("工件列表已刷新"));
         updateButtonStates();
         return;
@@ -1035,9 +1083,14 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("recycle_workpiece")) {
-        lastPredictionWorkpieceId_.clear();
-        lastPredictionImagePath_.clear();
-        lastPredictionResponse_ = QJsonObject();
+        const QString recycledWorkpieceId = issuedFields.value(
+            QStringLiteral("workpiece_id")).toString();
+        if (!recycledWorkpieceId.isEmpty()
+            && recycledWorkpieceId == lastPredictionWorkpieceId_) {
+            lastPredictionWorkpieceId_.clear();
+            lastPredictionImagePath_.clear();
+            lastPredictionResponse_ = QJsonObject();
+        }
         workpieceLibraryPage_->handleBackendResponse(command, response);
         requestWorkpieceRefresh(false);
         return;
@@ -1223,9 +1276,7 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     }
     if (command == QStringLiteral("register")) {
         workpieceLibraryPage_->handleBackendResponse(command, response);
-        QTimer::singleShot(0, this, [this]() {
-            requestWorkpieceRefresh(true);
-        });
+        requestWorkpieceRefresh(true);
         return;
     }
     if (command == QStringLiteral("predict")
@@ -1248,6 +1299,7 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
     const CommandOwner failureOwner = pendingOwner_;
     const QString issuedCommand = pendingCommand_;
     const QJsonObject issuedFields = pendingFields_;
+    const bool failedListIncludedUserRefresh = pendingRefreshIncludesUser_;
     clearPendingCommand();
     const QString failedCommand = issuedCommand.isEmpty() ? command : issuedCommand;
     const auto matchesOwner = [failureOwner](CommandOwner expected) {
@@ -1265,8 +1317,8 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         return;
     }
     if (failedCommand == QStringLiteral("list_workpieces")
-               && failureOwner == CommandOwner::UserRefresh) {
-        deferredUserWorkpieceRefresh_ = false;
+               && (failureOwner == CommandOwner::UserRefresh
+                   || failedListIncludedUserRefresh)) {
         showLibraryMessage(
             QStringLiteral("刷新失败：%1；请手动重试").arg(message), true);
     } else if (failedCommand == QStringLiteral("get_workpiece_details")

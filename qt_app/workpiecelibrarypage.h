@@ -77,6 +77,9 @@ private:
     QString browsedDisplayName() const;
     void startRegistrationProgress();
     void stopRegistrationProgress();
+    void publishRegistrationTaskStatus(const QString &phase, int completed,
+                                       int total, qint64 elapsedMs);
+    void publishRegistrationFailure();
 
     Ui::WorkpieceLibraryPage *ui;
     QJsonArray workpieces_;
@@ -94,4 +97,8 @@ private:
     std::function<bool(const QString &)> replaceConfirmationHandler_;
     QElapsedTimer registrationElapsedClock_;
     QTimer registrationElapsedTimer_;
+    QString registrationTaskPhase_;
+    int registrationTaskCompleted_ = 0;
+    int registrationTaskTotal_ = 0;
+    qint64 registrationTaskElapsedMs_ = -1;
 };
