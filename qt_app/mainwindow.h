@@ -97,6 +97,7 @@ private:
         CommandOwner owner = CommandOwner::None;
         QString command;
         QJsonObject fields;
+        quint64 refreshTransactionId = 0;
     };
 
     enum class ResultContext {
@@ -108,7 +109,8 @@ private:
     void initializeUi();
     void connectBackendSignals();
     void sendPageCommand(CommandOwner owner, const QString &command,
-                         const QJsonObject &fields = QJsonObject());
+                         const QJsonObject &fields = QJsonObject(),
+                         quint64 refreshTransactionId = 0);
     void dispatchQueuedCommand();
     void issuePageCommand(const QueuedCommandIntent &intent,
                           bool includesMandatoryRefresh = false,
@@ -154,8 +156,15 @@ private:
     QJsonObject replaceRegistrationContinuationFields_;
     bool hasLatestDetailsIntent_ = false;
     QJsonObject latestDetailsFields_;
+    quint64 latestDetailsRefreshTransactionId_ = 0;
     bool mandatoryWorkpieceRefresh_ = false;
     bool mandatoryRefreshRetryRequired_ = false;
+    bool mandatoryDetailsRetryRequired_ = false;
+    QString activeMandatoryDetailsWorkpieceId_;
+    quint64 nextMandatoryRefreshTransactionId_ = 0;
+    quint64 activeMandatoryRefreshTransactionId_ = 0;
+    quint64 queuedMandatoryRefreshTransactionId_ = 0;
+    quint64 pendingRefreshTransactionId_ = 0;
     bool deferredUserWorkpieceRefresh_ = false;
     bool pendingRefreshIncludesMandatory_ = false;
     bool pendingRefreshIncludesUser_ = false;
