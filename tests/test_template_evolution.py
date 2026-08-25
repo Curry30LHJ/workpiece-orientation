@@ -73,6 +73,28 @@ class FailingProgressClassifier(FakeClassifier):
         return super().build_template_cache(front, back, progress_callback)
 
 
+class TimedBlockingProgressClassifier(BlockingProgressClassifier):
+    def __init__(self, now):
+        super().__init__()
+        self.now = now
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.block_appends:
+            self.now[0] += 1.25
+        return super().build_template_cache(front, back, progress_callback)
+
+
+class TimedFailingProgressClassifier(FailingProgressClassifier):
+    def __init__(self, now):
+        super().__init__()
+        self.now = now
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.fail_appends:
+            self.now[0] += 1.25
+        return super().build_template_cache(front, back, progress_callback)
+
+
 class BlockingGeometryProfiles:
     def __init__(self):
         self.validation_started = threading.Event()
@@ -82,6 +104,19 @@ class BlockingGeometryProfiles:
         self.validation_started.set()
         assert self.release_validation.wait(2.0)
         return {"status": "active", "needs_review": False}
+
+
+class TimedReviewProfiles:
+    def __init__(self, now):
+        self.now = now
+
+    def validate_new_template(self, workpiece_id, orientation, image_path):
+        self.now[0] += 1.25
+        return {
+            "status": "low_confidence",
+            "needs_review": True,
+            "reason": "synthetic timed review",
+        }
 
 
 def setup_catalog(tmp_path, front_count=1, classifier=None):
@@ -139,6 +174,57 @@ def test_submitted_job_reports_queued_progress_for_all_coalesced_items(tmp_path)
     assert second["completed"] == 0
     assert second["total"] == 2
     assert second["progress"] == 0
+    assert second["started_at"] is None
+    assert second["finished_at"] is None
+    assert second["elapsed_ms"] is None
+
+
+def test_elapsed_time_updates_during_progress_and_freezes_after_completion(tmp_path):
+    now = [100.0]
+    classifier = TimedBlockingProgressClassifier(now)
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    evolution = TemplateEvolution(
+        catalog, tmp_path / "timed-progress", clock=lambda: now[0], start_worker=False
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "timed-confirmed.png", 39),
+        operation_id="timed-progress",
+    )
+    classifier.block_appends = True
+    worker = threading.Thread(target=lambda: evolution.run_next(force=True))
+
+    worker.start()
+    assert classifier.feature_started.wait(1.0)
+    try:
+        progress = evolution.get_job(job["job_id"])
+        assert progress["state"] == "building"
+        assert progress["started_at"] == 100.0
+        assert progress["finished_at"] is None
+        assert progress["elapsed_ms"] == 1250
+        persisted = json.loads(evolution.jobs_path.read_text(encoding="utf-8"))
+        persisted_job = next(item for item in persisted["jobs"] if item["job_id"] == job["job_id"])
+        assert persisted_job["started_at"] == 100.0
+        assert persisted_job["finished_at"] is None
+        assert persisted_job["elapsed_ms"] == 1250
+    finally:
+        classifier.release_feature.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    completed = evolution.get_job(job["job_id"])
+    assert completed["state"] == "completed"
+    assert completed["started_at"] == 100.0
+    assert completed["finished_at"] == 101.25
+    assert completed["elapsed_ms"] == 1250
+    now[0] = 110.0
+    restarted = TemplateEvolution(
+        catalog, tmp_path / "timed-progress", clock=lambda: now[0], start_worker=False
+    )
+    persisted_completed = restarted.get_job(job["job_id"])
+    assert persisted_completed["finished_at"] == 101.25
+    assert persisted_completed["elapsed_ms"] == 1250
 
 
 def test_build_reports_features_without_publishing_candidate_early(tmp_path):
@@ -203,6 +289,58 @@ def test_feature_failure_keeps_previous_active_snapshot(tmp_path):
     assert active.cache is original.cache
 
 
+def test_failed_job_freezes_elapsed_time(tmp_path):
+    now = [200.0]
+    classifier = TimedFailingProgressClassifier(now)
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    evolution = TemplateEvolution(
+        catalog, tmp_path / "timed-failure", clock=lambda: now[0], start_worker=False
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "timed-failure.png", 40),
+        operation_id="timed-failure",
+    )
+    classifier.fail_appends = True
+
+    failed = evolution.run_next(force=True)
+
+    assert failed["state"] == "failed"
+    assert failed["started_at"] == 200.0
+    assert failed["finished_at"] == 201.25
+    assert failed["elapsed_ms"] == 1250
+    now[0] = 205.0
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+
+
+def test_needs_review_job_freezes_elapsed_time(tmp_path):
+    now = [300.0]
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / "timed-review",
+        clock=lambda: now[0],
+        start_worker=False,
+        geometry_profiles=TimedReviewProfiles(now),
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "timed-review.png", 41),
+        operation_id="timed-review",
+    )
+
+    review = evolution.run_next(force=True)
+
+    assert review["state"] == "needs_review"
+    assert review["started_at"] == 300.0
+    assert review["finished_at"] == 301.25
+    assert review["elapsed_ms"] == 1250
+    now[0] = 305.0
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+
+
 def test_build_reports_validating_while_geometry_check_is_running(tmp_path):
     catalog, record = setup_catalog(tmp_path)
     profiles = BlockingGeometryProfiles()
@@ -245,7 +383,14 @@ def test_restart_requeues_interrupted_build_with_recovery_detail(tmp_path):
     )
     with evolution._condition:
         evolution._jobs[job["job_id"]].update(
-            state="building", phase="features", completed=1, total=3, progress=33
+            state="building",
+            phase="features",
+            completed=1,
+            total=3,
+            progress=33,
+            started_at=100.0,
+            finished_at=None,
+            elapsed_ms=1250,
         )
         evolution._persist()
 
@@ -256,6 +401,9 @@ def test_restart_requeues_interrupted_build_with_recovery_detail(tmp_path):
     assert recovered["state"] == "queued"
     assert recovered["phase"] == "queued"
     assert recovered["recovery_detail"]
+    assert recovered["started_at"] is None
+    assert recovered["finished_at"] is None
+    assert recovered["elapsed_ms"] is None
 
 
 def test_retry_requeues_same_job_and_clears_failure_detail(tmp_path):
@@ -273,6 +421,9 @@ def test_retry_requeues_same_job_and_clears_failure_detail(tmp_path):
             progress=50,
             error="failed",
             recovery_detail="old recovery",
+            started_at=100.0,
+            finished_at=101.25,
+            elapsed_ms=1250,
         )
 
     retried = evolution.action(job["job_id"], "retry")
@@ -285,6 +436,9 @@ def test_retry_requeues_same_job_and_clears_failure_detail(tmp_path):
     assert retried["progress"] == 0
     assert retried["error"] is None
     assert not retried.get("recovery_detail")
+    assert retried["started_at"] is None
+    assert retried["finished_at"] is None
+    assert retried["elapsed_ms"] is None
 
 
 def test_resolve_review_requeues_same_job_and_clears_review_detail(tmp_path):
@@ -302,6 +456,9 @@ def test_resolve_review_requeues_same_job_and_clears_review_detail(tmp_path):
             progress=33,
             error="review required",
             recovery_detail="old recovery",
+            started_at=200.0,
+            finished_at=201.25,
+            elapsed_ms=1250,
         )
 
     resolved = evolution.action(job["job_id"], "resolve-review")
@@ -314,6 +471,9 @@ def test_resolve_review_requeues_same_job_and_clears_review_detail(tmp_path):
     assert resolved["progress"] == 0
     assert resolved["error"] is None
     assert not resolved.get("recovery_detail")
+    assert resolved["started_at"] is None
+    assert resolved["finished_at"] is None
+    assert resolved["elapsed_ms"] is None
 
 
 def test_cancel_preserves_last_phase_and_incomplete_progress(tmp_path):
@@ -335,6 +495,66 @@ def test_cancel_preserves_last_phase_and_incomplete_progress(tmp_path):
     assert cancelled["completed"] == 1
     assert cancelled["total"] == 4
     assert cancelled["progress"] == 25
+    assert cancelled["started_at"] is None
+    assert cancelled["finished_at"] is None
+    assert cancelled["elapsed_ms"] is None
+
+
+def test_cancel_preserves_existing_terminal_elapsed_time(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "cancel-terminal", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "cancel-terminal.png", 42),
+        operation_id="cancel-terminal",
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            state="failed",
+            started_at=400.0,
+            finished_at=401.25,
+            elapsed_ms=1250,
+        )
+
+    cancelled = evolution.action(job["job_id"], "cancel")
+
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["started_at"] == 400.0
+    assert cancelled["finished_at"] == 401.25
+    assert cancelled["elapsed_ms"] == 1250
+
+
+def test_legacy_queued_job_loads_with_unknown_elapsed_time(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    storage = tmp_path / "legacy-timing"
+    storage.mkdir()
+    (storage / "jobs.json").write_text(
+        json.dumps({
+            "jobs": [{
+                "job_id": "legacy-queued",
+                "workpiece_id": record.id,
+                "base_revision": record.revision,
+                "state": "queued",
+                "phase": "queued",
+                "completed": 0,
+                "total": 0,
+                "progress": 0,
+                "warnings": [],
+                "error": None,
+                "last_submitted_at": 0.0,
+                "items": [],
+            }],
+            "operations": {},
+        }),
+        encoding="utf-8",
+    )
+
+    legacy = TemplateEvolution(catalog, storage, start_worker=False).get_job("legacy-queued")
+
+    assert legacy["started_at"] is None
+    assert legacy["finished_at"] is None
+    assert legacy["elapsed_ms"] is None
 
 
 def test_restart_reconciles_manifest_commit_without_appending_twice(tmp_path):
@@ -358,11 +578,15 @@ def test_restart_reconciles_manifest_commit_without_appending_twice(tmp_path):
         evolution._jobs[job["job_id"]]["state"] = "building"
         evolution._persist()
 
-    restarted = TemplateEvolution(catalog, storage, start_worker=False)
+    ticks = iter((500.0, 501.25))
+    restarted = TemplateEvolution(catalog, storage, clock=lambda: next(ticks), start_worker=False)
     result = restarted.run_next(force=True)
 
     assert result["state"] == "completed"
     assert result["revision"] == committed.revision
+    assert result["started_at"] == 500.0
+    assert result["finished_at"] == 501.25
+    assert result["elapsed_ms"] == 1250
     assert len(catalog.get(record.id).front_images) == 2
     assert not staged.exists()
 

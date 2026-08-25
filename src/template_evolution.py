@@ -135,6 +135,9 @@ class TemplateEvolution:
                 "total": total,
                 "progress": 100 if state == "completed" else 0,
                 "recovery_detail": None,
+                "started_at": None,
+                "finished_at": None,
+                "elapsed_ms": None,
             }
             for key, value in defaults.items():
                 if key not in job:
@@ -208,6 +211,9 @@ class TemplateEvolution:
                     "total": 0,
                     "progress": 0,
                     "recovery_detail": None,
+                    "started_at": None,
+                    "finished_at": None,
+                    "elapsed_ms": None,
                     "warnings": [],
                     "error": None,
                     "last_submitted_at": now,
@@ -678,6 +684,9 @@ class TemplateEvolution:
             job["total"] = len(job.get("items", []))
             job["progress"] = 0
             job["recovery_detail"] = None
+            job["started_at"] = float(self._clock())
+            job["finished_at"] = None
+            job["elapsed_ms"] = 0
             self._persist()
 
         def update_progress(event: dict[str, object]) -> None:
@@ -694,6 +703,7 @@ class TemplateEvolution:
                 current_job["completed"] = completed
                 current_job["total"] = total
                 current_job["progress"] = 0 if total == 0 else min(99, completed * 100 // total)
+                self._update_elapsed(current_job)
                 self._persist()
         try:
             current = self.catalog.get(job["workpiece_id"])
@@ -706,6 +716,7 @@ class TemplateEvolution:
                     job["revision"] = current.revision
                     job["error"] = None
                     job["recovery_detail"] = None
+                    self._finish_elapsed(job)
                     self._cleanup_payload(job)
                     self._persist()
                     return self._snapshot(job)
@@ -724,6 +735,7 @@ class TemplateEvolution:
                     job["error"] = geometry_review.get("reason", "new template geometry could not be fitted")
                     job["review_reason"] = "geometry_mask_low_confidence"
                     job["geometry_review"] = geometry_review
+                    self._finish_elapsed(job)
                     self._persist()
                     return self._snapshot(job)
             front = [Path(item["path"]) for item in job["items"] if item["orientation"] == "front"]
@@ -744,6 +756,7 @@ class TemplateEvolution:
                 job["revision"] = record.revision
                 job["error"] = None
                 job["recovery_detail"] = None
+                self._finish_elapsed(job)
                 self._cleanup_payload(job)
                 self._persist()
                 return self._snapshot(job)
@@ -751,6 +764,7 @@ class TemplateEvolution:
             with self._condition:
                 job["state"] = "failed"
                 job["error"] = str(exc)
+                self._finish_elapsed(job)
                 self._persist()
                 return self._snapshot(job)
 
@@ -855,6 +869,21 @@ class TemplateEvolution:
         job["completed"] = 0
         job["total"] = len(job.get("items", []))
         job["progress"] = 0
+        job["started_at"] = None
+        job["finished_at"] = None
+        job["elapsed_ms"] = None
+
+    def _update_elapsed(self, job: dict, *, finished: bool = False) -> None:
+        started_at = job.get("started_at")
+        if started_at is None:
+            return
+        now = float(self._clock())
+        job["elapsed_ms"] = max(0, int(round((now - float(started_at)) * 1000.0)))
+        if finished:
+            job["finished_at"] = now
+
+    def _finish_elapsed(self, job: dict) -> None:
+        self._update_elapsed(job, finished=True)
 
     @staticmethod
     def _cleanup_payload(job: dict) -> None:
