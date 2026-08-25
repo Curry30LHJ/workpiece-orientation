@@ -7,7 +7,6 @@
 #include <QJsonArray>
 #include <QStringList>
 #include <QTimer>
-#include <QVector>
 
 #include <functional>
 
@@ -95,26 +94,6 @@ private slots:
 private:
     enum class CommandOwner { None, System, Inspection, Library, Geometry };
 
-    enum class BatchResultState {
-        Pending,
-        Submitting,
-        QueuedFront,
-        QueuedBack,
-        Rejected,
-        SubmitFailed,
-    };
-
-    struct BatchResult {
-        QString imagePath;
-        QString workpieceId;
-        QJsonObject response;
-        QString label;
-        bool needsReview = false;
-        double elapsedMs = 0.0;
-        BatchResultState state = BatchResultState::Pending;
-        QString submitError;
-    };
-
     enum class ResultContext {
         None,
         Single,
@@ -135,18 +114,6 @@ private:
     void clearBatchResults();
     void sendRegistration(bool replace);
     void requestWorkpieceRefresh(bool preserveRegistrationSummary);
-    void sendNextBatchPrediction();
-    void appendBatchResult(const QJsonObject &response);
-    void finishBatchPrediction();
-    void renderPredictionResult(const QString &imagePath, const QJsonObject &response,
-                                const QString &sourceText);
-    void selectBatchResult(int index, bool userInitiated);
-    void updateBatchRow(int index);
-    int preferredPendingBatchResult(int afterIndex = -1) const;
-    void updateBatchSummary();
-    QString batchResultStateText(BatchResultState state) const;
-    bool currentBatchResultCanBeProcessed() const;
-    void submitCurrentConfirmation(const QString &orientation);
     void submitTemplateConfirmation(const QString &workpieceId, const QString &imagePath,
                                     const QString &orientation);
     void startRegistrationProgress();
@@ -174,7 +141,6 @@ private:
     QStringList backTemplatePaths_;
     QString inspectionImagePath_;
     QStringList batchImagePaths_;
-    int batchIndex_ = 0;
     CommandOwner pendingOwner_ = CommandOwner::None;
     QString pendingCommand_;
     CommandOwner queuedOwner_ = CommandOwner::None;
@@ -185,10 +151,6 @@ private:
     bool registrationInFlight_ = false;
     bool registrationSummaryVisible_ = false;
     bool batchInFlight_ = false;
-    int batchFrontCount_ = 0;
-    int batchBackCount_ = 0;
-    int batchUncertainCount_ = 0;
-    int batchReviewCount_ = 0;
     bool backendReady_ = false;
     bool backendReadyHandled_ = false;
     bool clientBusy_ = false;
@@ -218,15 +180,9 @@ private:
     QJsonObject lastPredictionResponse_;
     QString pendingPredictionWorkpieceId_;
     QString pendingPredictionImagePath_;
-    QString batchWorkpieceId_;
-    QVector<BatchResult> batchResults_;
-    int selectedBatchResultIndex_ = -1;
-    int pendingConfirmationBatchIndex_ = -1;
+    QString pendingConfirmationRecordId_;
     QString pendingConfirmationOrientation_;
     ResultContext resultContext_ = ResultContext::None;
-    bool changingBatchSelection_ = false;
-    bool batchSelectionPinned_ = false;
-    bool batchCompletedSuccessfully_ = false;
     QPointer<AnnotationManagerDialog> annotationManagerDialog_;
     QString annotationWorkpieceId_;
     QPointer<GeometryMaskManagerDialog> geometryMaskManagerDialog_;

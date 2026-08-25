@@ -24,38 +24,57 @@
         </layout>
        </item>
        <item>
-        <layout class="QHBoxLayout" name="batchButtonLayout">
+       <layout class="QHBoxLayout" name="batchButtonLayout">
          <item><widget class="QPushButton" name="chooseBatchImagesButton"><property name="text"><string>选择批量图片</string></property></widget></item>
          <item><widget class="QPushButton" name="batchPredictButton"><property name="text"><string>批量检测</string></property></widget></item>
+         <item><widget class="QPushButton" name="stopBatchButton"><property name="text"><string>停止批量检测</string></property></widget></item>
         </layout>
        </item>
       </layout>
      </widget>
      <widget class="QWidget" name="resultPane">
       <layout class="QVBoxLayout" name="resultPaneLayout">
-       <item><widget class="QLabel" name="resultLabel"><property name="text"><string>尚未检测</string></property></widget></item>
-       <item><widget class="QLabel" name="resultMessageLabel"><property name="wordWrap"><bool>true</bool></property><property name="text"><string/></property></widget></item>
-       <item><widget class="QLabel" name="reviewLabel"><property name="styleSheet"><string notr="true">color: #b00020; font-weight: bold;</string></property><property name="text"><string/></property></widget></item>
        <item><widget class="QLabel" name="batchSummaryLabel"><property name="text"><string/></property></widget></item>
-       <item><widget class="QTableWidget" name="batchResultsTableWidget"/></item>
-       <item><widget class="QTextEdit" name="evidenceTextEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumHeight"><number>130</number></property></widget></item>
+       <item><widget class="QProgressBar" name="batchProgressBar"><property name="value"><number>0</number></property><property name="textVisible"><bool>true</bool></property></widget></item>
        <item>
-        <widget class="QGroupBox" name="rawEvidenceContainer">
-         <property name="title"><string>原始证据详情</string></property>
-         <property name="checkable"><bool>true</bool></property>
-         <property name="checked"><bool>false</bool></property>
-         <layout class="QVBoxLayout" name="rawEvidenceLayout">
-          <item><widget class="QTextEdit" name="rawEvidenceTextEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumHeight"><number>110</number></property></widget></item>
+        <layout class="QHBoxLayout" name="batchFilterLayout">
+         <item><widget class="QPushButton" name="allBatchFilterButton"><property name="text"><string>全部</string></property><property name="checkable"><bool>true</bool></property><property name="checked"><bool>true</bool></property></widget></item>
+         <item><widget class="QPushButton" name="needsReviewBatchFilterButton"><property name="text"><string>需复检</string></property><property name="checkable"><bool>true</bool></property></widget></item>
+         <item><widget class="QPushButton" name="unprocessedBatchFilterButton"><property name="text"><string>未处理</string></property><property name="checkable"><bool>true</bool></property></widget></item>
+         <item><widget class="QPushButton" name="failedBatchFilterButton"><property name="text"><string>失败</string></property><property name="checkable"><bool>true</bool></property></widget></item>
          </layout>
-        </widget>
        </item>
-       <item><widget class="QLabel" name="currentResultTargetLabel"><property name="wordWrap"><bool>true</bool></property><property name="text"><string/></property></widget></item>
        <item>
-        <layout class="QVBoxLayout" name="confirmationActionsLayout">
-         <item><widget class="QPushButton" name="confirmFrontButton"><property name="text"><string>确认正面</string></property></widget></item>
-         <item><widget class="QPushButton" name="confirmBackButton"><property name="text"><string>修正为反面</string></property></widget></item>
-         <item><widget class="QPushButton" name="rejectConfirmationButton"><property name="text"><string>不入库</string></property></widget></item>
-        </layout>
+        <widget class="QSplitter" name="batchReviewSplitter">
+         <property name="orientation"><enum>Qt::Vertical</enum></property>
+         <widget class="QWidget" name="resultDetailPane">
+          <layout class="QVBoxLayout" name="resultDetailLayout">
+           <item><widget class="QLabel" name="resultLabel"><property name="text"><string>尚未检测</string></property></widget></item>
+           <item><widget class="QLabel" name="resultMessageLabel"><property name="wordWrap"><bool>true</bool></property><property name="text"><string/></property></widget></item>
+           <item><widget class="QLabel" name="reviewLabel"><property name="styleSheet"><string notr="true">color: #b00020; font-weight: bold;</string></property><property name="text"><string/></property></widget></item>
+           <item><widget class="QTextEdit" name="evidenceTextEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumHeight"><number>130</number></property></widget></item>
+           <item>
+            <widget class="QGroupBox" name="rawEvidenceContainer">
+             <property name="title"><string>原始证据详情</string></property>
+             <property name="checkable"><bool>true</bool></property>
+             <property name="checked"><bool>false</bool></property>
+             <layout class="QVBoxLayout" name="rawEvidenceLayout">
+              <item><widget class="QTextEdit" name="rawEvidenceTextEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumHeight"><number>110</number></property></widget></item>
+             </layout>
+            </widget>
+           </item>
+           <item><widget class="QLabel" name="currentResultTargetLabel"><property name="wordWrap"><bool>true</bool></property><property name="text"><string/></property></widget></item>
+           <item>
+            <layout class="QVBoxLayout" name="confirmationActionsLayout">
+             <item><widget class="QPushButton" name="confirmFrontButton"><property name="text"><string>确认正面</string></property></widget></item>
+             <item><widget class="QPushButton" name="confirmBackButton"><property name="text"><string>修正为反面</string></property></widget></item>
+             <item><widget class="QPushButton" name="rejectConfirmationButton"><property name="text"><string>不入库</string></property></widget></item>
+            </layout>
+           </item>
+          </layout>
+         </widget>
+         <widget class="QTableWidget" name="batchResultsTableWidget"/>
+        </widget>
        </item>
        <item><widget class="QLabel" name="recentInspectionTitleLabel"><property name="text"><string>最近检测</string></property></widget></item>
        <item><widget class="QListWidget" name="recentInspectionList"><property name="maximumHeight"><number>180</number></property><property name="iconSize"><size><width>64</width><height>48</height></size></property></widget></item>

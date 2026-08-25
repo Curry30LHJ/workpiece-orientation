@@ -3,12 +3,17 @@
 #include "ui_inspectionpage.h"
 
 #include <QApplication>
+#include <QButtonGroup>
 #include <QFileInfo>
+#include <QHeaderView>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QListWidgetItem>
 #include <QPixmap>
 #include <QPushButton>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include <QUuid>
 #include <QVBoxLayout>
 #include <QWheelEvent>
@@ -29,6 +34,26 @@ InspectionPage::InspectionPage(QWidget *parent)
     : QWidget(parent), ui(new Ui::InspectionPage) {
     ui->setupUi(this);
     ui->inspectionSplitter->setSizes({650, 350});
+    ui->batchReviewSplitter->setSizes({430, 230});
+    ui->batchResultsTableWidget->setColumnCount(5);
+    ui->batchResultsTableWidget->setHorizontalHeaderLabels({
+        QStringLiteral("文件"), QStringLiteral("结果"), QStringLiteral("复检"),
+        QStringLiteral("耗时（毫秒）"), QStringLiteral("处理状态")});
+    ui->batchResultsTableWidget->horizontalHeader()->setSectionResizeMode(
+        0, QHeaderView::Stretch);
+    for (int column = 1; column < 5; ++column) {
+        ui->batchResultsTableWidget->horizontalHeader()->setSectionResizeMode(
+            column, QHeaderView::ResizeToContents);
+    }
+    ui->batchResultsTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    ui->batchResultsTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
+    ui->batchResultsTableWidget->setSelectionMode(QAbstractItemView::SingleSelection);
+    auto *filterGroup = new QButtonGroup(this);
+    filterGroup->setExclusive(true);
+    filterGroup->addButton(ui->allBatchFilterButton);
+    filterGroup->addButton(ui->needsReviewBatchFilterButton);
+    filterGroup->addButton(ui->unprocessedBatchFilterButton);
+    filterGroup->addButton(ui->failedBatchFilterButton);
     ui->rawEvidenceContainer->setChecked(false);
     ui->rawEvidenceTextEdit->setVisible(false);
     connect(ui->rawEvidenceContainer, &QGroupBox::toggled,
@@ -42,15 +67,31 @@ InspectionPage::InspectionPage(QWidget *parent)
             this, &InspectionPage::requestPrediction);
     connect(ui->confirmFrontButton, &QPushButton::clicked,
             this, [this]() {
-                if (mode_ == InspectionMode::Single) requestConfirmation(QStringLiteral("front"));
+                requestConfirmation(QStringLiteral("front"));
             });
     connect(ui->confirmBackButton, &QPushButton::clicked,
             this, [this]() {
-                if (mode_ == InspectionMode::Single) requestConfirmation(QStringLiteral("back"));
+                requestConfirmation(QStringLiteral("back"));
             });
     connect(ui->rejectConfirmationButton, &QPushButton::clicked,
-            this, [this]() {
-                if (mode_ == InspectionMode::Single) rejectCurrentRecord();
+            this, &InspectionPage::rejectCurrentRecord);
+    connect(ui->stopBatchButton, &QPushButton::clicked,
+            this, &InspectionPage::requestBatchStop);
+    connect(ui->allBatchFilterButton, &QPushButton::clicked,
+            this, [this]() { setBatchFilter(BatchFilter::All); });
+    connect(ui->needsReviewBatchFilterButton, &QPushButton::clicked,
+            this, [this]() { setBatchFilter(BatchFilter::NeedsReview); });
+    connect(ui->unprocessedBatchFilterButton, &QPushButton::clicked,
+            this, [this]() { setBatchFilter(BatchFilter::Unprocessed); });
+    connect(ui->failedBatchFilterButton, &QPushButton::clicked,
+            this, [this]() { setBatchFilter(BatchFilter::Failed); });
+    connect(ui->batchResultsTableWidget, &QTableWidget::currentCellChanged,
+            this, [this](int row, int, int, int) {
+                if (changingBatchSelection_ || row < 0) return;
+                QTableWidgetItem *item = ui->batchResultsTableWidget->item(row, 0);
+                if (item != nullptr) {
+                    selectBatchRecord(item->data(Qt::UserRole).toString(), true);
+                }
             });
     connect(ui->recentInspectionList, &QListWidget::itemActivated,
             this, [this](QListWidgetItem *item) {
@@ -110,7 +151,7 @@ InspectionUiState InspectionPage::uiState() const {
 void InspectionPage::setCurrentWorkpiece(const QString &id, const QString &name) {
     currentWorkpieceId_ = id;
     currentWorkpieceName_ = name;
-    updateActionAvailability();
+    renderActiveState();
 }
 
 void InspectionPage::setBackendAvailable(bool available, bool busy, const QString &reason) {
@@ -119,6 +160,10 @@ void InspectionPage::setBackendAvailable(bool available, bool busy, const QStrin
     backendBusy_ = busy;
     backendReason_ = reason;
     renderActiveState();
+    if (available && !busy && batchRunning_ && currentBatchRequestId_.isEmpty()
+        && !stopRequested_ && batchCursor_ < batchRecordOrder_.size()) {
+        requestNextBatchPrediction();
+    }
 }
 
 void InspectionPage::setSingleImagePath(const QString &path) {
@@ -133,9 +178,162 @@ void InspectionPage::setSingleImagePath(const QString &path) {
 
 void InspectionPage::clearBatchState() {
     batchState_ = ModeState();
+    batchRecords_.clear();
+    batchRecordOrder_.clear();
+    currentBatchRequestId_.clear();
+    selectedRecordId_.clear();
+    batchWorkpieceId_.clear();
+    batchFilter_ = BatchFilter::All;
+    batchCursor_ = 0;
+    batchSelectionPinned_ = false;
+    batchRunning_ = false;
+    stopRequested_ = false;
+    ui->batchResultsTableWidget->setRowCount(0);
+    ui->batchSummaryLabel->clear();
+    ui->batchProgressBar->setRange(0, 1);
+    ui->batchProgressBar->setValue(0);
+    ui->allBatchFilterButton->setChecked(true);
     if (mode_ == InspectionMode::Batch) {
         renderActiveState();
     }
+}
+
+void InspectionPage::beginBatch(const QStringList &paths, const QString &workpieceId) {
+    QStringList normalized;
+    normalized.reserve(paths.size());
+    for (const QString &path : paths) {
+        const QString absolute = QFileInfo(path).absoluteFilePath();
+        QImageReader reader(absolute);
+        if (!QFileInfo::exists(absolute) || !reader.canRead()) {
+            clearBatchState();
+            mode_ = InspectionMode::Batch;
+            batchState_.uiState = InspectionUiState::Failed;
+            batchState_.message = QStringLiteral("图片无法读取：%1")
+                                      .arg(QFileInfo(absolute).fileName());
+            renderActiveState();
+            return;
+        }
+        normalized.append(absolute);
+    }
+
+    clearBatchState();
+    mode_ = InspectionMode::Batch;
+    batchWorkpieceId_ = workpieceId;
+    for (const QString &path : normalized) {
+        InspectionRecord record;
+        record.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        record.imagePath = path;
+        record.workpieceId = workpieceId;
+        batchRecordOrder_.append(record.id);
+        batchRecords_.insert(record.id, record);
+    }
+    batchState_.imagePath = normalized.isEmpty() ? QString() : normalized.constFirst();
+    batchState_.uiState = normalized.isEmpty()
+        ? InspectionUiState::Idle : InspectionUiState::Running;
+    batchState_.message = normalized.isEmpty()
+        ? QStringLiteral("批量列表为空") : QStringLiteral("正在批量检测…");
+    batchRunning_ = !normalized.isEmpty();
+    rebuildBatchTable();
+    updateBatchSummary();
+    renderActiveState();
+    if (batchRunning_) requestNextBatchPrediction();
+}
+
+void InspectionPage::setBatchFilter(BatchFilter filter) {
+    batchFilter_ = filter;
+    ui->allBatchFilterButton->setChecked(filter == BatchFilter::All);
+    ui->needsReviewBatchFilterButton->setChecked(filter == BatchFilter::NeedsReview);
+    ui->unprocessedBatchFilterButton->setChecked(filter == BatchFilter::Unprocessed);
+    ui->failedBatchFilterButton->setChecked(filter == BatchFilter::Failed);
+    rebuildBatchTable();
+}
+
+BatchFilter InspectionPage::batchFilter() const {
+    return batchFilter_;
+}
+
+QString InspectionPage::selectedRecordId() const {
+    return mode_ == InspectionMode::Batch
+        ? selectedRecordId_ : singleState_.visibleRecord.id;
+}
+
+QStringList InspectionPage::batchRecordIds() const {
+    return batchRecordOrder_;
+}
+
+void InspectionPage::requestBatchStop() {
+    if (!batchRunning_) return;
+    stopRequested_ = true;
+    if (currentBatchRequestId_.isEmpty()) finishBatch(true);
+    updateActionAvailability();
+}
+
+int InspectionPage::completedBatchCount() const {
+    int completed = 0;
+    for (const QString &recordId : batchRecordOrder_) {
+        if (batchRecords_.value(recordId).completedAt.isValid()) ++completed;
+    }
+    return completed;
+}
+
+int InspectionPage::failedBatchCount() const {
+    int failed = 0;
+    for (const QString &recordId : batchRecordOrder_) {
+        const InspectionRecord record = batchRecords_.value(recordId);
+        if (record.disposition == BatchDisposition::PredictionFailed
+            || record.disposition == BatchDisposition::SubmitFailed
+            || !record.error.isEmpty()) {
+            ++failed;
+        }
+    }
+    return failed;
+}
+
+void InspectionPage::setRecordDisposition(const QString &recordId,
+                                           BatchDisposition disposition,
+                                           const QString &evolutionJobId,
+                                           const QString &error) {
+    const bool resolvesPendingConfirmation = recordId == pendingConfirmationRecordId_
+        && disposition != BatchDisposition::Submitting;
+    if (batchRecords_.contains(recordId)) {
+        InspectionRecord record = batchRecords_.value(recordId);
+        record.disposition = disposition;
+        if (!evolutionJobId.isEmpty()) record.evolutionJobId = evolutionJobId;
+        record.error = error;
+        record.submissionError = error;
+        batchRecords_.insert(recordId, record);
+        if (selectedRecordId_ == recordId) {
+            batchState_.visibleRecord = record;
+            batchState_.hasRecord = record.completedAt.isValid();
+        }
+        rebuildBatchTable();
+        updateBatchSummary();
+        if (selectedRecordId_ == recordId
+            && (disposition == BatchDisposition::QueuedFront
+                || disposition == BatchDisposition::QueuedBack
+                || disposition == BatchDisposition::Rejected)) {
+            selectPreferredBatchRecord(recordId);
+        } else {
+            renderActiveState();
+        }
+        if (resolvesPendingConfirmation) {
+            pendingConfirmationRecordId_.clear();
+            pendingConfirmationOrientation_.clear();
+        }
+        return;
+    }
+    updateRecordDisposition(recordId, disposition, error);
+    if (recentRecords_.contains(recordId) && !evolutionJobId.isEmpty()) {
+        InspectionRecord record = recentRecords_.value(recordId);
+        record.evolutionJobId = evolutionJobId;
+        recentRecords_.insert(recordId, record);
+        if (singleState_.visibleRecord.id == recordId) singleState_.visibleRecord = record;
+    }
+    if (resolvesPendingConfirmation) {
+        pendingConfirmationRecordId_.clear();
+        pendingConfirmationOrientation_.clear();
+    }
+    renderActiveState();
 }
 
 QString InspectionPage::singleImagePath() const {
@@ -207,6 +405,34 @@ void InspectionPage::selectRecentRecord(const QString &recordId) {
 void InspectionPage::handleBackendResponse(const QString &command,
                                            const QJsonObject &response) {
     if (command == QStringLiteral("predict")) {
+        if (mode_ == InspectionMode::Batch && !currentBatchRequestId_.isEmpty()) {
+            InspectionRecord *record = batchRecord(currentBatchRequestId_);
+            if (record == nullptr) return;
+            record->response = response;
+            record->label = response.value(QStringLiteral("label")).toString();
+            record->needsReview = response.value(QStringLiteral("needs_review")).toBool();
+            record->elapsedMs = response.value(QStringLiteral("elapsed_ms")).toDouble();
+            record->completedAt = QDateTime::currentDateTime();
+            record->error.clear();
+            const QString completedRecordId = currentBatchRequestId_;
+            currentBatchRequestId_.clear();
+            ++batchCursor_;
+            if (selectedRecordId_ == completedRecordId) {
+                batchState_.visibleRecord = *record;
+                batchState_.hasRecord = true;
+            }
+            rebuildBatchTable();
+            updateBatchSummary();
+            renderActiveState();
+            if (stopRequested_) {
+                finishBatch(true);
+            } else if (batchCursor_ >= batchRecordOrder_.size()) {
+                finishBatch(false);
+            } else {
+                requestNextBatchPrediction();
+            }
+            return;
+        }
         InspectionRecord record;
         record.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
         record.imagePath = pendingPredictionImagePath_.isEmpty()
@@ -225,26 +451,22 @@ void InspectionPage::handleBackendResponse(const QString &command,
     }
     if (command == QStringLiteral("submit_confirmation")) {
         const QString recordId = pendingConfirmationRecordId_;
-        if (recordId.isEmpty() || !recentRecords_.contains(recordId)) return;
-        InspectionRecord record = recentRecords_.value(recordId);
+        if (recordId.isEmpty()) return;
         const QJsonObject job = response.value(QStringLiteral("job")).toObject();
-        record.evolutionJobId = job.value(QStringLiteral("job_id")).toString();
+        const QString jobId = job.value(QStringLiteral("job_id")).toString();
         const QString state = job.value(QStringLiteral("state")).toString(QStringLiteral("queued"));
         if (state == QStringLiteral("failed")) {
-            record.disposition = BatchDisposition::SubmitFailed;
-            record.submissionError = job.value(QStringLiteral("error")).toString();
+            setRecordDisposition(recordId, BatchDisposition::SubmitFailed, jobId,
+                                 job.value(QStringLiteral("error")).toString());
         } else {
-            record.disposition = pendingConfirmationOrientation_ == QStringLiteral("back")
-                ? BatchDisposition::QueuedBack : BatchDisposition::QueuedFront;
-            record.submissionError.clear();
-            record.response.insert(QStringLiteral("evolution_state"), state);
+            setRecordDisposition(
+                recordId,
+                pendingConfirmationOrientation_ == QStringLiteral("back")
+                    ? BatchDisposition::QueuedBack : BatchDisposition::QueuedFront,
+                jobId);
         }
-        recentRecords_.insert(recordId, record);
         pendingConfirmationRecordId_.clear();
         pendingConfirmationOrientation_.clear();
-        if (singleState_.visibleRecord.id == recordId) singleState_.visibleRecord = record;
-        rebuildRecentList();
-        renderActiveState();
         return;
     }
     if (command == QStringLiteral("list_evolution_jobs")) {
@@ -264,8 +486,23 @@ void InspectionPage::handleBackendResponse(const QString &command,
                 recentRecords_.insert(recordId, record);
                 if (singleState_.visibleRecord.id == recordId) singleState_.visibleRecord = record;
             }
+            for (const QString &recordId : batchRecordOrder_) {
+                InspectionRecord record = batchRecords_.value(recordId);
+                if (record.evolutionJobId != jobId) continue;
+                const QString state = job.value(QStringLiteral("state")).toString();
+                record.response.insert(QStringLiteral("evolution_state"), state);
+                if (state == QStringLiteral("failed")) {
+                    record.disposition = BatchDisposition::SubmitFailed;
+                    record.error = job.value(QStringLiteral("error")).toString();
+                    record.submissionError = record.error;
+                }
+                batchRecords_.insert(recordId, record);
+                if (selectedRecordId_ == recordId) batchState_.visibleRecord = record;
+            }
         }
         rebuildRecentList();
+        rebuildBatchTable();
+        updateBatchSummary();
         renderActiveState();
     }
 }
@@ -274,14 +511,45 @@ void InspectionPage::handleBackendFailure(const QString &command, const QString 
                                           const QString &message) {
     if (command == QStringLiteral("submit_confirmation")
         && !pendingConfirmationRecordId_.isEmpty()) {
-        updateRecordDisposition(pendingConfirmationRecordId_,
-                                BatchDisposition::SubmitFailed, message);
+        setRecordDisposition(pendingConfirmationRecordId_,
+                             BatchDisposition::SubmitFailed, QString(), message);
         pendingConfirmationRecordId_.clear();
         pendingConfirmationOrientation_.clear();
         renderActiveState();
         return;
     }
     if (command == QStringLiteral("predict")) {
+        if (mode_ == InspectionMode::Batch && !currentBatchRequestId_.isEmpty()) {
+            InspectionRecord *record = batchRecord(currentBatchRequestId_);
+            if (record == nullptr) return;
+            const bool transportFailure = code == QStringLiteral("CONNECTION_LOST")
+                || code == QStringLiteral("TRANSPORT_ERROR");
+            record->completedAt = QDateTime::currentDateTime();
+            record->disposition = BatchDisposition::PredictionFailed;
+            record->error = transportFailure
+                ? QStringLiteral("结果未知：%1").arg(message) : message;
+            const QString failedRecordId = currentBatchRequestId_;
+            currentBatchRequestId_.clear();
+            ++batchCursor_;
+            if (selectedRecordId_ == failedRecordId) {
+                batchState_.visibleRecord = *record;
+                batchState_.hasRecord = true;
+            }
+            rebuildBatchTable();
+            updateBatchSummary();
+            renderActiveState();
+            if (transportFailure) {
+                backendStatusKnown_ = true;
+                backendAvailable_ = false;
+                backendReason_ = message;
+                finishBatch(true);
+            } else if (stopRequested_ || batchCursor_ >= batchRecordOrder_.size()) {
+                finishBatch(stopRequested_);
+            } else if (backendAvailable_ && !backendBusy_) {
+                requestNextBatchPrediction();
+            }
+            return;
+        }
         showSingleFailure(message);
         if (code == QStringLiteral("CONNECTION_LOST")
             || code == QStringLiteral("TRANSPORT_ERROR")) {
@@ -311,9 +579,48 @@ void InspectionPage::requestPrediction() {
     });
 }
 
+void InspectionPage::requestNextBatchPrediction() {
+    if (!batchRunning_ || stopRequested_ || !currentBatchRequestId_.isEmpty()) return;
+    if (batchCursor_ >= batchRecordOrder_.size()) {
+        finishBatch(false);
+        return;
+    }
+    currentBatchRequestId_ = batchRecordOrder_.at(batchCursor_);
+    const InspectionRecord record = batchRecords_.value(currentBatchRequestId_);
+    batchState_.uiState = InspectionUiState::Running;
+    batchState_.message = QStringLiteral("正在检测：%1")
+                              .arg(QFileInfo(record.imagePath).fileName());
+    updateBatchSummary();
+    emit commandRequested(QStringLiteral("predict"), QJsonObject{
+        {QStringLiteral("workpiece_id"), batchWorkpieceId_},
+        {QStringLiteral("image_path"), record.imagePath},
+    });
+}
+
+void InspectionPage::finishBatch(bool stopped) {
+    if (!batchRunning_) return;
+    batchRunning_ = false;
+    currentBatchRequestId_.clear();
+    batchSelectionPinned_ = false;
+    batchState_.uiState = failedBatchCount() > 0
+        ? InspectionUiState::Failed : InspectionUiState::Completed;
+    batchState_.message = stopped
+        ? QStringLiteral("批量检测已停止")
+        : (failedBatchCount() > 0 ? QStringLiteral("批量检测完成，存在失败记录")
+                                  : QStringLiteral("批量检测完成"));
+    selectPreferredBatchRecord();
+    updateBatchSummary();
+    renderActiveState();
+    emit batchFinished(stopped);
+}
+
 void InspectionPage::requestConfirmation(const QString &orientation) {
-    const InspectionRecord record = singleState_.visibleRecord;
-    if (!singleState_.hasRecord || record.id.isEmpty()
+    const InspectionRecord record = mode_ == InspectionMode::Batch
+        ? batchRecords_.value(selectedRecordId_) : singleState_.visibleRecord;
+    const bool hasRecord = mode_ == InspectionMode::Batch
+        ? batchRecords_.contains(selectedRecordId_) && record.completedAt.isValid()
+        : singleState_.hasRecord;
+    if (!hasRecord || record.id.isEmpty()
         || record.imagePath.isEmpty() || record.workpieceId.isEmpty()
         || record.workpieceId != currentWorkpieceId_
         || !backendAvailable_ || backendBusy_) {
@@ -321,16 +628,17 @@ void InspectionPage::requestConfirmation(const QString &orientation) {
     }
     pendingConfirmationRecordId_ = record.id;
     pendingConfirmationOrientation_ = orientation;
-    updateRecordDisposition(record.id, BatchDisposition::Submitting);
+    setRecordDisposition(record.id, BatchDisposition::Submitting);
     renderActiveState();
     emit confirmationRequested(record.id, record.workpieceId,
                                record.imagePath, orientation);
 }
 
 void InspectionPage::rejectCurrentRecord() {
-    if (!singleState_.hasRecord || singleState_.visibleRecord.id.isEmpty()) return;
-    const QString recordId = singleState_.visibleRecord.id;
-    updateRecordDisposition(recordId, BatchDisposition::Rejected);
+    const QString recordId = mode_ == InspectionMode::Batch
+        ? selectedRecordId_ : singleState_.visibleRecord.id;
+    if (recordId.isEmpty()) return;
+    setRecordDisposition(recordId, BatchDisposition::Rejected);
     renderActiveState();
     emit rejectionRequested(recordId);
 }
@@ -369,7 +677,176 @@ void InspectionPage::rebuildRecentList() {
     }
 }
 
+void InspectionPage::rebuildBatchTable() {
+    changingBatchSelection_ = true;
+    ui->batchResultsTableWidget->setRowCount(0);
+    QStringList visibleIds;
+    for (const QString &recordId : batchRecordOrder_) {
+        const InspectionRecord record = batchRecords_.value(recordId);
+        if (!matchesFilter(record)) continue;
+        visibleIds.append(recordId);
+        const int row = ui->batchResultsTableWidget->rowCount();
+        ui->batchResultsTableWidget->insertRow(row);
+        const QString prediction = record.completedAt.isValid() && !record.label.isEmpty()
+            ? orientationText(record.label) : QStringLiteral("—");
+        const QString review = record.completedAt.isValid()
+            ? (record.needsReview ? QStringLiteral("是") : QStringLiteral("否"))
+            : QStringLiteral("—");
+        const QString elapsed = record.completedAt.isValid()
+            ? QString::number(record.elapsedMs, 'f', 1) : QStringLiteral("—");
+        const QStringList values{
+            QFileInfo(record.imagePath).fileName(), prediction, review, elapsed,
+            dispositionText(record)};
+        for (int column = 0; column < values.size(); ++column) {
+            auto *item = new QTableWidgetItem(values.at(column));
+            item->setData(Qt::UserRole, record.id);
+            if (column == 0) item->setToolTip(record.imagePath);
+            ui->batchResultsTableWidget->setItem(row, column, item);
+        }
+    }
+
+    QString targetId = visibleIds.contains(selectedRecordId_)
+        ? selectedRecordId_ : QString();
+    if (targetId.isEmpty()) {
+        for (const QString &recordId : visibleIds) {
+            if (batchRecords_.value(recordId).needsReview) {
+                targetId = recordId;
+                break;
+            }
+        }
+    }
+    if (targetId.isEmpty()) {
+        for (const QString &recordId : visibleIds) {
+            if (batchRecords_.value(recordId).disposition == BatchDisposition::Pending) {
+                targetId = recordId;
+                break;
+            }
+        }
+    }
+    if (targetId.isEmpty() && !visibleIds.isEmpty()) targetId = visibleIds.constFirst();
+    selectedRecordId_ = targetId;
+    if (!targetId.isEmpty()) {
+        for (int row = 0; row < ui->batchResultsTableWidget->rowCount(); ++row) {
+            if (ui->batchResultsTableWidget->item(row, 0)->data(Qt::UserRole).toString()
+                == targetId) {
+                ui->batchResultsTableWidget->setCurrentCell(row, 0);
+                break;
+            }
+        }
+        const InspectionRecord record = batchRecords_.value(targetId);
+        batchState_.imagePath = record.imagePath;
+        batchState_.visibleRecord = record;
+        batchState_.hasRecord = record.completedAt.isValid();
+    } else {
+        batchState_.visibleRecord = InspectionRecord();
+        batchState_.hasRecord = false;
+    }
+    changingBatchSelection_ = false;
+}
+
+void InspectionPage::selectBatchRecord(const QString &recordId, bool userInitiated) {
+    const InspectionRecord *record = batchRecord(recordId);
+    if (record == nullptr) return;
+    selectedRecordId_ = recordId;
+    if (userInitiated) batchSelectionPinned_ = true;
+    batchState_.imagePath = record->imagePath;
+    batchState_.visibleRecord = *record;
+    batchState_.hasRecord = record->completedAt.isValid();
+    changingBatchSelection_ = true;
+    for (int row = 0; row < ui->batchResultsTableWidget->rowCount(); ++row) {
+        QTableWidgetItem *item = ui->batchResultsTableWidget->item(row, 0);
+        if (item != nullptr && item->data(Qt::UserRole).toString() == recordId) {
+            ui->batchResultsTableWidget->setCurrentCell(row, 0);
+            break;
+        }
+    }
+    changingBatchSelection_ = false;
+    renderActiveState();
+}
+
+void InspectionPage::selectPreferredBatchRecord(const QString &afterRecordId) {
+    if (batchRecordOrder_.isEmpty()) return;
+    const int afterIndex = batchRecordOrder_.indexOf(afterRecordId);
+    const int start = afterIndex >= 0 ? (afterIndex + 1) % batchRecordOrder_.size() : 0;
+    for (int reviewPass = 0; reviewPass < 2; ++reviewPass) {
+        for (int offset = 0; offset < batchRecordOrder_.size(); ++offset) {
+            const QString recordId = batchRecordOrder_.at(
+                (start + offset) % batchRecordOrder_.size());
+            const InspectionRecord record = batchRecords_.value(recordId);
+            if (!matchesFilter(record) || !record.completedAt.isValid()
+                || record.response.isEmpty()
+                || (record.disposition != BatchDisposition::Pending
+                    && record.disposition != BatchDisposition::SubmitFailed)) {
+                continue;
+            }
+            if (reviewPass == 0 && !record.needsReview) continue;
+            selectBatchRecord(recordId, false);
+            return;
+        }
+    }
+    rebuildBatchTable();
+}
+
+InspectionRecord *InspectionPage::batchRecord(const QString &recordId) {
+    auto it = batchRecords_.find(recordId);
+    return it == batchRecords_.end() ? nullptr : &it.value();
+}
+
+const InspectionRecord *InspectionPage::batchRecord(const QString &recordId) const {
+    auto it = batchRecords_.constFind(recordId);
+    return it == batchRecords_.constEnd() ? nullptr : &it.value();
+}
+
+bool InspectionPage::matchesFilter(const InspectionRecord &record) const {
+    switch (batchFilter_) {
+    case BatchFilter::All:
+        return true;
+    case BatchFilter::NeedsReview:
+        return record.needsReview;
+    case BatchFilter::Unprocessed:
+        return record.disposition == BatchDisposition::Pending
+            || record.disposition == BatchDisposition::SubmitFailed;
+    case BatchFilter::Failed:
+        return record.disposition == BatchDisposition::PredictionFailed
+            || record.disposition == BatchDisposition::SubmitFailed
+            || !record.error.isEmpty();
+    }
+    return true;
+}
+
+void InspectionPage::updateBatchSummary() {
+    const int total = batchRecordOrder_.size();
+    const int completed = completedBatchCount();
+    const int failed = failedBatchCount();
+    int review = 0;
+    for (const QString &recordId : batchRecordOrder_) {
+        const InspectionRecord record = batchRecords_.value(recordId);
+        if (record.completedAt.isValid() && record.needsReview) ++review;
+    }
+    const int successful = qMax(0, completed - failed);
+    ui->batchSummaryLabel->setText(
+        QStringLiteral("已处理 %1/%2，成功 %3，需复检 %4，失败 %5")
+            .arg(completed).arg(total).arg(successful).arg(review).arg(failed));
+    ui->batchProgressBar->setRange(0, qMax(1, total));
+    ui->batchProgressBar->setValue(completed);
+}
+
 void InspectionPage::renderActiveState() {
+    const bool batchMode = mode_ == InspectionMode::Batch;
+    ui->chooseImageButton->setVisible(!batchMode);
+    ui->predictButton->setVisible(!batchMode);
+    ui->chooseBatchImagesButton->setVisible(batchMode);
+    ui->batchPredictButton->setVisible(batchMode);
+    ui->stopBatchButton->setVisible(batchMode);
+    ui->batchSummaryLabel->setVisible(batchMode);
+    ui->batchProgressBar->setVisible(batchMode);
+    ui->allBatchFilterButton->setVisible(batchMode);
+    ui->needsReviewBatchFilterButton->setVisible(batchMode);
+    ui->unprocessedBatchFilterButton->setVisible(batchMode);
+    ui->failedBatchFilterButton->setVisible(batchMode);
+    ui->batchResultsTableWidget->setVisible(batchMode);
+    ui->recentInspectionTitleLabel->setVisible(!batchMode);
+    ui->recentInspectionList->setVisible(!batchMode);
     const ModeState &state = activeState();
     if (state.imagePath.isEmpty()) {
         ui->inspectionImageView->setImagePath(QString());
@@ -412,9 +889,21 @@ void InspectionPage::renderRecord(const InspectionRecord &record) {
                                  ? QStringLiteral("建议人工复检") : QString());
     ui->evidenceTextEdit->setPlainText(evidenceSummary(record));
     ui->rawEvidenceTextEdit->setPlainText(rawEvidence(record));
+    QString detail = dispositionText(record);
+    if (mode_ == InspectionMode::Batch && record.workpieceId != currentWorkpieceId_) {
+        detail = QStringLiteral("结果来自其他工件，请切回原工件后处理");
+    } else if (mode_ == InspectionMode::Batch && batchRunning_) {
+        detail = QStringLiteral("批量检测完成后可处理");
+    } else if (!backendAvailable_) {
+        detail = QStringLiteral("后端不可用，结果已保留");
+    } else if (record.needsReview
+               && (record.disposition == BatchDisposition::Pending
+                   || record.disposition == BatchDisposition::SubmitFailed)) {
+        detail = QStringLiteral("建议复检，%1").arg(detail);
+    }
     ui->currentResultTargetLabel->setText(
         QStringLiteral("当前：%1（%2）")
-            .arg(QFileInfo(record.imagePath).fileName(), dispositionText(record)));
+            .arg(QFileInfo(record.imagePath).fileName(), detail));
     updateActionOrder(record.label);
 }
 
@@ -441,6 +930,9 @@ void InspectionPage::updateActionAvailability() {
     const ModeState &state = activeState();
     const bool interactive = backendAvailable_ && !backendBusy_;
     ui->chooseImageButton->setEnabled(interactive);
+    ui->chooseBatchImagesButton->setEnabled(interactive && !batchRunning_);
+    ui->batchPredictButton->setEnabled(interactive && !batchRunning_);
+    ui->stopBatchButton->setEnabled(batchRunning_ && !stopRequested_);
     ui->predictButton->setEnabled(interactive && mode_ == InspectionMode::Single
                                   && !state.imagePath.isEmpty()
                                   && ui->inspectionImageView->imagePath() == state.imagePath
@@ -454,6 +946,17 @@ void InspectionPage::updateActionAvailability() {
         ui->confirmFrontButton->setEnabled(singleRecordReady);
         ui->confirmBackButton->setEnabled(singleRecordReady);
         ui->rejectConfirmationButton->setEnabled(singleRecordReady);
+    } else {
+        const InspectionRecord record = batchRecords_.value(selectedRecordId_);
+        const bool batchRecordReady = interactive && !batchRunning_
+            && batchRecords_.contains(selectedRecordId_)
+            && record.completedAt.isValid() && !record.response.isEmpty()
+            && record.workpieceId == currentWorkpieceId_
+            && (record.disposition == BatchDisposition::Pending
+                || record.disposition == BatchDisposition::SubmitFailed);
+        ui->confirmFrontButton->setEnabled(batchRecordReady);
+        ui->confirmBackButton->setEnabled(batchRecordReady);
+        ui->rejectConfirmationButton->setEnabled(batchRecordReady);
     }
 }
 
@@ -479,13 +982,23 @@ QString InspectionPage::orientationText(const QString &label) const {
 QString InspectionPage::dispositionText(const InspectionRecord &record) const {
     const QString evolutionState = record.response.value(
         QStringLiteral("evolution_state")).toString();
-    if (record.disposition == BatchDisposition::SubmitFailed) return QStringLiteral("写入失败");
+    if (record.disposition == BatchDisposition::PredictionFailed) {
+        return record.error.startsWith(QStringLiteral("结果未知"))
+            ? QStringLiteral("结果未知") : QStringLiteral("预测失败");
+    }
+    if (record.disposition == BatchDisposition::SubmitFailed) {
+        return batchRecords_.contains(record.id)
+            ? QStringLiteral("提交失败") : QStringLiteral("写入失败");
+    }
     if (record.disposition == BatchDisposition::Rejected) return QStringLiteral("不入库");
+    if (record.disposition == BatchDisposition::QueuedFront) return QStringLiteral("正面已排队");
+    if (record.disposition == BatchDisposition::QueuedBack) return QStringLiteral("反面已排队");
     if (record.disposition == BatchDisposition::Submitting
         || evolutionState == QStringLiteral("running")) {
         return QStringLiteral("正在更新缓存");
     }
     if (evolutionState == QStringLiteral("completed")) return QStringLiteral("已参与预测");
+    if (!record.completedAt.isValid()) return QStringLiteral("待检测");
     return QStringLiteral("等待写入");
 }
 

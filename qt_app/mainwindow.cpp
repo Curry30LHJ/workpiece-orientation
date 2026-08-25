@@ -5,10 +5,6 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QCryptographicHash>
-#include <QBrush>
-#include <QColor>
-#include <QHeaderView>
-#include <QAbstractItemView>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -16,7 +12,6 @@
 #include <QPushButton>
 #include <QSet>
 #include <QTableWidget>
-#include <QTableWidgetItem>
 #include <QTextEdit>
 #include <QTimer>
 #include <QUuid>
@@ -139,24 +134,6 @@ void MainWindow::initializeUi() {
     geometryPollTimer_ = new QTimer(this);
     geometryPollTimer_->setInterval(1000);
     connect(geometryPollTimer_, &QTimer::timeout, this, &MainWindow::pollGeometryValidation);
-    batchResultsTableWidget_->setColumnCount(5);
-    batchResultsTableWidget_->setHorizontalHeaderLabels({
-        QStringLiteral("文件"), QStringLiteral("结果"), QStringLiteral("复检"),
-        QStringLiteral("耗时（毫秒）"), QStringLiteral("处理状态")});
-    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
-    batchResultsTableWidget_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    batchResultsTableWidget_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    batchResultsTableWidget_->setSelectionMode(QAbstractItemView::SingleSelection);
-    connect(batchResultsTableWidget_, &QTableWidget::currentCellChanged,
-            this, [this](int row, int, int, int) {
-                if (!changingBatchSelection_) {
-                    selectBatchResult(row, true);
-                }
-            });
     updateTemplateLabels();
     clearBatchResults();
     updateButtonStates();
@@ -179,9 +156,17 @@ void MainWindow::initializeUi() {
                 sendPageCommand(CommandOwner::Inspection, command, fields);
             });
     connect(inspectionPage_, &InspectionPage::confirmationRequested,
-            this, [this](const QString &, const QString &workpieceId,
+            this, [this](const QString &recordId, const QString &workpieceId,
                          const QString &imagePath, const QString &orientation) {
+                pendingConfirmationRecordId_ = recordId;
+                pendingConfirmationOrientation_ = orientation;
                 submitTemplateConfirmation(workpieceId, imagePath, orientation);
+            });
+    connect(inspectionPage_, &InspectionPage::batchFinished,
+            this, [this](bool) {
+                batchInFlight_ = false;
+                resultContext_ = ResultContext::Batch;
+                updateButtonStates();
             });
     connect(appHeader_, &AppHeader::pageRequested,
             this, [this](AppPage page) { requestPage(page); });
@@ -204,15 +189,6 @@ void MainWindow::initializeUi() {
     });
     connect(deleteWorkpieceButton_, &QPushButton::clicked,
             this, &MainWindow::deleteSelectedWorkpiece);
-    connect(confirmFrontButton_, &QPushButton::clicked, this, [this]() {
-        if (inspectionPage_->mode() == InspectionMode::Batch) confirmFrontTemplate();
-    });
-    connect(confirmBackButton_, &QPushButton::clicked, this, [this]() {
-        if (inspectionPage_->mode() == InspectionMode::Batch) confirmBackTemplate();
-    });
-    connect(rejectConfirmationButton_, &QPushButton::clicked, this, [this]() {
-        if (inspectionPage_->mode() == InspectionMode::Batch) rejectTemplateConfirmation();
-    });
     connect(annotationEditorButton_, &QPushButton::clicked,
             this, &MainWindow::openAnnotationManager);
     confirmFrontButton_->setEnabled(false);
@@ -275,6 +251,14 @@ void MainWindow::sendPageCommand(CommandOwner owner, const QString &command,
             queuedOwner_ = owner;
             queuedCommand_ = command;
             queuedFields_ = fields;
+        } else if (owner == CommandOwner::Inspection
+                   && command == QStringLiteral("predict")
+                   && queuedOwner_ == CommandOwner::System
+                   && (queuedCommand_ == QStringLiteral("list_evolution_jobs")
+                       || queuedCommand_ == QStringLiteral("list_workpieces"))) {
+            queuedOwner_ = owner;
+            queuedCommand_ = command;
+            queuedFields_ = fields;
         } else {
             showLibraryMessage(
                 QStringLiteral("已有后续操作等待发送，请稍后重试：%1").arg(command), true);
@@ -332,7 +316,6 @@ void MainWindow::setInspectionImagePath(const QString &path) {
 void MainWindow::setBatchImagePaths(const QStringList &paths) {
     batchImagePaths_ = normalizedPaths(paths);
     batchInFlight_ = false;
-    batchIndex_ = 0;
     lastPredictionImagePath_.clear();
     lastPredictionWorkpieceId_.clear();
     lastPredictionResponse_ = QJsonObject();
@@ -464,16 +447,9 @@ void MainWindow::submitBatchPrediction() {
         }
     }
     batchInFlight_ = true;
-    batchWorkpieceId_ = workpieceId;
-    batchIndex_ = 0;
-    clearBatchResults();
-    batchSelectionPinned_ = false;
-    batchCompletedSuccessfully_ = false;
-    inspectionPage_->setMode(InspectionMode::Batch);
-    resultLabel_->setText(QStringLiteral("批量检测进行中…"));
-    reviewLabel_->clear();
-    evidenceTextEdit_->clear();
-    sendNextBatchPrediction();
+    resultContext_ = ResultContext::Batch;
+    inspectionPage_->beginBatch(batchImagePaths_, workpieceId);
+    updateButtonStates();
 }
 
 void MainWindow::deleteSelectedWorkpiece() {
@@ -497,35 +473,14 @@ void MainWindow::deleteSelectedWorkpiece() {
 }
 
 void MainWindow::confirmFrontTemplate() {
-    submitCurrentConfirmation(QStringLiteral("front"));
+    if (confirmFrontButton_ != nullptr) confirmFrontButton_->click();
 }
 
 void MainWindow::confirmBackTemplate() {
-    submitCurrentConfirmation(QStringLiteral("back"));
+    if (confirmBackButton_ != nullptr) confirmBackButton_->click();
 }
 
 void MainWindow::rejectTemplateConfirmation() {
-    if (resultContext_ == ResultContext::Batch) {
-        if (!currentBatchResultCanBeProcessed()) {
-            return;
-        }
-        const int rejectedIndex = selectedBatchResultIndex_;
-        BatchResult &result = batchResults_[rejectedIndex];
-        result.state = BatchResultState::Rejected;
-        result.submitError.clear();
-        updateBatchRow(rejectedIndex);
-        updateBatchSummary();
-        const int nextIndex = preferredPendingBatchResult(rejectedIndex);
-        if (nextIndex >= 0) {
-            selectBatchResult(nextIndex, false);
-        } else {
-            currentResultTargetLabel_->setText(
-                QStringLiteral("当前：%1（不入库）").arg(QFileInfo(result.imagePath).fileName()));
-        }
-        reviewLabel_->setText(QStringLiteral("本次结果不入库"));
-        updateButtonStates();
-        return;
-    }
     lastPredictionImagePath_.clear();
     lastPredictionWorkpieceId_.clear();
     lastPredictionResponse_ = QJsonObject();
@@ -808,23 +763,6 @@ void MainWindow::reviewAnnotation(const QString &groupId, const QString &templat
     }}, baseRevision);
 }
 
-void MainWindow::submitCurrentConfirmation(const QString &orientation) {
-    if (resultContext_ == ResultContext::Batch) {
-        if (!currentBatchResultCanBeProcessed()) {
-            return;
-        }
-        BatchResult &result = batchResults_[selectedBatchResultIndex_];
-        result.state = BatchResultState::Submitting;
-        result.submitError.clear();
-        pendingConfirmationBatchIndex_ = selectedBatchResultIndex_;
-        pendingConfirmationOrientation_ = orientation;
-        updateBatchRow(selectedBatchResultIndex_);
-        submitTemplateConfirmation(result.workpieceId, result.imagePath, orientation);
-        return;
-    }
-    submitTemplateConfirmation(lastPredictionWorkpieceId_, lastPredictionImagePath_, orientation);
-}
-
 void MainWindow::submitTemplateConfirmation(const QString &workpieceId, const QString &imagePath,
                                             const QString &orientation) {
     if (imagePath.isEmpty() || workpieceId.isEmpty()
@@ -900,8 +838,6 @@ void MainWindow::onBackendLoading(const QString &message) {
 void MainWindow::onBackendUnavailable(const QString &reason) {
     const CommandOwner interruptedOwner = pendingOwner_;
     const QString interruptedTask = pendingCommand_;
-    const bool interruptedBatchCommand = batchInFlight_
-        || pendingConfirmationBatchIndex_ >= 0;
     const bool hasPreservedWork = registrationInFlight_ || batchInFlight_ || clientBusy_
         || !pendingCommand_.isEmpty() || !inspectionImagePath_.isEmpty()
         || (batchResultsTableWidget_ != nullptr && batchResultsTableWidget_->rowCount() > 0)
@@ -918,16 +854,12 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
         geometryMaskManagerDialog_->setOperationError(
             QStringLiteral("后端连接中断，操作结果未知；请重连后刷新"));
     }
-    if (pendingConfirmationBatchIndex_ >= 0
-        && pendingConfirmationBatchIndex_ < batchResults_.size()) {
-        const int failedIndex = pendingConfirmationBatchIndex_;
-        BatchResult &result = batchResults_[failedIndex];
-        result.state = BatchResultState::SubmitFailed;
-        result.submitError = QStringLiteral("连接中断，入库结果未知；请刷新后确认");
-        pendingConfirmationBatchIndex_ = -1;
+    if (!pendingConfirmationRecordId_.isEmpty()) {
+        inspectionPage_->setRecordDisposition(
+            pendingConfirmationRecordId_, BatchDisposition::SubmitFailed, QString(),
+            QStringLiteral("连接中断，入库结果未知；请刷新后确认"));
+        pendingConfirmationRecordId_.clear();
         pendingConfirmationOrientation_.clear();
-        updateBatchRow(failedIndex);
-        selectBatchResult(failedIndex, false);
     }
     backendReadyHandled_ = false;
     backendReady_ = false;
@@ -940,7 +872,7 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     queuedCommand_.clear();
     queuedFields_ = QJsonObject();
     if (interruptedOwner == CommandOwner::Inspection
-        && !interruptedBatchCommand && inspectionPage_ != nullptr) {
+        && inspectionPage_ != nullptr && !interruptedTask.isEmpty()) {
         inspectionPage_->handleBackendFailure(interruptedTask,
                                               QStringLiteral("CONNECTION_LOST"), reason);
     }
@@ -967,7 +899,7 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
 }
 
 void MainWindow::pollEvolutionJobs() {
-    if (!backendReady_ || clientBusy_ || !pendingCommand_.isEmpty()
+    if (batchInFlight_ || !backendReady_ || clientBusy_ || !pendingCommand_.isEmpty()
         || client_ == nullptr || client_->state() != BackendClient::State::Ready) {
         return;
     }
@@ -1044,13 +976,7 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     const QString issuedCommand = pendingCommand_;
     clearPendingCommand();
     if (batchInFlight_ && command == QStringLiteral("predict")) {
-        appendBatchResult(response);
-        ++batchIndex_;
-        if (batchIndex_ >= batchImagePaths_.size()) {
-            finishBatchPrediction();
-        } else {
-            QTimer::singleShot(0, this, [this]() { sendNextBatchPrediction(); });
-        }
+        inspectionPage_->handleBackendResponse(command, response);
         return;
     }
     if (command == QStringLiteral("list_workpieces")) {
@@ -1097,29 +1023,17 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
             == QStringLiteral("failed");
         const QString jobError = job.value(QStringLiteral("error")).toString(
             QStringLiteral("后台入库任务失败"));
-        if (pendingConfirmationBatchIndex_ >= 0
-            && pendingConfirmationBatchIndex_ < batchResults_.size()) {
-            const int completedIndex = pendingConfirmationBatchIndex_;
-            BatchResult &result = batchResults_[completedIndex];
-            result.state = jobFailed
-                ? BatchResultState::SubmitFailed
-                : (pendingConfirmationOrientation_ == QStringLiteral("front")
-                       ? BatchResultState::QueuedFront : BatchResultState::QueuedBack);
-            result.submitError = jobFailed ? jobError : QString();
-            pendingConfirmationBatchIndex_ = -1;
+        if (!pendingConfirmationRecordId_.isEmpty()) {
+            inspectionPage_->setRecordDisposition(
+                pendingConfirmationRecordId_,
+                jobFailed ? BatchDisposition::SubmitFailed
+                          : (pendingConfirmationOrientation_ == QStringLiteral("front")
+                                 ? BatchDisposition::QueuedFront
+                                 : BatchDisposition::QueuedBack),
+                job.value(QStringLiteral("job_id")).toString(),
+                jobFailed ? jobError : QString());
+            pendingConfirmationRecordId_.clear();
             pendingConfirmationOrientation_.clear();
-            updateBatchRow(completedIndex);
-            updateBatchSummary();
-            if (jobFailed) {
-                selectBatchResult(completedIndex, false);
-            } else {
-                const int nextIndex = preferredPendingBatchResult(completedIndex);
-                if (nextIndex >= 0) {
-                    selectBatchResult(nextIndex, false);
-                } else {
-                    selectBatchResult(completedIndex, false);
-                }
-            }
         } else if (inspectionPage_ != nullptr
                    && (responseOwner == CommandOwner::Inspection
                        || responseOwner == CommandOwner::None)) {
@@ -1339,16 +1253,7 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
     }
     if (batchInFlight_ && failedCommand == QStringLiteral("predict")
         && matchesOwner(CommandOwner::Inspection)) {
-        batchInFlight_ = false;
-        batchCompletedSuccessfully_ = false;
-        const QString failedFile = batchIndex_ >= 0 && batchIndex_ < batchImagePaths_.size()
-            ? QFileInfo(batchImagePaths_.at(batchIndex_)).fileName() : QStringLiteral("未知");
-        batchSummaryLabel_->setText(
-            QStringLiteral("批量检测未完成：已完成 %1/%2，失败文件：%3，原因：%4")
-                .arg(batchResults_.size())
-                .arg(batchImagePaths_.size())
-                .arg(failedFile, message));
-        resultLabel_->setText(QStringLiteral("批量检测未完成"));
+        inspectionPage_->handleBackendFailure(failedCommand, code, message);
         updateButtonStates();
         return;
     }
@@ -1366,17 +1271,12 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         }
     } else if (failedCommand == QStringLiteral("submit_confirmation")
                && matchesOwner(CommandOwner::Inspection)) {
-        if (pendingConfirmationBatchIndex_ >= 0
-            && pendingConfirmationBatchIndex_ < batchResults_.size()) {
-            const int failedIndex = pendingConfirmationBatchIndex_;
-            BatchResult &result = batchResults_[failedIndex];
-            result.state = BatchResultState::SubmitFailed;
-            result.submitError = message;
-            pendingConfirmationBatchIndex_ = -1;
+        if (!pendingConfirmationRecordId_.isEmpty()) {
+            inspectionPage_->setRecordDisposition(
+                pendingConfirmationRecordId_, BatchDisposition::SubmitFailed,
+                QString(), message);
+            pendingConfirmationRecordId_.clear();
             pendingConfirmationOrientation_.clear();
-            updateBatchRow(failedIndex);
-            selectBatchResult(failedIndex, false);
-            updateBatchSummary();
         } else if (inspectionPage_ != nullptr
                    && (failureOwner == CommandOwner::Inspection
                        || failureOwner == CommandOwner::None)) {
@@ -1456,7 +1356,7 @@ void MainWindow::updateButtonStates() {
     const bool interactive = backendReady_ && !clientBusy_ && !batchInFlight_ && !registrationInFlight_;
     inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
                                          appHeader_->currentWorkpieceName());
-    inspectionPage_->setBackendAvailable(backendReady_, !interactive,
+    inspectionPage_->setBackendAvailable(backendReady_, clientBusy_ || registrationInFlight_,
                                          backendReady_ ? QString() : QStringLiteral("后端尚未就绪"));
     ui->refreshWorkpiecesButton->setEnabled(interactive);
     ui->chooseFrontTemplatesButton->setEnabled(interactive);
@@ -1471,38 +1371,6 @@ void MainWindow::updateButtonStates() {
     }
     if (annotationEditorButton_ != nullptr) {
         annotationEditorButton_->setEnabled(interactive && !selectedWorkpieceId().isEmpty());
-    }
-    const bool confirmationAvailable = currentBatchResultCanBeProcessed();
-    if (confirmFrontButton_ != nullptr
-        && inspectionPage_->mode() == InspectionMode::Batch) {
-        confirmFrontButton_->setEnabled(confirmationAvailable);
-        confirmBackButton_->setEnabled(confirmationAvailable);
-        rejectConfirmationButton_->setEnabled(confirmationAvailable);
-    }
-    if (resultContext_ == ResultContext::Batch
-        && selectedBatchResultIndex_ >= 0 && selectedBatchResultIndex_ < batchResults_.size()) {
-        const BatchResult &result = batchResults_.at(selectedBatchResultIndex_);
-        const QString fileName = QFileInfo(result.imagePath).fileName();
-        QString detail;
-        if (batchInFlight_) {
-            detail = QStringLiteral("批量检测完成后可处理");
-        } else if (!batchCompletedSuccessfully_) {
-            detail = QStringLiteral("批量检测未完整完成，结果仅供查看");
-        } else if (selectedWorkpieceId() != result.workpieceId) {
-            detail = QStringLiteral("结果来自其他工件，请切回原工件后处理");
-        } else if (!backendReady_ || client_ == nullptr
-                   || client_->state() != BackendClient::State::Ready) {
-            detail = QStringLiteral("后端不可用，结果已保留");
-        } else {
-            detail = batchResultStateText(result.state);
-            if (result.needsReview
-                && (result.state == BatchResultState::Pending
-                    || result.state == BatchResultState::SubmitFailed)) {
-                detail = QStringLiteral("建议复检，%1").arg(detail);
-            }
-        }
-        currentResultTargetLabel_->setText(
-            QStringLiteral("当前：%1（%2）").arg(fileName, detail));
     }
 }
 
@@ -1544,8 +1412,6 @@ void MainWindow::clearInspectionState() {
 void MainWindow::clearBatchState() {
     batchImagePaths_.clear();
     batchInFlight_ = false;
-    batchIndex_ = 0;
-    batchWorkpieceId_.clear();
     clearBatchResults();
     chooseBatchImagesButton_->setText(QStringLiteral("选择批量图片"));
     updateButtonStates();
@@ -1553,17 +1419,8 @@ void MainWindow::clearBatchState() {
 
 void MainWindow::clearBatchResults() {
     const bool clearVisibleBatchResult = resultContext_ == ResultContext::Batch;
-    batchFrontCount_ = 0;
-    batchBackCount_ = 0;
-    batchUncertainCount_ = 0;
-    batchReviewCount_ = 0;
-    batchResults_.clear();
-    selectedBatchResultIndex_ = -1;
-    pendingConfirmationBatchIndex_ = -1;
+    pendingConfirmationRecordId_.clear();
     pendingConfirmationOrientation_.clear();
-    changingBatchSelection_ = false;
-    batchSelectionPinned_ = false;
-    batchCompletedSuccessfully_ = false;
     if (inspectionPage_ != nullptr) {
         inspectionPage_->clearBatchState();
     }
@@ -1625,220 +1482,6 @@ void MainWindow::sendRegistration(bool replace) {
         {QStringLiteral("progress_events"), true},
     });
     showLibraryMessage(replace ? QStringLiteral("正在覆盖并建立工件库…") : QStringLiteral("正在建立工件库…"));
-}
-
-void MainWindow::sendNextBatchPrediction() {
-    if (!batchInFlight_ || client_ == nullptr) {
-        return;
-    }
-    if (batchIndex_ >= batchImagePaths_.size()) {
-        finishBatchPrediction();
-        return;
-    }
-    pendingPredictionWorkpieceId_ = batchWorkpieceId_;
-    pendingPredictionImagePath_ = batchImagePaths_.at(batchIndex_);
-    sendPageCommand(CommandOwner::Inspection, QStringLiteral("predict"), {
-        {QStringLiteral("workpiece_id"), pendingPredictionWorkpieceId_},
-        {QStringLiteral("image_path"), batchImagePaths_.at(batchIndex_)},
-    });
-    batchSummaryLabel_->setText(
-        QStringLiteral("已完成 %1/%2，当前文件：%3")
-            .arg(batchResults_.size())
-            .arg(batchImagePaths_.size())
-            .arg(QFileInfo(batchImagePaths_.at(batchIndex_)).fileName()));
-}
-
-void MainWindow::renderPredictionResult(const QString &imagePath, const QJsonObject &response,
-                                        const QString &sourceText) {
-    InspectionRecord record;
-    record.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    record.imagePath = QFileInfo(imagePath).absoluteFilePath();
-    record.workpieceId = sourceText == QStringLiteral("批量结果")
-        ? batchWorkpieceId_ : selectedWorkpieceId();
-    record.response = response;
-    record.label = response.value(QStringLiteral("label")).toString();
-    record.needsReview = response.value(QStringLiteral("needs_review")).toBool();
-    record.elapsedMs = response.value(QStringLiteral("elapsed_ms")).toDouble();
-    record.completedAt = QDateTime::currentDateTime();
-    inspectionImagePath_ = record.imagePath;
-    inspectionPage_->setMode(sourceText == QStringLiteral("批量结果")
-                                 ? InspectionMode::Batch : InspectionMode::Single);
-    inspectionPage_->showSingleResult(record);
-    updateButtonStates();
-}
-
-void MainWindow::appendBatchResult(const QJsonObject &response) {
-    BatchResult result;
-    result.imagePath = batchImagePaths_.at(batchIndex_);
-    result.workpieceId = batchWorkpieceId_;
-    result.response = response;
-    result.label = response.value(QStringLiteral("label")).toString();
-    result.needsReview = response.value(QStringLiteral("needs_review")).toBool();
-    result.elapsedMs = response.value(QStringLiteral("elapsed_ms")).toDouble();
-    batchResults_.append(result);
-
-    const int row = batchResults_.size() - 1;
-    batchResultsTableWidget_->insertRow(row);
-    updateBatchRow(row);
-    if (selectedBatchResultIndex_ < 0) {
-        selectBatchResult(row, false);
-    }
-
-    if (result.label == QStringLiteral("front")) {
-        ++batchFrontCount_;
-    } else if (result.label == QStringLiteral("back")) {
-        ++batchBackCount_;
-    } else {
-        ++batchUncertainCount_;
-    }
-    if (result.needsReview) {
-        ++batchReviewCount_;
-    }
-    updateBatchSummary();
-}
-
-void MainWindow::updateBatchRow(int index) {
-    if (index < 0 || index >= batchResults_.size()) {
-        return;
-    }
-    const BatchResult &result = batchResults_.at(index);
-    auto *fileItem = new QTableWidgetItem(QFileInfo(result.imagePath).fileName());
-    fileItem->setToolTip(result.imagePath);
-    batchResultsTableWidget_->setItem(index, 0, fileItem);
-    batchResultsTableWidget_->setItem(
-        index, 1, new QTableWidgetItem(orientationText(result.label)));
-    batchResultsTableWidget_->setItem(
-        index, 2, new QTableWidgetItem(result.needsReview ? QStringLiteral("是")
-                                                         : QStringLiteral("否")));
-    batchResultsTableWidget_->setItem(
-        index, 3, new QTableWidgetItem(QString::number(result.elapsedMs, 'f', 1)));
-    batchResultsTableWidget_->setItem(
-        index, 4, new QTableWidgetItem(batchResultStateText(result.state)));
-    if (result.needsReview) {
-        const QBrush warningBrush(QColor(255, 244, 204));
-        for (int column = 0; column < batchResultsTableWidget_->columnCount(); ++column) {
-            batchResultsTableWidget_->item(index, column)->setBackground(warningBrush);
-        }
-    }
-}
-
-QString MainWindow::batchResultStateText(BatchResultState state) const {
-    switch (state) {
-    case BatchResultState::Pending:
-        return QStringLiteral("待处理");
-    case BatchResultState::Submitting:
-        return QStringLiteral("提交中");
-    case BatchResultState::QueuedFront:
-        return QStringLiteral("正面已排队");
-    case BatchResultState::QueuedBack:
-        return QStringLiteral("反面已排队");
-    case BatchResultState::Rejected:
-        return QStringLiteral("不入库");
-    case BatchResultState::SubmitFailed:
-        return QStringLiteral("提交失败");
-    }
-    return QString();
-}
-
-bool MainWindow::currentBatchResultCanBeProcessed() const {
-    if (!batchCompletedSuccessfully_ || batchInFlight_ || !backendReady_ || clientBusy_
-        || registrationInFlight_ || client_ == nullptr
-        || client_->state() != BackendClient::State::Ready
-        || selectedBatchResultIndex_ < 0 || selectedBatchResultIndex_ >= batchResults_.size()) {
-        return false;
-    }
-    const BatchResult &result = batchResults_.at(selectedBatchResultIndex_);
-    if (selectedWorkpieceId() != result.workpieceId) {
-        return false;
-    }
-    return result.state == BatchResultState::Pending
-        || result.state == BatchResultState::SubmitFailed;
-}
-
-void MainWindow::selectBatchResult(int index, bool userInitiated) {
-    if (index < 0 || index >= batchResults_.size()) {
-        return;
-    }
-    selectedBatchResultIndex_ = index;
-    resultContext_ = ResultContext::Batch;
-    if (userInitiated) {
-        batchSelectionPinned_ = true;
-    }
-    changingBatchSelection_ = true;
-    batchResultsTableWidget_->setCurrentCell(index, 0);
-    changingBatchSelection_ = false;
-    const BatchResult &result = batchResults_.at(index);
-    renderPredictionResult(result.imagePath, result.response, QStringLiteral("批量结果"));
-}
-
-int MainWindow::preferredPendingBatchResult(int afterIndex) const {
-    if (batchResults_.isEmpty()) {
-        return -1;
-    }
-    const int count = batchResults_.size();
-    const int start = (afterIndex >= 0 && afterIndex < count) ? (afterIndex + 1) % count : 0;
-    const auto isPending = [](const BatchResult &result) {
-        return result.state == BatchResultState::Pending
-            || result.state == BatchResultState::SubmitFailed;
-    };
-    for (int reviewPass = 0; reviewPass < 2; ++reviewPass) {
-        for (int offset = 0; offset < count; ++offset) {
-            const int index = (start + offset) % count;
-            const BatchResult &result = batchResults_.at(index);
-            if (isPending(result) && (!reviewPass ? result.needsReview : true)) {
-                return index;
-            }
-        }
-    }
-    return -1;
-}
-
-void MainWindow::updateBatchSummary() {
-    const int completed = batchResults_.size();
-    const int total = batchImagePaths_.size();
-    if (batchInFlight_) {
-        batchSummaryLabel_->setText(
-            QStringLiteral("已完成 %1/%2：正面 %3，反面 %4，不确定 %5，建议复检 %6")
-                .arg(completed)
-                .arg(total)
-                .arg(batchFrontCount_)
-                .arg(batchBackCount_)
-                .arg(batchUncertainCount_)
-                .arg(batchReviewCount_));
-        return;
-    }
-    int processed = 0;
-    for (const BatchResult &result : batchResults_) {
-        if (result.state == BatchResultState::QueuedFront
-            || result.state == BatchResultState::QueuedBack
-            || result.state == BatchResultState::Rejected) {
-            ++processed;
-        }
-    }
-    const int unprocessed = qMax(0, completed - processed);
-    batchSummaryLabel_->setText(
-        QStringLiteral("共 %1 张：正面 %2，反面 %3，不确定 %4，建议复检 %5，已处理 %6，未处理 %7")
-            .arg(total)
-            .arg(batchFrontCount_)
-            .arg(batchBackCount_)
-            .arg(batchUncertainCount_)
-            .arg(batchReviewCount_)
-            .arg(processed)
-            .arg(unprocessed));
-}
-
-void MainWindow::finishBatchPrediction() {
-    batchInFlight_ = false;
-    batchCompletedSuccessfully_ = true;
-    batchSelectionPinned_ = false;
-    clearPendingCommand();
-    resultLabel_->setText(QStringLiteral("批量检测完成"));
-    updateBatchSummary();
-    const int preferredIndex = preferredPendingBatchResult();
-    if (preferredIndex >= 0) {
-        selectBatchResult(preferredIndex, false);
-    }
-    updateButtonStates();
 }
 
 bool MainWindow::validateRegistration(QString *error) const {

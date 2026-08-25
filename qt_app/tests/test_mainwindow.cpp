@@ -420,6 +420,12 @@ private:
                                           Qt::DirectConnection));
     }
 
+    static void waitForBatchCompletion(MainWindow &window, int expected) {
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(inspectionPage->completedBatchCount(), expected, 5000);
+    }
+
 private slots:
     void deleteConfirmationShowsDisplayNameInsteadOfInternalId() {
         BackendClient client;
@@ -725,7 +731,8 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 3, 1500);
         QTableWidget *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
         QVERIFY(table != nullptr);
-        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 3, 1500);
+        waitForBatchCompletion(window, 3);
+        QCOMPARE(table->rowCount(), 3);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text().contains(QStringLiteral("3")));
 
         emit client.commandFailed(QStringLiteral("predict"), QStringLiteral("MODEL_ERROR"),
@@ -752,7 +759,8 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(&window, "submitBatchPrediction", Qt::DirectConnection));
 
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 3, 1500);
+        waitForBatchCompletion(window, 3);
+        QCOMPARE(table->rowCount(), 3);
         QCOMPARE(table->columnCount(), 5);
         table->setCurrentCell(1, 0);
 
@@ -776,20 +784,51 @@ private slots:
         startBatch(server, client, window, writeImages(dir, QStringLiteral("held"), 4));
 
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
         QTRY_VERIFY(server.predictionCount() >= 1);
         server.replyNextPrediction();
-        QTRY_COMPARE(table->rowCount(), 1);
+        QTRY_COMPARE(inspectionPage->completedBatchCount(), 1);
+        QCOMPARE(table->rowCount(), 4);
         QTRY_VERIFY(server.predictionCount() >= 2);
         server.replyNextPrediction();
-        QTRY_COMPARE(table->rowCount(), 2);
+        QTRY_COMPARE(inspectionPage->completedBatchCount(), 2);
+        QCOMPARE(table->rowCount(), 4);
         table->setCurrentCell(0, 0);
         QTRY_VERIFY(server.predictionCount() >= 3);
         server.replyNextPrediction();
-        QTRY_COMPARE(table->rowCount(), 3);
+        QTRY_COMPARE(inspectionPage->completedBatchCount(), 3);
+        QCOMPARE(table->rowCount(), 4);
 
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentImageLabel"))
                     ->text().contains(QStringLiteral("held-0.png")));
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
+    }
+
+    void queuedSystemRefreshDoesNotStrandBatchPrediction() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setHoldPredictions(true);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        const QStringList paths = writeImages(dir, QStringLiteral("queued-system"), 3);
+        startBatch(server, client, window, paths);
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        QTRY_COMPARE(server.predictionCount(), 1);
+
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+        server.replyNextPrediction();
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 2, 1000);
+        server.replyNextPrediction();
+        QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 3, 1000);
+        server.replyNextPrediction();
+        QTRY_COMPARE_WITH_TIMEOUT(inspectionPage->completedBatchCount(), 3, 1000);
     }
 
     void batchCompletionSelectsFirstReviewResult() {
@@ -804,7 +843,7 @@ private slots:
         startBatch(server, client, window, writeImages(dir, QStringLiteral("review"), 3));
 
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 3, 1500);
+        waitForBatchCompletion(window, 3);
         QTRY_COMPARE(table->currentRow(), 1);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))
                     ->text().contains(QStringLiteral("review-1.png")));
@@ -821,7 +860,7 @@ private slots:
         startBatch(server, client, window, writeImages(dir, QStringLiteral("normal"), 3));
 
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 3, 1500);
+        waitForBatchCompletion(window, 3);
         QTRY_COMPARE(table->currentRow(), 0);
     }
 
@@ -836,7 +875,7 @@ private slots:
         QTemporaryDir dir;
         startBatch(server, client, window, writeImages(dir, QStringLiteral("confirm"), 3));
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE(table->rowCount(), 3);
+        waitForBatchCompletion(window, 3);
         QTRY_COMPARE(table->currentRow(), 0);
 
         window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
@@ -844,12 +883,46 @@ private slots:
         QTRY_COMPARE(table->item(0, 4)->text(), QStringLiteral("正面已排队"));
         QTRY_COMPARE(table->currentRow(), 1);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))
-                    ->text().contains(QStringLiteral("已处理 1")));
+                    ->text().contains(QStringLiteral("已处理 3/3")));
         table->setCurrentCell(0, 0);
         auto *frontButton = window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
         QTRY_VERIFY(!frontButton->isEnabled());
         frontButton->click();
         QCOMPARE(server.confirmationCount(), 1);
+    }
+
+    void filteredBatchConfirmationUsesStableRecordIdentity() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setReviewRows(QSet<int>{1});
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        const QStringList paths = writeImages(dir, QStringLiteral("filtered-confirm"), 3);
+        startBatch(server, client, window, paths);
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        auto *table = window.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        QVERIFY(inspectionPage != nullptr);
+        waitForBatchCompletion(window, 3);
+
+        inspectionPage->setBatchFilter(BatchFilter::NeedsReview);
+        QCOMPARE(table->rowCount(), 1);
+        table->setCurrentCell(0, 0);
+        window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
+        QTRY_COMPARE(server.confirmationCount(), 1);
+
+        QJsonObject confirmation;
+        for (const QJsonObject &request : server.requests()) {
+            if (request.value(QStringLiteral("command")).toString()
+                == QStringLiteral("submit_confirmation")) {
+                confirmation = request;
+            }
+        }
+        QCOMPARE(confirmation.value(QStringLiteral("image_path")).toString(), paths.at(1));
+        QVERIFY(!confirmation.value(QStringLiteral("operation_id")).toString().isEmpty());
     }
 
     void rejectingBatchResultIsLocalAndAdvances() {
@@ -863,7 +936,7 @@ private slots:
         QTemporaryDir dir;
         startBatch(server, client, window, writeImages(dir, QStringLiteral("reject"), 3));
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE(table->rowCount(), 3);
+        waitForBatchCompletion(window, 3);
         const int before = server.confirmationCount();
 
         window.findChild<QPushButton *>(QStringLiteral("rejectConfirmationButton"))->click();
@@ -881,17 +954,40 @@ private slots:
         BackendProcessManager manager(configFor(server.port()), &client, &launcher);
         MainWindow window(&client, &manager);
         QTemporaryDir dir;
-        startBatch(server, client, window, writeImages(dir, QStringLiteral("failed"), 2));
+        const QStringList paths = writeImages(dir, QStringLiteral("failed"), 2);
+        startBatch(server, client, window, paths);
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE(table->rowCount(), 2);
+        waitForBatchCompletion(window, 2);
         server.failNextConfirmation();
+        const QString recordId = table->item(0, 0)->data(Qt::UserRole).toString();
 
         window.findChild<QPushButton *>(QStringLiteral("confirmBackButton"))->click();
         QTRY_COMPARE(table->item(0, 4)->text(), QStringLiteral("提交失败"));
         QCOMPARE(table->currentRow(), 0);
+        QCOMPARE(inspectionPage->selectedRecordId(), recordId);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
                     ->text().contains(QStringLiteral("queue failed")));
-        QTRY_VERIFY(window.findChild<QPushButton *>(QStringLiteral("confirmBackButton"))->isEnabled());
+        auto *backButton = window.findChild<QPushButton *>(QStringLiteral("confirmBackButton"));
+        QTRY_VERIFY(backButton->isEnabled());
+        backButton->click();
+        QTRY_COMPARE(server.confirmationCount(), 2);
+
+        QList<QJsonObject> confirmations;
+        for (const QJsonObject &request : server.requests()) {
+            if (request.value(QStringLiteral("command")).toString()
+                == QStringLiteral("submit_confirmation")) {
+                confirmations.append(request);
+            }
+        }
+        QCOMPARE(confirmations.size(), 2);
+        QCOMPARE(confirmations.at(0).value(QStringLiteral("image_path")).toString(),
+                 paths.at(0));
+        QCOMPARE(confirmations.at(1).value(QStringLiteral("image_path")).toString(),
+                 paths.at(0));
+        QVERIFY(confirmations.at(0).value(QStringLiteral("operation_id")).toString()
+                != confirmations.at(1).value(QStringLiteral("operation_id")).toString());
     }
 
     void failedConfirmationJobReportsFailureAndCanRetry() {
@@ -907,7 +1003,7 @@ private slots:
             dir, QStringLiteral("failed-job"), 1));
         auto *table = window.findChild<QTableWidget *>(
             QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE(table->rowCount(), 1);
+        waitForBatchCompletion(window, 1);
         QTRY_VERIFY(client.state() == BackendClient::State::Ready);
         auto *frontButton = window.findChild<QPushButton *>(
             QStringLiteral("confirmFrontButton"));
@@ -939,7 +1035,7 @@ private slots:
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
         auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
         auto *front = window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
-        QTRY_COMPARE(table->rowCount(), 2);
+        waitForBatchCompletion(window, 2);
         QTRY_VERIFY(front->isEnabled());
 
         combo->setCurrentIndex(1);
@@ -994,7 +1090,7 @@ private slots:
         QTemporaryDir dir;
         startBatch(server, client, window, writeImages(dir, QStringLiteral("disconnect"), 2));
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE(table->rowCount(), 2);
+        waitForBatchCompletion(window, 2);
         table->setCurrentCell(1, 0);
         const QString evidence = window.findChild<QTextEdit *>(
             QStringLiteral("evidenceTextEdit"))->toPlainText();
@@ -1019,7 +1115,7 @@ private slots:
         QTemporaryDir dir;
         startBatch(server, client, window, writeImages(dir, QStringLiteral("confirm-lost"), 2));
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE(table->rowCount(), 2);
+        waitForBatchCompletion(window, 2);
 
         window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
         QTRY_COMPARE(server.confirmationCount(), 1);
@@ -1042,7 +1138,7 @@ private slots:
         QTemporaryDir dir;
         startBatch(server, client, window, writeImages(dir, QStringLiteral("old"), 2));
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE(table->rowCount(), 2);
+        waitForBatchCompletion(window, 2);
         QVERIFY(!window.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))
                      ->toPlainText().isEmpty());
 
@@ -1087,9 +1183,7 @@ private slots:
         const QString singleEvidence = inspectionPage->findChild<QTextEdit *>(
             QStringLiteral("evidenceTextEdit"))->toPlainText();
         startBatch(server, client, window, oldBatchPaths);
-        auto *table = window.findChild<QTableWidget *>(
-            QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), oldBatchPaths.size(), 1500);
+        waitForBatchCompletion(window, oldBatchPaths.size());
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
 
         window.setBatchImagePaths(newBatchPaths);
@@ -1113,11 +1207,19 @@ private slots:
         QTemporaryDir dir;
         startBatch(server, client, window, writeImages(dir, QStringLiteral("partial"), 4));
         auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
-        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 2, 1500);
+        waitForBatchCompletion(window, 4);
+        bool foundFailedRecord = false;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            if (table->item(row, 0)->text() == QStringLiteral("partial-2.png")) {
+                foundFailedRecord = true;
+                QCOMPARE(table->item(row, 4)->text(), QStringLiteral("预测失败"));
+            }
+        }
+        QVERIFY(foundFailedRecord);
         const QString summary = window.findChild<QLabel *>(
             QStringLiteral("batchSummaryLabel"))->text();
-        QTRY_VERIFY(summary.contains(QStringLiteral("已完成 2/4")));
-        QVERIFY(summary.contains(QStringLiteral("partial-2.png")));
+        QTRY_VERIFY(summary.contains(QStringLiteral("已处理 4/4")));
+        QVERIFY(summary.contains(QStringLiteral("失败 1")));
     }
 
     void unreadablePreviewClearsPreviousPixmapAndNamesFile() {

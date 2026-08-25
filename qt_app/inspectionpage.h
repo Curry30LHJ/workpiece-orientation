@@ -25,6 +25,18 @@ public:
     void setBackendAvailable(bool available, bool busy, const QString &reason);
     void setSingleImagePath(const QString &path);
     void clearBatchState();
+    void beginBatch(const QStringList &paths, const QString &workpieceId);
+    void setBatchFilter(BatchFilter filter);
+    BatchFilter batchFilter() const;
+    QString selectedRecordId() const;
+    QStringList batchRecordIds() const;
+    void requestBatchStop();
+    int completedBatchCount() const;
+    int failedBatchCount() const;
+    void setRecordDisposition(const QString &recordId,
+                              BatchDisposition disposition,
+                              const QString &evolutionJobId = QString(),
+                              const QString &error = QString());
     QString singleImagePath() const;
     void showSingleResult(const InspectionRecord &record);
     void showSingleFailure(const QString &message);
@@ -40,6 +52,7 @@ signals:
                                const QString &imagePath,
                                const QString &orientation);
     void rejectionRequested(const QString &recordId);
+    void batchFinished(bool stopped);
 
 private:
     struct ModeState {
@@ -53,10 +66,19 @@ private:
     ModeState &activeState();
     const ModeState &activeState() const;
     void requestPrediction();
+    void requestNextBatchPrediction();
+    void finishBatch(bool stopped);
     void requestConfirmation(const QString &orientation);
     void rejectCurrentRecord();
     void storeRecentRecord(const InspectionRecord &record);
     void rebuildRecentList();
+    void rebuildBatchTable();
+    void selectBatchRecord(const QString &recordId, bool userInitiated);
+    void selectPreferredBatchRecord(const QString &afterRecordId = QString());
+    InspectionRecord *batchRecord(const QString &recordId);
+    const InspectionRecord *batchRecord(const QString &recordId) const;
+    bool matchesFilter(const InspectionRecord &record) const;
+    void updateBatchSummary();
     void renderActiveState();
     void renderRecord(const InspectionRecord &record);
     void updateActionOrder(const QString &predictedOrientation);
@@ -84,4 +106,15 @@ private:
     QString pendingPredictionWorkpieceId_;
     QString pendingConfirmationRecordId_;
     QString pendingConfirmationOrientation_;
+    QHash<QString, InspectionRecord> batchRecords_;
+    QStringList batchRecordOrder_;
+    QString currentBatchRequestId_;
+    QString selectedRecordId_;
+    QString batchWorkpieceId_;
+    BatchFilter batchFilter_ = BatchFilter::All;
+    int batchCursor_ = 0;
+    bool batchSelectionPinned_ = false;
+    bool changingBatchSelection_ = false;
+    bool batchRunning_ = false;
+    bool stopRequested_ = false;
 };
