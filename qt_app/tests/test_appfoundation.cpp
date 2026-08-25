@@ -1,6 +1,9 @@
 #include <QtTest>
 #include <QApplication>
+#include <QColor>
+#include <QFile>
 #include <QLabel>
+#include <QPalette>
 #include <QProgressBar>
 #include "apptheme.h"
 #include "taskstatuswidget.h"
@@ -16,6 +19,13 @@ private slots:
         QVERIFY(qss.contains(QStringLiteral("#C9362B"), Qt::CaseInsensitive));
     }
 
+    void themeResourceCanBeReadAtRegisteredPath() {
+        QFile themeFile(QStringLiteral(":/theme/theme.qss"));
+
+        QVERIFY(themeFile.open(QIODevice::ReadOnly | QIODevice::Text));
+        QVERIFY(!themeFile.readAll().isEmpty());
+    }
+
     void taskStatusKeepsActionableState() {
         TaskStatusWidget widget;
         widget.setRunning(QStringLiteral("建立工件库"),
@@ -29,6 +39,35 @@ private slots:
                           QStringLiteral("后端断开"), QStringLiteral("重试"));
         QCOMPARE(widget.property("messageKind").toString(),
                  QStringLiteral("error"));
+    }
+
+    void taskStatusMessageColors_data() {
+        QTest::addColumn<TaskStatusWidget::MessageKind>("kind");
+        QTest::addColumn<QColor>("expectedColor");
+        QTest::newRow("success") << TaskStatusWidget::MessageKind::Success
+                                  << QColor(QStringLiteral("#15803D"));
+        QTest::newRow("warning") << TaskStatusWidget::MessageKind::Warning
+                                  << QColor(QStringLiteral("#B7791F"));
+        QTest::newRow("error") << TaskStatusWidget::MessageKind::Error
+                                << QColor(QStringLiteral("#C9362B"));
+    }
+
+    void taskStatusMessageColors() {
+        QFETCH(TaskStatusWidget::MessageKind, kind);
+        QFETCH(QColor, expectedColor);
+        AppTheme::apply(qApp);
+        TaskStatusWidget widget;
+        widget.show();
+        QLabel *title = widget.findChild<QLabel *>(QStringLiteral("globalTaskTitleLabel"));
+        QLabel *detail = widget.findChild<QLabel *>(QStringLiteral("globalTaskDetailLabel"));
+        QVERIFY(title != nullptr);
+        QVERIFY(detail != nullptr);
+
+        widget.setMessage(kind, QStringLiteral("状态文案"));
+        QCoreApplication::processEvents();
+
+        QCOMPARE(title->palette().color(QPalette::WindowText), expectedColor);
+        QCOMPARE(detail->palette().color(QPalette::WindowText), expectedColor);
     }
 };
 

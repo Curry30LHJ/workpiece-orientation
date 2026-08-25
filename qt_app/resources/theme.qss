@@ -6,5 +6,8 @@ QPushButton[role="danger"] { color: #C9362B; border: 1px solid #C9362B; backgrou
 QWidget[messageKind="success"] { color: #15803D; }
 QWidget[messageKind="warning"] { color: #B7791F; }
 QWidget[messageKind="error"] { color: #C9362B; }
+QWidget[messageKind="success"] QLabel { color: #15803D; }
+QWidget[messageKind="warning"] QLabel { color: #B7791F; }
+QWidget[messageKind="error"] QLabel { color: #C9362B; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #FFFFFF; border: 1px solid #C9D2DC; min-height: 32px; padding: 0 8px; }
 QTableView { background: #FFFFFF; alternate-background-color: #F7F9FB; selection-background-color: #DCE9FF; selection-color: #17212B; }

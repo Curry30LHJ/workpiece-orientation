@@ -27,6 +27,11 @@ void setMessageKind(TaskStatusWidget *widget, TaskStatusWidget::MessageKind kind
     widget->setProperty("messageKind", messageKindName(kind));
     widget->style()->unpolish(widget);
     widget->style()->polish(widget);
+    for (QLabel *label : widget->findChildren<QLabel *>()) {
+        label->style()->unpolish(label);
+        label->style()->polish(label);
+        label->update();
+    }
     widget->update();
 }
 
