@@ -105,6 +105,22 @@ def test_compare_requires_per_image_label_and_review_identity():
     assert report["review_mismatches"][0]["adaptive"]["evidence"]["trace"]
 
 
+def test_compare_retains_every_per_image_timing_and_trace():
+    exhaustive_row = row("a.png", "front", False, "full", 56)
+    adaptive_row = row("a.png", "front", False, "top5", 10)
+
+    report = _compare_worker_payloads(
+        payload("exhaustive", [exhaustive_row]),
+        payload("adaptive", [adaptive_row]),
+    )
+
+    assert report["worker_rows"]["exhaustive"] == [exhaustive_row]
+    assert report["worker_rows"]["adaptive"] == [adaptive_row]
+    assert report["worker_rows"]["adaptive"][0]["wall_ms"] == 410.0
+    assert report["worker_rows"]["adaptive"][0]["timings_ms"]["local_matching"] == 300.0
+    assert report["worker_rows"]["adaptive"][0]["evidence"]["trace"]
+
+
 def test_compare_rejects_duplicate_or_missing_rows():
     duplicate = row("a.png", "front", False, "full", 56)
     with pytest.raises(ValueError, match="duplicate exhaustive row"):

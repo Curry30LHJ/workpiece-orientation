@@ -695,6 +695,10 @@ def _compare_worker_payloads(exhaustive: dict, adaptive: dict) -> dict:
             "exhaustive": exhaustive.get("environment", {}),
             "adaptive": adaptive.get("environment", {}),
         },
+        "worker_rows": {
+            "exhaustive": [exhaustive_rows[key] for key in ordered_keys],
+            "adaptive": [adaptive_rows[key] for key in ordered_keys],
+        },
         "benchmark": adaptive.get("benchmark", {}),
         "workers": {
             "exhaustive": exhaustive.get("benchmark", {}),
