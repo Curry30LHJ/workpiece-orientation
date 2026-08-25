@@ -4,13 +4,12 @@
 
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QCryptographicHash>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMessageBox>
 #include <QPushButton>
-#include <QSet>
+#include <QAbstractButton>
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QTimer>
@@ -24,6 +23,7 @@
 #include "inspectionpage.h"
 #include "inspectiontypes.h"
 #include "taskstatuswidget.h"
+#include "workpiecelibrarypage.h"
 
 namespace {
 const QStringList kImageFilters = {QStringLiteral("PNG/JPEG/BMP (*.png *.jpg *.jpeg *.bmp)")};
@@ -32,16 +32,6 @@ QStringList dialogFilters() {
     return kImageFilters;
 }
 
-QString imageContentKey(const QImage &image) {
-    const QImage normalized = image.convertToFormat(QImage::Format_RGBA8888);
-    const int width = normalized.width();
-    const int height = normalized.height();
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    hash.addData(reinterpret_cast<const char *>(&width), sizeof(width));
-    hash.addData(reinterpret_cast<const char *>(&height), sizeof(height));
-    hash.addData(reinterpret_cast<const char *>(normalized.constBits()), normalized.sizeInBytes());
-    return QString::fromLatin1(hash.result().toHex());
-}
 }
 
 MainWindow::MainWindow(QWidget *parent)
@@ -63,6 +53,8 @@ void MainWindow::initializeUi() {
     ui->appHeaderHostLayout->addWidget(appHeader_);
     inspectionPage_ = new InspectionPage(ui->inspectionPageHost);
     ui->inspectionPageHostLayout->addWidget(inspectionPage_);
+    workpieceLibraryPage_ = new WorkpieceLibraryPage(ui->libraryPageHost);
+    ui->libraryPageHostLayout->addWidget(workpieceLibraryPage_);
     chooseImageButton_ = inspectionPage_->findChild<QPushButton *>(
         QStringLiteral("chooseImageButton"));
     predictButton_ = inspectionPage_->findChild<QPushButton *>(
@@ -100,17 +92,9 @@ void MainWindow::initializeUi() {
     initialBackendDetails.canRestart = manager_ != nullptr;
     appHeader_->setBackendDetails(initialBackendDetails);
 
-    deleteWorkpieceButton_ = new QPushButton(QStringLiteral("删除工件"), ui->libraryGroupBox);
-    deleteWorkpieceButton_->setObjectName(QStringLiteral("deleteWorkpieceButton"));
-    ui->libraryLayout->addWidget(deleteWorkpieceButton_, 0, 3);
-    annotationEditorButton_ = new QPushButton(QStringLiteral("管理几何干扰规则"), ui->libraryGroupBox);
-    annotationEditorButton_->setObjectName(QStringLiteral("annotationEditorButton"));
-    ui->libraryLayout->addWidget(annotationEditorButton_, 8, 0, 1, 3);
-    ui->registerButton->setEnabled(false);
+    annotationEditorButton_ = workpieceLibraryPage_->findChild<QPushButton *>(
+        QStringLiteral("annotationEditorButton"));
     predictButton_->setEnabled(false);
-    ui->refreshWorkpiecesButton->setEnabled(false);
-    ui->chooseFrontTemplatesButton->setEnabled(false);
-    ui->chooseBackTemplatesButton->setEnabled(false);
     chooseImageButton_->setEnabled(false);
     chooseBatchImagesButton_->setEnabled(false);
     batchPredictButton_->setEnabled(false);
@@ -118,37 +102,18 @@ void MainWindow::initializeUi() {
     reviewLabel_->clear();
     batchSummaryLabel_->clear();
     evidenceTextEdit_->clear();
-    ui->libraryMessageLabel->clear();
-    ui->templateWarningLabel->clear();
-    ui->registrationProgressLabel->setText(QStringLiteral("建库进度：未开始"));
-    ui->registrationProgressBar->setRange(0, 1);
-    ui->registrationProgressBar->setValue(0);
-    ui->registrationElapsedLabel->setText(QStringLiteral("耗时：0 ms"));
-    registrationElapsedTimer_ = new QTimer(this);
-    registrationElapsedTimer_->setInterval(100);
-    connect(registrationElapsedTimer_, &QTimer::timeout,
-            this, &MainWindow::updateRegistrationElapsed);
     evolutionPollTimer_ = new QTimer(this);
     evolutionPollTimer_->setInterval(5000);
     connect(evolutionPollTimer_, &QTimer::timeout, this, &MainWindow::pollEvolutionJobs);
     geometryPollTimer_ = new QTimer(this);
     geometryPollTimer_->setInterval(1000);
     connect(geometryPollTimer_, &QTimer::timeout, this, &MainWindow::pollGeometryValidation);
-    updateTemplateLabels();
     clearBatchResults();
     updateButtonStates();
-    connect(ui->chooseFrontTemplatesButton, &QPushButton::clicked,
-            this, &MainWindow::chooseFrontTemplates);
-    connect(ui->chooseBackTemplatesButton, &QPushButton::clicked,
-            this, &MainWindow::chooseBackTemplates);
     connect(chooseImageButton_, &QPushButton::clicked,
             this, &MainWindow::chooseInspectionImage);
     connect(chooseBatchImagesButton_, &QPushButton::clicked,
             this, &MainWindow::chooseBatchImages);
-    connect(ui->refreshWorkpiecesButton, &QPushButton::clicked,
-            this, &MainWindow::refreshWorkpieces);
-    connect(ui->registerButton, &QPushButton::clicked,
-            this, &MainWindow::submitRegistration);
     connect(batchPredictButton_, &QPushButton::clicked,
             this, &MainWindow::submitBatchPrediction);
     connect(inspectionPage_, &InspectionPage::commandRequested,
@@ -168,6 +133,45 @@ void MainWindow::initializeUi() {
                 resultContext_ = ResultContext::Batch;
                 updateButtonStates();
             });
+    connect(workpieceLibraryPage_, &WorkpieceLibraryPage::commandRequested,
+            this, [this](const QString &command, const QJsonObject &fields) {
+                if (command == QStringLiteral("list_workpieces")) {
+                    refreshWorkpieces();
+                    return;
+                }
+                sendPageCommand(CommandOwner::Library, command, fields);
+            });
+    connect(workpieceLibraryPage_, &WorkpieceLibraryPage::setCurrentWorkpieceRequested,
+            this, [this](const QString &workpieceId) {
+                appHeader_->setCurrentWorkpieceId(workpieceId);
+                inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
+                                                     appHeader_->currentWorkpieceName());
+                workpieceLibraryPage_->setWorkpieces(
+                    workpieceSummaries_, appHeader_->currentWorkpieceId());
+                if (resultContext_ != ResultContext::Batch) {
+                    lastPredictionWorkpieceId_.clear();
+                    lastPredictionImagePath_.clear();
+                    lastPredictionResponse_ = QJsonObject();
+                }
+                updateButtonStates();
+            });
+    connect(workpieceLibraryPage_, &WorkpieceLibraryPage::taskStatusChanged,
+            this, [this](const QString &title, const QString &phase,
+                         int completed, int total, qint64 elapsedMs) {
+                globalTaskStatus_->setRunning(title, phase, completed, total,
+                                              qMax<qint64>(0, elapsedMs));
+                if (phase == QStringLiteral("failed")) {
+                    globalTaskStatus_->setMessage(
+                        TaskStatusWidget::MessageKind::Error,
+                        elapsedMs < 0 ? QStringLiteral("任务失败 · 耗时未知")
+                                      : QStringLiteral("任务失败"));
+                } else if (elapsedMs < 0) {
+                    globalTaskStatus_->setMessage(
+                        TaskStatusWidget::MessageKind::Neutral,
+                        QStringLiteral("%1 · %2/%3 · 耗时未知")
+                            .arg(phase).arg(completed).arg(total));
+                }
+            });
     connect(appHeader_, &AppHeader::pageRequested,
             this, [this](AppPage page) { requestPage(page); });
     connect(appHeader_, &AppHeader::restartBackendRequested,
@@ -180,6 +184,8 @@ void MainWindow::initializeUi() {
         }
         inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
                                              appHeader_->currentWorkpieceName());
+        workpieceLibraryPage_->setWorkpieces(
+            workpieceSummaries_, appHeader_->currentWorkpieceId());
         if (resultContext_ != ResultContext::Batch) {
             lastPredictionWorkpieceId_.clear();
             lastPredictionImagePath_.clear();
@@ -187,8 +193,6 @@ void MainWindow::initializeUi() {
         }
         updateButtonStates();
     });
-    connect(deleteWorkpieceButton_, &QPushButton::clicked,
-            this, &MainWindow::deleteSelectedWorkpiece);
     connect(annotationEditorButton_, &QPushButton::clicked,
             this, &MainWindow::openAnnotationManager);
     confirmFrontButton_->setEnabled(false);
@@ -198,6 +202,28 @@ void MainWindow::initializeUi() {
 
 bool MainWindow::requestPage(AppPage page) {
     if (page == currentPage_) return true;
+    if (currentPage_ == AppPage::WorkpieceLibrary
+        && workpieceLibraryPage_ != nullptr
+        && workpieceLibraryPage_->hasUnsavedChanges()) {
+        QMessageBox prompt(this);
+        prompt.setWindowTitle(QStringLiteral("未保存的工件草稿"));
+        prompt.setText(QStringLiteral("工件库中有未保存的编辑草稿，如何处理？"));
+        QAbstractButton *keep = prompt.addButton(
+            QStringLiteral("保留并离开"), QMessageBox::AcceptRole);
+        QAbstractButton *discard = prompt.addButton(
+            QStringLiteral("放弃修改"), QMessageBox::DestructiveRole);
+        QAbstractButton *cancel = prompt.addButton(
+            QStringLiteral("取消"), QMessageBox::RejectRole);
+        prompt.exec();
+        if (prompt.clickedButton() == cancel || prompt.clickedButton() == nullptr) {
+            appHeader_->setCurrentPage(currentPage_);
+            return false;
+        }
+        if (prompt.clickedButton() == discard) {
+            workpieceLibraryPage_->discardEditingDraft();
+        }
+        Q_UNUSED(keep)
+    }
     ui->mainPageStack->setCurrentIndex(static_cast<int>(page));
     currentPage_ = page;
     appHeader_->setCurrentPage(page);
@@ -247,7 +273,14 @@ void MainWindow::sendPageCommand(CommandOwner owner, const QString &command,
     if (client_ == nullptr || command.isEmpty()) return;
     if (clientBusy_ || !pendingCommand_.isEmpty()
         || client_->state() != BackendClient::State::Ready) {
-        if (queuedCommand_.isEmpty()) {
+        const bool replaceContinuation = owner == CommandOwner::Library
+            && command == QStringLiteral("register")
+            && fields.value(QStringLiteral("replace")).toBool();
+        const bool latestBrowseIntent = owner == CommandOwner::Library
+            && command == QStringLiteral("get_workpiece_details")
+            && queuedOwner_ == CommandOwner::Library
+            && queuedCommand_ == QStringLiteral("get_workpiece_details");
+        if (queuedCommand_.isEmpty() || replaceContinuation || latestBrowseIntent) {
             queuedOwner_ = owner;
             queuedCommand_ = command;
             queuedFields_ = fields;
@@ -267,6 +300,7 @@ void MainWindow::sendPageCommand(CommandOwner owner, const QString &command,
     }
     pendingOwner_ = owner;
     pendingCommand_ = command;
+    pendingFields_ = fields;
     client_->sendRequest(command, fields);
 }
 
@@ -288,18 +322,15 @@ void MainWindow::dispatchQueuedCommand() {
 void MainWindow::clearPendingCommand() {
     pendingOwner_ = CommandOwner::None;
     pendingCommand_.clear();
+    pendingFields_ = QJsonObject();
 }
 
 void MainWindow::setTemplatePaths(const QStringList &frontPaths, const QStringList &backPaths) {
-    frontTemplatePaths_ = normalizedPaths(frontPaths);
-    backTemplatePaths_ = normalizedPaths(backPaths);
-    updateTemplateLabels();
-    updateButtonStates();
+    workpieceLibraryPage_->setTemplatePaths(frontPaths, backPaths);
 }
 
 void MainWindow::setWorkpieceName(const QString &name) {
-    ui->workpieceNameEdit->setText(name);
-    updateButtonStates();
+    workpieceLibraryPage_->setWorkpieceName(name);
 }
 
 void MainWindow::setInspectionImagePath(const QString &path) {
@@ -328,7 +359,7 @@ void MainWindow::setBatchImagePaths(const QStringList &paths) {
 }
 
 void MainWindow::setReplaceConfirmationHandler(std::function<bool(const QString &)> handler) {
-    replaceConfirmationHandler_ = std::move(handler);
+    workpieceLibraryPage_->setReplaceConfirmationHandler(std::move(handler));
 }
 
 void MainWindow::setBackendError(const QString &message) {
@@ -345,28 +376,9 @@ void MainWindow::setBackendError(const QString &message) {
     details.recentError = message;
     details.canRestart = false;
     appHeader_->setBackendDetails(details);
+    workpieceLibraryPage_->setBackendState(BackendUiState::Error, message);
     showLibraryMessage(message, true);
     updateButtonStates();
-}
-
-void MainWindow::chooseFrontTemplates() {
-    const QStringList paths = QFileDialog::getOpenFileNames(
-        this, QStringLiteral("选择正面模板"), QString(), dialogFilters().constFirst());
-    if (!paths.isEmpty()) {
-        frontTemplatePaths_ = normalizedPaths(paths);
-        updateTemplateLabels();
-        updateButtonStates();
-    }
-}
-
-void MainWindow::chooseBackTemplates() {
-    const QStringList paths = QFileDialog::getOpenFileNames(
-        this, QStringLiteral("选择反面模板"), QString(), dialogFilters().constFirst());
-    if (!paths.isEmpty()) {
-        backTemplatePaths_ = normalizedPaths(paths);
-        updateTemplateLabels();
-        updateButtonStates();
-    }
 }
 
 void MainWindow::chooseInspectionImage() {
@@ -389,7 +401,6 @@ void MainWindow::refreshWorkpieces() {
     if (client_ == nullptr || !backendReady_) {
         return;
     }
-    registrationSummaryVisible_ = false;
     deferredUserWorkpieceRefresh_ = true;
     if (batchInFlight_ || clientBusy_ || !pendingCommand_.isEmpty()
         || !queuedCommand_.isEmpty()
@@ -404,9 +415,6 @@ void MainWindow::requestWorkpieceRefresh(bool preserveRegistrationSummary,
                                          CommandOwner owner) {
     if (client_ == nullptr || !backendReady_) {
         return;
-    }
-    if (!preserveRegistrationSummary) {
-        registrationSummaryVisible_ = false;
     }
     sendPageCommand(owner, QStringLiteral("list_workpieces"), QJsonObject());
     if (!preserveRegistrationSummary) {
@@ -425,22 +433,8 @@ void MainWindow::dispatchDeferredUserRefresh() {
 }
 
 void MainWindow::submitRegistration() {
-    QString error;
-    if (!validateRegistration(&error)) {
-        showLibraryMessage(error, true);
-        return;
-    }
-    if (client_ == nullptr || !backendReady_ || clientBusy_
-        || client_->state() != BackendClient::State::Ready) {
-        showLibraryMessage(QStringLiteral("后端尚未就绪"), true);
-        return;
-    }
-    pendingWorkpieceName_ = ui->workpieceNameEdit->text().trimmed();
-    pendingReplace_ = false;
-    registrationInFlight_ = true;
-    registrationSummaryVisible_ = false;
-    startRegistrationProgress();
-    sendRegistration(false);
+    QMetaObject::invokeMethod(workpieceLibraryPage_, "submitRegistration",
+                              Qt::DirectConnection);
 }
 
 void MainWindow::submitPrediction() {
@@ -474,26 +468,6 @@ void MainWindow::submitBatchPrediction() {
     updateButtonStates();
 }
 
-void MainWindow::deleteSelectedWorkpiece() {
-    const QString workpieceId = selectedWorkpieceId();
-    if (workpieceId.isEmpty() || client_ == nullptr || clientBusy_ || !backendReady_) {
-        return;
-    }
-    const QString name = appHeader_->currentWorkpieceName();
-    const bool confirmed = QMessageBox::question(
-        this, QStringLiteral("确认删除工件"),
-        QStringLiteral("工件“%1”将移入可恢复回收区，是否继续？").arg(name),
-        QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
-    if (!confirmed) {
-        return;
-    }
-    sendPageCommand(CommandOwner::Library, QStringLiteral("recycle_workpiece"), {
-        {QStringLiteral("workpiece_id"), workpieceId},
-        {QStringLiteral("operation_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
-    });
-    showLibraryMessage(QStringLiteral("正在将工件移入回收区…"));
-}
-
 void MainWindow::confirmFrontTemplate() {
     if (confirmFrontButton_ != nullptr) confirmFrontButton_->click();
 }
@@ -521,7 +495,9 @@ void MainWindow::openAnnotationManager() {
 }
 
 void MainWindow::openGeometryMaskManager() {
-    const QString workpieceId = selectedWorkpieceId();
+    const QString workpieceId = workpieceLibraryPage_ != nullptr
+        && !workpieceLibraryPage_->browsedWorkpieceId().isEmpty()
+        ? workpieceLibraryPage_->browsedWorkpieceId() : selectedWorkpieceId();
     if (workpieceId.isEmpty() || client_ == nullptr || !backendReady_ || clientBusy_
         || client_->state() != BackendClient::State::Ready) {
         showLibraryMessage(QStringLiteral("请先选择已建立的工件库，且等待后端空闲"), true);
@@ -854,13 +830,14 @@ void MainWindow::onBackendReady() {
     details.modelDetail = QStringLiteral("已加载");
     details.canRestart = true;
     appHeader_->setBackendDetails(details);
+    workpieceLibraryPage_->setBackendState(BackendUiState::Ready, QString());
     updateButtonStates();
     if (evolutionPollTimer_ != nullptr) {
         evolutionPollTimer_->start();
     }
     if (firstReadySignal) {
         QTimer::singleShot(0, this, [this]() {
-            requestWorkpieceRefresh(registrationSummaryVisible_);
+            requestWorkpieceRefresh(false);
         });
     }
 }
@@ -881,6 +858,7 @@ void MainWindow::onBackendLoading(const QString &message) {
     details.modelDetail = message.isEmpty() ? QStringLiteral("模型加载中") : message;
     details.canRestart = manager_ != nullptr;
     appHeader_->setBackendDetails(details);
+    workpieceLibraryPage_->setBackendState(BackendUiState::Loading, details.modelDetail);
     showLibraryMessage(message.isEmpty() ? QStringLiteral("正在加载模型，请稍候…") : message);
     updateButtonStates();
 }
@@ -888,14 +866,14 @@ void MainWindow::onBackendLoading(const QString &message) {
 void MainWindow::onBackendUnavailable(const QString &reason) {
     const CommandOwner interruptedOwner = pendingOwner_;
     const QString interruptedTask = pendingCommand_;
-    const bool hasPreservedWork = registrationInFlight_ || batchInFlight_ || clientBusy_
+    const bool hasPreservedWork = workpieceLibraryPage_->hasUnsavedChanges()
+        || batchInFlight_ || clientBusy_
         || !pendingCommand_.isEmpty() || !inspectionImagePath_.isEmpty()
         || (batchResultsTableWidget_ != nullptr && batchResultsTableWidget_->rowCount() > 0)
         || annotationManagerDialog_ != nullptr || geometryMaskManagerDialog_ != nullptr;
     if (interruptedOwner == CommandOwner::UserRefresh) {
         deferredUserWorkpieceRefresh_ = true;
     }
-    stopRegistrationProgress();
     if (annotationManagerDialog_ != nullptr) {
         annotationManagerDialog_->setBusy(false);
         annotationManagerDialog_->setOperationError(
@@ -922,9 +900,7 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     backendReadyHandled_ = false;
     backendReady_ = false;
     clientBusy_ = false;
-    registrationInFlight_ = false;
     batchInFlight_ = false;
-    pendingReplace_ = false;
     clearPendingCommand();
     queuedOwner_ = CommandOwner::None;
     queuedCommand_.clear();
@@ -942,6 +918,7 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     details.recentError = reason;
     details.canRestart = true;
     appHeader_->setBackendDetails(details);
+    workpieceLibraryPage_->setBackendState(BackendUiState::Error, reason);
     showLibraryMessage(hasPreservedWork
                            ? QStringLiteral("后端连接中断，未完成操作结果未知；请重连后刷新：%1").arg(reason)
                            : reason,
@@ -993,6 +970,7 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
         details.modelDetail = QStringLiteral("未加载");
     }
     appHeader_->setBackendDetails(details);
+    workpieceLibraryPage_->setBackendState(details.state, detail);
     updateButtonStates();
     if (state == BackendClient::State::Ready) {
         dispatchQueuedCommand();
@@ -1009,30 +987,14 @@ void MainWindow::onClientProgress(const QString &command, const QJsonObject &pro
         }
         return;
     }
-    if (command != QStringLiteral("register") || !registrationInFlight_) {
-        return;
+    if (command == QStringLiteral("register")) {
+        workpieceLibraryPage_->setRegistrationProgress(progress, -1);
     }
-    const QString phase = progress.value(QStringLiteral("phase")).toString();
-    const int total = progress.value(QStringLiteral("total")).toInt(1);
-    const int completed = progress.value(QStringLiteral("completed")).toInt(0);
-    ui->registrationProgressBar->setRange(0, qMax(1, total));
-    ui->registrationProgressBar->setValue(qBound(0, completed, qMax(1, total)));
-    if (phase == QStringLiteral("validating")) {
-        ui->registrationProgressLabel->setText(QStringLiteral("建库进度：正在校验图片"));
-    } else if (phase == QStringLiteral("copying")) {
-        ui->registrationProgressLabel->setText(QStringLiteral("建库进度：正在写入模板"));
-    } else if (phase == QStringLiteral("features")) {
-        ui->registrationProgressLabel->setText(QStringLiteral("建库进度：正在提取特征（%1/%2）")
-                                                    .arg(completed).arg(total));
-    } else if (phase == QStringLiteral("committing")) {
-        ui->registrationProgressLabel->setText(QStringLiteral("建库进度：正在提交"));
-    }
-    updateRegistrationElapsed();
 }
 
 void MainWindow::onClientResponse(const QString &command, const QJsonObject &response) {
     const CommandOwner responseOwner = pendingOwner_;
-    const QString issuedCommand = pendingCommand_;
+    const QJsonObject issuedFields = pendingFields_;
     clearPendingCommand();
     if (batchInFlight_ && command == QStringLiteral("predict")) {
         inspectionPage_->handleBackendResponse(command, response);
@@ -1041,6 +1003,7 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     if (command == QStringLiteral("list_workpieces")) {
         const QString previousId = selectedWorkpieceId();
         const QJsonArray workpieces = response.value(QStringLiteral("workpieces")).toArray();
+        workpieceSummaries_ = workpieces;
         QList<QPair<QString, QString>> items;
         QString requestedId = previousId;
         bool previousStillExists = false;
@@ -1050,32 +1013,32 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
             const QString name = item.value(QStringLiteral("name")).toString();
             items.append(qMakePair(id, name));
             previousStillExists = previousStillExists || id == previousId;
-            if (!pendingWorkpieceName_.isEmpty() && name == pendingWorkpieceName_) {
-                requestedId = id;
-            }
         }
-        if (!previousStillExists && pendingWorkpieceName_.isEmpty()) {
+        if (!previousStillExists) {
             requestedId.clear();
         }
         appHeader_->setWorkpieces(items, requestedId);
+        workpieceLibraryPage_->setWorkpieces(workpieces, appHeader_->currentWorkpieceId());
         if (responseOwner == CommandOwner::UserRefresh) {
             deferredUserWorkpieceRefresh_ = false;
         }
-        if (issuedCommand == QStringLiteral("list_workpieces")
-            || command == QStringLiteral("list_workpieces")) {
-            pendingWorkpieceName_.clear();
-        }
-        if (!registrationSummaryVisible_) {
-            showLibraryMessage(QStringLiteral("工件列表已刷新"));
-        }
+        showLibraryMessage(QStringLiteral("工件列表已刷新"));
         updateButtonStates();
+        return;
+    }
+    if (command == QStringLiteral("get_workpiece_details")) {
+        const QString requestedId = issuedFields.value(QStringLiteral("workpiece_id")).toString();
+        if (requestedId.isEmpty()
+            || requestedId == workpieceLibraryPage_->browsedWorkpieceId()) {
+            workpieceLibraryPage_->handleBackendResponse(command, response);
+        }
         return;
     }
     if (command == QStringLiteral("recycle_workpiece")) {
         lastPredictionWorkpieceId_.clear();
         lastPredictionImagePath_.clear();
         lastPredictionResponse_ = QJsonObject();
-        showLibraryMessage(QStringLiteral("工件已移入回收区，可在后端恢复"));
+        workpieceLibraryPage_->handleBackendResponse(command, response);
         requestWorkpieceRefresh(false);
         return;
     }
@@ -1249,6 +1212,7 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     if (command == QStringLiteral("list_evolution_jobs")) {
         const QJsonArray jobs = response.value(QStringLiteral("jobs")).toArray();
         inspectionPage_->handleBackendResponse(command, response);
+        workpieceLibraryPage_->setEvolutionJobs(jobs);
         if (!jobs.isEmpty()) {
             const QJsonObject latest = jobs.last().toObject();
             showLibraryMessage(QStringLiteral("后台入库：%1，进度 %2%%")
@@ -1258,16 +1222,7 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("register")) {
-        stopRegistrationProgress();
-        registrationInFlight_ = false;
-        const QJsonObject counts = response.value(QStringLiteral("template_counts")).toObject();
-        const int frontCount = counts.value(QStringLiteral("front")).toInt(frontTemplatePaths_.size());
-        const int backCount = counts.value(QStringLiteral("back")).toInt(backTemplatePaths_.size());
-        const double elapsedMs = response.value(QStringLiteral("elapsed_ms")).toDouble(
-            registrationElapsedClock_.isValid() ? registrationElapsedClock_.elapsed() : 0.0);
-        showLibraryMessage(QStringLiteral("工件库建立成功：正面 %1 张，反面 %2 张，耗时 %3 ms")
-                              .arg(frontCount).arg(backCount).arg(QString::number(elapsedMs, 'f', 1)));
-        registrationSummaryVisible_ = true;
+        workpieceLibraryPage_->handleBackendResponse(command, response);
         QTimer::singleShot(0, this, [this]() {
             requestWorkpieceRefresh(true);
         });
@@ -1292,28 +1247,15 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
                                        const QString &message) {
     const CommandOwner failureOwner = pendingOwner_;
     const QString issuedCommand = pendingCommand_;
+    const QJsonObject issuedFields = pendingFields_;
     clearPendingCommand();
     const QString failedCommand = issuedCommand.isEmpty() ? command : issuedCommand;
     const auto matchesOwner = [failureOwner](CommandOwner expected) {
         return failureOwner == expected || failureOwner == CommandOwner::None;
     };
     if (failedCommand == QStringLiteral("register")
-        && matchesOwner(CommandOwner::Library) && registrationInFlight_
-        && code == QStringLiteral("WORKPIECE_EXISTS")
-        && !pendingReplace_) {
-        const bool confirmed = replaceConfirmationHandler_
-            ? replaceConfirmationHandler_(pendingWorkpieceName_)
-            : QMessageBox::question(this, QStringLiteral("确认覆盖"),
-                                     QStringLiteral("工件“%1”已存在，是否覆盖？").arg(pendingWorkpieceName_),
-                                     QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
-        if (confirmed) {
-            pendingReplace_ = true;
-            QTimer::singleShot(0, this, [this]() { sendRegistration(true); });
-        } else {
-            stopRegistrationProgress();
-            registrationInFlight_ = false;
-            showLibraryMessage(QStringLiteral("已取消覆盖"));
-        }
+        && matchesOwner(CommandOwner::Library)) {
+        workpieceLibraryPage_->handleBackendFailure(failedCommand, code, message);
         return;
     }
     if (batchInFlight_ && failedCommand == QStringLiteral("predict")
@@ -1322,16 +1264,18 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         updateButtonStates();
         return;
     }
-    if (failedCommand == QStringLiteral("register")
-        && matchesOwner(CommandOwner::Library)) {
-        stopRegistrationProgress();
-        registrationInFlight_ = false;
-        showLibraryMessage(message, true);
-    } else if (failedCommand == QStringLiteral("list_workpieces")
+    if (failedCommand == QStringLiteral("list_workpieces")
                && failureOwner == CommandOwner::UserRefresh) {
         deferredUserWorkpieceRefresh_ = false;
         showLibraryMessage(
             QStringLiteral("刷新失败：%1；请手动重试").arg(message), true);
+    } else if (failedCommand == QStringLiteral("get_workpiece_details")
+               && matchesOwner(CommandOwner::Library)) {
+        const QString requestedId = issuedFields.value(QStringLiteral("workpiece_id")).toString();
+        if (requestedId.isEmpty()
+            || requestedId == workpieceLibraryPage_->browsedWorkpieceId()) {
+            workpieceLibraryPage_->handleBackendFailure(failedCommand, code, message);
+        }
     } else if (failedCommand == QStringLiteral("predict")
                && matchesOwner(CommandOwner::Inspection)) {
         if (inspectionPage_ != nullptr
@@ -1386,7 +1330,7 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         showLibraryMessage(detail, true);
     } else if (failedCommand == QStringLiteral("recycle_workpiece")
                && matchesOwner(CommandOwner::Library)) {
-        showLibraryMessage(QStringLiteral("删除失败：%1").arg(message), true);
+        workpieceLibraryPage_->handleBackendFailure(failedCommand, code, message);
     } else if (failedCommand == QStringLiteral("get_workpiece_annotations")
                && matchesOwner(CommandOwner::Geometry)) {
         showLibraryMessage(QStringLiteral("干扰标注加载失败：%1").arg(message), true);
@@ -1426,40 +1370,14 @@ void MainWindow::onClientTransportFailed(const QString &code, const QString &mes
 }
 
 void MainWindow::updateButtonStates() {
-    const bool interactive = backendReady_ && !clientBusy_ && !batchInFlight_ && !registrationInFlight_;
+    const bool interactive = backendReady_ && !clientBusy_ && !batchInFlight_;
     inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
                                          appHeader_->currentWorkpieceName());
-    inspectionPage_->setBackendAvailable(backendReady_, clientBusy_ || registrationInFlight_,
+    inspectionPage_->setBackendAvailable(backendReady_, clientBusy_,
                                          backendReady_ ? QString() : QStringLiteral("后端尚未就绪"));
-    ui->refreshWorkpiecesButton->setEnabled(interactive);
-    ui->chooseFrontTemplatesButton->setEnabled(interactive);
-    ui->chooseBackTemplatesButton->setEnabled(interactive);
     chooseBatchImagesButton_->setEnabled(interactive);
-    ui->registerButton->setEnabled(interactive && !ui->workpieceNameEdit->text().trimmed().isEmpty()
-                                   && !frontTemplatePaths_.isEmpty() && !backTemplatePaths_.isEmpty());
     batchPredictButton_->setEnabled(interactive && !selectedWorkpieceId().isEmpty()
                                     && !batchImagePaths_.isEmpty());
-    if (deleteWorkpieceButton_ != nullptr) {
-        deleteWorkpieceButton_->setEnabled(interactive && !selectedWorkpieceId().isEmpty());
-    }
-    if (annotationEditorButton_ != nullptr) {
-        annotationEditorButton_->setEnabled(interactive && !selectedWorkpieceId().isEmpty());
-    }
-}
-
-void MainWindow::updateTemplateLabels() {
-    ui->frontTemplatesLabel->setText(QStringLiteral("正面已选择 %1 张").arg(frontTemplatePaths_.size()));
-    ui->backTemplatesLabel->setText(QStringLiteral("反面已选择 %1 张").arg(backTemplatePaths_.size()));
-    ui->frontTemplatesFilesLabel->setText(frontTemplatePaths_.join(QLatin1Char('\n')));
-    ui->backTemplatesFilesLabel->setText(backTemplatePaths_.join(QLatin1Char('\n')));
-    QStringList warnings;
-    if (frontTemplatePaths_.size() < 3 || backTemplatePaths_.size() < 3) {
-        warnings.append(QStringLiteral("模板较少，建议补充更多角度，但仍可建库"));
-    }
-    if (frontTemplatePaths_.size() + backTemplatePaths_.size() > 30) {
-        warnings.append(QStringLiteral("模板较多，建库和检测耗时可能增加"));
-    }
-    ui->templateWarningLabel->setText(warnings.join(QStringLiteral("\n")));
 }
 
 void MainWindow::updatePreview() {
@@ -1510,91 +1428,6 @@ void MainWindow::clearBatchResults() {
     batchSummaryLabel_->clear();
 }
 
-void MainWindow::startRegistrationProgress() {
-    registrationElapsedClock_.start();
-    registrationElapsedTimer_->start();
-    const int total = frontTemplatePaths_.size() + backTemplatePaths_.size();
-    ui->registrationProgressBar->setRange(0, qMax(1, total));
-    ui->registrationProgressBar->setValue(0);
-    ui->registrationProgressLabel->setText(QStringLiteral("建库进度：准备中（共 %1 张）").arg(total));
-    ui->registrationElapsedLabel->setText(QStringLiteral("耗时：0 ms"));
-}
-
-void MainWindow::stopRegistrationProgress() {
-    if (registrationElapsedTimer_ != nullptr) {
-        registrationElapsedTimer_->stop();
-    }
-    if (registrationElapsedClock_.isValid()) {
-        ui->registrationElapsedLabel->setText(QStringLiteral("耗时：%1 ms")
-                                                   .arg(registrationElapsedClock_.elapsed()));
-    }
-}
-
-void MainWindow::updateRegistrationElapsed() {
-    if (registrationInFlight_ && registrationElapsedClock_.isValid()) {
-        ui->registrationElapsedLabel->setText(QStringLiteral("耗时：%1 ms")
-                                                   .arg(registrationElapsedClock_.elapsed()));
-    }
-}
-
-void MainWindow::sendRegistration(bool replace) {
-    if (client_ == nullptr || client_->state() != BackendClient::State::Ready) {
-        return;
-    }
-    QJsonArray front;
-    QJsonArray back;
-    for (const QString &path : frontTemplatePaths_) {
-        front.append(path);
-    }
-    for (const QString &path : backTemplatePaths_) {
-        back.append(path);
-    }
-    sendPageCommand(CommandOwner::Library, QStringLiteral("register"), {
-        {QStringLiteral("name"), pendingWorkpieceName_},
-        {QStringLiteral("replace"), replace},
-        {QStringLiteral("front_images"), front},
-        {QStringLiteral("back_images"), back},
-        {QStringLiteral("progress_events"), true},
-    });
-    showLibraryMessage(replace ? QStringLiteral("正在覆盖并建立工件库…") : QStringLiteral("正在建立工件库…"));
-}
-
-bool MainWindow::validateRegistration(QString *error) const {
-    if (ui->workpieceNameEdit->text().trimmed().isEmpty()) {
-        if (error != nullptr) *error = QStringLiteral("请输入工件名称");
-        return false;
-    }
-    if (frontTemplatePaths_.isEmpty() || backTemplatePaths_.isEmpty()) {
-        if (error != nullptr) *error = QStringLiteral("正面和反面都至少需要选择 1 张图片");
-        return false;
-    }
-    QSet<QString> paths;
-    QSet<QString> contents;
-    for (const QString &path : frontTemplatePaths_ + backTemplatePaths_) {
-        const QString absolute = QFileInfo(path).absoluteFilePath();
-        const QString pathKey = absolute.toCaseFolded();
-        if (paths.contains(pathKey)) {
-            if (error != nullptr) *error = QStringLiteral("模板图片不能重复");
-            return false;
-        }
-        paths.insert(pathKey);
-        QString imageError;
-        if (!validateImagePath(absolute, &imageError)) {
-            if (error != nullptr) *error = QStringLiteral("模板图片无效：%1").arg(absolute);
-            return false;
-        }
-        QImageReader reader(absolute);
-        const QImage image = reader.read();
-        const QString contentKey = imageContentKey(image);
-        if (contents.contains(contentKey)) {
-            if (error != nullptr) *error = QStringLiteral("模板图片内容不能重复");
-            return false;
-        }
-        contents.insert(contentKey);
-    }
-    return true;
-}
-
 bool MainWindow::validateImagePath(const QString &path, QString *error) const {
     if (path.isEmpty()) {
         if (error != nullptr) *error = QStringLiteral("请选择待测图片");
@@ -1635,6 +1468,9 @@ QString MainWindow::orientationText(const QString &label) const {
 }
 
 void MainWindow::showLibraryMessage(const QString &message, bool error) {
-    ui->libraryMessageLabel->setStyleSheet(error ? QStringLiteral("color: #b00020;") : QString());
-    ui->libraryMessageLabel->setText(message);
+    QLabel *label = workpieceLibraryPage_ == nullptr ? nullptr
+        : workpieceLibraryPage_->findChild<QLabel *>(QStringLiteral("libraryMessageLabel"));
+    if (label == nullptr) return;
+    label->setStyleSheet(error ? QStringLiteral("color: #b00020;") : QString());
+    label->setText(message);
 }

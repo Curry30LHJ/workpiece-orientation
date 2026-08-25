@@ -1,7 +1,6 @@
 #pragma once
 
 #include <QMainWindow>
-#include <QElapsedTimer>
 #include <QHash>
 #include <QJsonObject>
 #include <QPointer>
@@ -16,6 +15,7 @@
 
 class BackendProcessManager;
 class InspectionPage;
+class WorkpieceLibraryPage;
 class QLabel;
 class QPushButton;
 class QTableWidget;
@@ -48,15 +48,12 @@ private slots:
     void showInspection();
     void showWorkpieceLibrary();
     void showGeometryRules();
-    void chooseFrontTemplates();
-    void chooseBackTemplates();
     void chooseInspectionImage();
     void chooseBatchImages();
     void refreshWorkpieces();
     void submitRegistration();
     void submitPrediction();
     void submitBatchPrediction();
-    void deleteSelectedWorkpiece();
     void confirmFrontTemplate();
     void confirmBackTemplate();
     void rejectTemplateConfirmation();
@@ -108,21 +105,15 @@ private:
     void dispatchQueuedCommand();
     void clearPendingCommand();
     void updateButtonStates();
-    void updateTemplateLabels();
     void updatePreview();
     void clearInspectionState();
     void clearBatchState();
     void clearBatchResults();
-    void sendRegistration(bool replace);
     void requestWorkpieceRefresh(bool preserveRegistrationSummary,
                                  CommandOwner owner = CommandOwner::System);
     void dispatchDeferredUserRefresh();
     void submitTemplateConfirmation(const QString &workpieceId, const QString &imagePath,
                                     const QString &orientation);
-    void startRegistrationProgress();
-    void stopRegistrationProgress();
-    void updateRegistrationElapsed();
-    bool validateRegistration(QString *error) const;
     bool validateImagePath(const QString &path, QString *error) const;
     QStringList normalizedPaths(const QStringList &paths) const;
     QString selectedWorkpieceId() const;
@@ -137,33 +128,26 @@ private:
     AppHeader *appHeader_ = nullptr;
     TaskStatusWidget *globalTaskStatus_ = nullptr;
     InspectionPage *inspectionPage_ = nullptr;
+    WorkpieceLibraryPage *workpieceLibraryPage_ = nullptr;
     AppPage currentPage_ = AppPage::Inspection;
     BackendClient *client_ = nullptr;
     BackendProcessManager *manager_ = nullptr;
-    QStringList frontTemplatePaths_;
-    QStringList backTemplatePaths_;
     QString inspectionImagePath_;
     QStringList batchImagePaths_;
+    QJsonArray workpieceSummaries_;
     CommandOwner pendingOwner_ = CommandOwner::None;
     QString pendingCommand_;
+    QJsonObject pendingFields_;
     CommandOwner queuedOwner_ = CommandOwner::None;
     QString queuedCommand_;
     QJsonObject queuedFields_;
-    QString pendingWorkpieceName_;
-    bool pendingReplace_ = false;
-    bool registrationInFlight_ = false;
-    bool registrationSummaryVisible_ = false;
     bool deferredUserWorkpieceRefresh_ = false;
     bool batchInFlight_ = false;
     bool backendReady_ = false;
     bool backendReadyHandled_ = false;
     bool clientBusy_ = false;
-    QElapsedTimer registrationElapsedClock_;
-    QTimer *registrationElapsedTimer_ = nullptr;
     QTimer *evolutionPollTimer_ = nullptr;
     QTimer *geometryPollTimer_ = nullptr;
-    std::function<bool(const QString &)> replaceConfirmationHandler_;
-    QPushButton *deleteWorkpieceButton_ = nullptr;
     QPushButton *chooseImageButton_ = nullptr;
     QPushButton *predictButton_ = nullptr;
     QPushButton *chooseBatchImagesButton_ = nullptr;

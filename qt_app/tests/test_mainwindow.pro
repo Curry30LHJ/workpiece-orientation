@@ -13,6 +13,7 @@ SOURCES += test_mainwindow.cpp \
            ../mainwindow.cpp \
            ../inspectionimageview.cpp \
            ../inspectionpage.cpp \
+           ../workpiecelibrarypage.cpp \
            ../geometryrulecanvas.cpp \
            ../geometrymaskmanager.cpp \
            ../annotationcanvas.cpp \
@@ -28,6 +29,7 @@ HEADERS += ../appheader.h \
            ../inspectiontypes.h \
            ../inspectionimageview.h \
            ../inspectionpage.h \
+           ../workpiecelibrarypage.h \
            ../geometryrulecanvas.h \
            ../geometrymaskmanager.h \
            ../annotationcanvas.h \
@@ -35,4 +37,5 @@ HEADERS += ../appheader.h \
            ../annotationeditor.h \
            ../taskstatuswidget.h
 FORMS += ../mainwindow.ui \
-         ../inspectionpage.ui
+         ../inspectionpage.ui \
+         ../workpiecelibrarypage.ui

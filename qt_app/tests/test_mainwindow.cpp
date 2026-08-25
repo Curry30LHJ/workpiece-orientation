@@ -6,6 +6,8 @@
 #include <QJsonObject>
 #include <QComboBox>
 #include <QLabel>
+#include <QListWidget>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QQueue>
@@ -26,23 +28,35 @@
 #include "../inspectiontypes.h"
 #include "../mainwindow.h"
 #include "../processlauncher.h"
+#include "../workpiecelibrarypage.h"
 
-class MessageBoxTextCapture : public QObject {
+class MessageBoxButtonChooser : public QObject {
 public:
-    QString text;
-    bool wasShown = false;
+    explicit MessageBoxButtonChooser(const QString &text)
+        : QObject(qApp), text_(text) {
+        qApp->installEventFilter(this);
+    }
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override {
         auto *dialog = qobject_cast<QMessageBox *>(watched);
-        if (dialog == nullptr || event->type() != QEvent::Show) {
-            return false;
-        }
-        wasShown = true;
-        text = dialog->text();
-        QTimer::singleShot(0, dialog, [dialog]() { dialog->done(QMessageBox::No); });
+        if (dialog == nullptr || event->type() != QEvent::Show) return false;
+        qApp->removeEventFilter(this);
+        const QString text = text_;
+        QTimer::singleShot(0, dialog, [dialog, text]() {
+            for (QAbstractButton *button : dialog->buttons()) {
+                if (button->text() == text) {
+                    button->click();
+                    return;
+                }
+            }
+        });
+        deleteLater();
         return true;
     }
+
+private:
+    QString text_;
 };
 
 class PassiveLauncher : public ProcessLauncher {
@@ -443,11 +457,203 @@ private:
         QTRY_COMPARE_WITH_TIMEOUT(inspectionPage->completedBatchCount(), expected, 5000);
     }
 
+    static void chooseDirtyNavigationOption(const QString &text) {
+        new MessageBoxButtonChooser(text);
+    }
+
 private slots:
-    void deleteConfirmationShowsDisplayNameInsteadOfInternalId() {
+    void browsingLibraryDoesNotRetargetInspection() {
         BackendClient client;
         MainWindow window(&client, nullptr);
-        emit client.handshakeSucceeded();
+        emit client.responseReceived(QStringLiteral("list_workpieces"), QJsonObject{
+            {QStringLiteral("workpieces"), QJsonArray{
+                QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                            {QStringLiteral("name"), QStringLiteral("M1")},
+                            {QStringLiteral("template_counts"), QJsonObject{{"front", 5}, {"back", 5}}}},
+                QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                            {QStringLiteral("name"), QStringLiteral("M2")},
+                            {QStringLiteral("template_counts"), QJsonObject{{"front", 7}, {"back", 9}}}},
+            }},
+        });
+        auto *headerTarget = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *library = window.findChild<WorkpieceLibraryPage *>();
+        auto *list = window.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        QVERIFY(headerTarget != nullptr);
+        QVERIFY(library != nullptr);
+        QVERIFY(list != nullptr);
+        headerTarget->setCurrentIndex(headerTarget->findData(QStringLiteral("m1")));
+        QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
+
+        list->setCurrentRow(1);
+
+        QCOMPARE(library->browsedWorkpieceId(), QStringLiteral("m2"));
+        QCOMPARE(headerTarget->currentData().toString(), QStringLiteral("m1"));
+    }
+
+    void explicitSetCurrentUpdatesHeaderAndInspection() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        emit client.responseReceived(QStringLiteral("list_workpieces"), QJsonObject{
+            {QStringLiteral("workpieces"), QJsonArray{
+                QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                            {QStringLiteral("name"), QStringLiteral("M1")}},
+                QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                            {QStringLiteral("name"), QStringLiteral("M2")}},
+            }},
+        });
+        auto *headerTarget = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *list = window.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *activate = window.findChild<QPushButton *>(
+            QStringLiteral("setCurrentWorkpieceButton"));
+        QVERIFY(headerTarget != nullptr);
+        QVERIFY(list != nullptr);
+        QVERIFY(activate != nullptr);
+        headerTarget->setCurrentIndex(headerTarget->findData(QStringLiteral("m1")));
+        list->setCurrentRow(1);
+
+        activate->click();
+
+        QCOMPARE(headerTarget->currentData().toString(), QStringLiteral("m2"));
+        auto *inspection = window.findChild<InspectionPage *>();
+        QVERIFY(inspection != nullptr);
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString imagePath = writeImages(
+            directory, QStringLiteral("inspection"), 1).first();
+        inspection->setBackendAvailable(true, false, QString());
+        inspection->setSingleImagePath(imagePath);
+        QSignalSpy predictionSpy(inspection, &InspectionPage::commandRequested);
+        auto *predict = inspection->findChild<QPushButton *>(
+            QStringLiteral("predictButton"));
+        QVERIFY(predict != nullptr);
+        QVERIFY(predict->isEnabled());
+        predict->click();
+        QCOMPARE(predictionSpy.count(), 1);
+        QCOMPARE(predictionSpy.first().at(1).toJsonObject()
+                     .value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m2"));
+    }
+
+    void registrationContinuesWhileInspectionPageIsVisible() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        auto *library = window.findChild<WorkpieceLibraryPage *>();
+        QVERIFY(library != nullptr);
+        library->setBackendState(BackendUiState::Ready, QString());
+        library->setWorkpieceName(QStringLiteral("M-running"));
+        library->setTemplatePaths(writeImages(directory, QStringLiteral("front"), 2),
+                                  writeImages(directory, QStringLiteral("back"), 3));
+        QVERIFY(QMetaObject::invokeMethod(library, "submitRegistration",
+                                          Qt::DirectConnection));
+        QVERIFY(window.requestPage(AppPage::Inspection));
+
+        const QJsonObject progress{
+            {QStringLiteral("phase"), QStringLiteral("features")},
+            {QStringLiteral("completed"), 3},
+            {QStringLiteral("total"), 5},
+        };
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientProgress", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("register")),
+            Q_ARG(QJsonObject, progress)));
+
+        auto *globalDetail = window.findChild<QLabel *>(QStringLiteral("globalTaskDetailLabel"));
+        QVERIFY(globalDetail != nullptr);
+        QVERIFY(globalDetail->text().contains(QStringLiteral("3/5")));
+        QCOMPARE(window.findChild<QStackedWidget *>(QStringLiteral("mainPageStack"))->currentIndex(),
+                 static_cast<int>(AppPage::Inspection));
+    }
+
+    void detailsFailureDoesNotOverwriteInspectionResult() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        emit client.responseReceived(QStringLiteral("predict"),
+                                     QJsonObject{{QStringLiteral("label"), QStringLiteral("front")},
+                                                 {QStringLiteral("needs_review"), false}});
+        auto *result = window.findChild<QLabel *>(QStringLiteral("resultLabel"));
+        QVERIFY(result != nullptr);
+        const QString before = result->text();
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientCommandFailed", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("get_workpiece_details")),
+            Q_ARG(QString, QStringLiteral("WORKPIECE_NOT_FOUND")),
+            Q_ARG(QString, QStringLiteral("详情不存在"))));
+
+        QCOMPARE(result->text(), before);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))->text()
+                    .contains(QStringLiteral("详情不存在")));
+    }
+
+    void reconnectPreservesLibraryDraftAndEvolutionRows() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        auto *library = window.findChild<WorkpieceLibraryPage *>();
+        QVERIFY(library != nullptr);
+        library->setWorkpieceName(QStringLiteral("M-draft"));
+        library->setTemplatePaths(writeImages(directory, QStringLiteral("front"), 1),
+                                  writeImages(directory, QStringLiteral("back"), 1));
+        emit client.responseReceived(QStringLiteral("list_evolution_jobs"), QJsonObject{
+            {QStringLiteral("jobs"), QJsonArray{QJsonObject{
+                {QStringLiteral("job_id"), QStringLiteral("job-preserved")},
+                {QStringLiteral("state"), QStringLiteral("failed")},
+                {QStringLiteral("phase"), QStringLiteral("features")},
+                {QStringLiteral("completed"), 1},
+                {QStringLiteral("total"), 2},
+                {QStringLiteral("error"), QStringLiteral("failed")},
+            }}},
+        });
+        auto *globalDetail = window.findChild<QLabel *>(
+            QStringLiteral("globalTaskDetailLabel"));
+        QVERIFY(globalDetail != nullptr);
+        QVERIFY(globalDetail->text().contains(QStringLiteral("任务失败")));
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onBackendUnavailable", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("lost"))));
+        QVERIFY(QMetaObject::invokeMethod(&window, "onBackendReady", Qt::DirectConnection));
+
+        QVERIFY(library->hasUnsavedChanges());
+        QCOMPARE(window.findChild<QLineEdit *>(QStringLiteral("workpieceNameEdit"))->text(),
+                 QStringLiteral("M-draft"));
+        QCOMPARE(window.findChild<QTableWidget *>(QStringLiteral("evolutionJobsTable"))->rowCount(),
+                 1);
+    }
+
+    void dirtyLibraryDraftCanCancelNavigation() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        auto *library = window.findChild<WorkpieceLibraryPage *>();
+        auto *stack = window.findChild<QStackedWidget *>(QStringLiteral("mainPageStack"));
+        QVERIFY(library != nullptr);
+        QVERIFY(stack != nullptr);
+        window.show();
+        QCoreApplication::processEvents();
+        QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
+
+        library->setWorkpieceName(QStringLiteral("keep-me"));
+        chooseDirtyNavigationOption(QStringLiteral("取消"));
+        QVERIFY(!window.requestPage(AppPage::Inspection));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::WorkpieceLibrary));
+        QVERIFY(library->hasUnsavedChanges());
+
+        chooseDirtyNavigationOption(QStringLiteral("保留并离开"));
+        QVERIFY(window.requestPage(AppPage::Inspection));
+        QVERIFY(library->hasUnsavedChanges());
+
+        QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
+        chooseDirtyNavigationOption(QStringLiteral("放弃修改"));
+        QVERIFY(window.requestPage(AppPage::Inspection));
+        QVERIFY(!library->hasUnsavedChanges());
+    }
+
+    void deleteRequiresExactBrowsedDisplayName() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
         emit client.responseReceived(
             QStringLiteral("list_workpieces"),
             QJsonObject{{QStringLiteral("workpieces"),
@@ -455,21 +661,31 @@ private slots:
                              {QStringLiteral("id"), QStringLiteral("internal-workpiece-id")},
                              {QStringLiteral("name"), QStringLiteral("泵体 A")}}}}});
 
+        auto *library = window.findChild<WorkpieceLibraryPage *>();
+        auto *list = window.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *confirmation = window.findChild<QLineEdit *>(
+            QStringLiteral("recycleNameConfirmationEdit"));
         auto *deleteButton = window.findChild<QPushButton *>(
             QStringLiteral("deleteWorkpieceButton"));
+        QVERIFY(library != nullptr);
+        QVERIFY(list != nullptr);
+        QVERIFY(confirmation != nullptr);
         QVERIFY(deleteButton != nullptr);
+        library->setBackendState(BackendUiState::Ready, QString());
+        list->setCurrentRow(0);
+        confirmation->setText(QStringLiteral("泵体"));
+        QVERIFY(!deleteButton->isEnabled());
+        confirmation->setText(QStringLiteral("泵体 A"));
         QVERIFY(deleteButton->isEnabled());
-        window.show();
-        QCoreApplication::processEvents();
 
-        MessageBoxTextCapture capture;
-        qApp->installEventFilter(&capture);
+        QSignalSpy commandSpy(library, &WorkpieceLibraryPage::commandRequested);
         deleteButton->click();
-        qApp->removeEventFilter(&capture);
-
-        QVERIFY(capture.wasShown);
-        QVERIFY(capture.text.contains(QStringLiteral("泵体 A")));
-        QVERIFY(!capture.text.contains(QStringLiteral("internal-workpiece-id")));
+        QCOMPARE(commandSpy.count(), 1);
+        QCOMPARE(commandSpy.first().at(0).toString(),
+                 QStringLiteral("recycle_workpiece"));
+        QCOMPARE(commandSpy.first().at(1).toJsonObject()
+                     .value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("internal-workpiece-id"));
     }
 
     void successfulCallbackQueuesSerialRefreshUntilReady() {
@@ -608,8 +824,11 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(server.requests().size() >= 2, 1000);
         QVERIFY(QMetaObject::invokeMethod(&window, "submitRegistration", Qt::DirectConnection));
 
-        QTRY_VERIFY_WITH_TIMEOUT(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))->text().contains(QStringLiteral("正面 1 张")), 1500);
-        QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))->text().contains(QStringLiteral("反面 12 张")));
+        auto *result = window.findChild<QLabel *>(
+            QStringLiteral("latestRegistrationResultLabel"));
+        QVERIFY(result != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(result->text().contains(QStringLiteral("正面 1 张")), 1500);
+        QVERIFY(result->text().contains(QStringLiteral("反面 12 张")));
     }
 
     void confirmsBeforeSendingReplaceTrue() {

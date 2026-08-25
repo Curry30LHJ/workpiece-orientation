@@ -1,0 +1,356 @@
+#include <QtTest/QtTest>
+
+#include <QFile>
+#include <QImage>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QPushButton>
+#include <QSignalSpy>
+#include <QTableWidget>
+#include <QTemporaryDir>
+
+#include "../workpiecelibrarypage.h"
+
+namespace {
+
+QStringList writeImages(const QString &directory, const QString &prefix, int count,
+                        int markerBase) {
+    QStringList paths;
+    for (int index = 0; index < count; ++index) {
+        const QString path = QStringLiteral("%1/%2-%3.png")
+                                 .arg(directory, prefix)
+                                 .arg(index);
+        QImage image(32, 32, QImage::Format_RGB32);
+        image.fill(qRgb((markerBase + index) & 0xff,
+                        (markerBase + index * 3) & 0xff,
+                        (markerBase + index * 7) & 0xff));
+        image.setPixel(index % 32, (index * 5) % 32,
+                       qRgb((markerBase + index * 11) & 0xff, 17, 193));
+        if (!image.save(path)) return {};
+        paths.append(path);
+    }
+    return paths;
+}
+
+QString copyImage(const QString &source, const QString &target) {
+    QFile::remove(target);
+    return QFile::copy(source, target) ? target : QString();
+}
+
+QJsonObject summary(const QString &id, const QString &name, int front, int back,
+                    bool detectable = true) {
+    return QJsonObject{
+        {QStringLiteral("id"), id},
+        {QStringLiteral("name"), name},
+        {QStringLiteral("template_counts"),
+         QJsonObject{{QStringLiteral("front"), front},
+                     {QStringLiteral("back"), back}}},
+        {QStringLiteral("geometry_rule_count"), 2},
+        {QStringLiteral("detectable"), detectable},
+        {QStringLiteral("updated_at"), QStringLiteral("2026-08-25T09:30:00+00:00")},
+    };
+}
+
+} // namespace
+
+class TestWorkpieceLibraryPage : public QObject {
+    Q_OBJECT
+
+private slots:
+    void unequalCountsAndWarningsDoNotBlockRegistration() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M1"));
+        page.setTemplatePaths(writeImages(directory.path(), QStringLiteral("front"), 1, 10),
+                              writeImages(directory.path(), QStringLiteral("back"), 12, 80));
+
+        QCOMPARE(page.findChild<QLabel *>(QStringLiteral("frontTemplatesLabel"))->text(),
+                 QStringLiteral("正面已选择 1 张"));
+        QCOMPARE(page.findChild<QLabel *>(QStringLiteral("backTemplatesLabel"))->text(),
+                 QStringLiteral("反面已选择 12 张"));
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("templateWarningLabel"))->text()
+                    .contains(QStringLiteral("模板较少")));
+        QVERIFY(page.findChild<QPushButton *>(QStringLiteral("registerButton"))->isEnabled());
+    }
+
+    void everySelectedImageIsEmittedInOriginalOrder() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        const QStringList frontPaths = writeImages(
+            directory.path(), QStringLiteral("front"), 5, 10);
+        const QStringList backPaths = writeImages(
+            directory.path(), QStringLiteral("back"), 10, 80);
+        QSignalSpy spy(&page, &WorkpieceLibraryPage::commandRequested);
+        page.setTemplatePaths(frontPaths, backPaths);
+        page.setWorkpieceName(QStringLiteral("M1"));
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration",
+                                          Qt::DirectConnection));
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.first().at(0).toString(), QStringLiteral("register"));
+        const QJsonObject fields = spy.first().at(1).toJsonObject();
+        QCOMPARE(fields.value("replace").toBool(), false);
+        QCOMPARE(fields.value("progress_events").toBool(), true);
+        QCOMPARE(fields.value("front_images").toArray(), QJsonArray::fromStringList(frontPaths));
+        QCOMPARE(fields.value("back_images").toArray(), QJsonArray::fromStringList(backPaths));
+    }
+
+    void emptyUnreadableAndDuplicateTemplatesBlockRegistration() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList front = writeImages(
+            directory.path(), QStringLiteral("front"), 2, 10);
+        const QStringList back = writeImages(
+            directory.path(), QStringLiteral("back"), 2, 80);
+        const QString unreadable = directory.filePath(QStringLiteral("broken.png"));
+        QFile unreadableFile(unreadable);
+        QVERIFY(unreadableFile.open(QIODevice::WriteOnly));
+        unreadableFile.write("not an image");
+        unreadableFile.close();
+        const QString copied = copyImage(
+            front.first(), directory.filePath(QStringLiteral("same-content.png")));
+        QVERIFY(!copied.isEmpty());
+
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M1"));
+        QSignalSpy spy(&page, &WorkpieceLibraryPage::commandRequested);
+
+        page.setTemplatePaths({}, back);
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration", Qt::DirectConnection));
+        QCOMPARE(spy.count(), 0);
+
+        page.setTemplatePaths(QStringList{unreadable}, back);
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration", Qt::DirectConnection));
+        QCOMPARE(spy.count(), 0);
+
+        page.setTemplatePaths(front, QStringList{front.first()});
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration", Qt::DirectConnection));
+        QCOMPARE(spy.count(), 0);
+
+        page.setTemplatePaths(front, QStringList{copied});
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration", Qt::DirectConnection));
+        QCOMPARE(spy.count(), 0);
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))->text()
+                    .contains(QStringLiteral("重复")));
+    }
+
+    void moreThanThirtyTemplatesOnlyWarns() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M-many"));
+        page.setTemplatePaths(writeImages(directory.path(), QStringLiteral("front"), 31, 10),
+                              writeImages(directory.path(), QStringLiteral("back"), 1, 180));
+        QSignalSpy spy(&page, &WorkpieceLibraryPage::commandRequested);
+
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("templateWarningLabel"))->text()
+                    .contains(QStringLiteral("耗时")));
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration", Qt::DirectConnection));
+        QCOMPARE(spy.count(), 1);
+    }
+
+    void searchFiltersLibraryWithoutChangingDetectionTarget() {
+        WorkpieceLibraryPage page;
+        QSignalSpy targetSpy(&page, &WorkpieceLibraryPage::setCurrentWorkpieceRequested);
+        QSignalSpy commandSpy(&page, &WorkpieceLibraryPage::commandRequested);
+        page.setWorkpieces(
+            QJsonArray{summary(QStringLiteral("m1"), QStringLiteral("泵体 A"), 5, 6),
+                       summary(QStringLiteral("m2"), QStringLiteral("法兰 B"), 7, 8)},
+            QStringLiteral("m2"));
+
+        auto *search = page.findChild<QLineEdit *>(QStringLiteral("librarySearchEdit"));
+        auto *list = page.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        QVERIFY(search != nullptr);
+        QVERIFY(list != nullptr);
+        search->setText(QStringLiteral("泵体"));
+        QCOMPARE(list->count(), 1);
+        list->setCurrentRow(0);
+        QTRY_COMPARE(commandSpy.count(), 1);
+        QCOMPARE(commandSpy.first().at(0).toString(), QStringLiteral("get_workpiece_details"));
+        QCOMPARE(targetSpy.count(), 0);
+        QCOMPARE(page.browsedWorkpieceId(), QStringLiteral("m1"));
+
+        auto *confirmation = page.findChild<QLineEdit *>(
+            QStringLiteral("recycleNameConfirmationEdit"));
+        auto *recycle = page.findChild<QPushButton *>(
+            QStringLiteral("deleteWorkpieceButton"));
+        QVERIFY(confirmation != nullptr);
+        QVERIFY(recycle != nullptr);
+        page.setBackendState(BackendUiState::Ready, QString());
+        confirmation->setText(QStringLiteral("泵体 A"));
+        QVERIFY(recycle->isEnabled());
+
+        search->setText(QStringLiteral("法兰"));
+        QCOMPARE(list->count(), 1);
+        QCOMPARE(page.browsedWorkpieceId(), QString());
+        QVERIFY(!recycle->isEnabled());
+        QCOMPARE(targetSpy.count(), 0);
+        QVERIFY(list->item(0)->text().contains(QStringLiteral("[当前检测]")));
+    }
+
+    void exactNameConfirmationIsRequiredForRecycle() {
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieces(QJsonArray{summary(QStringLiteral("m1"), QStringLiteral("泵体 A"), 5, 6)},
+                           QStringLiteral("m1"));
+        auto *list = page.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *confirmation = page.findChild<QLineEdit *>(
+            QStringLiteral("recycleNameConfirmationEdit"));
+        auto *recycle = page.findChild<QPushButton *>(QStringLiteral("deleteWorkpieceButton"));
+        QVERIFY(list != nullptr);
+        QVERIFY(confirmation != nullptr);
+        QVERIFY(recycle != nullptr);
+        list->setCurrentRow(0);
+        confirmation->setText(QStringLiteral("泵体"));
+        QVERIFY(!recycle->isEnabled());
+        confirmation->setText(QStringLiteral("泵体 A"));
+        QVERIFY(recycle->isEnabled());
+        QSignalSpy spy(&page, &WorkpieceLibraryPage::commandRequested);
+        recycle->click();
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.first().at(0).toString(), QStringLiteral("recycle_workpiece"));
+        const QJsonObject fields = spy.first().at(1).toJsonObject();
+        QCOMPARE(fields.value(QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"));
+        QVERIFY(!fields.value(QStringLiteral("operation_id")).toString().isEmpty());
+    }
+
+    void detailsRenderEveryTemplateWithoutTruncation() {
+        WorkpieceLibraryPage page;
+        QJsonArray templates;
+        for (int index = 0; index < 37; ++index) {
+            templates.append(QJsonObject{
+                {QStringLiteral("template_id"), QStringLiteral("front:%1.png").arg(index)},
+                {QStringLiteral("direction"), index < 31 ? QStringLiteral("front")
+                                                         : QStringLiteral("back")},
+                {QStringLiteral("preview_path"), QStringLiteral("C:/templates/%1.png").arg(index)},
+                {QStringLiteral("source"), QStringLiteral("initial_registration")},
+                {QStringLiteral("added_at"), QStringLiteral("2026-08-25T10:00:00+00:00")},
+                {QStringLiteral("readable"), index != 36},
+            });
+        }
+        page.setWorkpieceDetails(QJsonObject{
+            {QStringLiteral("id"), QStringLiteral("m1")},
+            {QStringLiteral("name"), QStringLiteral("M1")},
+            {QStringLiteral("templates"), templates},
+        });
+
+        auto *table = page.findChild<QTableWidget *>(QStringLiteral("templateDetailsTable"));
+        QVERIFY(table != nullptr);
+        QCOMPARE(table->rowCount(), 37);
+        QCOMPARE(table->item(36, 4)->text(), QStringLiteral("无法读取"));
+        QCOMPARE(table->item(36, 0)->data(Qt::UserRole).toString(),
+                 QStringLiteral("front:36.png"));
+    }
+
+    void evolutionRowsUseJobIdAndPreserveFailures() {
+        WorkpieceLibraryPage page;
+        QSignalSpy taskSpy(&page, &WorkpieceLibraryPage::taskStatusChanged);
+        page.setEvolutionJobs(QJsonArray{
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("job-1")},
+                        {QStringLiteral("workpiece_id"), QStringLiteral("m1")},
+                        {QStringLiteral("state"), QStringLiteral("failed")},
+                        {QStringLiteral("phase"), QStringLiteral("features")},
+                        {QStringLiteral("completed"), 3},
+                        {QStringLiteral("total"), 5},
+                        {QStringLiteral("elapsed_ms"), QJsonValue()},
+                        {QStringLiteral("error"), QStringLiteral("feature extraction failed")}},
+        });
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> failedTask = taskSpy.takeFirst();
+        QCOMPARE(failedTask.at(1).toString(), QStringLiteral("failed"));
+        QCOMPARE(failedTask.at(4).toLongLong(), qint64(-1));
+        page.setEvolutionJobs(QJsonArray{
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("job-1")},
+                        {QStringLiteral("workpiece_id"), QStringLiteral("m1")},
+                        {QStringLiteral("state"), QStringLiteral("failed")},
+                        {QStringLiteral("phase"), QStringLiteral("features")},
+                        {QStringLiteral("completed"), 3},
+                        {QStringLiteral("total"), 5}},
+            QJsonObject{{QStringLiteral("job_id"), QStringLiteral("job-2")},
+                        {QStringLiteral("workpiece_id"), QStringLiteral("m2")},
+                        {QStringLiteral("state"), QStringLiteral("completed")},
+                        {QStringLiteral("phase"), QStringLiteral("active")},
+                        {QStringLiteral("completed"), 1},
+                        {QStringLiteral("total"), 1}},
+        });
+        QCOMPARE(taskSpy.count(), 1);
+        QCOMPARE(taskSpy.takeFirst().at(1).toString(), QStringLiteral("active"));
+
+        auto *table = page.findChild<QTableWidget *>(QStringLiteral("evolutionJobsTable"));
+        QVERIFY(table != nullptr);
+        QCOMPARE(table->rowCount(), 2);
+        QCOMPARE(table->item(0, 0)->text(), QStringLiteral("job-1"));
+        QCOMPARE(table->item(0, 5)->text(), QStringLiteral("feature extraction failed"));
+    }
+
+    void backendUnavailableKeepsTheEditingDraft() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        const QStringList front = writeImages(directory.path(), QStringLiteral("front"), 2, 10);
+        const QStringList back = writeImages(directory.path(), QStringLiteral("back"), 3, 80);
+        page.setWorkpieceName(QStringLiteral("M-draft"));
+        page.setTemplatePaths(front, back);
+        QVERIFY(page.hasUnsavedChanges());
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration",
+                                          Qt::DirectConnection));
+        auto *registerButton = page.findChild<QPushButton *>(
+            QStringLiteral("registerButton"));
+        QVERIFY(registerButton != nullptr);
+        QVERIFY(!registerButton->isEnabled());
+
+        page.setBackendState(BackendUiState::Error, QStringLiteral("连接中断"));
+        page.setBackendState(BackendUiState::Ready, QString());
+
+        QVERIFY(page.hasUnsavedChanges());
+        QCOMPARE(page.findChild<QLineEdit *>(QStringLiteral("workpieceNameEdit"))->text(),
+                 QStringLiteral("M-draft"));
+        QCOMPARE(page.findChild<QLabel *>(QStringLiteral("frontTemplatesLabel"))->text(),
+                 QStringLiteral("正面已选择 2 张"));
+        QCOMPARE(page.findChild<QLabel *>(QStringLiteral("backTemplatesLabel"))->text(),
+                 QStringLiteral("反面已选择 3 张"));
+        QVERIFY(registerButton->isEnabled());
+    }
+
+    void overwriteConfirmationResendsAllPathsWithReplaceTrue() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        const QStringList front = writeImages(directory.path(), QStringLiteral("front"), 5, 10);
+        const QStringList back = writeImages(directory.path(), QStringLiteral("back"), 10, 80);
+        page.setWorkpieceName(QStringLiteral("M1"));
+        page.setTemplatePaths(front, back);
+        page.setReplaceConfirmationHandler([](const QString &) { return true; });
+        QSignalSpy spy(&page, &WorkpieceLibraryPage::commandRequested);
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration", Qt::DirectConnection));
+        QCOMPARE(spy.count(), 1);
+
+        page.handleBackendFailure(QStringLiteral("register"),
+                                  QStringLiteral("WORKPIECE_EXISTS"),
+                                  QStringLiteral("exists"));
+
+        QCOMPARE(spy.count(), 2);
+        const QJsonObject original = spy.at(0).at(1).toJsonObject();
+        const QJsonObject replacement = spy.at(1).at(1).toJsonObject();
+        QCOMPARE(replacement.value(QStringLiteral("replace")).toBool(), true);
+        QCOMPARE(replacement.value(QStringLiteral("front_images")),
+                 original.value(QStringLiteral("front_images")));
+        QCOMPARE(replacement.value(QStringLiteral("back_images")),
+                 original.value(QStringLiteral("back_images")));
+        QCOMPARE(replacement.value(QStringLiteral("name")),
+                 original.value(QStringLiteral("name")));
+    }
+};
+
+QTEST_MAIN(TestWorkpieceLibraryPage)
+#include "test_workpiecelibrarypage.moc"

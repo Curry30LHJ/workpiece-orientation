@@ -15,6 +15,7 @@ SOURCES += \
     mainwindow.cpp \
     inspectionimageview.cpp \
     inspectionpage.cpp \
+    workpiecelibrarypage.cpp \
     geometryrulecanvas.cpp \
     geometrymaskmanager.cpp \
     annotationcanvas.cpp \
@@ -33,6 +34,7 @@ HEADERS += \
     inspectiontypes.h \
     inspectionimageview.h \
     inspectionpage.h \
+    workpiecelibrarypage.h \
     geometryrulecanvas.h \
     geometrymaskmanager.h \
     annotationcanvas.h \
@@ -41,6 +43,7 @@ HEADERS += \
     taskstatuswidget.h
 
 FORMS += mainwindow.ui \
-         inspectionpage.ui
+         inspectionpage.ui \
+         workpiecelibrarypage.ui
 
 RESOURCES += resources.qrc

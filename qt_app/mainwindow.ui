@@ -27,28 +27,6 @@
         <property name="topMargin"><number>0</number></property>
         <property name="rightMargin"><number>0</number></property>
         <property name="bottomMargin"><number>0</number></property>
-        <item>
-         <widget class="QGroupBox" name="libraryGroupBox">
-          <property name="title"><string>工件模板库</string></property>
-          <layout class="QGridLayout" name="libraryLayout">
-           <item row="0" column="2"><widget class="QPushButton" name="refreshWorkpiecesButton"><property name="text"><string>刷新列表</string></property></widget></item>
-           <item row="1" column="0"><widget class="QLabel" name="nameLabel"><property name="text"><string>新工件名称：</string></property></widget></item>
-           <item row="1" column="1" colspan="2"><widget class="QLineEdit" name="workpieceNameEdit"/></item>
-           <item row="2" column="0"><widget class="QLabel" name="frontTemplatesLabel"><property name="text"><string>正面已选择 0 张</string></property></widget></item>
-           <item row="2" column="1"><widget class="QPushButton" name="chooseFrontTemplatesButton"><property name="text"><string>选择正面模板</string></property></widget></item>
-           <item row="2" column="2"><widget class="QLabel" name="frontTemplatesFilesLabel"><property name="text"><string/></property></widget></item>
-           <item row="3" column="0"><widget class="QLabel" name="backTemplatesLabel"><property name="text"><string>反面已选择 0 张</string></property></widget></item>
-           <item row="3" column="1"><widget class="QPushButton" name="chooseBackTemplatesButton"><property name="text"><string>选择反面模板</string></property></widget></item>
-           <item row="3" column="2"><widget class="QLabel" name="backTemplatesFilesLabel"><property name="text"><string/></property></widget></item>
-           <item row="4" column="0" colspan="3"><widget class="QLabel" name="templateWarningLabel"><property name="styleSheet"><string notr="true">color: #9a6700;</string></property><property name="text"><string/></property></widget></item>
-           <item row="5" column="0"><widget class="QLabel" name="registrationProgressLabel"><property name="text"><string>建库进度：未开始</string></property></widget></item>
-           <item row="5" column="1"><widget class="QProgressBar" name="registrationProgressBar"><property name="value"><number>0</number></property></widget></item>
-           <item row="5" column="2"><widget class="QLabel" name="registrationElapsedLabel"><property name="text"><string>耗时：0 ms</string></property></widget></item>
-           <item row="6" column="1" colspan="2"><widget class="QPushButton" name="registerButton"><property name="text"><string>建立工件库</string></property></widget></item>
-           <item row="7" column="1" colspan="2"><widget class="QLabel" name="libraryMessageLabel"><property name="text"><string/></property></widget></item>
-          </layout>
-         </widget>
-        </item>
        </layout>
       </widget>
       <widget class="QWidget" name="libraryPageHost">
@@ -57,7 +35,6 @@
         <property name="topMargin"><number>0</number></property>
         <property name="rightMargin"><number>0</number></property>
         <property name="bottomMargin"><number>0</number></property>
-        <item><widget class="QLabel" name="libraryPagePlaceholderLabel"><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string>工件库页面将在 Task 7 接入</string></property></widget></item>
        </layout>
       </widget>
       <widget class="QWidget" name="geometryPageHost">
