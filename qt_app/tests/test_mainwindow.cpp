@@ -8,6 +8,7 @@
 #include <QPushButton>
 #include <QQueue>
 #include <QSet>
+#include <QStackedWidget>
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QTemporaryDir>
@@ -380,6 +381,21 @@ private:
     }
 
 private slots:
+    void startsOnInspectionAndPreservesHeaderAcrossNavigation() {
+        MainWindow window;
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        QVERIFY(stack != nullptr);
+        QCOMPARE(stack->currentIndex(), 0);
+        QVERIFY(QMetaObject::invokeMethod(&window, "showWorkpieceLibrary",
+                                          Qt::DirectConnection));
+        QCOMPARE(stack->currentIndex(), 1);
+        QVERIFY(window.findChild<QLabel *>(
+                    QStringLiteral("backendStatusLabel")) != nullptr);
+        QVERIFY(window.findChild<QComboBox *>(
+                    QStringLiteral("workpieceComboBox")) != nullptr);
+    }
+
     void acceptsUnequalTemplateCountsAndShowsLowCountWarning() {
         QTemporaryDir dir;
         BackendClient client;

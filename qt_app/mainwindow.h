@@ -11,12 +11,14 @@
 
 #include <functional>
 
+#include "appheader.h"
 #include "backendclient.h"
 
 class BackendProcessManager;
 class QPushButton;
 class AnnotationManagerDialog;
 class GeometryMaskManagerDialog;
+class TaskStatusWidget;
 
 namespace Ui {
 class MainWindow;
@@ -36,8 +38,12 @@ public:
     void setBatchImagePaths(const QStringList &paths);
     void setReplaceConfirmationHandler(std::function<bool(const QString &)> handler);
     void setBackendError(const QString &message);
+    bool requestPage(AppPage page);
 
 private slots:
+    void showInspection();
+    void showWorkpieceLibrary();
+    void showGeometryRules();
     void chooseFrontTemplates();
     void chooseBackTemplates();
     void chooseInspectionImage();
@@ -150,6 +156,9 @@ private:
     bool maybeContinueGeometryPublish(const QJsonObject &job);
 
     Ui::MainWindow *ui;
+    AppHeader *appHeader_ = nullptr;
+    TaskStatusWidget *globalTaskStatus_ = nullptr;
+    AppPage currentPage_ = AppPage::Inspection;
     BackendClient *client_ = nullptr;
     BackendProcessManager *manager_ = nullptr;
     QStringList frontTemplatePaths_;

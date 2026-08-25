@@ -6,6 +6,7 @@ QMAKE_CXXFLAGS += /utf-8
 
 SOURCES += \
     main.cpp \
+    appheader.cpp \
     apptheme.cpp \
     appconfig.cpp \
     backendclient.cpp \
@@ -21,6 +22,7 @@ SOURCES += \
 
 HEADERS += \
     appconfig.h \
+    appheader.h \
     apptheme.h \
     backendclient.h \
     backendprocessmanager.h \

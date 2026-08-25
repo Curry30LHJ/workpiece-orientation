@@ -7,7 +7,6 @@
 #include <QCryptographicHash>
 #include <QBrush>
 #include <QColor>
-#include <QComboBox>
 #include <QHeaderView>
 #include <QAbstractItemView>
 #include <QImageReader>
@@ -27,6 +26,7 @@
 #include "annotationeditor.h"
 #include "annotationmanager.h"
 #include "geometrymaskmanager.h"
+#include "taskstatuswidget.h"
 
 namespace {
 const QStringList kImageFilters = {QStringLiteral("PNG/JPEG/BMP (*.png *.jpg *.jpeg *.bmp)")};
@@ -62,6 +62,19 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::initializeUi() {
+    appHeader_ = new AppHeader(ui->centralwidget);
+    ui->appHeaderHostLayout->addWidget(appHeader_);
+    globalTaskStatus_ = new TaskStatusWidget(ui->centralwidget);
+    ui->taskStatusHostLayout->addWidget(globalTaskStatus_);
+    ui->mainPageStack->setCurrentIndex(static_cast<int>(AppPage::Inspection));
+    appHeader_->setCurrentPage(AppPage::Inspection);
+
+    BackendStatusDetails initialBackendDetails;
+    initialBackendDetails.connectionDetail = QStringLiteral("未连接");
+    initialBackendDetails.modelDetail = QStringLiteral("未加载");
+    initialBackendDetails.canRestart = manager_ != nullptr;
+    appHeader_->setBackendDetails(initialBackendDetails);
+
     deleteWorkpieceButton_ = new QPushButton(QStringLiteral("删除工件"), ui->libraryGroupBox);
     deleteWorkpieceButton_->setObjectName(QStringLiteral("deleteWorkpieceButton"));
     ui->libraryLayout->addWidget(deleteWorkpieceButton_, 0, 3);
@@ -85,7 +98,6 @@ void MainWindow::initializeUi() {
     ui->chooseImageButton->setEnabled(false);
     ui->chooseBatchImagesButton->setEnabled(false);
     ui->batchPredictButton->setEnabled(false);
-    ui->restartBackendButton->setEnabled(manager_ != nullptr);
     ui->resultLabel->setText(QStringLiteral("尚未检测"));
     ui->reviewLabel->clear();
     ui->batchSummaryLabel->clear();
@@ -143,9 +155,11 @@ void MainWindow::initializeUi() {
             this, &MainWindow::submitPrediction);
     connect(ui->batchPredictButton, &QPushButton::clicked,
             this, &MainWindow::submitBatchPrediction);
-    connect(ui->restartBackendButton, &QPushButton::clicked,
+    connect(appHeader_, &AppHeader::pageRequested,
+            this, [this](AppPage page) { requestPage(page); });
+    connect(appHeader_, &AppHeader::restartBackendRequested,
             this, &MainWindow::restartBackend);
-    connect(ui->workpieceComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+    connect(appHeader_, &AppHeader::currentWorkpieceRequested, this, [this](const QString &) {
         if (annotationManagerDialog_ != nullptr) {
             annotationManagerDialog_->close();
             annotationManagerDialog_.clear();
@@ -171,6 +185,26 @@ void MainWindow::initializeUi() {
     confirmFrontButton_->setEnabled(false);
     confirmBackButton_->setEnabled(false);
     rejectConfirmationButton_->setEnabled(false);
+}
+
+bool MainWindow::requestPage(AppPage page) {
+    if (page == currentPage_) return true;
+    ui->mainPageStack->setCurrentIndex(static_cast<int>(page));
+    currentPage_ = page;
+    appHeader_->setCurrentPage(page);
+    return true;
+}
+
+void MainWindow::showInspection() {
+    requestPage(AppPage::Inspection);
+}
+
+void MainWindow::showWorkpieceLibrary() {
+    requestPage(AppPage::WorkpieceLibrary);
+}
+
+void MainWindow::showGeometryRules() {
+    requestPage(AppPage::GeometryRules);
 }
 
 void MainWindow::connectBackendSignals() {
@@ -245,9 +279,14 @@ void MainWindow::setReplaceConfirmationHandler(std::function<bool(const QString 
 void MainWindow::setBackendError(const QString &message) {
     backendReady_ = false;
     clientBusy_ = false;
-    ui->backendStatusLabel->setText(QStringLiteral("后端：配置错误"));
+    BackendStatusDetails details;
+    details.state = BackendUiState::Error;
+    details.connectionDetail = QStringLiteral("配置错误");
+    details.modelDetail = QStringLiteral("未加载");
+    details.recentError = message;
+    details.canRestart = false;
+    appHeader_->setBackendDetails(details);
     showLibraryMessage(message, true);
-    ui->restartBackendButton->setEnabled(false);
     updateButtonStates();
 }
 
@@ -390,7 +429,7 @@ void MainWindow::deleteSelectedWorkpiece() {
     if (workpieceId.isEmpty() || client_ == nullptr || clientBusy_ || !backendReady_) {
         return;
     }
-    const QString name = ui->workpieceComboBox->currentText();
+    const QString name = appHeader_->currentWorkpieceId();
     const bool confirmed = QMessageBox::question(
         this, QStringLiteral("确认删除工件"),
         QStringLiteral("工件“%1”将移入可恢复回收区，是否继续？").arg(name),
@@ -780,8 +819,12 @@ void MainWindow::onBackendReady() {
     if (geometryMaskManagerDialog_ != nullptr) {
         geometryMaskManagerDialog_->setBusy(false);
     }
-    ui->backendStatusLabel->setText(QStringLiteral("后端：已连接"));
-    ui->restartBackendButton->setEnabled(true);
+    BackendStatusDetails details;
+    details.state = BackendUiState::Ready;
+    details.connectionDetail = QStringLiteral("已连接");
+    details.modelDetail = QStringLiteral("已加载");
+    details.canRestart = true;
+    appHeader_->setBackendDetails(details);
     updateButtonStates();
     if (evolutionPollTimer_ != nullptr) {
         evolutionPollTimer_->start();
@@ -800,12 +843,18 @@ void MainWindow::onBackendLoading(const QString &message) {
     if (geometryMaskManagerDialog_ != nullptr) {
         geometryMaskManagerDialog_->setBusy(true);
     }
-    ui->backendStatusLabel->setText(QStringLiteral("后端：模型加载中"));
+    BackendStatusDetails details;
+    details.state = BackendUiState::Loading;
+    details.connectionDetail = QStringLiteral("已连接");
+    details.modelDetail = message.isEmpty() ? QStringLiteral("模型加载中") : message;
+    details.canRestart = manager_ != nullptr;
+    appHeader_->setBackendDetails(details);
     showLibraryMessage(message.isEmpty() ? QStringLiteral("正在加载模型，请稍候…") : message);
     updateButtonStates();
 }
 
 void MainWindow::onBackendUnavailable(const QString &reason) {
+    const QString interruptedTask = pendingCommand_;
     const bool hasPreservedWork = registrationInFlight_ || batchInFlight_ || clientBusy_
         || !pendingCommand_.isEmpty() || !inspectionImagePath_.isEmpty()
         || (ui->batchResultsTableWidget != nullptr && ui->batchResultsTableWidget->rowCount() > 0)
@@ -839,12 +888,18 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     batchInFlight_ = false;
     pendingReplace_ = false;
     pendingCommand_.clear();
-    ui->backendStatusLabel->setText(QStringLiteral("后端：不可用"));
+    BackendStatusDetails details;
+    details.state = BackendUiState::Error;
+    details.connectionDetail = QStringLiteral("连接中断");
+    details.modelDetail = QStringLiteral("状态未知");
+    details.currentTask = interruptedTask;
+    details.recentError = reason;
+    details.canRestart = true;
+    appHeader_->setBackendDetails(details);
     showLibraryMessage(hasPreservedWork
                            ? QStringLiteral("后端连接中断，未完成操作结果未知；请重连后刷新：%1").arg(reason)
                            : reason,
                        true);
-    ui->restartBackendButton->setEnabled(true);
     if (evolutionPollTimer_ != nullptr) {
         evolutionPollTimer_->stop();
     }
@@ -864,14 +919,31 @@ void MainWindow::pollEvolutionJobs() {
 }
 
 void MainWindow::onClientStateChanged(BackendClient::State state, const QString &detail) {
-    Q_UNUSED(detail)
     clientBusy_ = state == BackendClient::State::Busy;
+    BackendStatusDetails details;
+    details.connectionDetail = detail;
+    details.canRestart = manager_ != nullptr || state == BackendClient::State::Error;
     if (state == BackendClient::State::Ready) {
         backendReady_ = true;
-        ui->backendStatusLabel->setText(QStringLiteral("后端：已连接"));
-    } else if (state == BackendClient::State::Disconnected || state == BackendClient::State::Error) {
-        ui->restartBackendButton->setEnabled(manager_ != nullptr || state == BackendClient::State::Error);
+        details.state = BackendUiState::Ready;
+        details.modelDetail = QStringLiteral("已加载");
+    } else if (state == BackendClient::State::Busy) {
+        details.state = BackendUiState::Busy;
+        details.modelDetail = QStringLiteral("已加载");
+        details.currentTask = detail;
+    } else if (state == BackendClient::State::Connecting
+               || state == BackendClient::State::Handshaking) {
+        details.state = BackendUiState::Loading;
+        details.modelDetail = detail;
+    } else if (state == BackendClient::State::Error) {
+        details.state = BackendUiState::Error;
+        details.modelDetail = QStringLiteral("状态未知");
+        details.recentError = detail;
+    } else {
+        details.state = BackendUiState::Disconnected;
+        details.modelDetail = QStringLiteral("未加载");
     }
+    appHeader_->setBackendDetails(details);
     updateButtonStates();
 }
 
@@ -918,22 +990,24 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     }
     if (command == QStringLiteral("list_workpieces")) {
         const QString previousId = selectedWorkpieceId();
-        ui->workpieceComboBox->blockSignals(true);
-        ui->workpieceComboBox->clear();
         const QJsonArray workpieces = response.value(QStringLiteral("workpieces")).toArray();
+        QList<QPair<QString, QString>> items;
+        QString requestedId = previousId;
+        bool previousStillExists = false;
         for (const QJsonValue &value : workpieces) {
             const QJsonObject item = value.toObject();
-            ui->workpieceComboBox->addItem(item.value(QStringLiteral("name")).toString(),
-                                           item.value(QStringLiteral("id")).toString());
+            const QString id = item.value(QStringLiteral("id")).toString();
+            const QString name = item.value(QStringLiteral("name")).toString();
+            items.append(qMakePair(id, name));
+            previousStillExists = previousStillExists || id == previousId;
+            if (!pendingWorkpieceName_.isEmpty() && name == pendingWorkpieceName_) {
+                requestedId = id;
+            }
         }
-        int index = ui->workpieceComboBox->findData(previousId);
-        if (index < 0 && !pendingWorkpieceName_.isEmpty()) {
-            index = ui->workpieceComboBox->findText(pendingWorkpieceName_);
+        if (!previousStillExists && pendingWorkpieceName_.isEmpty()) {
+            requestedId.clear();
         }
-        if (index >= 0) {
-            ui->workpieceComboBox->setCurrentIndex(index);
-        }
-        ui->workpieceComboBox->blockSignals(false);
+        appHeader_->setWorkpieces(items, requestedId);
         if (pendingCommand_ == QStringLiteral("list_workpieces")) {
             pendingCommand_.clear();
             pendingWorkpieceName_.clear();
@@ -1802,7 +1876,7 @@ QStringList MainWindow::normalizedPaths(const QStringList &paths) const {
 }
 
 QString MainWindow::selectedWorkpieceId() const {
-    return ui->workpieceComboBox->currentData().toString();
+    return appHeader_->currentWorkpieceId();
 }
 
 QString MainWindow::orientationText(const QString &label) const {
