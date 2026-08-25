@@ -54,6 +54,7 @@ class TemplateEvolution:
     MAX_PROJECTION_FAILURES = 3
 
     def __init__(self, catalog: WorkpieceCatalog, storage_dir: Path, *, clock: Callable[[], float] | None = None,
+                 duration_clock: Callable[[], float] | None = None,
                  start_worker: bool = True, geometry_profiles=None):
         self.catalog = catalog
         self.geometry_profiles = geometry_profiles or getattr(catalog, "geometry_profiles", None)
@@ -63,6 +64,8 @@ class TemplateEvolution:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._clock = clock or time.time
+        self._duration_clock = duration_clock or time.perf_counter
+        self._duration_started: dict[str, float] = {}
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._jobs: dict[str, dict] = {}
@@ -161,7 +164,14 @@ class TemplateEvolution:
         temp.replace(self.jobs_path)
 
     def _snapshot(self, job: dict) -> dict:
-        return deepcopy(job)
+        snapshot = deepcopy(job)
+        if snapshot.get("state") == "building":
+            duration_started = self._duration_started.get(str(snapshot.get("job_id")))
+            if duration_started is not None:
+                snapshot["elapsed_ms"] = self._duration_ms(
+                    duration_started, float(self._duration_clock())
+                )
+        return snapshot
 
     def _existing_digests(self, workpiece_id: str) -> set[str]:
         record = self.catalog.get(workpiece_id)
@@ -687,6 +697,7 @@ class TemplateEvolution:
             job["started_at"] = float(self._clock())
             job["finished_at"] = None
             job["elapsed_ms"] = 0
+            self._duration_started[job["job_id"]] = float(self._duration_clock())
             self._persist()
 
         def update_progress(event: dict[str, object]) -> None:
@@ -840,11 +851,13 @@ class TemplateEvolution:
                 self._cleanup_payload(job)
             elif action == "retry" and job["state"] in {"failed", "needs_review"}:
                 self._reset_queued_progress(job)
+                self._duration_started.pop(job_id, None)
                 job["error"] = None
                 job["recovery_detail"] = None
                 job["last_submitted_at"] = float(self._clock())
             elif action == "resolve-review" and job["state"] == "needs_review":
                 self._reset_queued_progress(job)
+                self._duration_started.pop(job_id, None)
                 job["error"] = None
                 job["recovery_detail"] = None
             else:
@@ -873,17 +886,28 @@ class TemplateEvolution:
         job["finished_at"] = None
         job["elapsed_ms"] = None
 
-    def _update_elapsed(self, job: dict, *, finished: bool = False) -> None:
-        started_at = job.get("started_at")
-        if started_at is None:
+    @staticmethod
+    def _duration_ms(started_at: float, finished_at: float) -> int:
+        return max(0, int(round((finished_at - started_at) * 1000.0)))
+
+    def _update_elapsed(self, job: dict) -> None:
+        duration_started = self._duration_started.get(str(job.get("job_id")))
+        if duration_started is None:
             return
-        now = float(self._clock())
-        job["elapsed_ms"] = max(0, int(round((now - float(started_at)) * 1000.0)))
-        if finished:
-            job["finished_at"] = now
+        job["elapsed_ms"] = self._duration_ms(
+            duration_started, float(self._duration_clock())
+        )
 
     def _finish_elapsed(self, job: dict) -> None:
-        self._update_elapsed(job, finished=True)
+        wall_finished = float(self._clock())
+        wall_started = job.get("started_at")
+        job["finished_at"] = (
+            wall_finished
+            if wall_started is None
+            else max(float(wall_started), wall_finished)
+        )
+        self._update_elapsed(job)
+        self._duration_started.pop(str(job.get("job_id")), None)
 
     @staticmethod
     def _cleanup_payload(job: dict) -> None:

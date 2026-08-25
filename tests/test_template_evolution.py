@@ -184,7 +184,11 @@ def test_elapsed_time_updates_during_progress_and_freezes_after_completion(tmp_p
     classifier = TimedBlockingProgressClassifier(now)
     catalog, record = setup_catalog(tmp_path, classifier=classifier)
     evolution = TemplateEvolution(
-        catalog, tmp_path / "timed-progress", clock=lambda: now[0], start_worker=False
+        catalog,
+        tmp_path / "timed-progress",
+        clock=lambda: now[0],
+        duration_clock=lambda: now[0],
+        start_worker=False,
     )
     job = evolution.submit_confirmation(
         record.id,
@@ -225,6 +229,93 @@ def test_elapsed_time_updates_during_progress_and_freezes_after_completion(tmp_p
     persisted_completed = restarted.get_job(job["job_id"])
     assert persisted_completed["finished_at"] == 101.25
     assert persisted_completed["elapsed_ms"] == 1250
+
+
+def test_get_and_list_jobs_report_live_elapsed_while_validating(tmp_path):
+    wall_now = [100.0]
+    duration_now = [10.0]
+    catalog, record = setup_catalog(tmp_path)
+    profiles = BlockingGeometryProfiles()
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / "live-validating",
+        clock=lambda: wall_now[0],
+        duration_clock=lambda: duration_now[0],
+        start_worker=False,
+        geometry_profiles=profiles,
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "live-validating.png", 43),
+        operation_id="live-validating",
+    )
+    worker = threading.Thread(target=lambda: evolution.run_next(force=True))
+
+    worker.start()
+    assert profiles.validation_started.wait(1.0)
+    try:
+        duration_now[0] = 11.25
+        assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+        listed = next(item for item in evolution.list_jobs() if item["job_id"] == job["job_id"])
+        assert listed["elapsed_ms"] == 1250
+    finally:
+        profiles.release_validation.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+    duration_now[0] = 20.0
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+
+
+@pytest.mark.parametrize(
+    "finish_wall,expected_finished",
+    [(1100.0, 1100.0), (90.0, 100.0)],
+)
+def test_feature_elapsed_uses_duration_clock_when_wall_clock_jumps(
+    tmp_path, finish_wall, expected_finished
+):
+    wall_now = [100.0]
+    duration_now = [20.0]
+    classifier = BlockingProgressClassifier()
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / f"wall-jump-{finish_wall}",
+        clock=lambda: wall_now[0],
+        duration_clock=lambda: duration_now[0],
+        start_worker=False,
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / f"wall-jump-{finish_wall}.png", 44),
+        operation_id=f"wall-jump-{finish_wall}",
+    )
+    classifier.block_appends = True
+    worker = threading.Thread(target=lambda: evolution.run_next(force=True))
+
+    worker.start()
+    assert classifier.feature_started.wait(1.0)
+    try:
+        wall_now[0] = finish_wall
+        duration_now[0] = 21.25
+        assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+        listed = next(item for item in evolution.list_jobs() if item["job_id"] == job["job_id"])
+        assert listed["elapsed_ms"] == 1250
+    finally:
+        classifier.release_feature.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    completed = evolution.get_job(job["job_id"])
+    assert completed["started_at"] == 100.0
+    assert completed["finished_at"] == expected_finished
+    assert completed["elapsed_ms"] == 1250
+    wall_now[0] = 5000.0
+    duration_now[0] = 200.0
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
 
 
 def test_build_reports_features_without_publishing_candidate_early(tmp_path):
@@ -294,7 +385,11 @@ def test_failed_job_freezes_elapsed_time(tmp_path):
     classifier = TimedFailingProgressClassifier(now)
     catalog, record = setup_catalog(tmp_path, classifier=classifier)
     evolution = TemplateEvolution(
-        catalog, tmp_path / "timed-failure", clock=lambda: now[0], start_worker=False
+        catalog,
+        tmp_path / "timed-failure",
+        clock=lambda: now[0],
+        duration_clock=lambda: now[0],
+        start_worker=False,
     )
     job = evolution.submit_confirmation(
         record.id,
@@ -321,6 +416,7 @@ def test_needs_review_job_freezes_elapsed_time(tmp_path):
         catalog,
         tmp_path / "timed-review",
         clock=lambda: now[0],
+        duration_clock=lambda: now[0],
         start_worker=False,
         geometry_profiles=TimedReviewProfiles(now),
     )
@@ -578,8 +674,15 @@ def test_restart_reconciles_manifest_commit_without_appending_twice(tmp_path):
         evolution._jobs[job["job_id"]]["state"] = "building"
         evolution._persist()
 
-    ticks = iter((500.0, 501.25))
-    restarted = TemplateEvolution(catalog, storage, clock=lambda: next(ticks), start_worker=False)
+    wall_ticks = iter((500.0, 501.25))
+    duration_ticks = iter((50.0, 51.25))
+    restarted = TemplateEvolution(
+        catalog,
+        storage,
+        clock=lambda: next(wall_ticks),
+        duration_clock=lambda: next(duration_ticks),
+        start_worker=False,
+    )
     result = restarted.run_next(force=True)
 
     assert result["state"] == "completed"
