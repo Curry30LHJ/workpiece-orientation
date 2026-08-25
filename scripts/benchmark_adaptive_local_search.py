@@ -957,14 +957,36 @@ def _fingerprint_validation_issues(value: Any) -> list[str]:
                 if issue:
                     issues.append(f"M1 {name} {issue}")
         profile = artifacts.get("active_geometry_profile")
-        if not isinstance(profile, dict) or "status" not in profile or "file" not in profile:
+        if (
+            not isinstance(profile, dict)
+            or not {"status", "revision", "file"}.issubset(profile)
+        ):
             issues.append("M1 active geometry profile status is incomplete")
-        elif profile.get("status") == "present":
-            issue = _file_identity_issue(profile.get("file"))
-            if issue:
-                issues.append(f"M1 active geometry profile {issue}")
-        elif profile.get("file") is not None:
-            issues.append("M1 inactive geometry profile must have a null file")
+        else:
+            profile_status = profile.get("status")
+            if profile_status not in {"present", "not_configured"}:
+                issues.append("status must be present or not_configured")
+            elif profile_status == "present":
+                revision = profile.get("revision")
+                if type(revision) is not int or revision <= 0:
+                    issues.append("present revision must be a positive integer")
+                issue = _file_identity_issue(profile.get("file"))
+                if issue:
+                    issues.append(f"M1 active geometry profile {issue}")
+                elif type(revision) is int and revision > 0:
+                    manifest_file = artifacts.get("manifest", {}).get("file", {})
+                    manifest_path = manifest_file.get("path")
+                    if isinstance(manifest_path, str):
+                        expected_path = (
+                            Path(manifest_path).parent
+                            / "geometry_masks"
+                            / "revisions"
+                            / f"{revision}.json"
+                        ).as_posix()
+                        if profile["file"]["path"] != expected_path:
+                            issues.append("present file path must match revision")
+            elif profile.get("revision") is not None or profile.get("file") is not None:
+                issues.append("not_configured revision and file must be null")
 
     selections = value.get("selections")
     if not isinstance(selections, dict) or set(selections) != set(RELEASE_CASES):
@@ -1020,14 +1042,36 @@ def _fingerprint_validation_issues(value: Any) -> list[str]:
     return issues
 
 
+def _expected_query_row_keys(
+    fingerprint: dict[str, Any],
+) -> set[tuple[str, str, str]]:
+    expected: set[tuple[str, str, str]] = set()
+    selections = fingerprint["selections"]
+    for case in RELEASE_CASES:
+        for direction in ("front", "back"):
+            for query in selections[case][direction]["queries"]:
+                expected.add((case, str(query["path"]), direction))
+    return expected
+
+
+def _row_key_payload(key: tuple[str, str, str]) -> dict[str, str]:
+    return {"case": key[0], "image_path": key[1], "actual": key[2]}
+
+
 def _compare_input_fingerprints(
     exhaustive: dict[str, Any],
     adaptive: dict[str, Any],
+    exhaustive_row_keys: set[tuple[str, str, str]],
+    adaptive_row_keys: set[tuple[str, str, str]],
 ) -> tuple[bool, list[dict[str, Any]]]:
     issues: list[dict[str, Any]] = []
     fingerprints = {
         "exhaustive": exhaustive.get("input_fingerprint"),
         "adaptive": adaptive.get("input_fingerprint"),
+    }
+    row_keys = {
+        "exhaustive": exhaustive_row_keys,
+        "adaptive": adaptive_row_keys,
     }
     for mode, fingerprint in fingerprints.items():
         if fingerprint is None:
@@ -1039,6 +1083,19 @@ def _compare_input_fingerprints(
                 "code": "incomplete_input_fingerprint",
                 "mode": mode,
                 "details": validation,
+            })
+            continue
+        expected = _expected_query_row_keys(fingerprint)
+        missing = sorted(expected - row_keys[mode])
+        unexpected = sorted(row_keys[mode] - expected)
+        if missing or unexpected:
+            issues.append({
+                "code": "row_selection_mismatch",
+                "mode": mode,
+                "missing_count": len(missing),
+                "unexpected_count": len(unexpected),
+                "missing": [_row_key_payload(key) for key in missing],
+                "unexpected": [_row_key_payload(key) for key in unexpected],
             })
     complete = not issues
     if complete and fingerprints["exhaustive"] != fingerprints["adaptive"]:
@@ -1105,7 +1162,10 @@ def _compare_worker_payloads(exhaustive: dict, adaptive: dict) -> dict:
         _release_scope_issues(exhaustive_rows)
     )
     input_fingerprint_match, input_fingerprint_issues = _compare_input_fingerprints(
-        exhaustive, adaptive
+        exhaustive,
+        adaptive,
+        set(exhaustive_rows),
+        set(adaptive_rows),
     )
     release_gate_passed = (
         gate_passed

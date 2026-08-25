@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 from scripts.benchmark_adaptive_local_search import (
+    DATASET_LABELS,
     M1_WORKPIECE_ID,
     _build_case_specs,
     _build_input_fingerprint,
@@ -19,6 +20,7 @@ from scripts.benchmark_adaptive_local_search import (
     _fingerprint_validation_issues,
     _render_markdown,
     _run_parent,
+    _selection_fingerprint,
 )
 
 
@@ -124,7 +126,7 @@ def synthetic_input_fingerprint(marker: str = "same") -> dict:
                 "file": file_entry("M1/.template_cache.pkl"),
             },
             "active_geometry_profile": {
-                "status": "absent",
+                "status": "not_configured",
                 "revision": None,
                 "file": None,
             },
@@ -132,6 +134,15 @@ def synthetic_input_fingerprint(marker: str = "same") -> dict:
         "selections": selections,
     }
     return {**body, "overall_sha256": _test_sha(body)}
+
+
+def refresh_fingerprint(fingerprint: dict) -> None:
+    body = {
+        key: value
+        for key, value in fingerprint.items()
+        if key != "overall_sha256"
+    }
+    fingerprint["overall_sha256"] = _test_sha(body)
 
 
 def payload(mode: str, rows: list[dict]) -> dict:
@@ -179,7 +190,7 @@ def release_rows(*, case_counts: dict[str, tuple[int, int]] | None = None) -> li
             for index in range(count):
                 rows.append(
                     row(
-                        f"{case.lower()}-{actual}-{index:02d}.png",
+                        f"{case}/{actual}/query-{index:02d}.png",
                         actual,
                         False,
                         "top5",
@@ -393,6 +404,106 @@ def test_release_gate_rejects_missing_worker_input_fingerprint():
     } >= {("missing_input_fingerprint", "adaptive")}
 
 
+def test_release_gate_rejects_rows_replaced_by_forged_unique_paths():
+    rows = release_rows()
+    for index, item in enumerate(rows):
+        item["image_path"] = f"forged/query-{index:03d}.png"
+
+    report = _compare_worker_payloads(
+        payload("exhaustive", rows), payload("adaptive", rows)
+    )
+
+    assert report["gate_passed"] is True
+    assert report["release_scope_issues"] == []
+    assert report["release_gate_passed"] is False
+    assert report["default_local_search_mode"] == "exhaustive"
+    mismatches = [
+        item
+        for item in report["input_fingerprint_issues"]
+        if item["code"] == "row_selection_mismatch"
+    ]
+    assert {item["mode"] for item in mismatches} == {"exhaustive", "adaptive"}
+    assert all(item["missing_count"] == 120 for item in mismatches)
+    assert all(item["unexpected_count"] == 120 for item in mismatches)
+
+
+def test_release_gate_rejects_row_actual_direction_that_disagrees_with_query_manifest():
+    rows = release_rows()
+    rows[0]["actual"] = "back"
+
+    report = _compare_worker_payloads(
+        payload("exhaustive", rows), payload("adaptive", rows)
+    )
+
+    assert report["gate_passed"] is True
+    assert report["release_gate_passed"] is False
+    assert report["input_fingerprint_match"] is False
+    mismatches = [
+        item
+        for item in report["input_fingerprint_issues"]
+        if item["code"] == "row_selection_mismatch"
+    ]
+    assert {item["mode"] for item in mismatches} == {"exhaustive", "adaptive"}
+    assert all(item["missing_count"] == 1 for item in mismatches)
+    assert all(item["unexpected_count"] == 1 for item in mismatches)
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_issue"),
+    [
+        (
+            {"status": "absent", "revision": None, "file": None},
+            "status must be present or not_configured",
+        ),
+        (
+            {"status": "present", "revision": None, "file": "valid"},
+            "present revision must be a positive integer",
+        ),
+        (
+            {"status": "not_configured", "revision": 13, "file": None},
+            "not_configured revision and file must be null",
+        ),
+        (
+            {"status": "not_configured", "file": None},
+            "M1 active geometry profile status is incomplete",
+        ),
+        (
+            {"status": "present", "revision": 13, "file": "valid"},
+            "present file path must match revision",
+        ),
+    ],
+)
+def test_active_profile_fingerprint_rejects_unknown_or_inconsistent_state(
+    profile, expected_issue
+):
+    fingerprint = synthetic_input_fingerprint()
+    if profile["file"] == "valid":
+        profile = {
+            **profile,
+            "file": fingerprint["m1_artifacts"]["manifest"]["file"],
+        }
+    fingerprint["m1_artifacts"]["active_geometry_profile"] = profile
+    refresh_fingerprint(fingerprint)
+
+    issues = _fingerprint_validation_issues(fingerprint)
+
+    assert expected_issue in issues
+
+
+def test_active_profile_fingerprint_accepts_valid_present_state():
+    fingerprint = synthetic_input_fingerprint()
+    file_identity = dict(fingerprint["m1_artifacts"]["manifest"]["file"])
+    file_identity["path"] = "M1/geometry_masks/revisions/13.json"
+    fingerprint["m1_artifacts"]["active_geometry_profile"] = {
+        "status": "present",
+        "revision": 13,
+        "file": file_identity,
+    }
+    refresh_fingerprint(fingerprint)
+
+    assert _fingerprint_validation_issues(fingerprint) == []
+
+
 def test_markdown_reports_environment_stage_counts_latency_and_gate():
     rows = release_rows()
     report = _compare_worker_payloads(
@@ -492,6 +603,60 @@ REAL_BENCHMARK_INPUTS_AVAILABLE = all(
         / "general_PPLCNetV2_base_pretrained_v1.0_infer",
     )
 )
+
+
+@pytest.mark.skipif(
+    not REAL_BENCHMARK_INPUTS_AVAILABLE,
+    reason="local ignored M1/M2/M7 benchmark inputs are unavailable",
+)
+def test_disk_labels_and_seed_reproduce_exact_query_manifest():
+    assert DATASET_LABELS == {"0": "front", "1": "back"}
+    library_dir = PROJECT_ROOT / "runtime_library"
+    first_specs = _build_case_specs(PROJECT_ROOT, library_dir, M1_WORKPIECE_ID)
+    second_specs = _build_case_specs(PROJECT_ROOT, library_dir, M1_WORKPIECE_ID)
+
+    first_manifest = [
+        (
+            spec.name,
+            tuple(
+                (actual, path.relative_to(PROJECT_ROOT).as_posix())
+                for actual, path in spec.queries
+            ),
+        )
+        for spec in first_specs
+    ]
+    second_manifest = [
+        (
+            spec.name,
+            tuple(
+                (actual, path.relative_to(PROJECT_ROOT).as_posix())
+                for actual, path in spec.queries
+            ),
+        )
+        for spec in second_specs
+    ]
+    assert first_manifest == second_manifest
+    assert _selection_fingerprint(
+        PROJECT_ROOT, first_specs
+    ) == _selection_fingerprint(PROJECT_ROOT, second_specs)
+
+    from src.shitu_baseline import split_labels
+
+    for spec in first_specs[1:]:
+        expected_templates, held_out = split_labels(
+            spec.dataset_dir,
+            template_count=20,
+            seed=20260825,
+        )
+        assert spec.templates["front"] == tuple(expected_templates["0"])
+        assert spec.templates["back"] == tuple(expected_templates["1"])
+        expected_queries = tuple(
+            [("front", path) for path in held_out["0"][:20]]
+            + [("back", path) for path in held_out["1"][:20]]
+        )
+        assert spec.queries == expected_queries
+        assert all(path.parent.name == "0" for path in spec.templates["front"])
+        assert all(path.parent.name == "1" for path in spec.templates["back"])
 
 
 @pytest.mark.skipif(
