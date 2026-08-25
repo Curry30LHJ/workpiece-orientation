@@ -10,6 +10,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import src.orientation_tcp_service as service_module
 
 from src.orientation_tcp_service import (
     OrientationCommandDispatcher,
@@ -636,6 +637,81 @@ def test_listener_reports_loading_then_accepts_ready_handshake():
         client.close()
         server.request_shutdown()
         thread.join(timeout=2)
+
+
+def test_local_search_mode_argument_defaults_to_adaptive(tmp_path):
+    parser = service_module._build_argument_parser()
+    args = parser.parse_args([
+        "--project-root", str(tmp_path),
+        "--model-dir", str(tmp_path / "models"),
+        "--library-dir", str(tmp_path / "library"),
+    ])
+
+    assert args.local_search_mode == "adaptive"
+
+
+def test_local_search_mode_argument_rejects_unknown_value(tmp_path):
+    parser = service_module._build_argument_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "--project-root", str(tmp_path),
+            "--model-dir", str(tmp_path / "models"),
+            "--library-dir", str(tmp_path / "library"),
+            "--local-search-mode", "fast",
+        ])
+
+
+def test_runtime_loader_forwards_local_search_mode(monkeypatch, tmp_path):
+    runtime = ServiceRuntime()
+    events = []
+
+    class LoadedClassifier:
+        geometry_calibrator = None
+
+        @classmethod
+        def load(cls, project_root, model_dir, *, local_search_mode):
+            events.append(f"model-loaded:{local_search_mode}")
+            return cls()
+
+    class LoadedLibrary:
+        def __init__(self, library_dir):
+            self.library_dir = Path(library_dir)
+
+    class LoadedCatalog:
+        def __init__(self, library, classifier):
+            self.geometry_profiles = None
+
+        def set_geometry_profiles(self, profiles):
+            self.geometry_profiles = profiles
+
+        def recover(self):
+            events.append("recovered")
+
+    class LoadedProfiles:
+        def __init__(self, catalog, calibrator, *, storage_dir):
+            events.append("profiles-created")
+
+    class LoadedEvolution:
+        def __init__(self, catalog, storage_dir, *, geometry_profiles):
+            events.append("evolution-created")
+
+    monkeypatch.setattr(service_module, "OrientationClassifier", LoadedClassifier)
+    monkeypatch.setattr(service_module, "WorkpieceLibrary", LoadedLibrary)
+    monkeypatch.setattr(service_module, "WorkpieceCatalog", LoadedCatalog)
+    monkeypatch.setattr(service_module, "GeometryMaskProfiles", LoadedProfiles)
+    monkeypatch.setattr(service_module, "TemplateEvolution", LoadedEvolution)
+
+    service_module._load_runtime(
+        runtime,
+        tmp_path,
+        tmp_path / "models",
+        tmp_path / "library",
+        local_search_mode="exhaustive",
+    )
+
+    assert runtime.snapshot().status == "ready"
+    assert events[0] == "model-loaded:exhaustive"
 
 
 def test_loading_runtime_accepts_shutdown_before_model_ready():

@@ -21,7 +21,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.orientation_classifier import (
+    DEFAULT_LOCAL_SEARCH_MODE,
     ImageUnreadableError,
+    LOCAL_SEARCH_MODES,
     OrientationClassifier,
     OrientationClassifierError,
     PropagationModelError,
@@ -792,9 +794,14 @@ def _load_runtime(
     project_root: Path,
     model_dir: Path,
     library_dir: Path,
+    local_search_mode: str = DEFAULT_LOCAL_SEARCH_MODE,
 ) -> None:
     try:
-        classifier = OrientationClassifier.load(project_root, model_dir)
+        classifier = OrientationClassifier.load(
+            project_root,
+            model_dir,
+            local_search_mode=local_search_mode,
+        )
         library = WorkpieceLibrary(library_dir)
         catalog = WorkpieceCatalog(library, classifier)
         profiles = GeometryMaskProfiles(
@@ -810,14 +817,23 @@ def _load_runtime(
         runtime.set_failed("MODEL_LOAD_FAILED", str(exc) or type(exc).__name__)
 
 
-def main() -> None:
+def _build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Workpiece orientation loopback service")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=37651)
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--library-dir", type=Path, required=True)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--local-search-mode",
+        choices=LOCAL_SEARCH_MODES,
+        default=DEFAULT_LOCAL_SEARCH_MODE,
+    )
+    return parser
+
+
+def main() -> None:
+    args = _build_argument_parser().parse_args()
     if args.host != "127.0.0.1":
         raise SystemExit("INVALID_BIND_ADDRESS: only 127.0.0.1 is allowed")
     configure_diagnostic_logging(args.library_dir)
@@ -829,7 +845,13 @@ def main() -> None:
         raise SystemExit(f"{exc.code}: {exc.message}") from exc
     loader = threading.Thread(
         target=_load_runtime,
-        args=(runtime, args.project_root, args.model_dir, args.library_dir),
+        args=(
+            runtime,
+            args.project_root,
+            args.model_dir,
+            args.library_dir,
+            args.local_search_mode,
+        ),
         name="orientation-model-loader",
         daemon=True,
     )
