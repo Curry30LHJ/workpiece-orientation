@@ -80,6 +80,7 @@ private:
     void publishRegistrationTaskStatus(const QString &phase, int completed,
                                        int total, qint64 elapsedMs);
     void publishRegistrationFailure();
+    qint64 currentRegistrationElapsedMs() const;
 
     Ui::WorkpieceLibraryPage *ui;
     QJsonArray workpieces_;

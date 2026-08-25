@@ -49,7 +49,12 @@ QString phaseText(const QString &phase) {
 }
 
 QDateTime jobSubmittedAt(const QJsonObject &job) {
-    const QString value = job.value(QStringLiteral("last_submitted_at")).toString();
+    const QJsonValue timestamp = job.value(QStringLiteral("last_submitted_at"));
+    if (timestamp.isDouble()) {
+        return QDateTime::fromMSecsSinceEpoch(
+            static_cast<qint64>(timestamp.toDouble() * 1000.0), Qt::UTC);
+    }
+    const QString value = timestamp.toString();
     QDateTime submittedAt = QDateTime::fromString(value, Qt::ISODateWithMs);
     if (!submittedAt.isValid()) submittedAt = QDateTime::fromString(value, Qt::ISODate);
     return submittedAt;
@@ -309,6 +314,10 @@ void WorkpieceLibraryPage::handleBackendFailure(const QString &command,
             emit commandRequested(QStringLiteral("register"), retry);
             showMessage(QStringLiteral("正在覆盖并建立工件库…"));
         } else {
+            publishRegistrationTaskStatus(QStringLiteral("cancelled"),
+                                          registrationTaskCompleted_,
+                                          registrationTaskTotal_,
+                                          currentRegistrationElapsedMs());
             registrationInFlight_ = false;
             stopRegistrationProgress();
             showMessage(QStringLiteral("已取消覆盖"));
@@ -689,5 +698,10 @@ void WorkpieceLibraryPage::publishRegistrationFailure() {
     publishRegistrationTaskStatus(QStringLiteral("failed"),
                                   registrationTaskCompleted_,
                                   registrationTaskTotal_,
-                                  registrationTaskElapsedMs_);
+                                  currentRegistrationElapsedMs());
+}
+
+qint64 WorkpieceLibraryPage::currentRegistrationElapsedMs() const {
+    if (!registrationElapsedClock_.isValid()) return registrationTaskElapsedMs_;
+    return qMax(registrationTaskElapsedMs_, registrationElapsedClock_.elapsed());
 }

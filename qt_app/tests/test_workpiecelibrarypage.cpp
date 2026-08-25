@@ -300,28 +300,24 @@ private slots:
                         {QStringLiteral("phase"), QStringLiteral("features")},
                         {QStringLiteral("completed"), 4},
                         {QStringLiteral("total"), 9},
-                        {QStringLiteral("last_submitted_at"),
-                         QStringLiteral("2026-08-25T11:00:00+00:00")}},
+                        {QStringLiteral("last_submitted_at"), 2000.0}},
             QJsonObject{{QStringLiteral("job_id"), QStringLiteral("queued-old")},
                         {QStringLiteral("state"), QStringLiteral("queued")},
                         {QStringLiteral("phase"), QStringLiteral("queued")},
                         {QStringLiteral("completed"), 0},
                         {QStringLiteral("total"), 3},
-                        {QStringLiteral("last_submitted_at"),
-                         QStringLiteral("2026-08-25T09:00:00+00:00")}},
+                        {QStringLiteral("last_submitted_at"), 1000.0}},
             QJsonObject{{QStringLiteral("job_id"), QStringLiteral("failed-newest")},
                         {QStringLiteral("state"), QStringLiteral("failed")},
                         {QStringLiteral("completed"), 8},
                         {QStringLiteral("total"), 8},
-                        {QStringLiteral("last_submitted_at"),
-                         QStringLiteral("2026-08-25T12:00:00+00:00")}},
+                        {QStringLiteral("last_submitted_at"), 3000.0}},
             QJsonObject{{QStringLiteral("job_id"), QStringLiteral("completed-mid")},
                         {QStringLiteral("state"), QStringLiteral("completed")},
                         {QStringLiteral("phase"), QStringLiteral("active")},
                         {QStringLiteral("completed"), 7},
                         {QStringLiteral("total"), 7},
-                        {QStringLiteral("last_submitted_at"),
-                         QStringLiteral("2026-08-25T10:00:00+00:00")}},
+                        {QStringLiteral("last_submitted_at"), 1500.0}},
         });
 
         QCOMPARE(taskSpy.count(), 1);
@@ -336,14 +332,12 @@ private slots:
                         {QStringLiteral("phase"), QStringLiteral("active")},
                         {QStringLiteral("completed"), 6},
                         {QStringLiteral("total"), 6},
-                        {QStringLiteral("last_submitted_at"),
-                         QStringLiteral("2026-08-25T14:00:00+00:00")}},
+                        {QStringLiteral("last_submitted_at"), 5000.0}},
             QJsonObject{{QStringLiteral("job_id"), QStringLiteral("failed-older")},
                         {QStringLiteral("state"), QStringLiteral("failed")},
                         {QStringLiteral("completed"), 2},
                         {QStringLiteral("total"), 5},
-                        {QStringLiteral("last_submitted_at"),
-                         QStringLiteral("2026-08-25T13:00:00+00:00")}},
+                        {QStringLiteral("last_submitted_at"), 4000.0}},
         });
 
         QCOMPARE(taskSpy.count(), 1);
@@ -493,6 +487,96 @@ private slots:
         QCOMPARE(failed.at(2).toInt(), 1);
         QCOMPARE(failed.at(3).toInt(), 4);
         QCOMPARE(failed.at(4).toLongLong(), qint64(135));
+    }
+
+    void decliningOverwritePublishesCancelledTerminalStatus() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M-decline"));
+        page.setTemplatePaths(
+            writeImages(directory.path(), QStringLiteral("decline-front"), 1, 10),
+            writeImages(directory.path(), QStringLiteral("decline-back"), 2, 80));
+        page.setReplaceConfirmationHandler([](const QString &) { return false; });
+        QSignalSpy taskSpy(&page, &WorkpieceLibraryPage::taskStatusChanged);
+
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration",
+                                          Qt::DirectConnection));
+        taskSpy.clear();
+        QTest::qWait(25);
+        page.handleBackendFailure(QStringLiteral("register"),
+                                  QStringLiteral("WORKPIECE_EXISTS"),
+                                  QStringLiteral("exists"));
+
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> cancelled = taskSpy.takeFirst();
+        QCOMPARE(cancelled.at(1).toString(), QStringLiteral("cancelled"));
+        QCOMPARE(cancelled.at(2).toInt(), 0);
+        QCOMPARE(cancelled.at(3).toInt(), 3);
+        QVERIFY(cancelled.at(4).toLongLong() >= 20);
+    }
+
+    void registrationFailureUsesLiveElapsedWithoutProgress() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M-no-progress"));
+        page.setTemplatePaths(
+            writeImages(directory.path(), QStringLiteral("no-progress-front"), 1, 10),
+            writeImages(directory.path(), QStringLiteral("no-progress-back"), 1, 80));
+        QSignalSpy taskSpy(&page, &WorkpieceLibraryPage::taskStatusChanged);
+
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration",
+                                          Qt::DirectConnection));
+        taskSpy.clear();
+        QTest::qWait(25);
+        page.handleBackendFailure(QStringLiteral("register"),
+                                  QStringLiteral("MODEL_ERROR"),
+                                  QStringLiteral("failed without progress"));
+
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> failed = taskSpy.takeFirst();
+        QCOMPARE(failed.at(1).toString(), QStringLiteral("failed"));
+        QCOMPARE(failed.at(2).toInt(), 0);
+        QCOMPARE(failed.at(3).toInt(), 2);
+        QVERIFY(failed.at(4).toLongLong() >= 20);
+    }
+
+    void registrationFailureElapsedContinuesAfterSparseProgress() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        WorkpieceLibraryPage page;
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M-sparse-progress"));
+        page.setTemplatePaths(
+            writeImages(directory.path(), QStringLiteral("sparse-front"), 2, 10),
+            writeImages(directory.path(), QStringLiteral("sparse-back"), 2, 80));
+        QSignalSpy taskSpy(&page, &WorkpieceLibraryPage::taskStatusChanged);
+
+        QVERIFY(QMetaObject::invokeMethod(&page, "submitRegistration",
+                                          Qt::DirectConnection));
+        taskSpy.clear();
+        QTest::qWait(10);
+        page.setRegistrationProgress(QJsonObject{
+            {QStringLiteral("phase"), QStringLiteral("features")},
+            {QStringLiteral("completed"), 1},
+            {QStringLiteral("total"), 4},
+        }, -1);
+        QCOMPARE(taskSpy.count(), 1);
+        const qint64 progressElapsed = taskSpy.takeFirst().at(4).toLongLong();
+        QTest::qWait(25);
+        page.handleBackendFailure(QStringLiteral("register"),
+                                  QStringLiteral("MODEL_ERROR"),
+                                  QStringLiteral("failed after sparse progress"));
+
+        QCOMPARE(taskSpy.count(), 1);
+        const QList<QVariant> failed = taskSpy.takeFirst();
+        QCOMPARE(failed.at(1).toString(), QStringLiteral("failed"));
+        QCOMPARE(failed.at(2).toInt(), 1);
+        QCOMPARE(failed.at(3).toInt(), 4);
+        QVERIFY(failed.at(4).toLongLong() >= progressElapsed + 20);
     }
 
     void overwriteConfirmationResendsAllPathsWithReplaceTrue() {

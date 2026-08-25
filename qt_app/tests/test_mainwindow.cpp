@@ -144,6 +144,8 @@ public:
     quint16 port() const { return server_.serverPort(); }
     void holdFirstRegister() { holdFirstRegister_ = true; }
     void holdRecycle() { holdRecycle_ = true; }
+    void failNextListRefresh() { failNextListRefresh_ = true; }
+    void disconnectNextListRefresh() { disconnectNextListRefresh_ = true; }
     int registerCount() const { return registerCount_; }
     int recycleCount() const { return recycleCount_; }
     int listCount() const { return listCount_; }
@@ -189,13 +191,23 @@ private slots:
                       {"service", "workpiece-orientation"}, {"ready", true}});
             } else if (command == QStringLiteral("list_workpieces")) {
                 ++listCount_;
-                send({{"version", 1}, {"request_id", requestId}, {"ok", true},
-                      {"workpieces", QJsonArray{
-                          QJsonObject{{"id", "m1"}, {"name", "M1"},
-                                      {"template_counts", QJsonObject{{"front", 2}, {"back", 3}}}},
-                          QJsonObject{{"id", "m2"}, {"name", "M2"},
-                                      {"template_counts", QJsonObject{{"front", 4}, {"back", 5}}}},
-                      }}});
+                if (disconnectNextListRefresh_) {
+                    disconnectNextListRefresh_ = false;
+                    socket_->abort();
+                } else if (failNextListRefresh_) {
+                    failNextListRefresh_ = false;
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", false},
+                          {"error", QJsonObject{{"code", "REFRESH_FAILED"},
+                                                 {"message", "refresh failed"}}}});
+                } else {
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", true},
+                          {"workpieces", QJsonArray{
+                              QJsonObject{{"id", "m1"}, {"name", "M1"},
+                                          {"template_counts", QJsonObject{{"front", 2}, {"back", 3}}}},
+                              QJsonObject{{"id", "m2"}, {"name", "M2"},
+                                          {"template_counts", QJsonObject{{"front", 4}, {"back", 5}}}},
+                          }}});
+                }
             } else if (command == QStringLiteral("get_workpiece_details")) {
                 const QString workpieceId = request.value(
                     QStringLiteral("workpiece_id")).toString();
@@ -242,6 +254,8 @@ private:
     QString heldRecycleRequestId_;
     bool holdFirstRegister_ = false;
     bool holdRecycle_ = false;
+    bool failNextListRefresh_ = false;
+    bool disconnectNextListRefresh_ = false;
     int registerCount_ = 0;
     int recycleCount_ = 0;
     int listCount_ = 0;
@@ -1006,6 +1020,7 @@ private slots:
         client.connectToService(QHostAddress::LocalHost, server.port(), 500);
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
         QTRY_VERIFY_WITH_TIMEOUT(server.requests().size() >= 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
         QVERIFY(QMetaObject::invokeMethod(&window, "submitRegistration", Qt::DirectConnection));
 
         auto *result = window.findChild<QLabel *>(
@@ -1078,7 +1093,7 @@ private slots:
         auto *list = window.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
         QVERIFY(library != nullptr);
         QVERIFY(list != nullptr);
-        QCOMPARE(list->count(), 2);
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 2, 1000);
         QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
 
         QVERIFY(QMetaObject::invokeMethod(&window, "submitRegistration",
@@ -1142,6 +1157,7 @@ private slots:
         QVERIFY(list != nullptr);
         QVERIFY(confirmation != nullptr);
         QVERIFY(recycle != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 2, 1000);
         QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
         list->setCurrentRow(0);
         QTRY_VERIFY_WITH_TIMEOUT(
@@ -1174,6 +1190,117 @@ private slots:
         QCOMPARE(routed, QStringList({QStringLiteral("recycle_workpiece"),
                                      QStringLiteral("list_workpieces"),
                                      QStringLiteral("get_workpiece_details")}));
+    }
+
+    void failedMandatoryRefreshWaitsForExplicitRetryAndReloadsBrowsedDetails() {
+        LibraryIntentServer server;
+        QVERIFY(server.listen());
+        server.holdFirstRegister();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        window.setReplaceConfirmationHandler([](const QString &) { return true; });
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        window.setWorkpieceName(QStringLiteral("M-refresh-retry"));
+        window.setTemplatePaths(
+            writeImages(directory, QStringLiteral("retry-front"), 1),
+            writeImages(directory, QStringLiteral("retry-back"), 2));
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 1, 1000);
+        auto *list = window.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *refresh = window.findChild<QPushButton *>(
+            QStringLiteral("refreshWorkpiecesButton"));
+        auto *message = window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"));
+        QVERIFY(list != nullptr);
+        QVERIFY(refresh != nullptr);
+        QVERIFY(message != nullptr);
+        QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
+        list->setCurrentRow(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            server.detailsWorkpieceIds().contains(QStringLiteral("m1")), 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        const int detailsBeforeRegistration = server.detailsWorkpieceIds().size();
+
+        server.failNextListRefresh();
+        QVERIFY(QMetaObject::invokeMethod(&window, "submitRegistration",
+                                          Qt::DirectConnection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.registerCount(), 1, 1000);
+        QVERIFY(server.replyFirstRegisterExists());
+        QTRY_COMPARE_WITH_TIMEOUT(server.registerCount(), 2, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(message->text().contains(QStringLiteral("刷新失败")), 1000);
+        QVERIFY(message->text().contains(QStringLiteral("刷新工件列表")));
+        QVERIFY(refresh->isEnabled());
+        QTest::qWait(100);
+        QCOMPARE(server.listCount(), 2);
+
+        refresh->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 3, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            server.detailsWorkpieceIds().size() > detailsBeforeRegistration, 1000);
+        QCOMPARE(server.detailsWorkpieceIds().last(), QStringLiteral("m1"));
+
+        QStringList routed;
+        bool afterRegister = false;
+        for (const QJsonObject &request : server.requests()) {
+            const QString command = request.value(QStringLiteral("command")).toString();
+            if (command == QStringLiteral("register")) afterRegister = true;
+            if (afterRegister
+                && (command == QStringLiteral("register")
+                    || command == QStringLiteral("list_workpieces")
+                    || command == QStringLiteral("get_workpiece_details"))) {
+                routed.append(command);
+            }
+        }
+        QCOMPARE(routed, QStringList({QStringLiteral("register"),
+                                     QStringLiteral("register"),
+                                     QStringLiteral("list_workpieces"),
+                                     QStringLiteral("list_workpieces"),
+                                     QStringLiteral("get_workpiece_details")}));
+    }
+
+    void recycleRefreshTransportFailureRecoversOnceAfterReconnect() {
+        LibraryIntentServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 1, 1000);
+        auto *list = window.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *confirmation = window.findChild<QLineEdit *>(
+            QStringLiteral("recycleNameConfirmationEdit"));
+        auto *recycle = window.findChild<QPushButton *>(
+            QStringLiteral("deleteWorkpieceButton"));
+        QVERIFY(list != nullptr);
+        QVERIFY(confirmation != nullptr);
+        QVERIFY(recycle != nullptr);
+        QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
+        list->setCurrentRow(0);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            server.detailsWorkpieceIds().contains(QStringLiteral("m1")), 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        confirmation->setText(QStringLiteral("M1"));
+        QVERIFY(recycle->isEnabled());
+
+        server.disconnectNextListRefresh();
+        recycle->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.recycleCount(), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Disconnected
+                                     || client.state() == BackendClient::State::Error,
+                                 1000);
+
+        const int detailsBeforeReconnect = server.detailsWorkpieceIds().size();
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 3, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            server.detailsWorkpieceIds().size() > detailsBeforeReconnect, 1000);
+        QTest::qWait(100);
+        QCOMPARE(server.listCount(), 3);
     }
 
     void busyStateDisablesRegisterAndPredict() {
@@ -1409,7 +1536,11 @@ private slots:
         client.connectToService(QHostAddress::LocalHost, server.port(), 500);
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
         QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(),
-                                  refreshCountBeforeReconnect + 2, 1000);
+                                  refreshCountBeforeReconnect + 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
+                ->text().contains(QStringLiteral("工件列表已刷新")),
+            1000);
         const int refreshCountAfterSuccess = server.listWorkpieceCount();
 
         emit client.stateChanged(BackendClient::State::Ready,
@@ -1446,7 +1577,7 @@ private slots:
         QCOMPARE(server.listWorkpieceCount(), refreshCountAfterFailure);
     }
 
-    void queuedInternalRefreshDoesNotStrandBatchPrediction() {
+    void mandatoryRefreshWaitsUntilBatchPredictionSequenceCompletes() {
         BatchPredictionServer server;
         QVERIFY(server.listen());
         server.setHoldPredictions(true);
@@ -1460,6 +1591,7 @@ private slots:
         auto *inspectionPage = window.findChild<InspectionPage *>();
         QVERIFY(inspectionPage != nullptr);
         QTRY_COMPARE(server.predictionCount(), 1);
+        const int refreshCountBefore = server.listWorkpieceCount();
 
         QVERIFY(QMetaObject::invokeMethod(
             &window, "onClientResponse", Qt::DirectConnection,
@@ -1468,10 +1600,28 @@ private slots:
         server.replyNextPrediction();
 
         QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 2, 1000);
+        QCOMPARE(server.listWorkpieceCount(), refreshCountBefore);
         server.replyNextPrediction();
         QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 3, 1000);
+        QCOMPARE(server.listWorkpieceCount(), refreshCountBefore);
         server.replyNextPrediction();
         QTRY_COMPARE_WITH_TIMEOUT(inspectionPage->completedBatchCount(), 3, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), refreshCountBefore + 1, 1000);
+
+        QStringList routed;
+        bool inBatch = false;
+        for (const QJsonObject &request : server.requests()) {
+            const QString command = request.value(QStringLiteral("command")).toString();
+            if (command == QStringLiteral("predict")) inBatch = true;
+            if (inBatch && (command == QStringLiteral("predict")
+                            || command == QStringLiteral("list_workpieces"))) {
+                routed.append(command);
+            }
+        }
+        QCOMPARE(routed, QStringList({QStringLiteral("predict"),
+                                     QStringLiteral("predict"),
+                                     QStringLiteral("predict"),
+                                     QStringLiteral("list_workpieces")}));
     }
 
     void batchCompletionSelectsFirstReviewResult() {

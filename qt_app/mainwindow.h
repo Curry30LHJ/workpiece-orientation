@@ -155,6 +155,7 @@ private:
     bool hasLatestDetailsIntent_ = false;
     QJsonObject latestDetailsFields_;
     bool mandatoryWorkpieceRefresh_ = false;
+    bool mandatoryRefreshRetryRequired_ = false;
     bool deferredUserWorkpieceRefresh_ = false;
     bool pendingRefreshIncludesMandatory_ = false;
     bool pendingRefreshIncludesUser_ = false;
