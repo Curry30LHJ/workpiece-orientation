@@ -9,6 +9,7 @@ import pytest
 
 from src.orientation_classifier import (
     ImageUnreadableError,
+    LocalSearchResult,
     OrientationClassifier,
     OrientationClassifierError,
     PropagationModelError,
@@ -190,6 +191,7 @@ def test_geometry_fit_failure_uses_raw_cache_and_sets_review(classifier, tmp_pat
         geometry_profile(fail_marker=3), FakeGeometryCalibrator()
     )
     classifier.set_template_cache("m7", candidate)
+    classifier.extractor.markers.clear()
 
     result = classifier.predict("m7", write_marker(tmp_path / "query.png", 3))
 
@@ -201,6 +203,7 @@ def test_geometry_fit_failure_uses_raw_cache_and_sets_review(classifier, tmp_pat
     assert result["local_search"]["available_counts"] == {
         label: len(candidate.raw_local_features[label]) for label in ("front", "back")
     }
+    assert classifier.extractor.markers == [3]
 
 
 def test_low_global_margin_is_overridden_by_decisive_local_evidence(registered_classifier, tmp_path):
@@ -453,6 +456,92 @@ def test_baseline_exhaustive_search_matches_explicit_full_fusion(tmp_path):
         "global_margin", "local_margin", "decision_source",
     ):
         assert result[key] == expected[key]
+
+
+@pytest.mark.parametrize("geometry", [False, True])
+@pytest.mark.parametrize("label", ["front", "back"])
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_globals", "missing_locals", "empty_globals", "empty_locals", "mismatch"],
+)
+def test_predict_with_cache_rejects_corrupt_direction_before_scoring(
+    classifier, tmp_path, geometry, label, corruption
+):
+    global_vectors = {
+        "front": np.asarray([[1.0, 0.0]], dtype=np.float32),
+        "back": np.asarray([[0.0, 1.0]], dtype=np.float32),
+    }
+    local_features = {"front": [{"marker": 1}], "back": [{"marker": 2}]}
+    if corruption == "missing_globals":
+        global_vectors.pop(label)
+    elif corruption == "missing_locals":
+        local_features.pop(label)
+    elif corruption == "empty_globals":
+        global_vectors[label] = np.empty((0, 2), dtype=np.float32)
+    elif corruption == "empty_locals":
+        local_features[label] = []
+    else:
+        global_vectors[label] = np.repeat(global_vectors[label], 2, axis=0)
+    cache = TemplateCache(
+        global_vectors=global_vectors,
+        local_features=local_features,
+        geometry_profile={"directions": {}} if geometry else None,
+    )
+    classifier.geometry_calibrator = FakeGeometryCalibrator()
+
+    with pytest.raises(
+        OrientationClassifierError,
+        match=f"template cache alignment error for {label}",
+    ):
+        classifier.predict_with_cache(
+            cache, write_marker(tmp_path / f"corrupt-{geometry}-{label}-{corruption}.png", 3)
+        )
+
+
+def test_geometry_timings_exclude_matching_from_local_features(
+    classifier, tmp_path, monkeypatch
+):
+    import src.orientation_classifier as classifier_module
+
+    front = [write_marker(tmp_path / "timing-front.png", 1)]
+    back = [write_marker(tmp_path / "timing-back.png", 2)]
+    record = SimpleNamespace(front_images=tuple(front), back_images=tuple(back))
+    classifier.set_template_cache("m7", classifier.build_template_cache(front, back))
+    cache, _ = classifier.prepare_geometry_cache(
+        "m7", record, geometry_profile(), FakeGeometryCalibrator()
+    )
+    classifier.geometry_calibrator = FakeGeometryCalibrator()
+    now = [100.0]
+    extraction_calls = []
+    original_extract_local = classifier._extract_local
+
+    def timed_extract_local(image):
+        extraction_calls.append(int(image[0, 0, 0]))
+        result = original_extract_local(image)
+        now[0] += 0.010
+        return result
+
+    def timed_search(**_kwargs):
+        now[0] += 0.100
+        return LocalSearchResult(
+            scores={"front": 5.0, "back": 8.0},
+            diagnostics={"mode": "adaptive"},
+            matching_ms=37.0,
+            trace={},
+        )
+
+    monkeypatch.setattr(classifier_module.time, "perf_counter", lambda: now[0])
+    monkeypatch.setattr(classifier, "_extract_local", timed_extract_local)
+    monkeypatch.setattr(classifier, "_search_local", timed_search)
+
+    result = classifier.predict_with_cache(
+        cache, write_marker(tmp_path / "timing-query.png", 3)
+    )
+    timings = result["geometry_mask"]["timings_ms"]
+
+    assert extraction_calls == [7, 7]
+    assert timings["local_features"] == pytest.approx(20.0)
+    assert timings["local_matching"] == pytest.approx(37.0)
 
 
 def test_template_cache_round_trip_preserves_unequal_template_sets(classifier, tmp_path):

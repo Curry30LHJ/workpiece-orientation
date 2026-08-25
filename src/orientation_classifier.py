@@ -633,29 +633,57 @@ class OrientationClassifier:
             return "local_conflict"
         return "local_uncertain"
 
+    @staticmethod
+    def _validate_local_cache_alignment(
+        global_vectors: Mapping[str, np.ndarray],
+        local_features: Mapping[str, Sequence[dict[str, Any]]],
+    ) -> dict[str, np.ndarray]:
+        normalized_vectors: dict[str, np.ndarray] = {}
+        for label in ("front", "back"):
+            if label not in global_vectors or label not in local_features:
+                raise OrientationClassifierError(
+                    f"template cache alignment error for {label}: "
+                    "missing vectors or local features"
+                )
+            try:
+                vectors = np.asarray(global_vectors[label], dtype=np.float32)
+                candidate_count = len(local_features[label])
+            except (TypeError, ValueError):
+                raise OrientationClassifierError(
+                    f"template cache alignment error for {label}: "
+                    "invalid vectors or local features"
+                ) from None
+            if vectors.ndim != 2:
+                raise OrientationClassifierError(
+                    f"template cache alignment error for {label}: "
+                    "global vectors must be a 2D array"
+                )
+            if vectors.shape[0] == 0 or candidate_count == 0:
+                raise OrientationClassifierError(
+                    f"template cache alignment error for {label}: "
+                    "at least one local template is required"
+                )
+            if vectors.shape[0] != candidate_count:
+                raise OrientationClassifierError(
+                    f"template cache alignment error for {label}: "
+                    f"{vectors.shape[0]} global vectors != "
+                    f"{candidate_count} local templates"
+                )
+            normalized_vectors[label] = vectors
+        return normalized_vectors
+
     def _rank_local_candidates(
         self,
         global_vectors: Mapping[str, np.ndarray],
         query_embeddings: Mapping[str, np.ndarray],
         local_features: Mapping[str, Sequence[dict[str, Any]]],
     ) -> dict[str, list[int]]:
+        vectors_by_label = self._validate_local_cache_alignment(
+            global_vectors, local_features
+        )
         rankings = {}
         for label in ("front", "back"):
-            vectors = np.asarray(global_vectors.get(label), dtype=np.float32)
-            candidates = local_features.get(label)
-            if vectors.ndim != 2 or candidates is None:
-                raise OrientationClassifierError(
-                    f"template cache alignment error for {label}: missing vectors or local features"
-                )
-            if vectors.shape[0] == 0 or len(candidates) == 0:
-                raise OrientationClassifierError(
-                    f"template cache alignment error for {label}: at least one local template is required"
-                )
-            if vectors.shape[0] != len(candidates):
-                raise OrientationClassifierError(
-                    f"template cache alignment error for {label}: "
-                    f"{vectors.shape[0]} global vectors != {len(candidates)} local templates"
-                )
+            vectors = vectors_by_label[label]
             query = np.asarray(query_embeddings[label], dtype=np.float32)
             similarities = np.asarray(vectors @ query, dtype=np.float32).reshape(-1)
             rankings[label] = np.argsort(-similarities, kind="stable").tolist()
@@ -858,6 +886,7 @@ class OrientationClassifier:
     ) -> dict[str, object]:
         raw_globals = getattr(cache, "raw_global_vectors", None) or cache.global_vectors
         raw_locals = getattr(cache, "raw_local_features", None) or cache.local_features
+        self._validate_local_cache_alignment(raw_globals, raw_locals)
         global_started = time.perf_counter()
         query_embedding = self._global_embedding(image)
         global_prediction, global_scores, _ = classify_embedding(query_embedding, raw_globals)
@@ -927,19 +956,17 @@ class OrientationClassifier:
         reports: dict[str, Any] = {}
         raw_globals = getattr(cache, "raw_global_vectors", None) or cache.global_vectors
         raw_locals = getattr(cache, "raw_local_features", None) or cache.local_features
+        directions: dict[str, dict[str, Any] | None] = {}
+        fits: dict[str, dict[str, Any]] = {}
         for label in ("front", "back"):
             direction = self._geometry_direction(profile, label)
+            directions[label] = direction
             if direction is None or direction.get("anchor") is None or not direction.get("rules"):
-                local_started = time.perf_counter()
-                query_features[label] = self._extract_local(image)
-                timings["local_features"] += (time.perf_counter() - local_started) * 1000.0
-                global_started = time.perf_counter()
-                query_embeddings[label] = self._global_embedding(image)
-                timings["global_batch"] += (time.perf_counter() - global_started) * 1000.0
                 reports[label] = {"status": "not_configured"}
                 continue
             fit_started = time.perf_counter()
             fit = calibrator.fit(image, direction)
+            fits[label] = fit
             timings["fit_directions"] += (time.perf_counter() - fit_started) * 1000.0
             reports[label] = self._geometry_report(fit)
             if fit.get("status") != "active":
@@ -955,6 +982,21 @@ class OrientationClassifier:
                     raw_global_vectors=raw_globals,
                     raw_local_features=raw_locals,
                 ), started, geometry_mask, timings)
+
+        self._validate_local_cache_alignment(
+            cache.global_vectors, cache.local_features
+        )
+        for label in ("front", "back"):
+            direction = directions[label]
+            if direction is None or direction.get("anchor") is None or not direction.get("rules"):
+                local_started = time.perf_counter()
+                query_features[label] = self._extract_local(image)
+                timings["local_features"] += (time.perf_counter() - local_started) * 1000.0
+                global_started = time.perf_counter()
+                query_embeddings[label] = self._global_embedding(image)
+                timings["global_batch"] += (time.perf_counter() - global_started) * 1000.0
+                continue
+            fit = fits[label]
             mask = fit["ignore_mask"]
             fill = direction.get("fill_bgr") or self._neutral_fill(image, mask)
             mask_started = time.perf_counter()
@@ -997,12 +1039,27 @@ class OrientationClassifier:
         timings["fusion"] = (time.perf_counter() - fusion_started) * 1000.0
         return result
 
-    def predict(self, workpiece_id: str, image_path: Path) -> dict[str, object]:
+    def predict_with_cache(
+        self,
+        cache: TemplateCache,
+        image_path: Path,
+        *,
+        library_revision: int | None = None,
+    ) -> dict[str, object]:
+        """Predict exclusively from a caller-owned cache snapshot."""
         started = time.perf_counter()
+        image = _read_image(Path(image_path))
+        result = (
+            self._predict_geometry(image, cache, started)
+            if getattr(cache, "geometry_profile", None) is not None
+            else self._predict_baseline(image, cache, started)
+        )
+        if library_revision is not None:
+            result["library_revision"] = int(library_revision)
+        return result
+
+    def predict(self, workpiece_id: str, image_path: Path) -> dict[str, object]:
         cache = self._template_caches.get(workpiece_id)
         if cache is None:
             raise WorkpieceNotFoundError(f"Unknown workpiece: {workpiece_id}")
-        image = _read_image(Path(image_path))
-        if getattr(cache, "geometry_profile", None) is not None:
-            return self._predict_geometry(image, cache, started)
-        return self._predict_baseline(image, cache, started)
+        return self.predict_with_cache(cache, image_path)
