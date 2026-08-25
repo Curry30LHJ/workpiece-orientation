@@ -118,9 +118,88 @@ class WorkpieceCatalog:
             self._save_template_cache(record, cache)
             return record, cache
 
-    def list_workpieces(self):
+    @staticmethod
+    def _summary_from_snapshot(
+        record: WorkpieceRecord,
+        metadata: dict[str, Any],
+        detectable: bool,
+        geometry_profiles: Any | None,
+    ) -> dict[str, Any]:
+        geometry = geometry_profiles.snapshot(record.id) if geometry_profiles is not None else {}
+        active = geometry.get("active") if isinstance(geometry, dict) else None
+        rules = active.get("rules") if isinstance(active, dict) else None
+        return {
+            "id": record.id,
+            "name": record.name,
+            "revision": record.revision,
+            "template_counts": {
+                "front": len(record.front_images),
+                "back": len(record.back_images),
+            },
+            "updated_at": metadata.get("updated_at"),
+            "geometry_status": geometry.get("profile_status") or "not_configured"
+            if isinstance(geometry, dict) else "not_configured",
+            "geometry_rule_count": len(rules) if isinstance(rules, list) else 0,
+            "detectable": detectable,
+        }
+
+    def list_workpiece_summaries(self) -> list[dict[str, Any]]:
         with self._lock:
-            return self.library.list_workpieces()
+            geometry_profiles = self.geometry_profiles
+            captured = [
+                (
+                    record,
+                    self.library.get_workpiece_metadata(record.id),
+                    record.id in self._snapshots,
+                )
+                for item in self.library.list_workpieces()
+                for record in (self.library.get(item["id"]),)
+            ]
+        return [
+            self._summary_from_snapshot(record, metadata, detectable, geometry_profiles)
+            for record, metadata, detectable in captured
+        ]
+
+    def list_workpieces(self):
+        return self.list_workpiece_summaries()
+
+    def get_workpiece_details(self, workpiece_id: str) -> dict[str, Any]:
+        with self._lock:
+            record = self.library.get(workpiece_id)
+            metadata = self.library.get_workpiece_metadata(workpiece_id)
+            inventory = self.library.get_template_inventory(workpiece_id)
+            detectable = record.id in self._snapshots
+            geometry_profiles = self.geometry_profiles
+        summary = self._summary_from_snapshot(
+            record,
+            metadata,
+            detectable,
+            geometry_profiles,
+        )
+        template_paths = {
+            (direction, path.name): path.resolve()
+            for direction, paths in (("front", record.front_images), ("back", record.back_images))
+            for path in paths
+        }
+        templates = []
+        for item in inventory:
+            direction = item["direction"]
+            filename = item["filename"]
+            path = template_paths.get((direction, filename))
+            if path is None:
+                label_dir = "0" if direction == "front" else "1"
+                path = (record.root / label_dir / filename).resolve()
+            templates.append(
+                {
+                    "template_id": item["template_id"],
+                    "direction": direction,
+                    "preview_path": str(path),
+                    "source": item["source"],
+                    "added_at": item.get("added_at"),
+                    "readable": read_color_image(path) is not None,
+                }
+            )
+        return {**summary, "templates": templates}
 
     def get(self, workpiece_id: str) -> WorkpieceRecord:
         with self._lock:
@@ -478,6 +557,7 @@ class WorkpieceCatalog:
         *,
         operation_id: str | None = None,
         progress_callback=None,
+        source: str = "manual_append",
     ):
         base = self.capture_snapshot(workpiece_id)
         prepared = self.library.prepare_append(
@@ -487,6 +567,7 @@ class WorkpieceCatalog:
             self.classifier.build_template_cache,
             operation_id=operation_id or uuid.uuid4().hex,
             progress_callback=progress_callback,
+            source=source,
         )
         try:
             effective = self._prepare_effective_staged_cache(prepared)

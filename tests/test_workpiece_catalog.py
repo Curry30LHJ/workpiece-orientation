@@ -136,6 +136,14 @@ class SlowAppendClassifier(FakeClassifier):
         return super().build_template_cache(front, back, progress_callback)
 
 
+class SummaryGeometryProfiles:
+    def snapshot(self, workpiece_id):
+        return {
+            "profile_status": "ok",
+            "active": {"rules": [{"rule_id": "glare"}, {"rule_id": "intrusion"}]},
+        }
+
+
 def create_catalog(tmp_path):
     library = WorkpieceLibrary(tmp_path / "library")
     classifier = FakeClassifier()
@@ -144,6 +152,173 @@ def create_catalog(tmp_path):
     back = [image(tmp_path / "back.png", 20)]
     record, _ = catalog.register("M7", front, back, False)
     return catalog, classifier, record
+
+
+def create_catalog_with_counts(tmp_path, front_count, back_count):
+    classifier = FakeClassifier()
+    library = WorkpieceLibrary(tmp_path / "summary-library")
+    catalog = WorkpieceCatalog(library, classifier, SummaryGeometryProfiles())
+    front = [
+        image(tmp_path / f"summary-front-{i}.png", 10 + i)
+        for i in range(front_count)
+    ]
+    back = [
+        image(tmp_path / f"summary-back-{i}.png", 80 + i)
+        for i in range(back_count)
+    ]
+    record, _ = catalog.register("M-summary", front, back, False)
+    return catalog, classifier, record
+
+
+def test_workpiece_summary_reports_unequal_counts_and_rules(tmp_path):
+    catalog, _, record = create_catalog_with_counts(tmp_path, 1, 12)
+
+    summary = catalog.list_workpiece_summaries()[0]
+
+    assert summary["id"] == record.id
+    assert summary["template_counts"] == {"front": 1, "back": 12}
+    assert summary["geometry_rule_count"] == 2
+    assert summary["geometry_status"] == "ok"
+    assert summary["detectable"] is True
+
+
+def test_details_return_all_unequal_and_over_thirty_templates(tmp_path):
+    catalog, _, record = create_catalog_with_counts(tmp_path, 31, 1)
+
+    details = catalog.get_workpiece_details(record.id)
+    template_ids = [item["template_id"] for item in details["templates"]]
+
+    assert details["template_counts"] == {"front": 31, "back": 1}
+    assert len(template_ids) == 32
+    assert len(set(template_ids)) == 32
+    assert template_ids[0] == "front:00.png"
+    assert template_ids[-1] == "back:00.png"
+    assert all(Path(item["preview_path"]).is_absolute() for item in details["templates"])
+    assert all(item["readable"] is True for item in details["templates"])
+
+
+def test_legacy_details_are_derived_without_manifest_or_cache_mutation(tmp_path):
+    classifier = CachingFakeClassifier()
+    library = WorkpieceLibrary(tmp_path / "legacy-library")
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register(
+        "M-legacy",
+        [image(tmp_path / f"legacy-front-{index}.png", 10 + index) for index in range(5)],
+        [image(tmp_path / f"legacy-back-{index}.png", 30 + index) for index in range(5)],
+        False,
+    )
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("template_inventory")
+    manifest.pop("created_at")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    before = manifest_path.read_bytes()
+    before_mtime = manifest_path.stat().st_mtime_ns
+    build_calls = classifier.build_calls
+    save_calls = list(classifier.save_calls)
+
+    details = catalog.get_workpiece_details(record.id)
+
+    assert details["template_counts"] == {"front": 5, "back": 5}
+    assert len(details["templates"]) == 10
+    assert {item["source"] for item in details["templates"]} == {"initial_registration"}
+    assert {item["added_at"] for item in details["templates"]} == {None}
+    assert manifest_path.read_bytes() == before
+    assert manifest_path.stat().st_mtime_ns == before_mtime
+    assert classifier.build_calls == build_calls
+    assert classifier.save_calls == save_calls
+
+
+def test_summary_detectable_reflects_runtime_snapshot_presence(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "snapshot-library")
+    record, _ = library.register(
+        "M-snapshot",
+        [image(tmp_path / "snapshot-front.png", 10)],
+        [image(tmp_path / "snapshot-back.png", 20)],
+        False,
+        builder,
+    )
+    catalog = WorkpieceCatalog(library, FakeClassifier())
+
+    assert catalog.list_workpiece_summaries()[0]["detectable"] is False
+
+    catalog.recover()
+
+    assert catalog.list_workpiece_summaries()[0]["id"] == record.id
+    assert catalog.list_workpiece_summaries()[0]["detectable"] is True
+
+
+def test_details_keep_all_templates_and_mark_an_unreadable_preview(tmp_path):
+    catalog, _, record = create_catalog_with_counts(tmp_path, 2, 1)
+    record.front_images[1].write_bytes(b"corrupt")
+
+    details = catalog.get_workpiece_details(record.id)
+
+    assert len(details["templates"]) == 3
+    readable = {item["template_id"]: item["readable"] for item in details["templates"]}
+    assert readable == {
+        "front:00.png": True,
+        "front:01.png": False,
+        "back:00.png": True,
+    }
+
+
+def test_details_resolve_preview_paths_from_relative_library_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(Path("relative-library")), classifier)
+    record, _ = catalog.register(
+        "M-relative",
+        [image(tmp_path / "relative-front.png", 10)],
+        [image(tmp_path / "relative-back.png", 20)],
+        False,
+    )
+
+    details = catalog.get_workpiece_details(record.id)
+
+    assert all(Path(item["preview_path"]).is_absolute() for item in details["templates"])
+
+
+def test_append_forwards_source_and_details_switch_after_commit(tmp_path):
+    classifier = SlowAppendClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "append-details-library"), classifier)
+    record, _ = catalog.register(
+        "M-append-details",
+        [image(tmp_path / "append-details-front.png", 10)],
+        [image(tmp_path / "append-details-back.png", 20)],
+        False,
+    )
+    classifier.block_appends = True
+    result = []
+    errors = []
+
+    def append():
+        try:
+            result.append(catalog.append_templates(
+                record.id,
+                [image(tmp_path / "append-details-new.png", 30)],
+                [],
+                operation_id="append-details-1",
+                source="confirmed_inspection",
+            ))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=append)
+    worker.start()
+    assert classifier.build_started.wait(1.0)
+    old_details = catalog.get_workpiece_details(record.id)
+    try:
+        assert len(old_details["templates"]) == 2
+    finally:
+        classifier.release_build.set()
+        worker.join(timeout=2.0)
+
+    assert not errors
+    assert result
+    new_details = catalog.get_workpiece_details(record.id)
+    assert len(new_details["templates"]) == 3
+    assert new_details["templates"][-1]["source"] == "confirmed_inspection"
 
 
 def test_predict_releases_catalog_lock_before_classifier_runs(tmp_path):
@@ -335,7 +510,11 @@ def test_recycle_removes_prediction_and_restore_republishes_same_workpiece(tmp_p
     restored = catalog.restore(record.id, operation_id="restore-1")
 
     assert restored.id == record.id
-    assert catalog.list_workpieces() == [{"id": record.id, "name": "M7"}]
+    restored_summary = catalog.list_workpieces()[0]
+    assert {"id": restored_summary["id"], "name": restored_summary["name"]} == {
+        "id": record.id,
+        "name": "M7",
+    }
     assert record.id in classifier.caches
 
 
@@ -465,17 +644,30 @@ def test_prepare_template_masks_returns_unpublished_candidate_with_snapshot_stat
 
 def test_catalog_recover_uses_classifier_cache_before_rebuilding(tmp_path):
     initial_library = WorkpieceLibrary(tmp_path / "library")
-    front = [image(tmp_path / "front.png", 10)]
-    back = [image(tmp_path / "back.png", 20)]
+    front = [image(tmp_path / f"front-{index}.png", 10 + index) for index in range(5)]
+    back = [image(tmp_path / f"back-{index}.png", 20 + index) for index in range(5)]
     record, expected_cache = initial_library.register("M7", front, back, False, builder)
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("template_inventory")
+    manifest.pop("created_at")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    before = manifest_path.read_bytes()
+    before_mtime = manifest_path.stat().st_mtime_ns
     classifier = CachingFakeClassifier(preloaded=expected_cache)
     catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
 
     recovered = catalog.recover()
+    details = catalog.get_workpiece_details(record.id)
 
     assert [item.id for item, _ in recovered] == [record.id]
     assert classifier.load_calls == [record.id]
     assert classifier.build_calls == 0
+    assert classifier.save_calls == []
+    assert len(details["templates"]) == 10
+    assert {item["added_at"] for item in details["templates"]} == {None}
+    assert manifest_path.read_bytes() == before
+    assert manifest_path.stat().st_mtime_ns == before_mtime
 
 
 def test_recover_does_not_hold_catalog_lock_during_geometry_rebuild(tmp_path):

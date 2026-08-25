@@ -39,6 +39,46 @@ class FakeLibrary:
     def list_workpieces(self):
         return [] if self.recycled else [{"id": "m7", "name": "M7"}]
 
+    def get(self, workpiece_id):
+        if workpiece_id != "m7" or self.recycled:
+            raise KeyError(workpiece_id)
+        front = (Path("fake-front-00.png").resolve(),)
+        back = tuple(Path(f"fake-back-{index:02d}.png").resolve() for index in range(12))
+        return SimpleNamespace(
+            id="m7",
+            name="M7",
+            root=Path.cwd().resolve(),
+            front_images=front,
+            back_images=back,
+            revision=1,
+        )
+
+    def get_workpiece_metadata(self, workpiece_id):
+        self.get(workpiece_id)
+        return {"updated_at": "2026-08-25T00:00:00+00:00"}
+
+    def get_template_inventory(self, workpiece_id):
+        record = self.get(workpiece_id)
+        inventory = [{
+            "template_id": "front:00.png",
+            "direction": "front",
+            "filename": "fake-front-00.png",
+            "source": "initial_registration",
+            "added_at": "2026-08-25T00:00:00+00:00",
+            "preview_path": str(record.front_images[0]),
+            "readable": False,
+        }]
+        inventory.extend({
+            "template_id": f"back:{index:02d}.png",
+            "direction": "back",
+            "filename": f"fake-back-{index:02d}.png",
+            "source": "initial_registration",
+            "added_at": "2026-08-25T00:00:00+00:00",
+            "preview_path": str(record.back_images[index]),
+            "readable": False,
+        } for index in range(12))
+        return inventory
+
     def list_recycled(self):
         return list(self.recycled)
 
@@ -329,6 +369,31 @@ def test_partial_and_multiple_json_lines_are_decoded(client):
 
     assert client.read()["request_id"] == "1"
     assert client.read()["request_id"] == "2"
+
+
+def test_workpiece_list_and_details_are_additive(client):
+    listing = client.request("list_workpieces")
+    item = listing["workpieces"][0]
+
+    assert item["id"] == "m7"
+    assert item["name"] == "M7"
+    assert item["template_counts"] == {"front": 1, "back": 12}
+    details = client.request("get_workpiece_details", workpiece_id="m7")
+    assert details["ok"] is True
+    assert len(details["workpiece"]["templates"]) == 13
+
+
+def test_unknown_workpiece_details_return_stable_code(client):
+    response = client.request("get_workpiece_details", workpiece_id="missing")
+
+    assert response["error"]["code"] == "WORKPIECE_NOT_FOUND"
+
+
+@pytest.mark.parametrize("workpiece_id", [None, "", "   ", 7])
+def test_workpiece_details_reject_invalid_ids(client, workpiece_id):
+    response = client.request("get_workpiece_details", workpiece_id=workpiece_id)
+
+    assert response["error"]["code"] == "INVALID_REQUEST"
 
 
 def test_bad_json_does_not_stop_following_request(client):

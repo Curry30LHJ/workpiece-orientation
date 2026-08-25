@@ -208,6 +208,46 @@ class WorkpieceLibrary:
                 on_image(index + 1, len(paths))
         return tuple(copied)
 
+    @staticmethod
+    def _inventory_entries(
+        front_images: Sequence[Path],
+        back_images: Sequence[Path],
+        *,
+        source: str,
+        added_at: str | None,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "template_id": f"{direction}:{path.name}",
+                "direction": direction,
+                "filename": path.name,
+                "source": source,
+                "added_at": added_at,
+            }
+            for direction, paths in (("front", front_images), ("back", back_images))
+            for path in paths
+        ]
+
+    @staticmethod
+    def _copy_appended_templates(
+        paths: Sequence[Path],
+        target: Path,
+        *,
+        start_index: int,
+    ) -> tuple[Path, ...]:
+        copied: list[Path] = []
+        candidate_index = start_index
+        for source in paths:
+            while True:
+                width = max(2, len(str(candidate_index)))
+                destination = target / f"{candidate_index:0{width}d}{source.suffix.lower()}"
+                candidate_index += 1
+                if not destination.exists():
+                    break
+            shutil.copy2(source, destination)
+            copied.append(destination)
+        return tuple(copied)
+
     def register(
         self,
         name: str,
@@ -301,13 +341,20 @@ class WorkpieceLibrary:
                     }
                 ),
             )
+            created_at = datetime.now(timezone.utc).isoformat()
             manifest = {
                 "schema_version": 1,
                 "id": new_id,
                 "name": display_name,
                 "labels": {"0": "front", "1": "back"},
                 "template_counts": {"front": len(front), "back": len(back)},
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": created_at,
+                "template_inventory": self._inventory_entries(
+                    staged_front,
+                    staged_back,
+                    source="initial_registration",
+                    added_at=created_at,
+                ),
                 "revision": 1,
                 "state": "active",
             }
@@ -359,6 +406,7 @@ class WorkpieceLibrary:
         *,
         operation_id: str,
         progress_callback: ProgressCallback | None = None,
+        source: str = "manual_append",
     ) -> PreparedTemplateUpdate:
         """Build a complete append candidate without mutating the active record."""
         if not isinstance(operation_id, str) or not operation_id:
@@ -405,16 +453,28 @@ class WorkpieceLibrary:
             _image_fingerprint(read_color_image(path))
             for path in (*new_front, *new_back)
         )
+        old_inventory = self.get_template_inventory(base_record.id)
         staging = self.library_dir / f".staging-{uuid.uuid4().hex}"
         try:
             report({"phase": "copying", "completed": 0, "total": total})
             shutil.copytree(base_record.root, staging)
-            shutil.rmtree(staging / "0")
-            shutil.rmtree(staging / "1")
             (staging / TEMPLATE_CACHE_FILE_NAME).unlink(missing_ok=True)
-            staged_front = self._copy_templates(all_front, staging / "0")
-            staged_back = self._copy_templates(all_back, staging / "1")
+            staged_existing_front = tuple(staging / "0" / path.name for path in base_record.front_images)
+            staged_existing_back = tuple(staging / "1" / path.name for path in base_record.back_images)
+            staged_new_front = self._copy_appended_templates(
+                new_front,
+                staging / "0",
+                start_index=len(base_record.front_images),
+            )
+            staged_new_back = self._copy_appended_templates(
+                new_back,
+                staging / "1",
+                start_index=len(base_record.back_images),
+            )
+            staged_front = staged_existing_front + staged_new_front
+            staged_back = staged_existing_back + staged_new_back
             manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
+            updated_at = datetime.now(timezone.utc).isoformat()
             manifest.update(
                 {
                     "schema_version": max(3, int(manifest.get("schema_version", 1))),
@@ -424,7 +484,13 @@ class WorkpieceLibrary:
                     "template_counts": {"front": len(all_front), "back": len(all_back)},
                     "revision": base_record.revision + 1,
                     "state": "active",
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": updated_at,
+                    "template_inventory": old_inventory + self._inventory_entries(
+                        staged_new_front,
+                        staged_new_back,
+                        source=source,
+                        added_at=updated_at,
+                    ),
                     "last_template_update": {
                         "operation_id": operation_id,
                         "base_revision": base_record.revision,
@@ -539,6 +605,7 @@ class WorkpieceLibrary:
         *,
         operation_id: str | None = None,
         progress_callback: ProgressCallback | None = None,
+        source: str = "manual_append",
     ) -> tuple[WorkpieceRecord, TemplateCache]:
         """Compatibility wrapper around prepare, commit, and retired cleanup."""
         prepared = self.prepare_append(
@@ -548,6 +615,7 @@ class WorkpieceLibrary:
             build_cache,
             operation_id=operation_id or uuid.uuid4().hex,
             progress_callback=progress_callback,
+            source=source,
         )
         try:
             record, retired = self.commit_prepared(prepared)
@@ -628,6 +696,24 @@ class WorkpieceLibrary:
             {"id": record.id, "name": record.name}
             for record in sorted(self._records.values(), key=lambda item: item.name.casefold())
         ]
+
+    def get_workpiece_metadata(self, workpiece_id: str) -> dict[str, Any]:
+        record = self._records[workpiece_id]
+        manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
+        return {"updated_at": manifest.get("updated_at") or manifest.get("created_at")}
+
+    def get_template_inventory(self, workpiece_id: str) -> list[dict[str, Any]]:
+        record = self._records[workpiece_id]
+        manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
+        inventory = manifest.get("template_inventory")
+        if isinstance(inventory, list):
+            return deepcopy(inventory)
+        return self._inventory_entries(
+            record.front_images,
+            record.back_images,
+            source="initial_registration",
+            added_at=manifest.get("created_at"),
+        )
 
     def get(self, workpiece_id: str) -> WorkpieceRecord:
         return self._records[workpiece_id]

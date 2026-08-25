@@ -309,7 +309,23 @@ class OrientationCommandDispatcher:
                 if runtime.status != "ready":
                     return self._runtime_error(request_id, runtime)
                 catalog = runtime.catalog or WorkpieceCatalog(runtime.library, runtime.classifier)
-                return self._response(request_id, ok=True, workpieces=catalog.list_workpieces())
+                return self._response(request_id, ok=True, workpieces=catalog.list_workpiece_summaries())
+            if command == "get_workpiece_details":
+                if runtime.status != "ready":
+                    return self._runtime_error(request_id, runtime)
+                workpiece_id = request.get("workpiece_id")
+                if not isinstance(workpiece_id, str) or not workpiece_id.strip():
+                    return self._error(
+                        request_id,
+                        "INVALID_REQUEST",
+                        "workpiece_id must be a non-empty string",
+                    )
+                catalog = runtime.catalog or WorkpieceCatalog(runtime.library, runtime.classifier)
+                return self._response(
+                    request_id,
+                    ok=True,
+                    workpiece=catalog.get_workpiece_details(workpiece_id),
+                )
             if command == "list_recycled_workpieces":
                 if runtime.status != "ready":
                     return self._runtime_error(request_id, runtime)

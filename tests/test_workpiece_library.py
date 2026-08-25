@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+from datetime import datetime
 from pathlib import Path
 import shutil
 
@@ -155,6 +156,188 @@ def test_register_creates_uuid_manifest_and_label_folders(tmp_path: Path):
     assert manifest["template_counts"] == {"front": 5, "back": 5}
     assert len(list((record.root / "0").glob("*"))) == 5
     assert len(list((record.root / "1").glob("*"))) == 5
+
+
+def test_register_writes_inventory_for_every_copied_template(tmp_path: Path):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, _ = library.register(
+        "M7",
+        image_set(tmp_path, "front-inventory", 10, 2),
+        image_set(tmp_path, "back-inventory", 20, 3),
+        False,
+        fake_builder,
+    )
+
+    manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
+    inventory = manifest["template_inventory"]
+
+    assert [(item["template_id"], item["direction"], item["filename"]) for item in inventory] == [
+        ("front:00.png", "front", "00.png"),
+        ("front:01.png", "front", "01.png"),
+        ("back:00.png", "back", "00.png"),
+        ("back:01.png", "back", "01.png"),
+        ("back:02.png", "back", "02.png"),
+    ]
+    assert {item["source"] for item in inventory} == {"initial_registration"}
+    assert {item["added_at"] for item in inventory} == {manifest["created_at"]}
+
+
+def test_prepare_append_preserves_inventory_and_adds_confirmed_templates(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    original_inventory = json.loads(manifest_path.read_text(encoding="utf-8"))["template_inventory"]
+    original_manifest = manifest_path.read_bytes()
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "confirmed-front.png", 31)],
+        [write_image(tmp_path / "confirmed-back.png", 41)],
+        fake_builder,
+        operation_id="confirmed-1",
+        source="confirmed_inspection",
+    )
+    try:
+        staged_manifest = json.loads(
+            (prepared.staging_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        staged_inventory = staged_manifest["template_inventory"]
+
+        assert manifest_path.read_bytes() == original_manifest
+        assert staged_inventory[:4] == original_inventory
+        assert [(item["template_id"], item["source"]) for item in staged_inventory[4:]] == [
+            ("front:02.png", "confirmed_inspection"),
+            ("back:02.png", "confirmed_inspection"),
+        ]
+        for item in staged_inventory[4:]:
+            added_at = datetime.fromisoformat(item["added_at"])
+            assert added_at.utcoffset() is not None
+            assert added_at.utcoffset().total_seconds() == 0
+
+        assert library.get_template_inventory(record.id) == original_inventory
+        committed, retired = library.commit_prepared(prepared)
+        assert library.get_template_inventory(committed.id) == staged_inventory
+        library.remove_retired(retired)
+    finally:
+        library.abort_prepared(prepared)
+
+
+def test_append_across_filename_width_keeps_existing_inventory_stable(tmp_path: Path):
+    library = WorkpieceLibrary(tmp_path / "wide-library")
+    record, _ = library.register(
+        "M-wide",
+        image_set(tmp_path, "wide-front", 1, 100),
+        [write_image(tmp_path / "wide-back.png", 200)],
+        False,
+        fake_builder,
+    )
+    original_inventory = library.get_template_inventory(record.id)
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "wide-front-new.png", 201)],
+        [],
+        fake_builder,
+        operation_id="wide-append-1",
+    )
+    committed, retired = library.commit_prepared(prepared)
+    library.remove_retired(retired)
+    inventory = library.get_template_inventory(committed.id)
+
+    assert inventory[:101] == original_inventory
+    assert inventory[-1]["template_id"] == "front:100.png"
+    assert len({item["template_id"] for item in inventory}) == 102
+    for item in inventory:
+        label_dir = "0" if item["direction"] == "front" else "1"
+        template_path = committed.root / label_dir / item["filename"]
+        assert template_path.is_file()
+        assert cv2.imread(str(template_path)) is not None
+
+
+def test_aborted_prepared_append_leaves_active_manifest_unchanged(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    before = manifest_path.read_bytes()
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "aborted-front.png", 34)],
+        [],
+        fake_builder,
+        operation_id="aborted-1",
+    )
+
+    library.abort_prepared(prepared)
+
+    assert manifest_path.read_bytes() == before
+
+
+def test_failed_prepared_append_leaves_active_manifest_unchanged(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    before = manifest_path.read_bytes()
+
+    def raising_builder(front, back, progress_callback=None):
+        raise FeatureBuildError("feature extraction failed")
+
+    with pytest.raises(FeatureBuildError):
+        library.prepare_append(
+            record,
+            [write_image(tmp_path / "failed-inventory-front.png", 35)],
+            [],
+            raising_builder,
+            operation_id="failed-inventory-1",
+        )
+
+    assert manifest_path.read_bytes() == before
+
+
+def test_replace_registration_builds_fresh_inventory_for_replacement_only(tmp_path: Path):
+    library, old = _registered_library(tmp_path)
+
+    replacement, _ = library.register(
+        "M7",
+        [write_image(tmp_path / "replacement-front.png", 50)],
+        image_set(tmp_path, "replacement-back", 60, 3),
+        True,
+        fake_builder,
+    )
+
+    inventory = library.get_template_inventory(replacement.id)
+    assert replacement.id != old.id
+    assert [item["template_id"] for item in inventory] == [
+        "front:00.png",
+        "back:00.png",
+        "back:01.png",
+        "back:02.png",
+    ]
+    assert {item["source"] for item in inventory} == {"initial_registration"}
+    assert old.id not in {item["id"] for item in library.list_workpieces()}
+
+
+def test_workpiece_metadata_uses_created_append_and_legacy_timestamps(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    created_at = json.loads(manifest_path.read_text(encoding="utf-8"))["created_at"]
+
+    assert library.get_workpiece_metadata(record.id)["updated_at"] == created_at
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "metadata-front.png", 36)],
+        [],
+        fake_builder,
+        operation_id="metadata-append-1",
+    )
+    committed, retired = library.commit_prepared(prepared)
+    library.remove_retired(retired)
+    appended_at = json.loads(manifest_path.read_text(encoding="utf-8"))["updated_at"]
+    assert appended_at != created_at
+    assert library.get_workpiece_metadata(committed.id)["updated_at"] == appended_at
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("created_at")
+    manifest.pop("updated_at")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert library.get_workpiece_metadata(committed.id)["updated_at"] is None
 
 
 def test_register_accepts_unicode_source_paths(tmp_path: Path):
