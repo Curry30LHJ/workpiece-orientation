@@ -177,5 +177,6 @@ QStringList BackendProcessManager::backendArguments() const {
         QStringLiteral("--project-root"), config_.projectRoot,
         QStringLiteral("--model-dir"), config_.modelDir,
         QStringLiteral("--library-dir"), config_.libraryDir,
+        QStringLiteral("--local-search-mode"), config_.localSearchMode,
     };
 }

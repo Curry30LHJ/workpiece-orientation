@@ -71,6 +71,40 @@ private slots:
         QCOMPARE(config->startupTimeoutMs, 120000);
         QCOMPARE(config->requestTimeoutMs, 120000);
         QCOMPARE(config->libraryDir, temporary.filePath(QStringLiteral("运行库")));
+        QCOMPARE(config->localSearchMode, QStringLiteral("adaptive"));
+    }
+
+    void acceptsLocalSearchModes_data() {
+        QTest::addColumn<QString>("mode");
+        QTest::newRow("adaptive") << QStringLiteral("adaptive");
+        QTest::newRow("exhaustive") << QStringLiteral("exhaustive");
+    }
+
+    void acceptsLocalSearchModes() {
+        QFETCH(QString, mode);
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        QJsonObject object = validConfig(temporary);
+        object[QStringLiteral("local_search_mode")] = mode;
+        QString error;
+
+        const auto config = AppConfig::load(writeConfig(temporary, object), &error);
+
+        QVERIFY2(config.has_value(), qPrintable(error));
+        QCOMPARE(config->localSearchMode, mode);
+    }
+
+    void rejectsUnknownLocalSearchMode() {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        QJsonObject object = validConfig(temporary);
+        object[QStringLiteral("local_search_mode")] = QStringLiteral("fast");
+        QString error;
+
+        const auto config = AppConfig::load(writeConfig(temporary, object), &error);
+
+        QVERIFY(!config.has_value());
+        QVERIFY(error.contains(QStringLiteral("local_search_mode")));
     }
 
     void rejectsOutOfRangePort() {

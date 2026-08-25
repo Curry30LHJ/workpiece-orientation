@@ -151,7 +151,9 @@ private slots:
         HandshakeServer server;
         BackendClient client;
         FakeProcessLauncher launcher;
-        BackendProcessManager manager(configFor(port, 1000), &client, &launcher);
+        AppConfig config = configFor(port, 1000);
+        config.localSearchMode = QStringLiteral("exhaustive");
+        BackendProcessManager manager(config, &client, &launcher);
         QSignalSpy readySpy(&manager, &BackendProcessManager::backendReady);
         QObject::connect(&launcher, &FakeProcessLauncher::startRequested, &server, [&]() {
             QVERIFY(server.listen(port));
@@ -161,6 +163,14 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(launcher.startCalls, 1, 1000);
         QCOMPARE(launcher.lastArguments.first(), QStringLiteral("service.py"));
+        const int modeIndex = launcher.lastArguments.indexOf(
+            QStringLiteral("--local-search-mode")
+        );
+        QVERIFY(modeIndex >= 0);
+        QCOMPARE(
+            launcher.lastArguments.value(modeIndex + 1),
+            QStringLiteral("exhaustive")
+        );
         QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1500);
         QVERIFY(manager.ownedByThisSession());
     }
