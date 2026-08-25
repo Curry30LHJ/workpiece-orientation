@@ -13,11 +13,11 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMessageBox>
-#include <QPixmap>
 #include <QPushButton>
 #include <QSet>
 #include <QTableWidget>
 #include <QTableWidgetItem>
+#include <QTextEdit>
 #include <QTimer>
 #include <QUuid>
 
@@ -26,6 +26,8 @@
 #include "annotationeditor.h"
 #include "annotationmanager.h"
 #include "geometrymaskmanager.h"
+#include "inspectionpage.h"
+#include "inspectiontypes.h"
 #include "taskstatuswidget.h"
 
 namespace {
@@ -64,6 +66,34 @@ MainWindow::~MainWindow() {
 void MainWindow::initializeUi() {
     appHeader_ = new AppHeader(ui->centralwidget);
     ui->appHeaderHostLayout->addWidget(appHeader_);
+    inspectionPage_ = new InspectionPage(ui->inspectionPageHost);
+    ui->inspectionPageHostLayout->addWidget(inspectionPage_);
+    chooseImageButton_ = inspectionPage_->findChild<QPushButton *>(
+        QStringLiteral("chooseImageButton"));
+    predictButton_ = inspectionPage_->findChild<QPushButton *>(
+        QStringLiteral("predictButton"));
+    chooseBatchImagesButton_ = inspectionPage_->findChild<QPushButton *>(
+        QStringLiteral("chooseBatchImagesButton"));
+    batchPredictButton_ = inspectionPage_->findChild<QPushButton *>(
+        QStringLiteral("batchPredictButton"));
+    confirmFrontButton_ = inspectionPage_->findChild<QPushButton *>(
+        QStringLiteral("confirmFrontButton"));
+    confirmBackButton_ = inspectionPage_->findChild<QPushButton *>(
+        QStringLiteral("confirmBackButton"));
+    rejectConfirmationButton_ = inspectionPage_->findChild<QPushButton *>(
+        QStringLiteral("rejectConfirmationButton"));
+    currentImageLabel_ = inspectionPage_->findChild<QLabel *>(
+        QStringLiteral("currentImageLabel"));
+    resultLabel_ = inspectionPage_->findChild<QLabel *>(QStringLiteral("resultLabel"));
+    reviewLabel_ = inspectionPage_->findChild<QLabel *>(QStringLiteral("reviewLabel"));
+    batchSummaryLabel_ = inspectionPage_->findChild<QLabel *>(
+        QStringLiteral("batchSummaryLabel"));
+    currentResultTargetLabel_ = inspectionPage_->findChild<QLabel *>(
+        QStringLiteral("currentResultTargetLabel"));
+    evidenceTextEdit_ = inspectionPage_->findChild<QTextEdit *>(
+        QStringLiteral("evidenceTextEdit"));
+    batchResultsTableWidget_ = inspectionPage_->findChild<QTableWidget *>(
+        QStringLiteral("batchResultsTableWidget"));
     globalTaskStatus_ = new TaskStatusWidget(ui->centralwidget);
     ui->taskStatusHostLayout->addWidget(globalTaskStatus_);
     ui->mainPageStack->setCurrentIndex(static_cast<int>(AppPage::Inspection));
@@ -78,30 +108,21 @@ void MainWindow::initializeUi() {
     deleteWorkpieceButton_ = new QPushButton(QStringLiteral("删除工件"), ui->libraryGroupBox);
     deleteWorkpieceButton_->setObjectName(QStringLiteral("deleteWorkpieceButton"));
     ui->libraryLayout->addWidget(deleteWorkpieceButton_, 0, 3);
-    confirmFrontButton_ = new QPushButton(QStringLiteral("确认正面并入库"), ui->resultGroupBox);
-    confirmFrontButton_->setObjectName(QStringLiteral("confirmFrontButton"));
-    confirmBackButton_ = new QPushButton(QStringLiteral("确认反面并入库"), ui->resultGroupBox);
-    confirmBackButton_->setObjectName(QStringLiteral("confirmBackButton"));
-    rejectConfirmationButton_ = new QPushButton(QStringLiteral("不入库"), ui->resultGroupBox);
-    rejectConfirmationButton_->setObjectName(QStringLiteral("rejectConfirmationButton"));
     annotationEditorButton_ = new QPushButton(QStringLiteral("管理几何干扰规则"), ui->libraryGroupBox);
     annotationEditorButton_->setObjectName(QStringLiteral("annotationEditorButton"));
     ui->libraryLayout->addWidget(annotationEditorButton_, 8, 0, 1, 3);
-    ui->resultLayout->addWidget(confirmFrontButton_);
-    ui->resultLayout->addWidget(confirmBackButton_);
-    ui->resultLayout->addWidget(rejectConfirmationButton_);
     ui->registerButton->setEnabled(false);
-    ui->predictButton->setEnabled(false);
+    predictButton_->setEnabled(false);
     ui->refreshWorkpiecesButton->setEnabled(false);
     ui->chooseFrontTemplatesButton->setEnabled(false);
     ui->chooseBackTemplatesButton->setEnabled(false);
-    ui->chooseImageButton->setEnabled(false);
-    ui->chooseBatchImagesButton->setEnabled(false);
-    ui->batchPredictButton->setEnabled(false);
-    ui->resultLabel->setText(QStringLiteral("尚未检测"));
-    ui->reviewLabel->clear();
-    ui->batchSummaryLabel->clear();
-    ui->evidenceTextEdit->clear();
+    chooseImageButton_->setEnabled(false);
+    chooseBatchImagesButton_->setEnabled(false);
+    batchPredictButton_->setEnabled(false);
+    resultLabel_->setText(QStringLiteral("尚未检测"));
+    reviewLabel_->clear();
+    batchSummaryLabel_->clear();
+    evidenceTextEdit_->clear();
     ui->libraryMessageLabel->clear();
     ui->templateWarningLabel->clear();
     ui->registrationProgressLabel->setText(QStringLiteral("建库进度：未开始"));
@@ -118,19 +139,19 @@ void MainWindow::initializeUi() {
     geometryPollTimer_ = new QTimer(this);
     geometryPollTimer_->setInterval(1000);
     connect(geometryPollTimer_, &QTimer::timeout, this, &MainWindow::pollGeometryValidation);
-    ui->batchResultsTableWidget->setColumnCount(5);
-    ui->batchResultsTableWidget->setHorizontalHeaderLabels({
+    batchResultsTableWidget_->setColumnCount(5);
+    batchResultsTableWidget_->setHorizontalHeaderLabels({
         QStringLiteral("文件"), QStringLiteral("结果"), QStringLiteral("复检"),
         QStringLiteral("耗时（毫秒）"), QStringLiteral("处理状态")});
-    ui->batchResultsTableWidget->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    ui->batchResultsTableWidget->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    ui->batchResultsTableWidget->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    ui->batchResultsTableWidget->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    ui->batchResultsTableWidget->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
-    ui->batchResultsTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    ui->batchResultsTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
-    ui->batchResultsTableWidget->setSelectionMode(QAbstractItemView::SingleSelection);
-    connect(ui->batchResultsTableWidget, &QTableWidget::currentCellChanged,
+    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    batchResultsTableWidget_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    batchResultsTableWidget_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    batchResultsTableWidget_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    batchResultsTableWidget_->setSelectionMode(QAbstractItemView::SingleSelection);
+    connect(batchResultsTableWidget_, &QTableWidget::currentCellChanged,
             this, [this](int row, int, int, int) {
                 if (!changingBatchSelection_) {
                     selectBatchResult(row, true);
@@ -143,18 +164,25 @@ void MainWindow::initializeUi() {
             this, &MainWindow::chooseFrontTemplates);
     connect(ui->chooseBackTemplatesButton, &QPushButton::clicked,
             this, &MainWindow::chooseBackTemplates);
-    connect(ui->chooseImageButton, &QPushButton::clicked,
+    connect(chooseImageButton_, &QPushButton::clicked,
             this, &MainWindow::chooseInspectionImage);
-    connect(ui->chooseBatchImagesButton, &QPushButton::clicked,
+    connect(chooseBatchImagesButton_, &QPushButton::clicked,
             this, &MainWindow::chooseBatchImages);
     connect(ui->refreshWorkpiecesButton, &QPushButton::clicked,
             this, &MainWindow::refreshWorkpieces);
     connect(ui->registerButton, &QPushButton::clicked,
             this, &MainWindow::submitRegistration);
-    connect(ui->predictButton, &QPushButton::clicked,
-            this, &MainWindow::submitPrediction);
-    connect(ui->batchPredictButton, &QPushButton::clicked,
+    connect(batchPredictButton_, &QPushButton::clicked,
             this, &MainWindow::submitBatchPrediction);
+    connect(inspectionPage_, &InspectionPage::commandRequested,
+            this, [this](const QString &command, const QJsonObject &fields) {
+                sendPageCommand(CommandOwner::Inspection, command, fields);
+            });
+    connect(inspectionPage_, &InspectionPage::confirmationRequested,
+            this, [this](const QString &, const QString &workpieceId,
+                         const QString &imagePath, const QString &orientation) {
+                submitTemplateConfirmation(workpieceId, imagePath, orientation);
+            });
     connect(appHeader_, &AppHeader::pageRequested,
             this, [this](AppPage page) { requestPage(page); });
     connect(appHeader_, &AppHeader::restartBackendRequested,
@@ -165,6 +193,8 @@ void MainWindow::initializeUi() {
             annotationManagerDialog_.clear();
             annotationWorkpieceId_.clear();
         }
+        inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
+                                             appHeader_->currentWorkpieceName());
         if (resultContext_ != ResultContext::Batch) {
             lastPredictionWorkpieceId_.clear();
             lastPredictionImagePath_.clear();
@@ -174,12 +204,15 @@ void MainWindow::initializeUi() {
     });
     connect(deleteWorkpieceButton_, &QPushButton::clicked,
             this, &MainWindow::deleteSelectedWorkpiece);
-    connect(confirmFrontButton_, &QPushButton::clicked,
-            this, &MainWindow::confirmFrontTemplate);
-    connect(confirmBackButton_, &QPushButton::clicked,
-            this, &MainWindow::confirmBackTemplate);
-    connect(rejectConfirmationButton_, &QPushButton::clicked,
-            this, &MainWindow::rejectTemplateConfirmation);
+    connect(confirmFrontButton_, &QPushButton::clicked, this, [this]() {
+        if (inspectionPage_->mode() == InspectionMode::Batch) confirmFrontTemplate();
+    });
+    connect(confirmBackButton_, &QPushButton::clicked, this, [this]() {
+        if (inspectionPage_->mode() == InspectionMode::Batch) confirmBackTemplate();
+    });
+    connect(rejectConfirmationButton_, &QPushButton::clicked, this, [this]() {
+        if (inspectionPage_->mode() == InspectionMode::Batch) rejectTemplateConfirmation();
+    });
     connect(annotationEditorButton_, &QPushButton::clicked,
             this, &MainWindow::openAnnotationManager);
     confirmFrontButton_->setEnabled(false);
@@ -233,6 +266,19 @@ void MainWindow::connectBackendSignals() {
     }
 }
 
+void MainWindow::sendPageCommand(CommandOwner owner, const QString &command,
+                                 const QJsonObject &fields) {
+    if (client_ == nullptr || command.isEmpty()) return;
+    pendingOwner_ = owner;
+    pendingCommand_ = command;
+    client_->sendRequest(command, fields);
+}
+
+void MainWindow::clearPendingCommand() {
+    pendingOwner_ = CommandOwner::None;
+    pendingCommand_.clear();
+}
+
 void MainWindow::setTemplatePaths(const QStringList &frontPaths, const QStringList &backPaths) {
     frontTemplatePaths_ = normalizedPaths(frontPaths);
     backTemplatePaths_ = normalizedPaths(backPaths);
@@ -247,14 +293,12 @@ void MainWindow::setWorkpieceName(const QString &name) {
 
 void MainWindow::setInspectionImagePath(const QString &path) {
     inspectionImagePath_ = QFileInfo(path).absoluteFilePath();
+    inspectionPage_->setMode(InspectionMode::Single);
+    inspectionPage_->setSingleImagePath(inspectionImagePath_);
     resultContext_ = ResultContext::None;
     lastPredictionImagePath_.clear();
     lastPredictionWorkpieceId_.clear();
     lastPredictionResponse_ = QJsonObject();
-    ui->currentImageLabel->setText(
-        QStringLiteral("当前图片：%1（单图）").arg(QFileInfo(inspectionImagePath_).fileName()));
-    ui->currentResultTargetLabel->clear();
-    updatePreview();
     updateButtonStates();
 }
 
@@ -266,7 +310,8 @@ void MainWindow::setBatchImagePaths(const QStringList &paths) {
     lastPredictionWorkpieceId_.clear();
     lastPredictionResponse_ = QJsonObject();
     clearBatchResults();
-    ui->chooseBatchImagesButton->setText(batchImagePaths_.isEmpty()
+    inspectionPage_->setMode(InspectionMode::Batch);
+    chooseBatchImagesButton_->setText(batchImagePaths_.isEmpty()
                                              ? QStringLiteral("选择批量图片")
                                              : QStringLiteral("选择批量图片（%1）").arg(batchImagePaths_.size()));
     updateButtonStates();
@@ -338,8 +383,7 @@ void MainWindow::requestWorkpieceRefresh(bool preserveRegistrationSummary) {
     if (!preserveRegistrationSummary) {
         registrationSummaryVisible_ = false;
     }
-    pendingCommand_ = QStringLiteral("list_workpieces");
-    client_->sendRequest(QStringLiteral("list_workpieces"));
+    sendPageCommand(CommandOwner::System, QStringLiteral("list_workpieces"), QJsonObject());
     if (!preserveRegistrationSummary) {
         showLibraryMessage(QStringLiteral("正在刷新工件列表…"));
     }
@@ -365,30 +409,7 @@ void MainWindow::submitRegistration() {
 }
 
 void MainWindow::submitPrediction() {
-    if (client_ == nullptr || !backendReady_ || clientBusy_
-        || client_->state() != BackendClient::State::Ready) {
-        return;
-    }
-    const QString workpieceId = selectedWorkpieceId();
-    if (workpieceId.isEmpty()) {
-        ui->resultLabel->setText(QStringLiteral("请先选择工件"));
-        return;
-    }
-    QString error;
-    if (!validateImagePath(inspectionImagePath_, &error)) {
-        ui->resultLabel->setText(error);
-        return;
-    }
-    pendingPredictionWorkpieceId_ = workpieceId;
-    pendingPredictionImagePath_ = inspectionImagePath_;
-    pendingCommand_ = QStringLiteral("predict");
-    client_->sendRequest(QStringLiteral("predict"), {
-        {QStringLiteral("workpiece_id"), workpieceId},
-        {QStringLiteral("image_path"), inspectionImagePath_},
-    });
-    ui->resultLabel->setText(QStringLiteral("正在检测…"));
-    ui->reviewLabel->clear();
-    ui->evidenceTextEdit->clear();
+    if (predictButton_ != nullptr) predictButton_->click();
 }
 
 void MainWindow::submitBatchPrediction() {
@@ -398,17 +419,17 @@ void MainWindow::submitBatchPrediction() {
     }
     const QString workpieceId = selectedWorkpieceId();
     if (workpieceId.isEmpty()) {
-        ui->batchSummaryLabel->setText(QStringLiteral("请先选择工件"));
+        batchSummaryLabel_->setText(QStringLiteral("请先选择工件"));
         return;
     }
     if (batchImagePaths_.isEmpty()) {
-        ui->batchSummaryLabel->setText(QStringLiteral("请先选择批量图片"));
+        batchSummaryLabel_->setText(QStringLiteral("请先选择批量图片"));
         return;
     }
     for (const QString &path : batchImagePaths_) {
         QString error;
         if (!validateImagePath(path, &error)) {
-            ui->batchSummaryLabel->setText(QStringLiteral("批量检测无法开始：%1").arg(error));
+            batchSummaryLabel_->setText(QStringLiteral("批量检测无法开始：%1").arg(error));
             return;
         }
     }
@@ -418,9 +439,10 @@ void MainWindow::submitBatchPrediction() {
     clearBatchResults();
     batchSelectionPinned_ = false;
     batchCompletedSuccessfully_ = false;
-    ui->resultLabel->setText(QStringLiteral("批量检测进行中…"));
-    ui->reviewLabel->clear();
-    ui->evidenceTextEdit->clear();
+    inspectionPage_->setMode(InspectionMode::Batch);
+    resultLabel_->setText(QStringLiteral("批量检测进行中…"));
+    reviewLabel_->clear();
+    evidenceTextEdit_->clear();
     sendNextBatchPrediction();
 }
 
@@ -437,8 +459,7 @@ void MainWindow::deleteSelectedWorkpiece() {
     if (!confirmed) {
         return;
     }
-    pendingCommand_ = QStringLiteral("recycle_workpiece");
-    client_->sendRequest(QStringLiteral("recycle_workpiece"), {
+    sendPageCommand(CommandOwner::Library, QStringLiteral("recycle_workpiece"), {
         {QStringLiteral("workpiece_id"), workpieceId},
         {QStringLiteral("operation_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
     });
@@ -468,10 +489,10 @@ void MainWindow::rejectTemplateConfirmation() {
         if (nextIndex >= 0) {
             selectBatchResult(nextIndex, false);
         } else {
-            ui->currentResultTargetLabel->setText(
+            currentResultTargetLabel_->setText(
                 QStringLiteral("当前：%1（不入库）").arg(QFileInfo(result.imagePath).fileName()));
         }
-        ui->reviewLabel->setText(QStringLiteral("本次结果不入库"));
+        reviewLabel_->setText(QStringLiteral("本次结果不入库"));
         updateButtonStates();
         return;
     }
@@ -481,7 +502,7 @@ void MainWindow::rejectTemplateConfirmation() {
     confirmFrontButton_->setEnabled(false);
     confirmBackButton_->setEnabled(false);
     rejectConfirmationButton_->setEnabled(false);
-    ui->reviewLabel->setText(QStringLiteral("本次结果不入库"));
+    reviewLabel_->setText(QStringLiteral("本次结果不入库"));
 }
 
 void MainWindow::openAnnotationEditor() {
@@ -541,8 +562,7 @@ void MainWindow::requestGeometryProfile(const QString &workpieceId) {
         return;
     }
     geometryWorkpieceId_ = workpieceId;
-    pendingCommand_ = QStringLiteral("get_geometry_mask_profile");
-    client_->sendRequest(QStringLiteral("get_geometry_mask_profile"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("get_geometry_mask_profile"), {
         {QStringLiteral("workpiece_id"), workpieceId},
     });
 }
@@ -550,9 +570,8 @@ void MainWindow::requestGeometryProfile(const QString &workpieceId) {
 void MainWindow::saveGeometryDraft(const QJsonObject &draft, int libraryRevision, int draftRevision) {
     if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
         || client_->state() != BackendClient::State::Ready) return;
-    pendingCommand_ = QStringLiteral("save_geometry_mask_draft");
     if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
-    client_->sendRequest(QStringLiteral("save_geometry_mask_draft"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("save_geometry_mask_draft"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("base_library_revision"), libraryRevision},
         {QStringLiteral("base_draft_revision"), draftRevision},
@@ -573,9 +592,8 @@ void MainWindow::publishGeometryWorkflow(const QJsonObject &draft, int libraryRe
 void MainWindow::validateGeometryDraft(int libraryRevision, int draftRevision) {
     if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
         || client_->state() != BackendClient::State::Ready) return;
-    pendingCommand_ = QStringLiteral("validate_geometry_mask_draft");
     if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
-    client_->sendRequest(QStringLiteral("validate_geometry_mask_draft"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("validate_geometry_mask_draft"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("base_library_revision"), libraryRevision},
         {QStringLiteral("base_draft_revision"), draftRevision},
@@ -586,8 +604,7 @@ void MainWindow::validateGeometryDraft(int libraryRevision, int draftRevision) {
 void MainWindow::pollGeometryValidation() {
     if (geometryValidationJobId_.isEmpty() || client_ == nullptr || !backendReady_ || clientBusy_
         || !pendingCommand_.isEmpty() || client_->state() != BackendClient::State::Ready) return;
-    pendingCommand_ = QStringLiteral("get_geometry_mask_validation_job");
-    client_->sendRequest(QStringLiteral("get_geometry_mask_validation_job"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("get_geometry_mask_validation_job"), {
         {QStringLiteral("job_id"), geometryValidationJobId_},
     });
 }
@@ -630,8 +647,7 @@ bool MainWindow::maybeContinueGeometryPublish(const QJsonObject &job) {
 
 void MainWindow::geometryJobAction(const QString &jobId, const QString &action) {
     if (client_ == nullptr || clientBusy_ || client_->state() != BackendClient::State::Ready) return;
-    pendingCommand_ = QStringLiteral("geometry_mask_validation_job_action");
-    client_->sendRequest(QStringLiteral("geometry_mask_validation_job_action"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("geometry_mask_validation_job_action"), {
         {QStringLiteral("job_id"), jobId}, {QStringLiteral("action"), action},
     });
 }
@@ -642,9 +658,8 @@ void MainWindow::publishGeometryProfile(const QString &jobId, int libraryRevisio
         || client_->state() != BackendClient::State::Ready) return;
     geometryPublishAfterValidation_ = false;
     geometryPublishOverrideReason_.clear();
-    pendingCommand_ = QStringLiteral("publish_geometry_mask_profile");
     if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
-    client_->sendRequest(QStringLiteral("publish_geometry_mask_profile"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("publish_geometry_mask_profile"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("job_id"), jobId},
         {QStringLiteral("base_library_revision"), libraryRevision},
@@ -657,9 +672,8 @@ void MainWindow::publishGeometryProfile(const QString &jobId, int libraryRevisio
 void MainWindow::rollbackGeometryProfile(int libraryRevision) {
     if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
         || client_->state() != BackendClient::State::Ready) return;
-    pendingCommand_ = QStringLiteral("rollback_geometry_mask_profile");
     if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
-    client_->sendRequest(QStringLiteral("rollback_geometry_mask_profile"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("rollback_geometry_mask_profile"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("base_library_revision"), libraryRevision},
         {QStringLiteral("operation_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
@@ -673,18 +687,16 @@ void MainWindow::previewGeometryRule(const QJsonObject &request) {
     }
     QJsonObject fields = request;
     fields.insert(QStringLiteral("workpiece_id"), geometryWorkpieceId_);
-    pendingCommand_ = QStringLiteral("preview_geometry_mask_rule");
     if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setPreviewBusy(true);
-    client_->sendRequest(QStringLiteral("preview_geometry_mask_rule"), fields);
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("preview_geometry_mask_rule"), fields);
 }
 
 void MainWindow::resolveGeometryMigration(const QString &conflictId, const QJsonObject &resolution,
                                           int libraryRevision, int draftRevision) {
     if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
         || client_->state() != BackendClient::State::Ready) return;
-    pendingCommand_ = QStringLiteral("resolve_geometry_mask_migration");
     if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
-    client_->sendRequest(QStringLiteral("resolve_geometry_mask_migration"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("resolve_geometry_mask_migration"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("conflict_id"), conflictId},
         {QStringLiteral("resolution"), resolution},
@@ -703,8 +715,7 @@ void MainWindow::requestAnnotationSnapshot(const QString &workpieceId) {
         return;
     }
     annotationWorkpieceId_ = workpieceId;
-    pendingCommand_ = QStringLiteral("get_workpiece_annotations");
-    client_->sendRequest(QStringLiteral("get_workpiece_annotations"), {
+    sendPageCommand(CommandOwner::Geometry, QStringLiteral("get_workpiece_annotations"), {
         {QStringLiteral("workpiece_id"), workpieceId},
     });
 }
@@ -714,8 +725,7 @@ void MainWindow::sendAnnotationMutation(const QString &command, const QJsonObjec
         || client_->state() != BackendClient::State::Ready) {
         return;
     }
-    pendingCommand_ = command;
-    client_->sendRequest(command, fields);
+    sendPageCommand(CommandOwner::Geometry, command, fields);
     if (annotationManagerDialog_ != nullptr) {
         annotationManagerDialog_->setBusy(true);
     }
@@ -791,8 +801,7 @@ void MainWindow::submitTemplateConfirmation(const QString &workpieceId, const QS
         || client_ == nullptr || clientBusy_ || !backendReady_) {
         return;
     }
-    pendingCommand_ = QStringLiteral("submit_confirmation");
-    client_->sendRequest(QStringLiteral("submit_confirmation"), {
+    sendPageCommand(CommandOwner::Inspection, QStringLiteral("submit_confirmation"), {
         {QStringLiteral("workpiece_id"), workpieceId},
         {QStringLiteral("orientation"), orientation},
         {QStringLiteral("image_path"), imagePath},
@@ -854,10 +863,13 @@ void MainWindow::onBackendLoading(const QString &message) {
 }
 
 void MainWindow::onBackendUnavailable(const QString &reason) {
+    const CommandOwner interruptedOwner = pendingOwner_;
     const QString interruptedTask = pendingCommand_;
+    const bool interruptedBatchCommand = batchInFlight_
+        || pendingConfirmationBatchIndex_ >= 0;
     const bool hasPreservedWork = registrationInFlight_ || batchInFlight_ || clientBusy_
         || !pendingCommand_.isEmpty() || !inspectionImagePath_.isEmpty()
-        || (ui->batchResultsTableWidget != nullptr && ui->batchResultsTableWidget->rowCount() > 0)
+        || (batchResultsTableWidget_ != nullptr && batchResultsTableWidget_->rowCount() > 0)
         || annotationManagerDialog_ != nullptr || geometryMaskManagerDialog_ != nullptr;
     stopRegistrationProgress();
     if (annotationManagerDialog_ != nullptr) {
@@ -887,7 +899,12 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     registrationInFlight_ = false;
     batchInFlight_ = false;
     pendingReplace_ = false;
-    pendingCommand_.clear();
+    clearPendingCommand();
+    if (interruptedOwner == CommandOwner::Inspection
+        && !interruptedBatchCommand && inspectionPage_ != nullptr) {
+        inspectionPage_->handleBackendFailure(interruptedTask,
+                                              QStringLiteral("CONNECTION_LOST"), reason);
+    }
     BackendStatusDetails details;
     details.state = BackendUiState::Error;
     details.connectionDetail = QStringLiteral("连接中断");
@@ -906,6 +923,7 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     if (geometryPollTimer_ != nullptr) {
         geometryPollTimer_->stop();
     }
+    inspectionPage_->setBackendAvailable(false, false, reason);
     updateButtonStates();
 }
 
@@ -914,8 +932,7 @@ void MainWindow::pollEvolutionJobs() {
         || client_ == nullptr || client_->state() != BackendClient::State::Ready) {
         return;
     }
-    pendingCommand_ = QStringLiteral("list_evolution_jobs");
-    client_->sendRequest(QStringLiteral("list_evolution_jobs"));
+    sendPageCommand(CommandOwner::System, QStringLiteral("list_evolution_jobs"), QJsonObject());
 }
 
 void MainWindow::onClientStateChanged(BackendClient::State state, const QString &detail) {
@@ -978,6 +995,9 @@ void MainWindow::onClientProgress(const QString &command, const QJsonObject &pro
 }
 
 void MainWindow::onClientResponse(const QString &command, const QJsonObject &response) {
+    const CommandOwner responseOwner = pendingOwner_;
+    const QString issuedCommand = pendingCommand_;
+    clearPendingCommand();
     if (batchInFlight_ && command == QStringLiteral("predict")) {
         appendBatchResult(response);
         ++batchIndex_;
@@ -1008,8 +1028,8 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
             requestedId.clear();
         }
         appHeader_->setWorkpieces(items, requestedId);
-        if (pendingCommand_ == QStringLiteral("list_workpieces")) {
-            pendingCommand_.clear();
+        if (issuedCommand == QStringLiteral("list_workpieces")
+            || command == QStringLiteral("list_workpieces")) {
             pendingWorkpieceName_.clear();
         }
         if (!registrationSummaryVisible_) {
@@ -1019,7 +1039,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("recycle_workpiece")) {
-        pendingCommand_.clear();
         lastPredictionWorkpieceId_.clear();
         lastPredictionImagePath_.clear();
         lastPredictionResponse_ = QJsonObject();
@@ -1028,7 +1047,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("submit_confirmation")) {
-        pendingCommand_.clear();
         if (pendingConfirmationBatchIndex_ >= 0
             && pendingConfirmationBatchIndex_ < batchResults_.size()) {
             const int completedIndex = pendingConfirmationBatchIndex_;
@@ -1046,13 +1064,16 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
             } else {
                 selectBatchResult(completedIndex, false);
             }
+        } else if (inspectionPage_ != nullptr
+                   && (responseOwner == CommandOwner::Inspection
+                       || responseOwner == CommandOwner::None)) {
+            inspectionPage_->handleBackendResponse(command, response);
         }
         showLibraryMessage(QStringLiteral("确认图片已进入后台入库队列"));
         updateButtonStates();
         return;
     }
     if (command == QStringLiteral("get_geometry_mask_profile")) {
-        pendingCommand_.clear();
         if (geometryMaskManagerDialog_ != nullptr) {
             geometryMaskManagerDialog_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
             geometryMaskManagerDialog_->setBusy(false);
@@ -1061,7 +1082,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("preview_geometry_mask_rule")) {
-        pendingCommand_.clear();
         if (geometryMaskManagerDialog_ != nullptr) {
             geometryMaskManagerDialog_->setRulePreview(response.value(QStringLiteral("preview")).toObject());
             geometryMaskManagerDialog_->setPreviewBusy(false);
@@ -1070,7 +1090,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("save_geometry_mask_draft")) {
-        pendingCommand_.clear();
         const bool continuePublishWorkflow = geometryPublishAfterValidation_;
         if (geometryMaskManagerDialog_ != nullptr) {
             geometryMaskManagerDialog_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
@@ -1090,7 +1109,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("resolve_geometry_mask_migration")) {
-        pendingCommand_.clear();
         if (geometryMaskManagerDialog_ != nullptr) {
             geometryMaskManagerDialog_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
             geometryMaskManagerDialog_->setBusy(false);
@@ -1099,7 +1117,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("validate_geometry_mask_draft")) {
-        pendingCommand_.clear();
         const QJsonObject job = response.value(QStringLiteral("job")).toObject();
         geometryValidationJobId_ = job.value(QStringLiteral("job_id")).toString();
         if (geometryMaskManagerDialog_ != nullptr) {
@@ -1120,7 +1137,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("get_geometry_mask_validation_job")) {
-        pendingCommand_.clear();
         const QJsonObject job = response.value(QStringLiteral("job")).toObject();
         if (geometryMaskManagerDialog_ != nullptr) {
             geometryMaskManagerDialog_->setValidationJob(job);
@@ -1135,7 +1151,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("geometry_mask_validation_job_action")) {
-        pendingCommand_.clear();
         if (geometryMaskManagerDialog_ != nullptr) {
             geometryMaskManagerDialog_->setValidationJob(response.value(QStringLiteral("job")).toObject());
             geometryMaskManagerDialog_->setBusy(false);
@@ -1144,7 +1159,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     }
     if (command == QStringLiteral("publish_geometry_mask_profile")
         || command == QStringLiteral("rollback_geometry_mask_profile")) {
-        pendingCommand_.clear();
         if (geometryPollTimer_ != nullptr) geometryPollTimer_->stop();
         if (geometryMaskManagerDialog_ != nullptr) {
             geometryMaskManagerDialog_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
@@ -1157,7 +1171,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     if (command == QStringLiteral("get_workpiece_annotations")) {
         const QJsonObject annotations = response.value(QStringLiteral("annotations")).toObject();
         if (annotations.isEmpty()) {
-            pendingCommand_.clear();
             showLibraryMessage(QStringLiteral("后端返回的干扰标注快照为空"), true);
             return;
         }
@@ -1181,14 +1194,12 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         annotationManagerDialog_->show();
         annotationManagerDialog_->raise();
         annotationManagerDialog_->activateWindow();
-        pendingCommand_.clear();
         showLibraryMessage(QStringLiteral("干扰标注快照已加载"));
         return;
     }
     if (command == QStringLiteral("save_workpiece_annotations")
         || command == QStringLiteral("set_workpiece_annotation_group_enabled")
         || command == QStringLiteral("delete_workpiece_annotation_group")) {
-        pendingCommand_.clear();
         showLibraryMessage(QStringLiteral("干扰标注已保存，正在刷新生效状态…"));
         if (annotationManagerDialog_ != nullptr) {
             annotationManagerDialog_->setBusy(true);
@@ -1198,8 +1209,8 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("list_evolution_jobs")) {
-        pendingCommand_.clear();
         const QJsonArray jobs = response.value(QStringLiteral("jobs")).toArray();
+        inspectionPage_->handleBackendResponse(command, response);
         if (!jobs.isEmpty()) {
             const QJsonObject latest = jobs.last().toObject();
             showLibraryMessage(QStringLiteral("后台入库：%1，进度 %2%%")
@@ -1210,7 +1221,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     }
     if (command == QStringLiteral("register")) {
         stopRegistrationProgress();
-        pendingCommand_.clear();
         registrationInFlight_ = false;
         const QJsonObject counts = response.value(QStringLiteral("template_counts")).toObject();
         const int frontCount = counts.value(QStringLiteral("front")).toInt(frontTemplatePaths_.size());
@@ -1225,18 +1235,25 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         });
         return;
     }
-    if (command == QStringLiteral("predict")) {
-        lastPredictionWorkpieceId_ = pendingPredictionWorkpieceId_;
-        lastPredictionImagePath_ = pendingPredictionImagePath_;
+    if (command == QStringLiteral("predict")
+        && (responseOwner == CommandOwner::Inspection
+            || responseOwner == CommandOwner::None)) {
+        lastPredictionWorkpieceId_ = pendingPredictionWorkpieceId_.isEmpty()
+            ? selectedWorkpieceId() : pendingPredictionWorkpieceId_;
+        lastPredictionImagePath_ = pendingPredictionImagePath_.isEmpty()
+            ? inspectionPage_->singleImagePath() : pendingPredictionImagePath_;
         lastPredictionResponse_ = response;
         resultContext_ = ResultContext::Single;
-        renderPredictionResult(lastPredictionImagePath_, response, QStringLiteral("单图"));
-        pendingCommand_.clear();
+        inspectionPage_->setMode(InspectionMode::Single);
+        inspectionPage_->handleBackendResponse(command, response);
+        updateButtonStates();
     }
 }
 
 void MainWindow::onClientCommandFailed(const QString &command, const QString &code,
                                        const QString &message) {
+    const CommandOwner failureOwner = pendingOwner_;
+    clearPendingCommand();
     if (command == QStringLiteral("register") && registrationInFlight_
         && code == QStringLiteral("WORKPIECE_EXISTS")
         && !pendingReplace_) {
@@ -1251,7 +1268,6 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         } else {
             stopRegistrationProgress();
             registrationInFlight_ = false;
-            pendingCommand_.clear();
             showLibraryMessage(QStringLiteral("已取消覆盖"));
         }
         return;
@@ -1259,28 +1275,28 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
     if (batchInFlight_ && command == QStringLiteral("predict")) {
         batchInFlight_ = false;
         batchCompletedSuccessfully_ = false;
-        pendingCommand_.clear();
         const QString failedFile = batchIndex_ >= 0 && batchIndex_ < batchImagePaths_.size()
             ? QFileInfo(batchImagePaths_.at(batchIndex_)).fileName() : QStringLiteral("未知");
-        ui->batchSummaryLabel->setText(
+        batchSummaryLabel_->setText(
             QStringLiteral("批量检测未完成：已完成 %1/%2，失败文件：%3，原因：%4")
                 .arg(batchResults_.size())
                 .arg(batchImagePaths_.size())
                 .arg(failedFile, message));
-        ui->resultLabel->setText(QStringLiteral("批量检测未完成"));
+        resultLabel_->setText(QStringLiteral("批量检测未完成"));
         updateButtonStates();
         return;
     }
     if (command == QStringLiteral("register")) {
         stopRegistrationProgress();
         registrationInFlight_ = false;
-        pendingCommand_.clear();
         showLibraryMessage(message, true);
     } else if (command == QStringLiteral("predict")) {
-        pendingCommand_.clear();
-        ui->resultLabel->setText(QStringLiteral("检测失败：%1").arg(message));
+        if (inspectionPage_ != nullptr
+            && (failureOwner == CommandOwner::Inspection
+                || failureOwner == CommandOwner::None)) {
+            inspectionPage_->handleBackendFailure(command, code, message);
+        }
     } else if (command == QStringLiteral("submit_confirmation")) {
-        pendingCommand_.clear();
         if (pendingConfirmationBatchIndex_ >= 0
             && pendingConfirmationBatchIndex_ < batchResults_.size()) {
             const int failedIndex = pendingConfirmationBatchIndex_;
@@ -1292,6 +1308,10 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
             updateBatchRow(failedIndex);
             selectBatchResult(failedIndex, false);
             updateBatchSummary();
+        } else if (inspectionPage_ != nullptr
+                   && (failureOwner == CommandOwner::Inspection
+                       || failureOwner == CommandOwner::None)) {
+            inspectionPage_->handleBackendFailure(command, code, message);
         }
         showLibraryMessage(QStringLiteral("确认入库失败：%1").arg(message), true);
     } else if (command.startsWith(QStringLiteral("get_geometry_mask"))
@@ -1312,7 +1332,6 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
             actionable = QStringLiteral("规则缓存修订不一致，请重新验证草稿后再发布");
         }
         const QString detail = QStringLiteral("几何干扰规则操作失败（%1）：%2").arg(code, actionable);
-        pendingCommand_.clear();
         if (geometryMaskManagerDialog_ != nullptr) {
             geometryMaskManagerDialog_->setBusy(false);
             geometryMaskManagerDialog_->setPreviewBusy(false);
@@ -1323,17 +1342,14 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         if (geometryPollTimer_ != nullptr) geometryPollTimer_->stop();
         showLibraryMessage(detail, true);
     } else if (command == QStringLiteral("recycle_workpiece")) {
-        pendingCommand_.clear();
         showLibraryMessage(QStringLiteral("删除失败：%1").arg(message), true);
     } else if (command == QStringLiteral("get_workpiece_annotations")) {
-        pendingCommand_.clear();
         showLibraryMessage(QStringLiteral("干扰标注加载失败：%1").arg(message), true);
     } else if (command == QStringLiteral("save_workpiece_annotations")
                || command == QStringLiteral("set_workpiece_annotation_group_enabled")
                || command == QStringLiteral("delete_workpiece_annotation_group")) {
         const QString workpieceId = annotationWorkpieceId_;
         const bool stale = code == QStringLiteral("STALE_WORKPIECE_REVISION");
-        pendingCommand_.clear();
         if (annotationManagerDialog_ != nullptr) {
             annotationManagerDialog_->setBusy(stale);
             if (!stale) {
@@ -1353,9 +1369,6 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
             showLibraryMessage(QStringLiteral("干扰标注保存失败：%1").arg(message), true);
         }
     } else {
-        if (pendingCommand_ == command) {
-            pendingCommand_.clear();
-        }
         showLibraryMessage(message, true);
     }
     updateButtonStates();
@@ -1368,28 +1381,27 @@ void MainWindow::onClientTransportFailed(const QString &code, const QString &mes
 
 void MainWindow::updateButtonStates() {
     const bool interactive = backendReady_ && !clientBusy_ && !batchInFlight_ && !registrationInFlight_;
+    inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
+                                         appHeader_->currentWorkpieceName());
+    inspectionPage_->setBackendAvailable(backendReady_, !interactive,
+                                         backendReady_ ? QString() : QStringLiteral("后端尚未就绪"));
     ui->refreshWorkpiecesButton->setEnabled(interactive);
     ui->chooseFrontTemplatesButton->setEnabled(interactive);
     ui->chooseBackTemplatesButton->setEnabled(interactive);
-    ui->chooseImageButton->setEnabled(interactive);
-    ui->chooseBatchImagesButton->setEnabled(interactive);
+    chooseBatchImagesButton_->setEnabled(interactive);
     ui->registerButton->setEnabled(interactive && !ui->workpieceNameEdit->text().trimmed().isEmpty()
                                    && !frontTemplatePaths_.isEmpty() && !backTemplatePaths_.isEmpty());
-    ui->predictButton->setEnabled(interactive && !selectedWorkpieceId().isEmpty()
-                                  && !inspectionImagePath_.isEmpty());
-    ui->batchPredictButton->setEnabled(interactive && !selectedWorkpieceId().isEmpty()
-                                       && !batchImagePaths_.isEmpty());
+    batchPredictButton_->setEnabled(interactive && !selectedWorkpieceId().isEmpty()
+                                    && !batchImagePaths_.isEmpty());
     if (deleteWorkpieceButton_ != nullptr) {
         deleteWorkpieceButton_->setEnabled(interactive && !selectedWorkpieceId().isEmpty());
     }
     if (annotationEditorButton_ != nullptr) {
         annotationEditorButton_->setEnabled(interactive && !selectedWorkpieceId().isEmpty());
     }
-    const bool confirmationAvailable = resultContext_ == ResultContext::Batch
-        ? currentBatchResultCanBeProcessed()
-        : interactive && resultContext_ == ResultContext::Single
-            && !lastPredictionImagePath_.isEmpty() && !lastPredictionWorkpieceId_.isEmpty();
-    if (confirmFrontButton_ != nullptr) {
+    const bool confirmationAvailable = currentBatchResultCanBeProcessed();
+    if (confirmFrontButton_ != nullptr
+        && inspectionPage_->mode() == InspectionMode::Batch) {
         confirmFrontButton_->setEnabled(confirmationAvailable);
         confirmBackButton_->setEnabled(confirmationAvailable);
         rejectConfirmationButton_->setEnabled(confirmationAvailable);
@@ -1416,7 +1428,7 @@ void MainWindow::updateButtonStates() {
                 detail = QStringLiteral("建议复检，%1").arg(detail);
             }
         }
-        ui->currentResultTargetLabel->setText(
+        currentResultTargetLabel_->setText(
             QStringLiteral("当前：%1（%2）").arg(fileName, detail));
     }
 }
@@ -1437,31 +1449,17 @@ void MainWindow::updateTemplateLabels() {
 }
 
 void MainWindow::updatePreview() {
-    if (inspectionImagePath_.isEmpty()) {
-        ui->imagePreviewLabel->setPixmap(QPixmap());
-        ui->imagePreviewLabel->setText(QStringLiteral("请选择待测图片"));
-        return;
-    }
-    QImageReader reader(inspectionImagePath_);
-    const QImage image = reader.read();
-    if (image.isNull()) {
-        ui->imagePreviewLabel->setPixmap(QPixmap());
-        ui->imagePreviewLabel->setText(
-            QStringLiteral("图片无法读取：%1").arg(QFileInfo(inspectionImagePath_).fileName()));
-        return;
-    }
-    ui->imagePreviewLabel->setText(QString());
-    ui->imagePreviewLabel->setPixmap(QPixmap::fromImage(image).scaled(
-        ui->imagePreviewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    inspectionPage_->setMode(InspectionMode::Single);
+    inspectionPage_->setSingleImagePath(inspectionImagePath_);
 }
 
 void MainWindow::clearInspectionState() {
     inspectionImagePath_.clear();
     updatePreview();
-    ui->resultLabel->setText(QStringLiteral("尚未检测"));
-    ui->reviewLabel->clear();
-    ui->evidenceTextEdit->clear();
-    pendingCommand_.clear();
+    resultLabel_->setText(QStringLiteral("尚未检测"));
+    reviewLabel_->clear();
+    evidenceTextEdit_->clear();
+    clearPendingCommand();
     pendingPredictionWorkpieceId_.clear();
     pendingPredictionImagePath_.clear();
     lastPredictionWorkpieceId_.clear();
@@ -1476,7 +1474,7 @@ void MainWindow::clearBatchState() {
     batchIndex_ = 0;
     batchWorkpieceId_.clear();
     clearBatchResults();
-    ui->chooseBatchImagesButton->setText(QStringLiteral("选择批量图片"));
+    chooseBatchImagesButton_->setText(QStringLiteral("选择批量图片"));
     updateButtonStates();
 }
 
@@ -1497,17 +1495,19 @@ void MainWindow::clearBatchResults() {
         resultContext_ = ResultContext::None;
         inspectionImagePath_.clear();
         updatePreview();
-        ui->currentImageLabel->clear();
-        ui->currentResultTargetLabel->clear();
-        ui->resultLabel->setText(QStringLiteral("尚未检测"));
-        ui->reviewLabel->clear();
-        ui->evidenceTextEdit->clear();
+        inspectionPage_->setMode(InspectionMode::Batch);
+        inspectionPage_->setSingleImagePath(QString());
+        currentImageLabel_->clear();
+        currentResultTargetLabel_->clear();
+        resultLabel_->setText(QStringLiteral("尚未检测"));
+        reviewLabel_->clear();
+        evidenceTextEdit_->clear();
     }
-    if (ui == nullptr || ui->batchResultsTableWidget == nullptr) {
+    if (batchResultsTableWidget_ == nullptr) {
         return;
     }
-    ui->batchResultsTableWidget->setRowCount(0);
-    ui->batchSummaryLabel->clear();
+    batchResultsTableWidget_->setRowCount(0);
+    batchSummaryLabel_->clear();
 }
 
 void MainWindow::startRegistrationProgress() {
@@ -1549,8 +1549,7 @@ void MainWindow::sendRegistration(bool replace) {
     for (const QString &path : backTemplatePaths_) {
         back.append(path);
     }
-    pendingCommand_ = QStringLiteral("register");
-    client_->sendRequest(QStringLiteral("register"), {
+    sendPageCommand(CommandOwner::Library, QStringLiteral("register"), {
         {QStringLiteral("name"), pendingWorkpieceName_},
         {QStringLiteral("replace"), replace},
         {QStringLiteral("front_images"), front},
@@ -1568,14 +1567,13 @@ void MainWindow::sendNextBatchPrediction() {
         finishBatchPrediction();
         return;
     }
-    pendingCommand_ = QStringLiteral("batch_predict");
     pendingPredictionWorkpieceId_ = batchWorkpieceId_;
     pendingPredictionImagePath_ = batchImagePaths_.at(batchIndex_);
-    client_->sendRequest(QStringLiteral("predict"), {
+    sendPageCommand(CommandOwner::Inspection, QStringLiteral("predict"), {
         {QStringLiteral("workpiece_id"), pendingPredictionWorkpieceId_},
         {QStringLiteral("image_path"), batchImagePaths_.at(batchIndex_)},
     });
-    ui->batchSummaryLabel->setText(
+    batchSummaryLabel_->setText(
         QStringLiteral("已完成 %1/%2，当前文件：%3")
             .arg(batchResults_.size())
             .arg(batchImagePaths_.size())
@@ -1584,56 +1582,20 @@ void MainWindow::sendNextBatchPrediction() {
 
 void MainWindow::renderPredictionResult(const QString &imagePath, const QJsonObject &response,
                                         const QString &sourceText) {
-    if (!imagePath.isEmpty()) {
-        inspectionImagePath_ = QFileInfo(imagePath).absoluteFilePath();
-        updatePreview();
-        const QString fileName = QFileInfo(inspectionImagePath_).fileName();
-        ui->currentImageLabel->setText(
-            QStringLiteral("当前图片：%1（%2）").arg(fileName, sourceText));
-        ui->currentResultTargetLabel->setText(
-            QStringLiteral("当前：%1（%2）").arg(fileName, sourceText));
-    }
-
-    const QString label = response.value(QStringLiteral("label")).toString();
-    ui->resultLabel->setText(QStringLiteral("检测结果：%1").arg(orientationText(label)));
-    ui->reviewLabel->clear();
-    QStringList lines;
-    lines << QStringLiteral("全局得分：正面 %1，反面 %2")
-                 .arg(formatScore(response.value(QStringLiteral("global_scores")).toObject(),
-                                  QStringLiteral("front")),
-                      formatScore(response.value(QStringLiteral("global_scores")).toObject(),
-                                  QStringLiteral("back")));
-    lines << QStringLiteral("全局间隔：%1")
-                 .arg(response.value(QStringLiteral("global_margin")).toDouble());
-    lines << QStringLiteral("局部预测：%1")
-                 .arg(orientationText(response.value(QStringLiteral("local_prediction")).toString()));
-    lines << QStringLiteral("局部得分：正面 %1，反面 %2")
-                 .arg(formatScore(response.value(QStringLiteral("local_scores")).toObject(),
-                                  QStringLiteral("front")),
-                      formatScore(response.value(QStringLiteral("local_scores")).toObject(),
-                                  QStringLiteral("back")));
-    lines << QStringLiteral("局部间隔：%1")
-                 .arg(response.value(QStringLiteral("local_margin")).toDouble());
-    lines << QStringLiteral("决策来源：%1")
-                 .arg(decisionSourceText(response.value(QStringLiteral("decision_source")).toString()));
-    lines << QStringLiteral("耗时（毫秒）：%1")
-                 .arg(response.value(QStringLiteral("elapsed_ms")).toDouble());
-    const QJsonObject geometryMask = response.value(QStringLiteral("geometry_mask")).toObject();
-    const QString geometryStatus = geometryMask.value(QStringLiteral("status")).toString();
-    if (geometryStatus == QStringLiteral("active")) {
-        lines << QStringLiteral("几何遮罩：已启用（版本 %1）")
-                     .arg(geometryMask.value(QStringLiteral("profile_revision")).toInt());
-    } else if (geometryStatus == QStringLiteral("low_confidence")
-               || geometryStatus == QStringLiteral("unavailable")
-               || geometryStatus == QStringLiteral("unreadable")) {
-        lines << QStringLiteral("几何遮罩：未启用（需复核，%1）").arg(geometryStatus);
-        ui->reviewLabel->setText(QStringLiteral("遮罩未启用，需复核；保留原始识别结果"));
-    }
-    if (geometryStatus.isEmpty() || geometryStatus == QStringLiteral("active")) {
-        ui->reviewLabel->setText(response.value(QStringLiteral("needs_review")).toBool()
-                                     ? QStringLiteral("建议人工复检") : QString());
-    }
-    ui->evidenceTextEdit->setPlainText(lines.join(QLatin1Char('\n')));
+    InspectionRecord record;
+    record.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    record.imagePath = QFileInfo(imagePath).absoluteFilePath();
+    record.workpieceId = sourceText == QStringLiteral("批量结果")
+        ? batchWorkpieceId_ : selectedWorkpieceId();
+    record.response = response;
+    record.label = response.value(QStringLiteral("label")).toString();
+    record.needsReview = response.value(QStringLiteral("needs_review")).toBool();
+    record.elapsedMs = response.value(QStringLiteral("elapsed_ms")).toDouble();
+    record.completedAt = QDateTime::currentDateTime();
+    inspectionImagePath_ = record.imagePath;
+    inspectionPage_->setMode(sourceText == QStringLiteral("批量结果")
+                                 ? InspectionMode::Batch : InspectionMode::Single);
+    inspectionPage_->showSingleResult(record);
     updateButtonStates();
 }
 
@@ -1648,7 +1610,7 @@ void MainWindow::appendBatchResult(const QJsonObject &response) {
     batchResults_.append(result);
 
     const int row = batchResults_.size() - 1;
-    ui->batchResultsTableWidget->insertRow(row);
+    batchResultsTableWidget_->insertRow(row);
     updateBatchRow(row);
     if (selectedBatchResultIndex_ < 0) {
         selectBatchResult(row, false);
@@ -1674,20 +1636,20 @@ void MainWindow::updateBatchRow(int index) {
     const BatchResult &result = batchResults_.at(index);
     auto *fileItem = new QTableWidgetItem(QFileInfo(result.imagePath).fileName());
     fileItem->setToolTip(result.imagePath);
-    ui->batchResultsTableWidget->setItem(index, 0, fileItem);
-    ui->batchResultsTableWidget->setItem(
+    batchResultsTableWidget_->setItem(index, 0, fileItem);
+    batchResultsTableWidget_->setItem(
         index, 1, new QTableWidgetItem(orientationText(result.label)));
-    ui->batchResultsTableWidget->setItem(
+    batchResultsTableWidget_->setItem(
         index, 2, new QTableWidgetItem(result.needsReview ? QStringLiteral("是")
                                                          : QStringLiteral("否")));
-    ui->batchResultsTableWidget->setItem(
+    batchResultsTableWidget_->setItem(
         index, 3, new QTableWidgetItem(QString::number(result.elapsedMs, 'f', 1)));
-    ui->batchResultsTableWidget->setItem(
+    batchResultsTableWidget_->setItem(
         index, 4, new QTableWidgetItem(batchResultStateText(result.state)));
     if (result.needsReview) {
         const QBrush warningBrush(QColor(255, 244, 204));
-        for (int column = 0; column < ui->batchResultsTableWidget->columnCount(); ++column) {
-            ui->batchResultsTableWidget->item(index, column)->setBackground(warningBrush);
+        for (int column = 0; column < batchResultsTableWidget_->columnCount(); ++column) {
+            batchResultsTableWidget_->item(index, column)->setBackground(warningBrush);
         }
     }
 }
@@ -1735,7 +1697,7 @@ void MainWindow::selectBatchResult(int index, bool userInitiated) {
         batchSelectionPinned_ = true;
     }
     changingBatchSelection_ = true;
-    ui->batchResultsTableWidget->setCurrentCell(index, 0);
+    batchResultsTableWidget_->setCurrentCell(index, 0);
     changingBatchSelection_ = false;
     const BatchResult &result = batchResults_.at(index);
     renderPredictionResult(result.imagePath, result.response, QStringLiteral("批量结果"));
@@ -1767,7 +1729,7 @@ void MainWindow::updateBatchSummary() {
     const int completed = batchResults_.size();
     const int total = batchImagePaths_.size();
     if (batchInFlight_) {
-        ui->batchSummaryLabel->setText(
+        batchSummaryLabel_->setText(
             QStringLiteral("已完成 %1/%2：正面 %3，反面 %4，不确定 %5，建议复检 %6")
                 .arg(completed)
                 .arg(total)
@@ -1786,7 +1748,7 @@ void MainWindow::updateBatchSummary() {
         }
     }
     const int unprocessed = qMax(0, completed - processed);
-    ui->batchSummaryLabel->setText(
+    batchSummaryLabel_->setText(
         QStringLiteral("共 %1 张：正面 %2，反面 %3，不确定 %4，建议复检 %5，已处理 %6，未处理 %7")
             .arg(total)
             .arg(batchFrontCount_)
@@ -1801,8 +1763,8 @@ void MainWindow::finishBatchPrediction() {
     batchInFlight_ = false;
     batchCompletedSuccessfully_ = true;
     batchSelectionPinned_ = false;
-    pendingCommand_.clear();
-    ui->resultLabel->setText(QStringLiteral("批量检测完成"));
+    clearPendingCommand();
+    resultLabel_->setText(QStringLiteral("批量检测完成"));
     updateBatchSummary();
     const int preferredIndex = preferredPendingBatchResult();
     if (preferredIndex >= 0) {
@@ -1884,16 +1846,6 @@ QString MainWindow::orientationText(const QString &label) const {
     if (label == QStringLiteral("back")) return QStringLiteral("反面");
     if (label == QStringLiteral("uncertain")) return QStringLiteral("不确定");
     return label;
-}
-
-QString MainWindow::decisionSourceText(const QString &source) const {
-    if (source == QStringLiteral("global")) return QStringLiteral("全局特征");
-    if (source == QStringLiteral("local_override")) return QStringLiteral("局部特征覆盖");
-    return source;
-}
-
-QString MainWindow::formatScore(const QJsonObject &scores, const QString &key) const {
-    return QString::number(scores.value(key).toDouble(), 'g', 8);
 }
 
 void MainWindow::showLibraryMessage(const QString &message, bool error) {

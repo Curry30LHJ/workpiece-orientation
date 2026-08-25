@@ -1,6 +1,7 @@
 #include <QtTest/QtTest>
 
 #include <QJsonDocument>
+#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QComboBox>
@@ -20,6 +21,9 @@
 
 #include "../backendclient.h"
 #include "../backendprocessmanager.h"
+#include "../inspectionimageview.h"
+#include "../inspectionpage.h"
+#include "../inspectiontypes.h"
 #include "../mainwindow.h"
 #include "../processlauncher.h"
 
@@ -560,8 +564,11 @@ private slots:
         BackendClient client;
         MainWindow window(&client, nullptr);
         emit client.stateChanged(BackendClient::State::Busy, QStringLiteral("busy"));
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("registerButton"))->isEnabled());
-        QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("predictButton"))->isEnabled());
+        QVERIFY(!inspectionPage->findChild<QPushButton *>(
+                     QStringLiteral("predictButton"))->isEnabled());
     }
 
     void loadingStateShowsStatusAndKeepsActionsDisabled() {
@@ -572,22 +579,32 @@ private slots:
 
         emit manager.backendLoading(QStringLiteral("模型加载中"));
 
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("backendStatusLabel"))->text().contains(QStringLiteral("模型加载中")));
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("registerButton"))->isEnabled());
-        QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("predictButton"))->isEnabled());
+        QVERIFY(!inspectionPage->findChild<QPushButton *>(
+                     QStringLiteral("predictButton"))->isEnabled());
     }
 
     void transportFailurePreservesPreviousPredictionAndMarksOutcomeUnknown() {
+        QTemporaryDir dir;
+        const QString imagePath = writeImages(dir, QStringLiteral("preserved"), 1).constFirst();
+        QVERIFY(!imagePath.isEmpty());
         BackendClient client;
         MainWindow window(&client, nullptr);
         emit client.handshakeSucceeded();
-        window.setInspectionImagePath(QStringLiteral("C:/tmp/sample.png"));
+        window.setInspectionImagePath(imagePath);
         emit client.responseReceived(QStringLiteral("predict"),
                                      QJsonObject{{"label", "front"}, {"needs_review", false}});
-        QVERIFY(window.findChild<QLabel *>(QStringLiteral("resultLabel"))->text().contains(QStringLiteral("正面")));
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        QVERIFY(inspectionPage->findChild<QLabel *>(
+                    QStringLiteral("resultLabel"))->text().contains(QStringLiteral("正面")));
         emit client.transportFailed(QStringLiteral("CONNECTION_LOST"), QStringLiteral("lost"));
-        QVERIFY(window.findChild<QLabel *>(QStringLiteral("resultLabel"))->text().contains(QStringLiteral("正面")));
-        QVERIFY(!window.findChild<QLabel *>(QStringLiteral("imagePreviewLabel"))->text().contains(QStringLiteral("请选择")));
+        QVERIFY(inspectionPage->findChild<QLabel *>(
+                    QStringLiteral("resultLabel"))->text().contains(QStringLiteral("正面")));
+        QCOMPARE(inspectionPage->findChild<InspectionImageView *>()->imagePath(), imagePath);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))->text().contains(QStringLiteral("未知")));
         QVERIFY(window.findChild<QPushButton *>(QStringLiteral("restartBackendButton"))->isEnabled());
     }
@@ -602,11 +619,15 @@ private slots:
             {"local_scores", QJsonObject{{"front", 12.4}, {"back", 5.1}}},
             {"local_margin", 7.3}, {"decision_source", "local_override"},
             {"needs_review", true}, {"elapsed_ms", 248.5}});
-        const QString evidence = window.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))->toPlainText();
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        const QString evidence = inspectionPage->findChild<QTextEdit *>(
+            QStringLiteral("rawEvidenceTextEdit"))->toPlainText();
         QVERIFY(evidence.contains(QStringLiteral("0.91")));
         QVERIFY(evidence.contains(QStringLiteral("248.5")));
         QVERIFY(!evidence.contains(QStringLiteral("%")));
-        QCOMPARE(window.findChild<QLabel *>(QStringLiteral("reviewLabel"))->text(), QStringLiteral("建议人工复检"));
+        QCOMPARE(inspectionPage->findChild<QLabel *>(
+                     QStringLiteral("reviewLabel"))->text(), QStringLiteral("建议人工复检"));
     }
 
     void batchPredictionSendsEachImageAndShowsSummary() {
@@ -667,7 +688,7 @@ private slots:
 
         QTRY_VERIFY(window.findChild<QLabel *>(QStringLiteral("currentImageLabel"))
                         ->text().contains(QStringLiteral("select-1.png")));
-        QVERIFY(window.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))
+        QVERIFY(window.findChild<QTextEdit *>(QStringLiteral("rawEvidenceTextEdit"))
                     ->toPlainText().contains(QStringLiteral("0.75")));
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))
                     ->text().contains(QStringLiteral("select-1.png")));
@@ -931,8 +952,7 @@ private slots:
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))->text().isEmpty());
         QVERIFY(window.findChild<QTextEdit *>(QStringLiteral("evidenceTextEdit"))
                     ->toPlainText().isEmpty());
-        QVERIFY(window.findChild<QLabel *>(QStringLiteral("imagePreviewLabel"))
-                    ->text().contains(QStringLiteral("请选择")));
+        QVERIFY(window.findChild<InspectionImageView *>()->imagePath().isEmpty());
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
     }
 
@@ -959,13 +979,78 @@ private slots:
         MainWindow window(&client, nullptr);
         QTemporaryDir dir;
         const QString validPath = writeImages(dir, QStringLiteral("preview"), 1).first();
-        auto *preview = window.findChild<QLabel *>(QStringLiteral("imagePreviewLabel"));
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        auto *preview = inspectionPage->findChild<InspectionImageView *>();
+        QVERIFY(preview != nullptr);
         window.setInspectionImagePath(validPath);
-        QVERIFY(preview->pixmap() != nullptr && !preview->pixmap()->isNull());
+        QCOMPARE(preview->imagePath(), validPath);
 
         window.setInspectionImagePath(dir.filePath(QStringLiteral("broken.png")));
-        QVERIFY(preview->pixmap() == nullptr || preview->pixmap()->isNull());
-        QVERIFY(preview->text().contains(QStringLiteral("broken.png")));
+        QVERIFY(preview->imagePath().isEmpty());
+        QVERIFY(inspectionPage->findChild<QLabel *>(QStringLiteral("currentImageLabel"))
+                    ->text().contains(QStringLiteral("broken.png")));
+    }
+
+    void returningToInspectionPreservesDisplayedImageAndResult() {
+        QTemporaryDir dir;
+        const QString imagePath = writeImages(dir, QStringLiteral("return"), 1).constFirst();
+        QVERIFY(!imagePath.isEmpty());
+        MainWindow window;
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        InspectionRecord record;
+        record.id = QStringLiteral("return-record");
+        record.imagePath = imagePath;
+        record.workpieceId = QStringLiteral("m1");
+        record.label = QStringLiteral("front");
+        record.response = QJsonObject{{QStringLiteral("label"), QStringLiteral("front")},
+                                      {QStringLiteral("global_margin"), 0.12},
+                                      {QStringLiteral("local_margin"), 3.4}};
+        record.completedAt = QDateTime::currentDateTime();
+        inspectionPage->showSingleResult(record);
+
+        QVERIFY(QMetaObject::invokeMethod(&window, "showWorkpieceLibrary", Qt::DirectConnection));
+        QVERIFY(QMetaObject::invokeMethod(&window, "showInspection", Qt::DirectConnection));
+
+        QCOMPARE(inspectionPage->singleImagePath(), imagePath);
+        QVERIFY(inspectionPage->findChild<QLabel *>(QStringLiteral("resultLabel"))
+                    ->text().contains(QStringLiteral("正面")));
+    }
+
+    void switchingModesDoesNotOverwriteEitherResult() {
+        QTemporaryDir dir;
+        const QString singlePath = writeImages(dir, QStringLiteral("single-mode"), 1).constFirst();
+        const QString batchPath = writeImages(dir, QStringLiteral("batch-mode"), 1).constFirst();
+        QVERIFY(!singlePath.isEmpty());
+        QVERIFY(!batchPath.isEmpty());
+        MainWindow window;
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        InspectionRecord singleRecord;
+        singleRecord.id = QStringLiteral("single-mode-record");
+        singleRecord.imagePath = singlePath;
+        singleRecord.label = QStringLiteral("front");
+        singleRecord.response = QJsonObject{{QStringLiteral("label"), QStringLiteral("front")}};
+        singleRecord.completedAt = QDateTime::currentDateTime();
+        inspectionPage->setMode(InspectionMode::Single);
+        inspectionPage->showSingleResult(singleRecord);
+        InspectionRecord batchRecord = singleRecord;
+        batchRecord.id = QStringLiteral("batch-mode-record");
+        batchRecord.imagePath = batchPath;
+        batchRecord.label = QStringLiteral("back");
+        batchRecord.response = QJsonObject{{QStringLiteral("label"), QStringLiteral("back")}};
+        inspectionPage->setMode(InspectionMode::Batch);
+        inspectionPage->showSingleResult(batchRecord);
+
+        inspectionPage->setMode(InspectionMode::Single);
+        QCOMPARE(inspectionPage->singleImagePath(), singlePath);
+        QVERIFY(inspectionPage->findChild<QLabel *>(QStringLiteral("resultLabel"))
+                    ->text().contains(QStringLiteral("正面")));
+        inspectionPage->setMode(InspectionMode::Batch);
+        QCOMPARE(inspectionPage->singleImagePath(), batchPath);
+        QVERIFY(inspectionPage->findChild<QLabel *>(QStringLiteral("resultLabel"))
+                    ->text().contains(QStringLiteral("反面")));
     }
 
     void geometryPublishWorkflowSendsSaveValidatePublishInOrder() {

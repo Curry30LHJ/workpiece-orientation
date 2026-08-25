@@ -13,6 +13,8 @@ SOURCES += \
     backendprocessmanager.cpp \
     processlauncher.cpp \
     mainwindow.cpp \
+    inspectionimageview.cpp \
+    inspectionpage.cpp \
     geometryrulecanvas.cpp \
     geometrymaskmanager.cpp \
     annotationcanvas.cpp \
@@ -28,6 +30,9 @@ HEADERS += \
     backendprocessmanager.h \
     processlauncher.h \
     mainwindow.h \
+    inspectiontypes.h \
+    inspectionimageview.h \
+    inspectionpage.h \
     geometryrulecanvas.h \
     geometrymaskmanager.h \
     annotationcanvas.h \
@@ -35,6 +40,7 @@ HEADERS += \
     annotationeditor.h \
     taskstatuswidget.h
 
-FORMS += mainwindow.ui
+FORMS += mainwindow.ui \
+         inspectionpage.ui
 
 RESOURCES += resources.qrc

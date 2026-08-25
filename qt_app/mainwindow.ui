@@ -49,40 +49,6 @@
           </layout>
          </widget>
         </item>
-        <item>
-         <layout class="QHBoxLayout" name="inspectionLayout">
-          <item>
-           <widget class="QGroupBox" name="imageGroupBox">
-            <property name="title"><string>待测图片</string></property>
-            <layout class="QVBoxLayout" name="imageLayout">
-             <item><widget class="QLabel" name="imagePreviewLabel"><property name="minimumSize"><size><width>480</width><height>360</height></size></property><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string>请选择待测图片</string></property></widget></item>
-             <item><widget class="QLabel" name="currentImageLabel"><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string/></property></widget></item>
-             <item><widget class="QPushButton" name="chooseImageButton"><property name="text"><string>选择待测图片</string></property></widget></item>
-             <item><widget class="QPushButton" name="predictButton"><property name="text"><string>开始检测</string></property></widget></item>
-             <item>
-              <layout class="QHBoxLayout" name="batchButtonLayout">
-               <item><widget class="QPushButton" name="chooseBatchImagesButton"><property name="text"><string>选择批量图片</string></property></widget></item>
-               <item><widget class="QPushButton" name="batchPredictButton"><property name="text"><string>批量检测</string></property></widget></item>
-              </layout>
-             </item>
-            </layout>
-           </widget>
-          </item>
-          <item>
-           <widget class="QGroupBox" name="resultGroupBox">
-            <property name="title"><string>检测结果</string></property>
-            <layout class="QVBoxLayout" name="resultLayout">
-             <item><widget class="QLabel" name="resultLabel"><property name="text"><string>尚未检测</string></property></widget></item>
-             <item><widget class="QLabel" name="reviewLabel"><property name="styleSheet"><string notr="true">color: #b00020; font-weight: bold;</string></property></widget></item>
-             <item><widget class="QLabel" name="batchSummaryLabel"><property name="text"><string/></property></widget></item>
-             <item><widget class="QTableWidget" name="batchResultsTableWidget"/></item>
-             <item><widget class="QTextEdit" name="evidenceTextEdit"><property name="readOnly"><bool>true</bool></property></widget></item>
-             <item><widget class="QLabel" name="currentResultTargetLabel"><property name="text"><string/></property></widget></item>
-            </layout>
-           </widget>
-          </item>
-         </layout>
-        </item>
        </layout>
       </widget>
       <widget class="QWidget" name="libraryPageHost">

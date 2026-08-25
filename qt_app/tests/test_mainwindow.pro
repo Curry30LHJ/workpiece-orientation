@@ -11,6 +11,8 @@ SOURCES += test_mainwindow.cpp \
            ../backendprocessmanager.cpp \
            ../processlauncher.cpp \
            ../mainwindow.cpp \
+           ../inspectionimageview.cpp \
+           ../inspectionpage.cpp \
            ../geometryrulecanvas.cpp \
            ../geometrymaskmanager.cpp \
            ../annotationcanvas.cpp \
@@ -23,10 +25,14 @@ HEADERS += ../appheader.h \
            ../backendprocessmanager.h \
            ../processlauncher.h \
            ../mainwindow.h \
+           ../inspectiontypes.h \
+           ../inspectionimageview.h \
+           ../inspectionpage.h \
            ../geometryrulecanvas.h \
            ../geometrymaskmanager.h \
            ../annotationcanvas.h \
            ../annotationmanager.h \
            ../annotationeditor.h \
            ../taskstatuswidget.h
-FORMS += ../mainwindow.ui
+FORMS += ../mainwindow.ui \
+         ../inspectionpage.ui

@@ -15,7 +15,11 @@
 #include "backendclient.h"
 
 class BackendProcessManager;
+class InspectionPage;
+class QLabel;
 class QPushButton;
+class QTableWidget;
+class QTextEdit;
 class AnnotationManagerDialog;
 class GeometryMaskManagerDialog;
 class TaskStatusWidget;
@@ -89,6 +93,8 @@ private slots:
     void onClientTransportFailed(const QString &code, const QString &message);
 
 private:
+    enum class CommandOwner { None, System, Inspection, Library, Geometry };
+
     enum class BatchResultState {
         Pending,
         Submitting,
@@ -117,6 +123,9 @@ private:
 
     void initializeUi();
     void connectBackendSignals();
+    void sendPageCommand(CommandOwner owner, const QString &command,
+                         const QJsonObject &fields = QJsonObject());
+    void clearPendingCommand();
     void updateButtonStates();
     void updateTemplateLabels();
     void updatePreview();
@@ -147,8 +156,6 @@ private:
     QStringList normalizedPaths(const QStringList &paths) const;
     QString selectedWorkpieceId() const;
     QString orientationText(const QString &label) const;
-    QString decisionSourceText(const QString &source) const;
-    QString formatScore(const QJsonObject &scores, const QString &key) const;
     void showLibraryMessage(const QString &message, bool error = false);
     void requestAnnotationSnapshot(const QString &workpieceId);
     void sendAnnotationMutation(const QString &command, const QJsonObject &fields);
@@ -158,6 +165,7 @@ private:
     Ui::MainWindow *ui;
     AppHeader *appHeader_ = nullptr;
     TaskStatusWidget *globalTaskStatus_ = nullptr;
+    InspectionPage *inspectionPage_ = nullptr;
     AppPage currentPage_ = AppPage::Inspection;
     BackendClient *client_ = nullptr;
     BackendProcessManager *manager_ = nullptr;
@@ -166,6 +174,7 @@ private:
     QString inspectionImagePath_;
     QStringList batchImagePaths_;
     int batchIndex_ = 0;
+    CommandOwner pendingOwner_ = CommandOwner::None;
     QString pendingCommand_;
     QString pendingWorkpieceName_;
     bool pendingReplace_ = false;
@@ -184,10 +193,21 @@ private:
     QTimer *geometryPollTimer_ = nullptr;
     std::function<bool(const QString &)> replaceConfirmationHandler_;
     QPushButton *deleteWorkpieceButton_ = nullptr;
+    QPushButton *chooseImageButton_ = nullptr;
+    QPushButton *predictButton_ = nullptr;
+    QPushButton *chooseBatchImagesButton_ = nullptr;
+    QPushButton *batchPredictButton_ = nullptr;
     QPushButton *confirmFrontButton_ = nullptr;
     QPushButton *confirmBackButton_ = nullptr;
     QPushButton *rejectConfirmationButton_ = nullptr;
     QPushButton *annotationEditorButton_ = nullptr;
+    QLabel *currentImageLabel_ = nullptr;
+    QLabel *resultLabel_ = nullptr;
+    QLabel *reviewLabel_ = nullptr;
+    QLabel *batchSummaryLabel_ = nullptr;
+    QLabel *currentResultTargetLabel_ = nullptr;
+    QTextEdit *evidenceTextEdit_ = nullptr;
+    QTableWidget *batchResultsTableWidget_ = nullptr;
     QString lastPredictionWorkpieceId_;
     QString lastPredictionImagePath_;
     QJsonObject lastPredictionResponse_;
