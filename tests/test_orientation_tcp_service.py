@@ -430,6 +430,60 @@ def test_malformed_inventory_is_not_reported_as_missing_workpiece(tmp_path):
     assert response["error"]["code"] == "INVALID_TEMPLATE_SET"
 
 
+def test_unstable_workpiece_list_returns_stale_revision_error(tmp_path):
+    class AnyIdClassifier(FakeClassifier):
+        def set_template_cache(self, workpiece_id, cache):
+            self.active_workpiece_id = workpiece_id
+
+    class MutatingProfiles:
+        def __init__(self):
+            self.catalog = None
+            self.calls = 0
+
+        def snapshot(self, workpiece_id):
+            self.calls += 1
+            current = self.catalog.capture_snapshot(workpiece_id)
+            self.catalog.publish_geometry_profile(
+                workpiece_id,
+                current.cache,
+                profile_revision=self.calls,
+                previous_profile_revision=None,
+                expected_revision=current.record.revision,
+                operation_id=f"protocol-summary-churn-{self.calls}",
+            )
+            return {"profile_status": "ok", "active": {"rules": []}}
+
+    classifier = AnyIdClassifier()
+    profiles = MutatingProfiles()
+    library = WorkpieceLibrary(tmp_path / "protocol-summary-churn-library")
+    catalog = WorkpieceCatalog(library, classifier, profiles)
+    profiles.catalog = catalog
+    front_path = tmp_path / "protocol-summary-churn-front.png"
+    back_path = tmp_path / "protocol-summary-churn-back.png"
+    assert cv2.imwrite(str(front_path), np.full((8, 8, 3), 10, dtype=np.uint8))
+    assert cv2.imwrite(str(back_path), np.full((8, 8, 3), 20, dtype=np.uint8))
+    catalog.register("M-protocol-summary-churn", [front_path], [back_path], False)
+    dispatcher = OrientationCommandDispatcher(FakeClassifier(), FakeLibrary())
+    snapshot = dispatcher.runtime.snapshot()
+    dispatcher.runtime._snapshot = replace(
+        snapshot,
+        classifier=classifier,
+        library=library,
+        catalog=catalog,
+        geometry_profiles=profiles,
+    )
+
+    response = dispatcher.dispatch({
+        "version": 1,
+        "request_id": "protocol-summary-churn",
+        "command": "list_workpieces",
+    })
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "STALE_WORKPIECE_REVISION"
+    assert "workpieces" not in response
+
+
 @pytest.mark.parametrize("workpiece_id", [None, "", "   ", 7])
 def test_workpiece_details_reject_invalid_ids(client, workpiece_id):
     response = client.request("get_workpiece_details", workpiece_id=workpiece_id)

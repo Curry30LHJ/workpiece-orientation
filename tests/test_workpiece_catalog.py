@@ -164,6 +164,28 @@ class BlockingCatalogGeometryProfiles:
         }
 
 
+class AlwaysMutatingSummaryGeometryProfiles:
+    def __init__(self):
+        self.catalog = None
+        self.calls = 0
+
+    def snapshot(self, workpiece_id):
+        self.calls += 1
+        current = self.catalog.capture_snapshot(workpiece_id)
+        self.catalog.publish_geometry_profile(
+            workpiece_id,
+            current.cache,
+            profile_revision=self.calls,
+            previous_profile_revision=None,
+            expected_revision=current.record.revision,
+            operation_id=f"summary-churn-{self.calls}",
+        )
+        return {
+            "profile_status": "ok",
+            "active": {"rules": []},
+        }
+
+
 def create_catalog(tmp_path):
     library = WorkpieceLibrary(tmp_path / "library")
     classifier = FakeClassifier()
@@ -424,6 +446,28 @@ def test_summary_list_skips_recycled_record_during_geometry_snapshot(tmp_path):
     assert not reader.is_alive()
     assert errors == []
     assert results == [[]]
+
+
+def test_summary_list_reports_stale_after_all_snapshot_retries_change_revision(tmp_path):
+    profiles = AlwaysMutatingSummaryGeometryProfiles()
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(
+        WorkpieceLibrary(tmp_path / "summary-churn-library"),
+        classifier,
+        profiles,
+    )
+    profiles.catalog = catalog
+    catalog.register(
+        "M-summary-churn",
+        [image(tmp_path / "summary-churn-front.png", 10)],
+        [image(tmp_path / "summary-churn-back.png", 20)],
+        False,
+    )
+
+    with pytest.raises(StaleWorkpieceRevisionError, match="changed repeatedly"):
+        catalog.list_workpiece_summaries()
+
+    assert profiles.calls == 3
 
 
 def test_predict_releases_catalog_lock_before_classifier_runs(tmp_path):

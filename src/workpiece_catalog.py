@@ -191,7 +191,9 @@ class WorkpieceCatalog:
                     and self.geometry_profiles is geometry_profiles
                 ):
                     return summaries
-        return []
+        raise StaleWorkpieceRevisionError(
+            "Workpiece list changed repeatedly while reading summaries"
+        )
 
     def list_workpieces(self):
         return self.list_workpiece_summaries()
