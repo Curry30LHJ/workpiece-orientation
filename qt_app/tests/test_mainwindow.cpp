@@ -1215,6 +1215,7 @@ private slots:
         QVERIFY(list != nullptr);
         QVERIFY(refresh != nullptr);
         QVERIFY(message != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 2, 1000);
         QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
         list->setCurrentRow(0);
         QTRY_VERIFY_WITH_TIMEOUT(
