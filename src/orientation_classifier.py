@@ -848,17 +848,49 @@ class OrientationClassifier:
             result["needs_review"] = bool(result["needs_review"] or geometry_mask.get("needs_review", False))
         return result
 
-    def _predict_baseline(self, image: np.ndarray, cache: TemplateCache,
-                          started: float, geometry_mask: dict[str, Any] | None = None) -> dict[str, object]:
+    def _predict_baseline(
+        self,
+        image: np.ndarray,
+        cache: TemplateCache,
+        started: float,
+        geometry_mask: dict[str, Any] | None = None,
+        timings: dict[str, float] | None = None,
+    ) -> dict[str, object]:
         raw_globals = getattr(cache, "raw_global_vectors", None) or cache.global_vectors
         raw_locals = getattr(cache, "raw_local_features", None) or cache.local_features
-        global_prediction, global_scores, _ = classify_embedding(self._global_embedding(image), raw_globals)
+        global_started = time.perf_counter()
+        query_embedding = self._global_embedding(image)
+        global_prediction, global_scores, _ = classify_embedding(query_embedding, raw_globals)
+        if timings is not None:
+            timings["global_batch"] += (time.perf_counter() - global_started) * 1000.0
         del global_prediction
+        local_started = time.perf_counter()
         with self._inference_lock:
-            query_features = self._extract_features(image, self.extractor, self.device, roi_ratio=ROI_RATIO)
-        local_scores = {label: self._score_local(query_features, candidates, image.shape[:2])
-                        for label, candidates in raw_locals.items()}
-        return self._fuse_scores(global_scores, local_scores, started, geometry_mask=geometry_mask)
+            query_features = self._extract_features(
+                image, self.extractor, self.device, roi_ratio=ROI_RATIO
+            )
+        if timings is not None:
+            timings["local_features"] += (time.perf_counter() - local_started) * 1000.0
+        search = self._search_local(
+            query_features_by_label={"front": query_features, "back": query_features},
+            global_vectors=raw_globals,
+            query_embeddings={"front": query_embedding, "back": query_embedding},
+            local_features=raw_locals,
+            image_shape=image.shape[:2],
+            global_scores=global_scores,
+        )
+        if timings is not None:
+            timings["local_matching"] += search.matching_ms
+        fusion_started = time.perf_counter()
+        result = self._fuse_scores(
+            global_scores, search.scores, started, geometry_mask=geometry_mask
+        )
+        result["local_search"] = search.diagnostics
+        if timings is not None:
+            timings["fusion"] += (time.perf_counter() - fusion_started) * 1000.0
+            if geometry_mask is not None:
+                geometry_mask["timings_ms"] = timings
+        return result
 
     @staticmethod
     def _geometry_report(fit: dict[str, Any]) -> dict[str, Any]:
@@ -869,14 +901,27 @@ class OrientationClassifier:
         ]
         return result
 
+    @staticmethod
+    def _geometry_timings() -> dict[str, float]:
+        return {
+            "fit_context": 0.0,
+            "fit_directions": 0.0,
+            "mask_build": 0.0,
+            "global_batch": 0.0,
+            "local_features": 0.0,
+            "local_matching": 0.0,
+            "fusion": 0.0,
+        }
+
     def _predict_geometry(self, image: np.ndarray, cache: TemplateCache,
                           started: float) -> dict[str, object]:
         profile = cache.geometry_profile or {}
         calibrator = self.geometry_calibrator
+        timings = self._geometry_timings()
         if calibrator is None:
             return self._predict_baseline(image, cache, started, {
                 "status": "unavailable", "needs_review": True, "profile_revision": cache.geometry_profile_revision,
-            })
+            }, timings)
         query_features: dict[str, dict[str, Any]] = {}
         query_embeddings: dict[str, np.ndarray] = {}
         reports: dict[str, Any] = {}
@@ -885,11 +930,17 @@ class OrientationClassifier:
         for label in ("front", "back"):
             direction = self._geometry_direction(profile, label)
             if direction is None or direction.get("anchor") is None or not direction.get("rules"):
+                local_started = time.perf_counter()
                 query_features[label] = self._extract_local(image)
+                timings["local_features"] += (time.perf_counter() - local_started) * 1000.0
+                global_started = time.perf_counter()
                 query_embeddings[label] = self._global_embedding(image)
+                timings["global_batch"] += (time.perf_counter() - global_started) * 1000.0
                 reports[label] = {"status": "not_configured"}
                 continue
+            fit_started = time.perf_counter()
             fit = calibrator.fit(image, direction)
+            timings["fit_directions"] += (time.perf_counter() - fit_started) * 1000.0
             reports[label] = self._geometry_report(fit)
             if fit.get("status") != "active":
                 geometry_mask = {
@@ -903,20 +954,31 @@ class OrientationClassifier:
                     local_features=raw_locals,
                     raw_global_vectors=raw_globals,
                     raw_local_features=raw_locals,
-                ), started, geometry_mask)
+                ), started, geometry_mask, timings)
             mask = fit["ignore_mask"]
             fill = direction.get("fill_bgr") or self._neutral_fill(image, mask)
+            mask_started = time.perf_counter()
             masked = apply_ignore_mask(image, mask, fill)
+            timings["mask_build"] += (time.perf_counter() - mask_started) * 1000.0
+            global_started = time.perf_counter()
             query_embeddings[label] = self._global_embedding(masked)
+            timings["global_batch"] += (time.perf_counter() - global_started) * 1000.0
+            local_started = time.perf_counter()
             query_features[label] = filter_features_by_mask(self._extract_local(masked), mask)
+            timings["local_features"] += (time.perf_counter() - local_started) * 1000.0
         global_scores = {
             label: float(np.max(cache.global_vectors[label] @ query_embeddings[label]))
             for label in ("front", "back")
         }
-        local_scores = {
-            label: self._score_local(query_features[label], cache.local_features[label], image.shape[:2])
-            for label in ("front", "back")
-        }
+        search = self._search_local(
+            query_features_by_label=query_features,
+            global_vectors=cache.global_vectors,
+            query_embeddings=query_embeddings,
+            local_features=cache.local_features,
+            image_shape=image.shape[:2],
+            global_scores=global_scores,
+        )
+        timings["local_matching"] = search.matching_ms
         geometry_mask = {
             "status": "active",
             "needs_review": False,
@@ -925,8 +987,15 @@ class OrientationClassifier:
             "ignored_ratio": {
                 label: float(reports[label].get("ignored_ratio", 0.0)) for label in ("front", "back")
             },
+            "timings_ms": timings,
         }
-        return self._fuse_scores(global_scores, local_scores, started, geometry_mask=geometry_mask)
+        fusion_started = time.perf_counter()
+        result = self._fuse_scores(
+            global_scores, search.scores, started, geometry_mask=geometry_mask
+        )
+        result["local_search"] = search.diagnostics
+        timings["fusion"] = (time.perf_counter() - fusion_started) * 1000.0
+        return result
 
     def predict(self, workpiece_id: str, image_path: Path) -> dict[str, object]:
         started = time.perf_counter()

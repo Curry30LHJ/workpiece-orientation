@@ -12,6 +12,7 @@ from src.orientation_classifier import (
     OrientationClassifier,
     OrientationClassifierError,
     PropagationModelError,
+    TemplateCache,
     WorkpieceNotFoundError,
 )
 
@@ -154,6 +155,11 @@ def test_active_geometry_profile_builds_directional_template_cache_and_query_fea
     assert classifier.extractor.markers[-2:] == [7, 7]
     assert result["geometry_mask"]["status"] == "active"
     assert result["geometry_mask"]["profile_revision"] == 3
+    assert set(result["geometry_mask"]["timings_ms"]) == {
+        "fit_context", "fit_directions", "mask_build", "global_batch",
+        "local_features", "local_matching", "fusion",
+    }
+    assert result["local_search"]["mode"] == "adaptive"
 
 
 def test_leave_one_out_scores_cached_candidate_without_feature_reextraction(classifier, tmp_path):
@@ -192,6 +198,9 @@ def test_geometry_fit_failure_uses_raw_cache_and_sets_review(classifier, tmp_pat
     assert result["needs_review"] is True
     assert classifier.global_predictor.markers[-1] == 3
     assert classifier.extractor.markers[-1] == 3
+    assert result["local_search"]["available_counts"] == {
+        label: len(candidate.raw_local_features[label]) for label in ("front", "back")
+    }
 
 
 def test_low_global_margin_is_overridden_by_decisive_local_evidence(registered_classifier, tmp_path):
@@ -330,6 +339,15 @@ def test_build_template_cache_rejects_an_empty_orientation(classifier, tmp_path)
 
 
 def test_prediction_scores_every_local_template(classifier, tmp_path):
+    classifier = OrientationClassifier(
+        global_predictor=FakeGlobalPredictor(),
+        extractor=FakeExtractor(),
+        matcher=FakeMatcher(),
+        device="cpu",
+        extract_features_fn=fake_extract_features,
+        score_feature_pair_fn=fake_score_feature_pair,
+        local_search_mode="exhaustive",
+    )
     front = [write_marker(tmp_path / f"front-{index}.png", 1) for index in range(10)]
     back = [write_marker(tmp_path / f"back-{index}.png", 2) for index in range(15)]
     scored = []
@@ -343,6 +361,98 @@ def test_prediction_scores_every_local_template(classifier, tmp_path):
     classifier.predict("m", write_marker(tmp_path / "query.png", 3))
 
     assert len(scored) == 25
+
+
+def test_baseline_prediction_exposes_adaptive_search_diagnostics(classifier, tmp_path):
+    calls = []
+    cache = TemplateCache(
+        global_vectors={
+            "front": np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (12, 1)),
+            "back": np.tile(np.asarray([[0.0, 1.0]], dtype=np.float32), (13, 1)),
+        },
+        local_features={
+            "front": [
+                {"label": "front", "index": index, "score": 5.0}
+                for index in range(12)
+            ],
+            "back": [
+                {"label": "back", "index": index, "score": 8.0}
+                for index in range(13)
+            ],
+        },
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+    classifier.set_template_cache("m", cache)
+
+    result = classifier.predict(
+        "m", write_marker(tmp_path / "adaptive-query.png", 3)
+    )
+
+    assert result["label"] == "back"
+    assert result["needs_review"] is False
+    assert result["local_search"]["stage"] == "top5"
+    assert result["local_search"]["matched_counts"] == {"front": 5, "back": 5}
+    assert len(calls) == 10
+
+
+def test_baseline_exhaustive_search_matches_explicit_full_fusion(tmp_path):
+    classifier = OrientationClassifier(
+        global_predictor=FakeGlobalPredictor(),
+        extractor=FakeExtractor(),
+        matcher=FakeMatcher(),
+        device="cpu",
+        extract_features_fn=fake_extract_features,
+        score_feature_pair_fn=fake_score_feature_pair,
+        local_search_mode="exhaustive",
+    )
+    calls = []
+    front_scores = [5.0] * 11 + [9.5]
+    back_scores = [8.0] * 12 + [9.0]
+    cache = TemplateCache(
+        global_vectors={
+            "front": np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (12, 1)),
+            "back": np.tile(np.asarray([[0.0, 1.0]], dtype=np.float32), (13, 1)),
+        },
+        local_features={
+            "front": [
+                {"label": "front", "index": index, "score": score}
+                for index, score in enumerate(front_scores)
+            ],
+            "back": [
+                {"label": "back", "index": index, "score": score}
+                for index, score in enumerate(back_scores)
+            ],
+        },
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+    classifier.set_template_cache("m", cache)
+    global_scores = {
+        "front": float(np.float32(0.9)),
+        "back": float(np.float32(0.91)),
+    }
+    expected = classifier._fuse_scores(
+        global_scores,
+        {"front": max(front_scores), "back": max(back_scores)},
+        0.0,
+    )
+
+    result = classifier.predict(
+        "m", write_marker(tmp_path / "exhaustive-query.png", 3)
+    )
+
+    assert len(calls) == 25
+    assert result["local_search"]["stage"] == "full"
+    for key in (
+        "label", "needs_review", "global_scores", "local_scores",
+        "global_margin", "local_margin", "decision_source",
+    ):
+        assert result[key] == expected[key]
 
 
 def test_template_cache_round_trip_preserves_unequal_template_sets(classifier, tmp_path):
