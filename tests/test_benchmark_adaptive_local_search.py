@@ -145,6 +145,16 @@ def refresh_fingerprint(fingerprint: dict) -> None:
     fingerprint["overall_sha256"] = _test_sha(body)
 
 
+def loaded_model_runtime_modules() -> set[str]:
+    return {
+        name
+        for name in sys.modules
+        if name in {"paddle", "torch"}
+        or name.startswith("paddle.")
+        or name.startswith("torch.")
+    }
+
+
 def payload(mode: str, rows: list[dict]) -> dict:
     return {
         "mode": mode,
@@ -527,15 +537,13 @@ def test_markdown_reports_environment_stage_counts_latency_and_gate():
 
 
 def test_environment_collection_does_not_load_model_runtimes(tmp_path):
-    assert "paddle" not in sys.modules
-    assert "torch" not in sys.modules
+    before = loaded_model_runtime_modules()
 
     environment = _collect_environment(tmp_path)
 
     assert environment["paddle"]
     assert environment["torch"]
-    assert "paddle" not in sys.modules
-    assert "torch" not in sys.modules
+    assert loaded_model_runtime_modules() == before
 
 
 def test_worker_makes_project_sources_importable(monkeypatch):
@@ -664,8 +672,7 @@ def test_disk_labels_and_seed_reproduce_exact_query_manifest():
     reason="local ignored M1/M2/M7 benchmark inputs are unavailable",
 )
 def test_real_selection_and_hash_fingerprint_are_isolated_without_loading_models():
-    assert "paddle" not in sys.modules
-    assert "torch" not in sys.modules
+    before = loaded_model_runtime_modules()
     library_dir = PROJECT_ROOT / "runtime_library"
     model_dir = (
         PROJECT_ROOT
@@ -707,5 +714,4 @@ def test_real_selection_and_hash_fingerprint_are_isolated_without_loading_models
     assert fingerprint["m1_artifacts"]["template_cache"]["status"] == "present"
     assert fingerprint["m1_artifacts"]["active_geometry_profile"]["status"] == "present"
     assert fingerprint["model"]["files"]
-    assert "paddle" not in sys.modules
-    assert "torch" not in sys.modules
+    assert loaded_model_runtime_modules() == before
