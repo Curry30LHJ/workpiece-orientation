@@ -101,6 +101,9 @@ InspectionMode InspectionPage::mode() const {
 }
 
 InspectionUiState InspectionPage::uiState() const {
+    if (backendStatusKnown_ && !backendAvailable_) {
+        return InspectionUiState::BackendUnavailable;
+    }
     return activeState().uiState;
 }
 
@@ -111,23 +114,11 @@ void InspectionPage::setCurrentWorkpiece(const QString &id, const QString &name)
 }
 
 void InspectionPage::setBackendAvailable(bool available, bool busy, const QString &reason) {
+    backendStatusKnown_ = true;
     backendAvailable_ = available;
     backendBusy_ = busy;
     backendReason_ = reason;
-    if (!available) {
-        activeState().uiState = InspectionUiState::BackendUnavailable;
-        activeState().message = reason;
-        renderActiveState();
-    } else {
-        if (activeState().uiState == InspectionUiState::BackendUnavailable) {
-            activeState().uiState = activeState().hasRecord
-                ? (activeState().visibleRecord.needsReview
-                       ? InspectionUiState::NeedsReview : InspectionUiState::Completed)
-                : InspectionUiState::Idle;
-            activeState().message.clear();
-        }
-        updateActionAvailability();
-    }
+    renderActiveState();
 }
 
 void InspectionPage::setSingleImagePath(const QString &path) {
@@ -138,6 +129,13 @@ void InspectionPage::setSingleImagePath(const QString &path) {
     state.uiState = InspectionUiState::Idle;
     state.message.clear();
     renderActiveState();
+}
+
+void InspectionPage::clearBatchState() {
+    batchState_ = ModeState();
+    if (mode_ == InspectionMode::Batch) {
+        renderActiveState();
+    }
 }
 
 QString InspectionPage::singleImagePath() const {
@@ -234,10 +232,11 @@ void InspectionPage::handleBackendResponse(const QString &command,
         const QString state = job.value(QStringLiteral("state")).toString(QStringLiteral("queued"));
         if (state == QStringLiteral("failed")) {
             record.disposition = BatchDisposition::SubmitFailed;
-            record.error = job.value(QStringLiteral("error")).toString();
+            record.submissionError = job.value(QStringLiteral("error")).toString();
         } else {
             record.disposition = pendingConfirmationOrientation_ == QStringLiteral("back")
                 ? BatchDisposition::QueuedBack : BatchDisposition::QueuedFront;
+            record.submissionError.clear();
             record.response.insert(QStringLiteral("evolution_state"), state);
         }
         recentRecords_.insert(recordId, record);
@@ -260,7 +259,7 @@ void InspectionPage::handleBackendResponse(const QString &command,
                                        job.value(QStringLiteral("state")));
                 if (job.value(QStringLiteral("state")).toString() == QStringLiteral("failed")) {
                     record.disposition = BatchDisposition::SubmitFailed;
-                    record.error = job.value(QStringLiteral("error")).toString();
+                    record.submissionError = job.value(QStringLiteral("error")).toString();
                 }
                 recentRecords_.insert(recordId, record);
                 if (singleState_.visibleRecord.id == recordId) singleState_.visibleRecord = record;
@@ -286,7 +285,9 @@ void InspectionPage::handleBackendFailure(const QString &command, const QString 
         showSingleFailure(message);
         if (code == QStringLiteral("CONNECTION_LOST")
             || code == QStringLiteral("TRANSPORT_ERROR")) {
-            activeState().uiState = InspectionUiState::BackendUnavailable;
+            backendStatusKnown_ = true;
+            backendAvailable_ = false;
+            backendReason_ = message;
             renderActiveState();
         }
     }
@@ -389,12 +390,13 @@ void InspectionPage::renderActiveState() {
         ui->rawEvidenceTextEdit->clear();
         ui->currentResultTargetLabel->clear();
     }
-    if (state.uiState == InspectionUiState::Running) {
+    const InspectionUiState visibleState = uiState();
+    if (visibleState == InspectionUiState::Running) {
         ui->resultMessageLabel->setText(QStringLiteral("正在检测…"));
-    } else if (state.uiState == InspectionUiState::BackendUnavailable) {
+    } else if (visibleState == InspectionUiState::BackendUnavailable) {
         ui->resultMessageLabel->setText(
-            state.message.isEmpty() ? QStringLiteral("后端不可用") : state.message);
-    } else if (state.uiState == InspectionUiState::Failed) {
+            backendReason_.isEmpty() ? QStringLiteral("后端不可用") : backendReason_);
+    } else if (visibleState == InspectionUiState::Failed) {
         ui->resultMessageLabel->setText(
             state.message.isEmpty() ? QStringLiteral("检测失败") : state.message);
     } else {
@@ -461,7 +463,7 @@ void InspectionPage::updateRecordDisposition(const QString &recordId,
     if (!recentRecords_.contains(recordId)) return;
     InspectionRecord record = recentRecords_.value(recordId);
     record.disposition = disposition;
-    record.error = error;
+    record.submissionError = error;
     recentRecords_.insert(recordId, record);
     if (singleState_.visibleRecord.id == recordId) singleState_.visibleRecord = record;
     rebuildRecentList();
@@ -489,15 +491,25 @@ QString InspectionPage::dispositionText(const InspectionRecord &record) const {
 
 QString InspectionPage::evidenceSummary(const InspectionRecord &record) const {
     const QJsonObject response = record.response;
+    const QString globalPrediction = response.value(
+        QStringLiteral("global_prediction")).toString(record.label);
     const QString localPrediction = response.value(
         QStringLiteral("local_prediction")).toString();
-    QStringList lines{
-        QStringLiteral("全局特征：已纳入%1判定").arg(orientationText(record.label)),
-        localPrediction.isEmpty()
-            ? QStringLiteral("局部匹配：未提供独立结论")
-            : QStringLiteral("局部匹配：支持%1").arg(orientationText(localPrediction)),
-        QStringLiteral("几何规则：%1").arg(geometryDescription(response)),
-    };
+    const QString decisionSource = response.value(
+        QStringLiteral("decision_source")).toString();
+    QString globalLine = globalPrediction.isEmpty()
+        ? QStringLiteral("全局特征：未提供独立结论")
+        : QStringLiteral("全局特征：支持%1").arg(orientationText(globalPrediction));
+    QString localLine = localPrediction.isEmpty()
+        ? QStringLiteral("局部匹配：未提供独立结论")
+        : QStringLiteral("局部匹配：支持%1").arg(orientationText(localPrediction));
+    if (decisionSource == QStringLiteral("global")) {
+        globalLine.append(QStringLiteral("（采用此结果）"));
+    } else if (decisionSource == QStringLiteral("local_override")) {
+        localLine.append(QStringLiteral("（采用此结果）"));
+    }
+    QStringList lines{globalLine, localLine,
+                      QStringLiteral("几何规则：%1").arg(geometryDescription(response))};
     if (record.needsReview) {
         const QString reason = response.value(QStringLiteral("review_reason"))
                                    .toString(QStringLiteral("证据需人工复核"));

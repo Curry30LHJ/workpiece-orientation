@@ -24,6 +24,7 @@ public:
     void setCurrentWorkpiece(const QString &id, const QString &name);
     void setBackendAvailable(bool available, bool busy, const QString &reason);
     void setSingleImagePath(const QString &path);
+    void clearBatchState();
     QString singleImagePath() const;
     void showSingleResult(const InspectionRecord &record);
     void showSingleFailure(const QString &message);
@@ -75,6 +76,7 @@ private:
     QString currentWorkpieceName_;
     bool backendAvailable_ = false;
     bool backendBusy_ = false;
+    bool backendStatusKnown_ = false;
     QString backendReason_;
     QHash<QString, InspectionRecord> recentRecords_;
     QStringList recentRecordOrder_;

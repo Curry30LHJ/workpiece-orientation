@@ -26,4 +26,5 @@ struct InspectionRecord {
     BatchDisposition disposition = BatchDisposition::Pending;
     QString evolutionJobId;
     QString error;
+    QString submissionError;
 };

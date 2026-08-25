@@ -269,9 +269,36 @@ void MainWindow::connectBackendSignals() {
 void MainWindow::sendPageCommand(CommandOwner owner, const QString &command,
                                  const QJsonObject &fields) {
     if (client_ == nullptr || command.isEmpty()) return;
+    if (clientBusy_ || !pendingCommand_.isEmpty()
+        || client_->state() != BackendClient::State::Ready) {
+        if (queuedCommand_.isEmpty()) {
+            queuedOwner_ = owner;
+            queuedCommand_ = command;
+            queuedFields_ = fields;
+        } else {
+            showLibraryMessage(
+                QStringLiteral("已有后续操作等待发送，请稍后重试：%1").arg(command), true);
+        }
+        return;
+    }
     pendingOwner_ = owner;
     pendingCommand_ = command;
     client_->sendRequest(command, fields);
+}
+
+void MainWindow::dispatchQueuedCommand() {
+    if (queuedCommand_.isEmpty() || client_ == nullptr || clientBusy_
+        || !pendingCommand_.isEmpty()
+        || client_->state() != BackendClient::State::Ready) {
+        return;
+    }
+    const CommandOwner owner = queuedOwner_;
+    const QString command = queuedCommand_;
+    const QJsonObject fields = queuedFields_;
+    queuedOwner_ = CommandOwner::None;
+    queuedCommand_.clear();
+    queuedFields_ = QJsonObject();
+    sendPageCommand(owner, command, fields);
 }
 
 void MainWindow::clearPendingCommand() {
@@ -323,7 +350,11 @@ void MainWindow::setReplaceConfirmationHandler(std::function<bool(const QString 
 
 void MainWindow::setBackendError(const QString &message) {
     backendReady_ = false;
+    backendReadyHandled_ = false;
     clientBusy_ = false;
+    queuedOwner_ = CommandOwner::None;
+    queuedCommand_.clear();
+    queuedFields_ = QJsonObject();
     BackendStatusDetails details;
     details.state = BackendUiState::Error;
     details.connectionDetail = QStringLiteral("配置错误");
@@ -376,8 +407,7 @@ void MainWindow::refreshWorkpieces() {
 }
 
 void MainWindow::requestWorkpieceRefresh(bool preserveRegistrationSummary) {
-    if (client_ == nullptr || !backendReady_ || clientBusy_
-        || client_->state() != BackendClient::State::Ready) {
+    if (client_ == nullptr || !backendReady_) {
         return;
     }
     if (!preserveRegistrationSummary) {
@@ -820,6 +850,8 @@ void MainWindow::restartBackend() {
 }
 
 void MainWindow::onBackendReady() {
+    const bool firstReadySignal = !backendReadyHandled_;
+    backendReadyHandled_ = true;
     backendReady_ = true;
     clientBusy_ = false;
     if (annotationManagerDialog_ != nullptr) {
@@ -838,12 +870,15 @@ void MainWindow::onBackendReady() {
     if (evolutionPollTimer_ != nullptr) {
         evolutionPollTimer_->start();
     }
-    QTimer::singleShot(0, this, [this]() {
-        requestWorkpieceRefresh(registrationSummaryVisible_);
-    });
+    if (firstReadySignal) {
+        QTimer::singleShot(0, this, [this]() {
+            requestWorkpieceRefresh(registrationSummaryVisible_);
+        });
+    }
 }
 
 void MainWindow::onBackendLoading(const QString &message) {
+    backendReadyHandled_ = false;
     backendReady_ = false;
     clientBusy_ = false;
     if (annotationManagerDialog_ != nullptr) {
@@ -894,12 +929,16 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
         updateBatchRow(failedIndex);
         selectBatchResult(failedIndex, false);
     }
+    backendReadyHandled_ = false;
     backendReady_ = false;
     clientBusy_ = false;
     registrationInFlight_ = false;
     batchInFlight_ = false;
     pendingReplace_ = false;
     clearPendingCommand();
+    queuedOwner_ = CommandOwner::None;
+    queuedCommand_.clear();
+    queuedFields_ = QJsonObject();
     if (interruptedOwner == CommandOwner::Inspection
         && !interruptedBatchCommand && inspectionPage_ != nullptr) {
         inspectionPage_->handleBackendFailure(interruptedTask,
@@ -937,6 +976,9 @@ void MainWindow::pollEvolutionJobs() {
 
 void MainWindow::onClientStateChanged(BackendClient::State state, const QString &detail) {
     clientBusy_ = state == BackendClient::State::Busy;
+    if (state != BackendClient::State::Ready && state != BackendClient::State::Busy) {
+        backendReadyHandled_ = false;
+    }
     BackendStatusDetails details;
     details.connectionDetail = detail;
     details.canRestart = manager_ != nullptr || state == BackendClient::State::Error;
@@ -962,6 +1004,9 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
     }
     appHeader_->setBackendDetails(details);
     updateButtonStates();
+    if (state == BackendClient::State::Ready) {
+        dispatchQueuedCommand();
+    }
 }
 
 void MainWindow::onClientProgress(const QString &command, const QJsonObject &progress) {
@@ -1047,29 +1092,43 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("submit_confirmation")) {
+        const QJsonObject job = response.value(QStringLiteral("job")).toObject();
+        const bool jobFailed = job.value(QStringLiteral("state")).toString()
+            == QStringLiteral("failed");
+        const QString jobError = job.value(QStringLiteral("error")).toString(
+            QStringLiteral("后台入库任务失败"));
         if (pendingConfirmationBatchIndex_ >= 0
             && pendingConfirmationBatchIndex_ < batchResults_.size()) {
             const int completedIndex = pendingConfirmationBatchIndex_;
             BatchResult &result = batchResults_[completedIndex];
-            result.state = pendingConfirmationOrientation_ == QStringLiteral("front")
-                ? BatchResultState::QueuedFront : BatchResultState::QueuedBack;
-            result.submitError.clear();
+            result.state = jobFailed
+                ? BatchResultState::SubmitFailed
+                : (pendingConfirmationOrientation_ == QStringLiteral("front")
+                       ? BatchResultState::QueuedFront : BatchResultState::QueuedBack);
+            result.submitError = jobFailed ? jobError : QString();
             pendingConfirmationBatchIndex_ = -1;
             pendingConfirmationOrientation_.clear();
             updateBatchRow(completedIndex);
             updateBatchSummary();
-            const int nextIndex = preferredPendingBatchResult(completedIndex);
-            if (nextIndex >= 0) {
-                selectBatchResult(nextIndex, false);
-            } else {
+            if (jobFailed) {
                 selectBatchResult(completedIndex, false);
+            } else {
+                const int nextIndex = preferredPendingBatchResult(completedIndex);
+                if (nextIndex >= 0) {
+                    selectBatchResult(nextIndex, false);
+                } else {
+                    selectBatchResult(completedIndex, false);
+                }
             }
         } else if (inspectionPage_ != nullptr
                    && (responseOwner == CommandOwner::Inspection
                        || responseOwner == CommandOwner::None)) {
             inspectionPage_->handleBackendResponse(command, response);
         }
-        showLibraryMessage(QStringLiteral("确认图片已进入后台入库队列"));
+        showLibraryMessage(jobFailed
+                               ? QStringLiteral("确认入库失败：%1").arg(jobError)
+                               : QStringLiteral("确认图片已进入后台入库队列"),
+                           jobFailed);
         updateButtonStates();
         return;
     }
@@ -1253,8 +1312,14 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
 void MainWindow::onClientCommandFailed(const QString &command, const QString &code,
                                        const QString &message) {
     const CommandOwner failureOwner = pendingOwner_;
+    const QString issuedCommand = pendingCommand_;
     clearPendingCommand();
-    if (command == QStringLiteral("register") && registrationInFlight_
+    const QString failedCommand = issuedCommand.isEmpty() ? command : issuedCommand;
+    const auto matchesOwner = [failureOwner](CommandOwner expected) {
+        return failureOwner == expected || failureOwner == CommandOwner::None;
+    };
+    if (failedCommand == QStringLiteral("register")
+        && matchesOwner(CommandOwner::Library) && registrationInFlight_
         && code == QStringLiteral("WORKPIECE_EXISTS")
         && !pendingReplace_) {
         const bool confirmed = replaceConfirmationHandler_
@@ -1272,7 +1337,8 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         }
         return;
     }
-    if (batchInFlight_ && command == QStringLiteral("predict")) {
+    if (batchInFlight_ && failedCommand == QStringLiteral("predict")
+        && matchesOwner(CommandOwner::Inspection)) {
         batchInFlight_ = false;
         batchCompletedSuccessfully_ = false;
         const QString failedFile = batchIndex_ >= 0 && batchIndex_ < batchImagePaths_.size()
@@ -1286,17 +1352,20 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         updateButtonStates();
         return;
     }
-    if (command == QStringLiteral("register")) {
+    if (failedCommand == QStringLiteral("register")
+        && matchesOwner(CommandOwner::Library)) {
         stopRegistrationProgress();
         registrationInFlight_ = false;
         showLibraryMessage(message, true);
-    } else if (command == QStringLiteral("predict")) {
+    } else if (failedCommand == QStringLiteral("predict")
+               && matchesOwner(CommandOwner::Inspection)) {
         if (inspectionPage_ != nullptr
             && (failureOwner == CommandOwner::Inspection
                 || failureOwner == CommandOwner::None)) {
-            inspectionPage_->handleBackendFailure(command, code, message);
+            inspectionPage_->handleBackendFailure(failedCommand, code, message);
         }
-    } else if (command == QStringLiteral("submit_confirmation")) {
+    } else if (failedCommand == QStringLiteral("submit_confirmation")
+               && matchesOwner(CommandOwner::Inspection)) {
         if (pendingConfirmationBatchIndex_ >= 0
             && pendingConfirmationBatchIndex_ < batchResults_.size()) {
             const int failedIndex = pendingConfirmationBatchIndex_;
@@ -1311,16 +1380,17 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         } else if (inspectionPage_ != nullptr
                    && (failureOwner == CommandOwner::Inspection
                        || failureOwner == CommandOwner::None)) {
-            inspectionPage_->handleBackendFailure(command, code, message);
+            inspectionPage_->handleBackendFailure(failedCommand, code, message);
         }
         showLibraryMessage(QStringLiteral("确认入库失败：%1").arg(message), true);
-    } else if (command.startsWith(QStringLiteral("get_geometry_mask"))
-               || command.startsWith(QStringLiteral("preview_geometry_mask"))
-               || command.startsWith(QStringLiteral("save_geometry_mask"))
-               || command.startsWith(QStringLiteral("validate_geometry_mask"))
-               || command.startsWith(QStringLiteral("publish_geometry_mask"))
-               || command.startsWith(QStringLiteral("resolve_geometry_mask"))
-               || command.startsWith(QStringLiteral("rollback_geometry_mask"))) {
+    } else if (matchesOwner(CommandOwner::Geometry)
+               && (failedCommand.startsWith(QStringLiteral("get_geometry_mask"))
+                   || failedCommand.startsWith(QStringLiteral("preview_geometry_mask"))
+                   || failedCommand.startsWith(QStringLiteral("save_geometry_mask"))
+                   || failedCommand.startsWith(QStringLiteral("validate_geometry_mask"))
+                   || failedCommand.startsWith(QStringLiteral("publish_geometry_mask"))
+                   || failedCommand.startsWith(QStringLiteral("resolve_geometry_mask"))
+                   || failedCommand.startsWith(QStringLiteral("rollback_geometry_mask")))) {
         QString actionable = message;
         if (code == QStringLiteral("MISSING_DIRECTION_CALIBRATION")) {
             actionable = QStringLiteral("正面或反面标定未完成，请按左侧规则状态补齐后重试");
@@ -1341,13 +1411,16 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         geometryPublishOverrideReason_.clear();
         if (geometryPollTimer_ != nullptr) geometryPollTimer_->stop();
         showLibraryMessage(detail, true);
-    } else if (command == QStringLiteral("recycle_workpiece")) {
+    } else if (failedCommand == QStringLiteral("recycle_workpiece")
+               && matchesOwner(CommandOwner::Library)) {
         showLibraryMessage(QStringLiteral("删除失败：%1").arg(message), true);
-    } else if (command == QStringLiteral("get_workpiece_annotations")) {
+    } else if (failedCommand == QStringLiteral("get_workpiece_annotations")
+               && matchesOwner(CommandOwner::Geometry)) {
         showLibraryMessage(QStringLiteral("干扰标注加载失败：%1").arg(message), true);
-    } else if (command == QStringLiteral("save_workpiece_annotations")
-               || command == QStringLiteral("set_workpiece_annotation_group_enabled")
-               || command == QStringLiteral("delete_workpiece_annotation_group")) {
+    } else if (matchesOwner(CommandOwner::Geometry)
+               && (failedCommand == QStringLiteral("save_workpiece_annotations")
+                   || failedCommand == QStringLiteral("set_workpiece_annotation_group_enabled")
+                   || failedCommand == QStringLiteral("delete_workpiece_annotation_group"))) {
         const QString workpieceId = annotationWorkpieceId_;
         const bool stale = code == QStringLiteral("STALE_WORKPIECE_REVISION");
         if (annotationManagerDialog_ != nullptr) {
@@ -1491,17 +1564,12 @@ void MainWindow::clearBatchResults() {
     changingBatchSelection_ = false;
     batchSelectionPinned_ = false;
     batchCompletedSuccessfully_ = false;
+    if (inspectionPage_ != nullptr) {
+        inspectionPage_->clearBatchState();
+    }
     if (clearVisibleBatchResult) {
         resultContext_ = ResultContext::None;
         inspectionImagePath_.clear();
-        updatePreview();
-        inspectionPage_->setMode(InspectionMode::Batch);
-        inspectionPage_->setSingleImagePath(QString());
-        currentImageLabel_->clear();
-        currentResultTargetLabel_->clear();
-        resultLabel_->setText(QStringLiteral("尚未检测"));
-        reviewLabel_->clear();
-        evidenceTextEdit_->clear();
     }
     if (batchResultsTableWidget_ == nullptr) {
         return;
@@ -1560,7 +1628,7 @@ void MainWindow::sendRegistration(bool replace) {
 }
 
 void MainWindow::sendNextBatchPrediction() {
-    if (!batchInFlight_ || client_ == nullptr || client_->state() != BackendClient::State::Ready) {
+    if (!batchInFlight_ || client_ == nullptr) {
         return;
     }
     if (batchIndex_ >= batchImagePaths_.size()) {

@@ -128,12 +128,15 @@ public:
     quint16 port() const { return server_.serverPort(); }
     int predictionCount() const { return predictionCount_; }
     int confirmationCount() const { return confirmationCount_; }
+    int listWorkpieceCount() const { return listWorkpieceCount_; }
+    int recycleCount() const { return recycleCount_; }
     QList<QJsonObject> requests() const { return requests_; }
     void setReviewRows(const QSet<int> &rows) { reviewRows_ = rows; }
     void setHoldPredictions(bool hold) { holdPredictions_ = hold; }
     void setHoldConfirmations(bool hold) { holdConfirmations_ = hold; }
     void failPredictionRow(int zeroBasedRow) { failedPredictionRow_ = zeroBasedRow; }
     void failNextConfirmation() { failNextConfirmation_ = true; }
+    void failNextConfirmationJob() { failNextConfirmationJob_ = true; }
     void replyNextPrediction() {
         if (pendingPredictions_.isEmpty()) {
             return;
@@ -165,8 +168,12 @@ private slots:
                 send({{"version", 1}, {"request_id", requestId}, {"ok", true},
                       {"service", "workpiece-orientation"}, {"ready", true}});
             } else if (command == QStringLiteral("list_workpieces")) {
+                ++listWorkpieceCount_;
                 send({{"version", 1}, {"request_id", requestId}, {"ok", true},
                       {"workpieces", QJsonArray{QJsonObject{{"id", "m1"}, {"name", "M1"}}}}});
+            } else if (command == QStringLiteral("recycle_workpiece")) {
+                ++recycleCount_;
+                send({{"version", 1}, {"request_id", requestId}, {"ok", true}});
             } else if (command == QStringLiteral("predict")) {
                 ++predictionCount_;
                 const int zeroBasedRow = predictionCount_ - 1;
@@ -191,6 +198,12 @@ private slots:
                     send({{"version", 1}, {"request_id", requestId}, {"ok", false},
                           {"error", QJsonObject{{"code", "MODEL_ERROR"},
                                                 {"message", "queue failed"}}}});
+                } else if (failNextConfirmationJob_) {
+                    failNextConfirmationJob_ = false;
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", true},
+                          {"job", QJsonObject{{"job_id", "job-failed"},
+                                               {"state", "failed"},
+                                               {"error", "job failed"}}}});
                 } else {
                     send({{"version", 1}, {"request_id", requestId}, {"ok", true},
                           {"job", QJsonObject{{"job_id",
@@ -235,9 +248,12 @@ private:
     bool holdPredictions_ = false;
     bool holdConfirmations_ = false;
     bool failNextConfirmation_ = false;
+    bool failNextConfirmationJob_ = false;
     int failedPredictionRow_ = -1;
     int predictionCount_ = 0;
     int confirmationCount_ = 0;
+    int listWorkpieceCount_ = 0;
+    int recycleCount_ = 0;
 };
 
 class GeometryWorkflowServer : public QObject {
@@ -431,6 +447,60 @@ private slots:
         QVERIFY(capture.wasShown);
         QVERIFY(capture.text.contains(QStringLiteral("泵体 A")));
         QVERIFY(!capture.text.contains(QStringLiteral("internal-workpiece-id")));
+    }
+
+    void successfulCallbackQueuesSerialRefreshUntilReady() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+
+        client.sendRequest(QStringLiteral("recycle_workpiece"), QJsonObject{
+            {QStringLiteral("workpiece_id"), QStringLiteral("m1")},
+            {QStringLiteral("operation_id"), QStringLiteral("test-recycle")},
+        });
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.recycleCount(), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+    }
+
+    void failedCallbackQueuesSerialRefreshUntilReady() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.failPredictionRow(0);
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        QTemporaryDir dir;
+        const QString imagePath = writeImages(
+            dir, QStringLiteral("failed-followup"), 1).constFirst();
+        QVERIFY(!imagePath.isEmpty());
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        window.setInspectionImagePath(imagePath);
+        bool failureCallbackRan = false;
+        connect(&client, &BackendClient::commandFailed, &window,
+                [&window, &failureCallbackRan](const QString &command,
+                                                const QString &, const QString &) {
+            if (command != QStringLiteral("predict")) return;
+            failureCallbackRan = true;
+            QMetaObject::invokeMethod(&window, "refreshWorkpieces", Qt::DirectConnection);
+        });
+
+        QVERIFY(QMetaObject::invokeMethod(&window, "submitPrediction", Qt::DirectConnection));
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(failureCallbackRan, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(window.findChild<InspectionPage *>()->uiState(),
+                                  InspectionUiState::Failed, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
     }
 
     void startsOnInspectionAndPreservesHeaderAcrossNavigation() {
@@ -824,6 +894,35 @@ private slots:
         QTRY_VERIFY(window.findChild<QPushButton *>(QStringLiteral("confirmBackButton"))->isEnabled());
     }
 
+    void failedConfirmationJobReportsFailureAndCanRetry() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setReviewRows(QSet<int>{0});
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(
+            dir, QStringLiteral("failed-job"), 1));
+        auto *table = window.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE(table->rowCount(), 1);
+        QTRY_VERIFY(client.state() == BackendClient::State::Ready);
+        auto *frontButton = window.findChild<QPushButton *>(
+            QStringLiteral("confirmFrontButton"));
+        QTRY_VERIFY(frontButton->isEnabled());
+        server.failNextConfirmationJob();
+
+        frontButton->click();
+
+        QTRY_COMPARE(table->item(0, 4)->text(), QStringLiteral("提交失败"));
+        QCOMPARE(table->currentRow(), 0);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))->text()
+                    .contains(QStringLiteral("job failed")));
+        QTRY_VERIFY(frontButton->isEnabled());
+    }
+
     void workpieceSwitchPreservesBatchButBlocksConfirmationUntilSwitchedBack() {
         BatchPredictionServer server;
         QVERIFY(server.listen());
@@ -954,6 +1053,53 @@ private slots:
                     ->toPlainText().isEmpty());
         QVERIFY(window.findChild<InspectionImageView *>()->imagePath().isEmpty());
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
+    }
+
+    void replacingBatchImagesPreservesPriorSingleResult() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        const QString singlePath = writeImages(
+            dir, QStringLiteral("single-preserved"), 1).constFirst();
+        const QStringList oldBatchPaths = writeImages(
+            dir, QStringLiteral("old-batch"), 2);
+        const QStringList newBatchPaths = writeImages(
+            dir, QStringLiteral("new-batch"), 2);
+        QVERIFY(!singlePath.isEmpty());
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        InspectionRecord singleRecord;
+        singleRecord.id = QStringLiteral("single-before-batch");
+        singleRecord.imagePath = singlePath;
+        singleRecord.workpieceId = QStringLiteral("m1");
+        singleRecord.label = QStringLiteral("front");
+        singleRecord.response = QJsonObject{
+            {QStringLiteral("label"), QStringLiteral("front")},
+            {QStringLiteral("global_prediction"), QStringLiteral("front")},
+            {QStringLiteral("global_margin"), 0.42}};
+        singleRecord.completedAt = QDateTime::currentDateTime();
+        inspectionPage->setMode(InspectionMode::Single);
+        inspectionPage->showSingleResult(singleRecord);
+        const QString singleEvidence = inspectionPage->findChild<QTextEdit *>(
+            QStringLiteral("evidenceTextEdit"))->toPlainText();
+        startBatch(server, client, window, oldBatchPaths);
+        auto *table = window.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), oldBatchPaths.size(), 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+
+        window.setBatchImagePaths(newBatchPaths);
+        inspectionPage->setMode(InspectionMode::Single);
+
+        QCOMPARE(inspectionPage->singleImagePath(), singlePath);
+        QVERIFY(inspectionPage->findChild<QLabel *>(QStringLiteral("resultLabel"))->text()
+                    .contains(QStringLiteral("正面")));
+        QCOMPARE(inspectionPage->findChild<QTextEdit *>(
+                     QStringLiteral("evidenceTextEdit"))->toPlainText(), singleEvidence);
     }
 
     void midBatchFailureKeepsCompletedRowsAndShowsExactProgress() {

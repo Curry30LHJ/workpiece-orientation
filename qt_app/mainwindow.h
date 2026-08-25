@@ -125,6 +125,7 @@ private:
     void connectBackendSignals();
     void sendPageCommand(CommandOwner owner, const QString &command,
                          const QJsonObject &fields = QJsonObject());
+    void dispatchQueuedCommand();
     void clearPendingCommand();
     void updateButtonStates();
     void updateTemplateLabels();
@@ -176,6 +177,9 @@ private:
     int batchIndex_ = 0;
     CommandOwner pendingOwner_ = CommandOwner::None;
     QString pendingCommand_;
+    CommandOwner queuedOwner_ = CommandOwner::None;
+    QString queuedCommand_;
+    QJsonObject queuedFields_;
     QString pendingWorkpieceName_;
     bool pendingReplace_ = false;
     bool registrationInFlight_ = false;
@@ -186,6 +190,7 @@ private:
     int batchUncertainCount_ = 0;
     int batchReviewCount_ = 0;
     bool backendReady_ = false;
+    bool backendReadyHandled_ = false;
     bool clientBusy_ = false;
     QElapsedTimer registrationElapsedClock_;
     QTimer *registrationElapsedTimer_ = nullptr;

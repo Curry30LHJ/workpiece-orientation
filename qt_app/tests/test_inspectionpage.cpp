@@ -225,6 +225,105 @@ private slots:
         QCOMPARE(back->text(), QStringLiteral("确认反面"));
         QCOMPARE(front->text(), QStringLiteral("修正为正面"));
     }
+
+    void submitFailureKeepsPredictionAndCanRetry() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(directory, QStringLiteral("submit-retry.png"));
+        QVERIFY(!path.isEmpty());
+        InspectionPage page;
+        page.setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("模型一"));
+        page.setBackendAvailable(true, false, QString());
+        page.showSingleResult(resultRecord(QStringLiteral("submit-retry"), path));
+        auto *front = page.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
+        auto *list = page.findChild<QListWidget *>(QStringLiteral("recentInspectionList"));
+        QVERIFY(front != nullptr);
+        QVERIFY(list != nullptr);
+        QSignalSpy confirmationSpy(&page, &InspectionPage::confirmationRequested);
+
+        front->click();
+        QCOMPARE(confirmationSpy.count(), 1);
+        page.handleBackendResponse(QStringLiteral("submit_confirmation"), QJsonObject{
+            {QStringLiteral("job"), QJsonObject{
+                {QStringLiteral("job_id"), QStringLiteral("job-failed")},
+                {QStringLiteral("state"), QStringLiteral("failed")},
+                {QStringLiteral("error"), QStringLiteral("写入队列失败")}}},
+        });
+
+        QCOMPARE(page.uiState(), InspectionUiState::Completed);
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("resultLabel"))->text()
+                    .contains(QStringLiteral("正面")));
+        const QString resultLine = list->item(0)->text().section(QLatin1Char('\n'), 0, 0);
+        QVERIFY(resultLine.contains(QStringLiteral("正面")));
+        QVERIFY(!resultLine.contains(QStringLiteral(" · 失败")));
+        QVERIFY(list->item(0)->text().contains(QStringLiteral("写入失败")));
+        QVERIFY(front->isEnabled());
+        front->click();
+        QCOMPARE(confirmationSpy.count(), 2);
+
+        page.handleBackendFailure(QStringLiteral("submit_confirmation"),
+                                  QStringLiteral("MODEL_ERROR"),
+                                  QStringLiteral("再次失败"));
+        page.selectRecentRecord(QStringLiteral("submit-retry"));
+        QCOMPARE(page.uiState(), InspectionUiState::Completed);
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("resultLabel"))->text()
+                    .contains(QStringLiteral("正面")));
+    }
+
+    void summarySeparatesGlobalAndLocalDecisionEvidence() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(directory, QStringLiteral("local-override.png"));
+        QVERIFY(!path.isEmpty());
+        InspectionPage page;
+        InspectionRecord record = resultRecord(QStringLiteral("local-override"), path);
+        record.label = QStringLiteral("back");
+        record.response.insert(QStringLiteral("label"), QStringLiteral("back"));
+        record.response.insert(QStringLiteral("global_prediction"), QStringLiteral("front"));
+        record.response.insert(QStringLiteral("local_prediction"), QStringLiteral("back"));
+        record.response.insert(QStringLiteral("decision_source"),
+                               QStringLiteral("local_override"));
+
+        page.showSingleResult(record);
+
+        const QString summary = page.findChild<QTextEdit *>(
+            QStringLiteral("evidenceTextEdit"))->toPlainText();
+        QVERIFY(summary.contains(QStringLiteral("全局特征：支持正面")));
+        QVERIFY(summary.contains(QStringLiteral("局部匹配：支持反面（采用此结果）")));
+        QVERIFY(!summary.contains(QStringLiteral("全局特征：支持反面")));
+    }
+
+    void backendRecoveryRestoresFailuresForBothModes() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString singlePath = writeImage(directory, QStringLiteral("single-failed.png"));
+        const QString batchPath = writeImage(directory, QStringLiteral("batch-failed.png"));
+        QVERIFY(!singlePath.isEmpty());
+        QVERIFY(!batchPath.isEmpty());
+        InspectionPage page;
+        page.setMode(InspectionMode::Single);
+        page.setSingleImagePath(singlePath);
+        page.showSingleFailure(QStringLiteral("单图预测失败"));
+        page.setMode(InspectionMode::Batch);
+        page.setSingleImagePath(batchPath);
+        page.showSingleFailure(QStringLiteral("批量预测失败"));
+
+        page.setBackendAvailable(false, false, QStringLiteral("连接中断"));
+        QCOMPARE(page.uiState(), InspectionUiState::BackendUnavailable);
+        page.setMode(InspectionMode::Single);
+        QCOMPARE(page.uiState(), InspectionUiState::BackendUnavailable);
+
+        page.setBackendAvailable(true, false, QString());
+        QCOMPARE(page.uiState(), InspectionUiState::Failed);
+        QCOMPARE(page.singleImagePath(), singlePath);
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("resultMessageLabel"))->text()
+                    .contains(QStringLiteral("单图预测失败")));
+        page.setMode(InspectionMode::Batch);
+        QCOMPARE(page.uiState(), InspectionUiState::Failed);
+        QCOMPARE(page.singleImagePath(), batchPath);
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("resultMessageLabel"))->text()
+                    .contains(QStringLiteral("批量预测失败")));
+    }
 };
 
 QTEST_MAIN(TestInspectionPage)
