@@ -22,6 +22,7 @@ from src.workpiece_library import (
 
 
 LOGGER = logging.getLogger(__name__)
+SUMMARY_READ_ATTEMPTS = 3
 
 
 class WorkpieceCatalogError(RuntimeError):
@@ -144,38 +145,109 @@ class WorkpieceCatalog:
         }
 
     def list_workpiece_summaries(self) -> list[dict[str, Any]]:
-        with self._lock:
-            geometry_profiles = self.geometry_profiles
-            captured = [
-                (
-                    record,
-                    self.library.get_workpiece_metadata(record.id),
-                    record.id in self._snapshots,
-                )
-                for item in self.library.list_workpieces()
-                for record in (self.library.get(item["id"]),)
-            ]
-        return [
-            self._summary_from_snapshot(record, metadata, detectable, geometry_profiles)
-            for record, metadata, detectable in captured
-        ]
+        for _ in range(SUMMARY_READ_ATTEMPTS):
+            with self._lock:
+                geometry_profiles = self.geometry_profiles
+                captured = [
+                    (
+                        record,
+                        self.library.get_workpiece_metadata(record.id),
+                        record.id in self._snapshots,
+                    )
+                    for item in self.library.list_workpieces()
+                    for record in (self.library.get(item["id"]),)
+                ]
+                captured_signatures = [self._record_signature(record) for record, _, _ in captured]
+            summaries = []
+            stable = True
+            for record, metadata, detectable in captured:
+                try:
+                    summary = self._summary_from_snapshot(
+                        record,
+                        metadata,
+                        detectable,
+                        geometry_profiles,
+                    )
+                except KeyError:
+                    with self._lock:
+                        if not self._record_is_current(record, geometry_profiles):
+                            stable = False
+                            break
+                    raise
+                with self._lock:
+                    if not self._record_is_current(record, geometry_profiles):
+                        stable = False
+                        break
+                summaries.append(summary)
+            if not stable:
+                continue
+            with self._lock:
+                current_signatures = [
+                    self._record_signature(self.library.get(item["id"]))
+                    for item in self.library.list_workpieces()
+                ]
+                if (
+                    current_signatures == captured_signatures
+                    and self.geometry_profiles is geometry_profiles
+                ):
+                    return summaries
+        return []
 
     def list_workpieces(self):
         return self.list_workpiece_summaries()
 
     def get_workpiece_details(self, workpiece_id: str) -> dict[str, Any]:
+        for _ in range(SUMMARY_READ_ATTEMPTS):
+            with self._lock:
+                record = self.library.get(workpiece_id)
+                metadata = self.library.get_workpiece_metadata(workpiece_id)
+                inventory = self.library.get_template_inventory(workpiece_id)
+                detectable = record.id in self._snapshots
+                geometry_profiles = self.geometry_profiles
+            try:
+                summary = self._summary_from_snapshot(
+                    record,
+                    metadata,
+                    detectable,
+                    geometry_profiles,
+                )
+                templates = self._template_details(record, inventory)
+            except KeyError:
+                with self._lock:
+                    if not self._record_is_current(record, geometry_profiles):
+                        continue
+                raise
+            with self._lock:
+                if self._record_is_current(record, geometry_profiles):
+                    return {**summary, "templates": templates}
         with self._lock:
-            record = self.library.get(workpiece_id)
-            metadata = self.library.get_workpiece_metadata(workpiece_id)
-            inventory = self.library.get_template_inventory(workpiece_id)
-            detectable = record.id in self._snapshots
-            geometry_profiles = self.geometry_profiles
-        summary = self._summary_from_snapshot(
-            record,
-            metadata,
-            detectable,
-            geometry_profiles,
+            self.library.get(workpiece_id)
+        raise StaleWorkpieceRevisionError(
+            f"Workpiece changed repeatedly while reading details: {workpiece_id}"
         )
+
+    @staticmethod
+    def _record_signature(record: WorkpieceRecord) -> tuple[str, int, Path, str]:
+        return record.id, record.revision, record.root, record.state
+
+    def _record_is_current(
+        self,
+        record: WorkpieceRecord,
+        geometry_profiles: Any | None,
+    ) -> bool:
+        if self.geometry_profiles is not geometry_profiles:
+            return False
+        try:
+            current = self.library.get(record.id)
+        except KeyError:
+            return False
+        return self._record_signature(current) == self._record_signature(record)
+
+    @staticmethod
+    def _template_details(
+        record: WorkpieceRecord,
+        inventory: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         template_paths = {
             (direction, path.name): path.resolve()
             for direction, paths in (("front", record.front_images), ("back", record.back_images))
@@ -199,7 +271,7 @@ class WorkpieceCatalog:
                     "readable": read_color_image(path) is not None,
                 }
             )
-        return {**summary, "templates": templates}
+        return templates
 
     def get(self, workpiece_id: str) -> WorkpieceRecord:
         with self._lock:

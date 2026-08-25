@@ -148,6 +148,63 @@ class WorkpieceLibrary:
         return next((record for record in self._records.values() if record.name.casefold() == key), None)
 
     @staticmethod
+    def _validated_template_inventory(
+        manifest_path: Path,
+        manifest: dict[str, Any],
+        front_paths: Sequence[Path],
+        back_paths: Sequence[Path],
+    ) -> tuple[list[dict[str, Any]], tuple[Path, ...], tuple[Path, ...]] | None:
+        if "template_inventory" not in manifest:
+            return None
+        inventory = manifest["template_inventory"]
+        if not isinstance(inventory, list):
+            raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+        paths_by_direction = {
+            "front": {path.name: path for path in front_paths},
+            "back": {path.name: path for path in back_paths},
+        }
+        expected = {
+            (direction, filename)
+            for direction, paths in paths_by_direction.items()
+            for filename in paths
+        }
+        seen: set[tuple[str, str]] = set()
+        ordered_paths: dict[str, list[Path]] = {"front": [], "back": []}
+        validated: list[dict[str, Any]] = []
+        required = {"template_id", "direction", "filename", "source", "added_at"}
+        for item in inventory:
+            if not isinstance(item, dict) or not required.issubset(item):
+                raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+            template_id = item["template_id"]
+            direction = item["direction"]
+            filename = item["filename"]
+            source = item["source"]
+            added_at = item["added_at"]
+            if (
+                not isinstance(direction, str)
+                or direction not in {"front", "back"}
+                or not isinstance(filename, str)
+                or not filename
+                or Path(filename).name != filename
+                or any(separator in filename for separator in ("/", "\\"))
+                or not isinstance(template_id, str)
+                or template_id != f"{direction}:{filename}"
+                or not isinstance(source, str)
+                or not source
+                or (added_at is not None and (not isinstance(added_at, str) or not added_at))
+            ):
+                raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+            key = (direction, filename)
+            if key in seen or key not in expected:
+                raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+            seen.add(key)
+            ordered_paths[direction].append(paths_by_direction[direction][filename])
+            validated.append(deepcopy(item))
+        if seen != expected:
+            raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+        return validated, tuple(ordered_paths["front"]), tuple(ordered_paths["back"])
+
+    @staticmethod
     def _record_from_root(root: Path) -> WorkpieceRecord:
         manifest_path = root / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -155,14 +212,24 @@ class WorkpieceLibrary:
         name = _validate_name(manifest["name"])
         if record_id != root.name or manifest.get("labels") != {"0": "front", "1": "back"}:
             raise InvalidTemplateSetError(f"Invalid manifest: {manifest_path}")
+        front_paths = tuple(sorted((root / "0").iterdir(), key=lambda path: path.name.casefold()))
+        back_paths = tuple(sorted((root / "1").iterdir(), key=lambda path: path.name.casefold()))
+        inventory = WorkpieceLibrary._validated_template_inventory(
+            manifest_path,
+            manifest,
+            front_paths,
+            back_paths,
+        )
+        if inventory is not None:
+            _, front_paths, back_paths = inventory
         seen_images: dict[str, Path] = {}
         front = _validate_images(
-            sorted((root / "0").iterdir(), key=lambda path: path.name.casefold()),
+            front_paths,
             "front",
             seen_images,
         )
         back = _validate_images(
-            sorted((root / "1").iterdir(), key=lambda path: path.name.casefold()),
+            back_paths,
             "back",
             seen_images,
         )
@@ -704,10 +771,16 @@ class WorkpieceLibrary:
 
     def get_template_inventory(self, workpiece_id: str) -> list[dict[str, Any]]:
         record = self._records[workpiece_id]
-        manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
-        inventory = manifest.get("template_inventory")
-        if isinstance(inventory, list):
-            return deepcopy(inventory)
+        manifest_path = record.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        inventory = self._validated_template_inventory(
+            manifest_path,
+            manifest,
+            tuple((record.root / "0").iterdir()),
+            tuple((record.root / "1").iterdir()),
+        )
+        if inventory is not None:
+            return inventory[0]
         return self._inventory_entries(
             record.front_images,
             record.back_images,

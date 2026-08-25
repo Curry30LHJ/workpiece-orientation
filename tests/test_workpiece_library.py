@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import pytest
 
-from src.orientation_classifier import TemplateCache
+from src.orientation_classifier import OrientationClassifier, TemplateCache
 from src.workpiece_library import (
     FeatureBuildError,
     InvalidTemplateSetError,
@@ -251,6 +251,65 @@ def test_append_across_filename_width_keeps_existing_inventory_stable(tmp_path: 
         template_path = committed.root / label_dir / item["filename"]
         assert template_path.is_file()
         assert cv2.imread(str(template_path)) is not None
+
+    loaded = []
+    build_calls = []
+    cache_io = OrientationClassifier.__new__(OrientationClassifier)
+    cache_io.save_template_cache(committed, prepared.candidate_cache)
+
+    def cache_loader(candidate):
+        loaded.append(candidate)
+        return cache_io.load_template_cache(candidate)
+
+    def unexpected_builder(front, back, progress_callback=None):
+        build_calls.append((tuple(front), tuple(back)))
+        return fake_builder(front, back, progress_callback)
+
+    restarted = WorkpieceLibrary(library.library_dir)
+    recovered = restarted.recover(
+        unexpected_builder,
+        cache_loader=cache_loader,
+    )
+    recovered_record = recovered[0][0]
+
+    assert [path.name for path in recovered_record.front_images] == [
+        *(f"{index:02d}.png" for index in range(100)),
+        "100.png",
+    ]
+    expected_template_ids = [
+        *(f"front:{index:02d}.png" for index in range(100)),
+        "back:00.png",
+        "front:100.png",
+    ]
+    assert [item["template_id"] for item in restarted.get_template_inventory(record.id)] == expected_template_ids
+    assert [item.id for item in loaded] == [record.id]
+    assert build_calls == []
+    assert recovered[0][1].global_vectors["front"].shape == (101, 2)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_source", "duplicate_entry", "wrong_template_id", "missing_template"],
+)
+def test_present_malformed_template_inventory_is_rejected_without_rewrite(tmp_path, corruption):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if corruption == "missing_source":
+        manifest["template_inventory"][0].pop("source")
+    elif corruption == "duplicate_entry":
+        manifest["template_inventory"][1] = dict(manifest["template_inventory"][0])
+    elif corruption == "wrong_template_id":
+        manifest["template_inventory"][0]["template_id"] = "front:not-the-file.png"
+    else:
+        manifest["template_inventory"].pop()
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    before = manifest_path.read_bytes()
+
+    with pytest.raises(InvalidTemplateSetError, match="template_inventory"):
+        library.get_template_inventory(record.id)
+
+    assert manifest_path.read_bytes() == before
 
 
 def test_aborted_prepared_append_leaves_active_manifest_unchanged(tmp_path: Path):

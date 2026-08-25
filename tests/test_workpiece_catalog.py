@@ -144,6 +144,26 @@ class SummaryGeometryProfiles:
         }
 
 
+class BlockingCatalogGeometryProfiles:
+    def __init__(self):
+        self.catalog = None
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def snapshot(self, workpiece_id):
+        self.calls += 1
+        if self.calls == 1:
+            self.started.set()
+            assert self.release.wait(2.0)
+        record = self.catalog.get(workpiece_id)
+        return {
+            "profile_status": "ok",
+            "active": {"rules": []},
+            "library_revision": record.revision,
+        }
+
+
 def create_catalog(tmp_path):
     library = WorkpieceLibrary(tmp_path / "library")
     classifier = FakeClassifier()
@@ -319,6 +339,91 @@ def test_append_forwards_source_and_details_switch_after_commit(tmp_path):
     new_details = catalog.get_workpiece_details(record.id)
     assert len(new_details["templates"]) == 3
     assert new_details["templates"][-1]["source"] == "confirmed_inspection"
+
+
+def test_details_retry_after_append_during_geometry_snapshot(tmp_path):
+    profiles = BlockingCatalogGeometryProfiles()
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(
+        WorkpieceLibrary(tmp_path / "details-retry-library"),
+        classifier,
+        profiles,
+    )
+    profiles.catalog = catalog
+    record, _ = catalog.register(
+        "M-details-retry",
+        [image(tmp_path / "details-retry-front.png", 10)],
+        [image(tmp_path / "details-retry-back.png", 20)],
+        False,
+    )
+    results = []
+    errors = []
+
+    def read_details():
+        try:
+            results.append(catalog.get_workpiece_details(record.id))
+        except Exception as exc:
+            errors.append(exc)
+
+    reader = threading.Thread(target=read_details)
+    reader.start()
+    assert profiles.started.wait(1.0)
+    try:
+        appended, _ = catalog.append_templates(
+            record.id,
+            [image(tmp_path / "details-retry-new.png", 30)],
+            [],
+            operation_id="details-retry-append",
+        )
+    finally:
+        profiles.release.set()
+        reader.join(timeout=2.0)
+
+    assert not reader.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert results[0]["revision"] == appended.revision
+    assert results[0]["template_counts"] == {"front": 2, "back": 1}
+    assert len(results[0]["templates"]) == 3
+    assert profiles.calls >= 2
+
+
+def test_summary_list_skips_recycled_record_during_geometry_snapshot(tmp_path):
+    profiles = BlockingCatalogGeometryProfiles()
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(
+        WorkpieceLibrary(tmp_path / "summary-retry-library"),
+        classifier,
+        profiles,
+    )
+    profiles.catalog = catalog
+    record, _ = catalog.register(
+        "M-summary-retry",
+        [image(tmp_path / "summary-retry-front.png", 10)],
+        [image(tmp_path / "summary-retry-back.png", 20)],
+        False,
+    )
+    results = []
+    errors = []
+
+    def read_summaries():
+        try:
+            results.append(catalog.list_workpiece_summaries())
+        except Exception as exc:
+            errors.append(exc)
+
+    reader = threading.Thread(target=read_summaries)
+    reader.start()
+    assert profiles.started.wait(1.0)
+    try:
+        catalog.recycle(record.id, operation_id="summary-retry-recycle")
+    finally:
+        profiles.release.set()
+        reader.join(timeout=2.0)
+
+    assert not reader.is_alive()
+    assert errors == []
+    assert results == [[]]
 
 
 def test_predict_releases_catalog_lock_before_classifier_runs(tmp_path):

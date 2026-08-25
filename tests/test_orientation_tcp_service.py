@@ -10,6 +10,8 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import cv2
+import numpy as np
 import src.orientation_tcp_service as service_module
 
 from src.orientation_tcp_service import (
@@ -20,6 +22,8 @@ from src.orientation_tcp_service import (
     configure_diagnostic_logging,
 )
 from src.orientation_classifier import PropagationModelError
+from src.workpiece_catalog import WorkpieceCatalog
+from src.workpiece_library import WorkpieceLibrary
 from src.geometry_mask_profiles import (
     DuplicateLogicalRuleError,
     FittedGeometryMissingError,
@@ -51,6 +55,7 @@ class FakeLibrary:
             front_images=front,
             back_images=back,
             revision=1,
+            state="active",
         )
 
     def get_workpiece_metadata(self, workpiece_id):
@@ -387,6 +392,42 @@ def test_unknown_workpiece_details_return_stable_code(client):
     response = client.request("get_workpiece_details", workpiece_id="missing")
 
     assert response["error"]["code"] == "WORKPIECE_NOT_FOUND"
+
+
+def test_malformed_inventory_is_not_reported_as_missing_workpiece(tmp_path):
+    class AnyIdClassifier(FakeClassifier):
+        def set_template_cache(self, workpiece_id, cache):
+            self.active_workpiece_id = workpiece_id
+
+    classifier = AnyIdClassifier()
+    library = WorkpieceLibrary(tmp_path / "malformed-inventory-library")
+    catalog = WorkpieceCatalog(library, classifier)
+    front_path = tmp_path / "malformed-front.png"
+    back_path = tmp_path / "malformed-back.png"
+    assert cv2.imwrite(str(front_path), np.full((8, 8, 3), 10, dtype=np.uint8))
+    assert cv2.imwrite(str(back_path), np.full((8, 8, 3), 20, dtype=np.uint8))
+    record, _ = catalog.register("M-malformed", [front_path], [back_path], False)
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["template_inventory"][0].pop("source")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    dispatcher = OrientationCommandDispatcher(FakeClassifier(), FakeLibrary())
+    snapshot = dispatcher.runtime.snapshot()
+    dispatcher.runtime._snapshot = replace(
+        snapshot,
+        classifier=classifier,
+        library=library,
+        catalog=catalog,
+    )
+
+    response = dispatcher.dispatch({
+        "version": 1,
+        "request_id": "malformed-inventory",
+        "command": "get_workpiece_details",
+        "workpiece_id": record.id,
+    })
+
+    assert response["error"]["code"] == "INVALID_TEMPLATE_SET"
 
 
 @pytest.mark.parametrize("workpiece_id", [None, "", "   ", 7])
