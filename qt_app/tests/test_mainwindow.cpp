@@ -134,6 +134,8 @@ public:
     void setReviewRows(const QSet<int> &rows) { reviewRows_ = rows; }
     void setHoldPredictions(bool hold) { holdPredictions_ = hold; }
     void setHoldConfirmations(bool hold) { holdConfirmations_ = hold; }
+    void setHoldWorkpieceResponses(bool hold) { holdWorkpieceResponses_ = hold; }
+    void failNextWorkpieceRefresh() { failNextWorkpieceRefresh_ = true; }
     void failPredictionRow(int zeroBasedRow) { failedPredictionRow_ = zeroBasedRow; }
     void failNextConfirmation() { failNextConfirmation_ = true; }
     void failNextConfirmationJob() { failNextConfirmationJob_ = true; }
@@ -172,8 +174,18 @@ private slots:
                       {"service", "workpiece-orientation"}, {"ready", true}});
             } else if (command == QStringLiteral("list_workpieces")) {
                 ++listWorkpieceCount_;
-                send({{"version", 1}, {"request_id", requestId}, {"ok", true},
-                      {"workpieces", QJsonArray{QJsonObject{{"id", "m1"}, {"name", "M1"}}}}});
+                if (holdWorkpieceResponses_) {
+                    continue;
+                }
+                if (failNextWorkpieceRefresh_) {
+                    failNextWorkpieceRefresh_ = false;
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", false},
+                          {"error", QJsonObject{{"code", "REFRESH_FAILED"},
+                                                {"message", "refresh failed"}}}});
+                } else {
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", true},
+                          {"workpieces", QJsonArray{QJsonObject{{"id", "m1"}, {"name", "M1"}}}}});
+                }
             } else if (command == QStringLiteral("recycle_workpiece")) {
                 ++recycleCount_;
                 send({{"version", 1}, {"request_id", requestId}, {"ok", true}});
@@ -250,6 +262,8 @@ private:
     QSet<int> reviewRows_;
     bool holdPredictions_ = false;
     bool holdConfirmations_ = false;
+    bool holdWorkpieceResponses_ = false;
+    bool failNextWorkpieceRefresh_ = false;
     bool failNextConfirmation_ = false;
     bool failNextConfirmationJob_ = false;
     int failedPredictionRow_ = -1;
@@ -837,6 +851,78 @@ private slots:
                                   refreshCountBeforeClick + 1, 1000);
     }
 
+    void deferredUserRefreshSurvivesTransportUntilSuccess() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setHoldPredictions(true);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(
+            dir, QStringLiteral("refresh-reconnect"), 2));
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        QTRY_COMPARE(server.predictionCount(), 1);
+
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+        server.replyNextPrediction();
+        QTRY_COMPARE(server.predictionCount(), 2);
+        server.setHoldWorkpieceResponses(true);
+        const int refreshCountBeforeAttempt = server.listWorkpieceCount();
+        server.replyNextPrediction();
+        QTRY_COMPARE(inspectionPage->completedBatchCount(), 2);
+        QTRY_COMPARE(server.listWorkpieceCount(), refreshCountBeforeAttempt + 1);
+        const int refreshCountBeforeReconnect = server.listWorkpieceCount();
+
+        server.disconnectClient();
+        QTRY_VERIFY(client.state() == BackendClient::State::Disconnected
+                    || client.state() == BackendClient::State::Error);
+        server.setHoldWorkpieceResponses(false);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(),
+                                  refreshCountBeforeReconnect + 2, 1000);
+        const int refreshCountAfterSuccess = server.listWorkpieceCount();
+
+        emit client.stateChanged(BackendClient::State::Ready,
+                                 QStringLiteral("still ready"));
+        QTest::qWait(100);
+        QCOMPARE(server.listWorkpieceCount(), refreshCountAfterSuccess);
+    }
+
+    void userRefreshCommandFailureStopsAutomaticRetry() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_VERIFY(server.listWorkpieceCount() >= 1);
+        QTRY_VERIFY(client.state() == BackendClient::State::Ready);
+        server.failNextWorkpieceRefresh();
+        const int refreshCountBeforeAttempt = server.listWorkpieceCount();
+
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+
+        QTRY_COMPARE(server.listWorkpieceCount(), refreshCountBeforeAttempt + 1);
+        QTRY_VERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
+                        ->text().contains(QStringLiteral("刷新失败")));
+        QTRY_VERIFY(client.state() == BackendClient::State::Ready);
+        const int refreshCountAfterFailure = server.listWorkpieceCount();
+        emit client.stateChanged(BackendClient::State::Ready,
+                                 QStringLiteral("still ready"));
+        QTest::qWait(100);
+        QCOMPARE(server.listWorkpieceCount(), refreshCountAfterFailure);
+    }
+
     void queuedInternalRefreshDoesNotStrandBatchPrediction() {
         BatchPredictionServer server;
         QVERIFY(server.listen());
@@ -997,7 +1083,7 @@ private slots:
         server.failNextConfirmation();
         const QString recordId = table->item(0, 0)->data(Qt::UserRole).toString();
 
-        window.findChild<QPushButton *>(QStringLiteral("confirmBackButton"))->click();
+        window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
         QTRY_COMPARE(table->item(0, 4)->text(), QStringLiteral("提交失败"));
         QCOMPARE(table->currentRow(), 0);
         QCOMPARE(inspectionPage->selectedRecordId(), recordId);
@@ -1020,6 +1106,10 @@ private slots:
                  paths.at(0));
         QCOMPARE(confirmations.at(1).value(QStringLiteral("image_path")).toString(),
                  paths.at(0));
+        QCOMPARE(confirmations.at(0).value(QStringLiteral("orientation")).toString(),
+                 QStringLiteral("front"));
+        QCOMPARE(confirmations.at(1).value(QStringLiteral("orientation")).toString(),
+                 QStringLiteral("back"));
         QVERIFY(confirmations.at(0).value(QStringLiteral("operation_id")).toString()
                 != confirmations.at(1).value(QStringLiteral("operation_id")).toString());
     }
@@ -1162,7 +1252,7 @@ private slots:
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->isEnabled());
     }
 
-    void transportUnknownConfirmationRetryReusesOperationId() {
+    void transportUnknownConfirmationRequiresIdenticalPayload() {
         BatchPredictionServer server;
         QVERIFY(server.listen());
         server.setHoldConfirmations(true);
@@ -1176,7 +1266,10 @@ private slots:
         waitForBatchCompletion(window, 1);
         auto *frontButton = window.findChild<QPushButton *>(
             QStringLiteral("confirmFrontButton"));
+        auto *backButton = window.findChild<QPushButton *>(
+            QStringLiteral("confirmBackButton"));
         QVERIFY(frontButton != nullptr);
+        QVERIFY(backButton != nullptr);
         QTRY_VERIFY(frontButton->isEnabled());
 
         frontButton->click();
@@ -1187,6 +1280,13 @@ private slots:
         server.setHoldConfirmations(false);
         client.connectToService(QHostAddress::LocalHost, server.port(), 500);
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_VERIFY(frontButton->isEnabled());
+
+        backButton->click();
+        QTest::qWait(50);
+        QCOMPARE(server.confirmationCount(), 1);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
+                    ->text().contains(QStringLiteral("正面")));
         QTRY_VERIFY(frontButton->isEnabled());
 
         frontButton->click();

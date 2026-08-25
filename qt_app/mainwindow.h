@@ -186,8 +186,8 @@ private:
     QString pendingPredictionImagePath_;
     QString pendingConfirmationRecordId_;
     QString pendingConfirmationOrientation_;
-    QString pendingConfirmationOperationId_;
-    QHash<QString, QString> uncertainConfirmationOperationIds_;
+    QJsonObject pendingConfirmationMutation_;
+    QHash<QString, QJsonObject> uncertainConfirmationMutations_;
     ResultContext resultContext_ = ResultContext::None;
     QPointer<AnnotationManagerDialog> annotationManagerDialog_;
     QString annotationWorkpieceId_;
