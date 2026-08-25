@@ -448,6 +448,54 @@ def test_adaptive_local_search_stops_at_top5_without_reordering_features(classif
     assert result.trace["ranked_indices"]["front"] == list(range(12))
 
 
+def test_adaptive_local_search_treats_exact_global_margin_threshold_as_low_margin(classifier):
+    calls = []
+    global_vectors, local_features = make_search_inputs(
+        12, 13, lambda label, index: 8.0 if label == "front" else 5.0
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.55, "back": 0.50},
+    )
+
+    assert result.diagnostics["stage"] == "top5"
+    assert result.diagnostics["global_margin_gate"] == "adaptive_low_margin"
+    assert len(calls) == 10
+
+
+def test_local_search_stable_ranking_preserves_cache_order_for_equal_similarity(classifier):
+    calls = []
+    global_vectors, local_features = make_search_inputs(
+        12, 13, lambda label, index: 8.0 if label == "front" else 5.0
+    )
+    for vectors in global_vectors.values():
+        vectors[:] = 1.0
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.51, "back": 0.50},
+    )
+
+    assert result.trace["ranked_indices"] == {
+        "front": list(range(12)),
+        "back": list(range(13)),
+    }
+    assert calls == [
+        (label, index)
+        for label in ("front", "back")
+        for index in range(5)
+    ]
+
+
 def test_adaptive_local_search_expands_to_top10_without_rematching(classifier):
     calls = []
     global_vectors, local_features = make_search_inputs(
@@ -470,6 +518,33 @@ def test_adaptive_local_search_expands_to_top10_without_rematching(classifier):
     assert len(calls) == 20
     assert len(set(calls)) == 20
     assert [item["stage"] for item in result.trace["stages"]] == ["top5", "top10"]
+
+
+def test_adaptive_local_search_expands_after_local_conflict(classifier):
+    calls = []
+    global_vectors, local_features = make_search_inputs(
+        12,
+        13,
+        lambda label, index: (
+            9.0 if label == "front" and index == 5
+            else 8.0 if label == "back"
+            else 5.0
+        ),
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.51, "back": 0.50},
+    )
+
+    assert result.diagnostics["stage"] == "top10"
+    assert result.diagnostics["expanded_because"] == "local_conflict"
+    assert len(calls) == 20
+    assert len(set(calls)) == 20
 
 
 def test_adaptive_local_search_reaches_full_once_when_still_uncertain(classifier):
@@ -532,6 +607,77 @@ def test_local_search_rejects_misaligned_cache(classifier):
             classifier, global_vectors, local_features,
             {"front": 0.51, "back": 0.50},
         )
+
+
+@pytest.mark.parametrize("missing_label", ["front", "back"])
+@pytest.mark.parametrize(
+    ("missing_input", "message"),
+    [
+        ("query_embeddings", "missing query embedding"),
+        ("query_features_by_label", "missing query local features"),
+        ("global_scores", "missing global score"),
+    ],
+)
+def test_local_search_rejects_missing_required_direction(
+    classifier, missing_label, missing_input, message
+):
+    global_vectors, local_features = make_search_inputs(
+        5, 5, lambda label, index: 8.0 if label == "front" else 5.0
+    )
+    inputs = {
+        "query_features_by_label": {
+            "front": {"label": "front"},
+            "back": {"label": "back"},
+        },
+        "global_vectors": global_vectors,
+        "query_embeddings": {
+            "front": np.asarray([1.0], dtype=np.float32),
+            "back": np.asarray([1.0], dtype=np.float32),
+        },
+        "local_features": local_features,
+        "image_shape": (8, 8),
+        "global_scores": {"front": 0.51, "back": 0.50},
+    }
+    inputs[missing_input].pop(missing_label)
+
+    with pytest.raises(
+        OrientationClassifierError,
+        match=f"{message} for {missing_label}",
+    ):
+        classifier._search_local(**inputs)
+
+
+def test_local_search_matching_time_excludes_template_tensor_movement(
+    classifier, monkeypatch
+):
+    import src.orientation_classifier as classifier_module
+
+    clock = {"value": 0.0}
+    global_vectors, local_features = make_search_inputs(
+        5, 5, lambda label, index: 8.0 if label == "front" else 5.0
+    )
+
+    def move_tensors(value, device):
+        if isinstance(value, dict) and "index" in value:
+            clock["value"] += 0.010
+        return value
+
+    def score_pair(query, template, image_shape, matcher):
+        clock["value"] += 0.001
+        return {"score": template["score"]}
+
+    monkeypatch.setattr(classifier_module, "_move_tensors", move_tensors)
+    monkeypatch.setattr(
+        classifier_module.time, "perf_counter", lambda: clock["value"]
+    )
+    classifier._score_feature_pair = score_pair
+
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.51, "back": 0.50},
+    )
+
+    assert result.matching_ms == pytest.approx(10.0)
 
 
 def test_adaptive_high_global_margin_searches_every_template_once(classifier):

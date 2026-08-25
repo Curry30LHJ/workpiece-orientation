@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import logging
+import math
 import os
 from pathlib import Path
 import pickle
@@ -670,6 +671,19 @@ class OrientationClassifier:
         image_shape: tuple[int, int],
         global_scores: dict[str, float],
     ) -> LocalSearchResult:
+        for label in ("front", "back"):
+            if label not in query_embeddings:
+                raise OrientationClassifierError(
+                    f"local search input error: missing query embedding for {label}"
+                )
+            if label not in query_features_by_label:
+                raise OrientationClassifierError(
+                    f"local search input error: missing query local features for {label}"
+                )
+            if label not in global_scores:
+                raise OrientationClassifierError(
+                    f"local search input error: missing global score for {label}"
+                )
         rankings = self._rank_local_candidates(
             global_vectors, query_embeddings, local_features
         )
@@ -694,10 +708,13 @@ class OrientationClassifier:
                 for index in rankings[label][:min(limit, available_counts[label])]:
                     if index in score_cache[label]:
                         continue
+                    template_features = _move_tensors(
+                        local_features[label][index], self.device
+                    )
                     started = time.perf_counter()
                     score_cache[label][index] = float(self._score_feature_pair(
                         query_features[label],
-                        _move_tensors(local_features[label][index], self.device),
+                        template_features,
                         image_shape,
                         self.matcher,
                     )["score"])
@@ -717,14 +734,23 @@ class OrientationClassifier:
         global_margin = float(
             global_scores[ordered_globals[0]] - global_scores[ordered_globals[1]]
         )
+        low_global_margin = (
+            global_margin <= GLOBAL_MARGIN_THRESHOLD
+            or math.isclose(
+                global_margin,
+                GLOBAL_MARGIN_THRESHOLD,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        )
         global_margin_gate = (
             "adaptive_low_margin"
-            if self.local_search_mode == "adaptive" and global_margin <= GLOBAL_MARGIN_THRESHOLD
+            if self.local_search_mode == "adaptive" and low_global_margin
             else "preserve_review_semantics"
         )
         direct_full = (
             self.local_search_mode == "exhaustive"
-            or global_margin > GLOBAL_MARGIN_THRESHOLD
+            or not low_global_margin
         )
         expanded_because: str | None = (
             "exhaustive_mode" if self.local_search_mode == "exhaustive"
