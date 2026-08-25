@@ -429,7 +429,7 @@ void MainWindow::deleteSelectedWorkpiece() {
     if (workpieceId.isEmpty() || client_ == nullptr || clientBusy_ || !backendReady_) {
         return;
     }
-    const QString name = appHeader_->currentWorkpieceId();
+    const QString name = appHeader_->currentWorkpieceName();
     const bool confirmed = QMessageBox::question(
         this, QStringLiteral("确认删除工件"),
         QStringLiteral("工件“%1”将移入可恢复回收区，是否继续？").arg(name),

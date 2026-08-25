@@ -140,6 +140,10 @@ QString AppHeader::currentWorkpieceId() const {
     return workpieceComboBox_->currentData().toString();
 }
 
+QString AppHeader::currentWorkpieceName() const {
+    return workpieceComboBox_->currentText();
+}
+
 void AppHeader::setBackendState(BackendUiState state, const QString &detail) {
     const QString baseText = backendStateText(state);
     backendStatusLabel_->setText(detail.isEmpty()

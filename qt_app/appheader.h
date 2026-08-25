@@ -35,6 +35,7 @@ public:
                        const QString &currentWorkpieceId);
     void setCurrentWorkpieceId(const QString &workpieceId);
     QString currentWorkpieceId() const;
+    QString currentWorkpieceName() const;
     void setBackendState(BackendUiState state, const QString &detail);
     void setBackendDetails(const BackendStatusDetails &details);
 

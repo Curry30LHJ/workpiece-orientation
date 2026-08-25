@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QComboBox>
 #include <QLabel>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QQueue>
 #include <QSet>
@@ -12,6 +13,7 @@
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QImage>
@@ -20,6 +22,24 @@
 #include "../backendprocessmanager.h"
 #include "../mainwindow.h"
 #include "../processlauncher.h"
+
+class MessageBoxTextCapture : public QObject {
+public:
+    QString text;
+    bool wasShown = false;
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override {
+        auto *dialog = qobject_cast<QMessageBox *>(watched);
+        if (dialog == nullptr || event->type() != QEvent::Show) {
+            return false;
+        }
+        wasShown = true;
+        text = dialog->text();
+        QTimer::singleShot(0, dialog, [dialog]() { dialog->done(QMessageBox::No); });
+        return true;
+    }
+};
 
 class PassiveLauncher : public ProcessLauncher {
 public:
@@ -381,6 +401,34 @@ private:
     }
 
 private slots:
+    void deleteConfirmationShowsDisplayNameInsteadOfInternalId() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        emit client.handshakeSucceeded();
+        emit client.responseReceived(
+            QStringLiteral("list_workpieces"),
+            QJsonObject{{QStringLiteral("workpieces"),
+                         QJsonArray{QJsonObject{
+                             {QStringLiteral("id"), QStringLiteral("internal-workpiece-id")},
+                             {QStringLiteral("name"), QStringLiteral("泵体 A")}}}}});
+
+        auto *deleteButton = window.findChild<QPushButton *>(
+            QStringLiteral("deleteWorkpieceButton"));
+        QVERIFY(deleteButton != nullptr);
+        QVERIFY(deleteButton->isEnabled());
+        window.show();
+        QCoreApplication::processEvents();
+
+        MessageBoxTextCapture capture;
+        qApp->installEventFilter(&capture);
+        deleteButton->click();
+        qApp->removeEventFilter(&capture);
+
+        QVERIFY(capture.wasShown);
+        QVERIFY(capture.text.contains(QStringLiteral("泵体 A")));
+        QVERIFY(!capture.text.contains(QStringLiteral("internal-workpiece-id")));
+    }
+
     void startsOnInspectionAndPreservesHeaderAcrossNavigation() {
         MainWindow window;
         auto *stack = window.findChild<QStackedWidget *>(
