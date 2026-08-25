@@ -11,7 +11,7 @@ from pathlib import Path
 import pickle
 import threading
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 import cv2
@@ -31,6 +31,9 @@ GLOBAL_MARGIN_THRESHOLD = 0.05
 LOCAL_MIN_SCORE = 4.0
 LOCAL_MIN_MARGIN = 0.5
 LOCAL_OVERRIDE_MARGIN = 3.0
+LOCAL_SEARCH_MODES = ("adaptive", "exhaustive")
+DEFAULT_LOCAL_SEARCH_MODE = "adaptive"
+LOCAL_SEARCH_STAGE_LIMITS = (("top5", 5), ("top10", 10))
 TEMPLATE_CACHE_FORMAT_VERSION = 2
 TEMPLATE_CACHE_FILE_NAME = ".template_cache.pkl"
 
@@ -71,6 +74,13 @@ class TemplateCache:
     geometry_profile: dict[str, Any] | None = None
     geometry_profile_revision: int | None = None
     geometry_template_report: dict[str, Any] | None = None
+
+@dataclass(frozen=True)
+class LocalSearchResult:
+    scores: dict[str, float]
+    diagnostics: dict[str, object]
+    matching_ms: float
+    trace: dict[str, object]
 
 
 def _move_tensors(value: Any, device: Any) -> Any:
@@ -136,6 +146,13 @@ def _decide_local_label(scores: dict[str, float]) -> tuple[str, float]:
     return ordered[0], margin
 
 
+def _validate_local_search_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in LOCAL_SEARCH_MODES:
+        raise ValueError("local_search_mode must be 'adaptive' or 'exhaustive'")
+    return mode
+
+
 class OrientationClassifier:
     """Fuse global retrieval with decisive soft-center local evidence."""
 
@@ -149,6 +166,7 @@ class OrientationClassifier:
         extract_features_fn: Callable[..., dict] | None = None,
         score_feature_pair_fn: Callable[..., dict] | None = None,
         geometry_calibrator: Any | None = None,
+        local_search_mode: str = DEFAULT_LOCAL_SEARCH_MODE,
     ) -> None:
         self.global_predictor = global_predictor
         self.extractor = extractor
@@ -157,11 +175,18 @@ class OrientationClassifier:
         self._extract_features = extract_features_fn or _default_extract_features
         self._score_feature_pair = score_feature_pair_fn or _default_score_feature_pair
         self.geometry_calibrator = geometry_calibrator
+        self.local_search_mode = _validate_local_search_mode(local_search_mode)
         self._inference_lock = threading.RLock()
         self._template_caches: dict[str, TemplateCache] = {}
 
     @classmethod
-    def load(cls, project_root: Path, model_dir: Path) -> "OrientationClassifier":
+    def load(
+        cls,
+        project_root: Path,
+        model_dir: Path,
+        *,
+        local_search_mode: str = DEFAULT_LOCAL_SEARCH_MODE,
+    ) -> "OrientationClassifier":
         """Load the production Paddle and Torch models lazily at service startup."""
         # On Windows, Paddle and PyTorch can expose incompatible DLLs when Paddle
         # is imported first. Load the Torch/ALIKED stack before PaddleClas.
@@ -181,7 +206,8 @@ class OrientationClassifier:
         from src.geometry_calibration import GeometryCalibrator
 
         return cls(global_predictor, extractor, matcher, device,
-                   geometry_calibrator=GeometryCalibrator())
+                   geometry_calibrator=GeometryCalibrator(),
+                   local_search_mode=local_search_mode)
 
     def _global_embedding(self, image: np.ndarray) -> np.ndarray:
         with self._inference_lock:
@@ -591,6 +617,160 @@ class OrientationClassifier:
 
     def remove_template_cache(self, workpiece_id: str) -> None:
         self._template_caches.pop(workpiece_id, None)
+
+    @staticmethod
+    def _local_expansion_reason(
+        global_scores: dict[str, float], local_scores: dict[str, float]
+    ) -> str:
+        local_prediction, _ = _decide_local_label(local_scores)
+        if local_prediction == "uncertain":
+            if max(local_scores.values()) < LOCAL_MIN_SCORE:
+                return "local_uncertain"
+            return "local_margin_low"
+        global_prediction = max(global_scores, key=global_scores.get)
+        if local_prediction != global_prediction:
+            return "local_conflict"
+        return "local_uncertain"
+
+    def _rank_local_candidates(
+        self,
+        global_vectors: Mapping[str, np.ndarray],
+        query_embeddings: Mapping[str, np.ndarray],
+        local_features: Mapping[str, Sequence[dict[str, Any]]],
+    ) -> dict[str, list[int]]:
+        rankings = {}
+        for label in ("front", "back"):
+            vectors = np.asarray(global_vectors.get(label), dtype=np.float32)
+            candidates = local_features.get(label)
+            if vectors.ndim != 2 or candidates is None:
+                raise OrientationClassifierError(
+                    f"template cache alignment error for {label}: missing vectors or local features"
+                )
+            if vectors.shape[0] == 0 or len(candidates) == 0:
+                raise OrientationClassifierError(
+                    f"template cache alignment error for {label}: at least one local template is required"
+                )
+            if vectors.shape[0] != len(candidates):
+                raise OrientationClassifierError(
+                    f"template cache alignment error for {label}: "
+                    f"{vectors.shape[0]} global vectors != {len(candidates)} local templates"
+                )
+            query = np.asarray(query_embeddings[label], dtype=np.float32)
+            similarities = np.asarray(vectors @ query, dtype=np.float32).reshape(-1)
+            rankings[label] = np.argsort(-similarities, kind="stable").tolist()
+        return rankings
+
+    def _search_local(
+        self,
+        *,
+        query_features_by_label: Mapping[str, dict[str, Any]],
+        global_vectors: Mapping[str, np.ndarray],
+        query_embeddings: Mapping[str, np.ndarray],
+        local_features: Mapping[str, Sequence[dict[str, Any]]],
+        image_shape: tuple[int, int],
+        global_scores: dict[str, float],
+    ) -> LocalSearchResult:
+        rankings = self._rank_local_candidates(
+            global_vectors, query_embeddings, local_features
+        )
+        available_counts = {label: len(rankings[label]) for label in ("front", "back")}
+        score_cache: dict[str, dict[int, float]] = {"front": {}, "back": {}}
+        query_features = {
+            label: _move_tensors(query_features_by_label[label], self.device)
+            for label in ("front", "back")
+        }
+        matching_ms = 0.0
+        trace: dict[str, object] = {"ranked_indices": rankings, "stages": []}
+
+        def scores() -> dict[str, float]:
+            return {
+                label: max(score_cache[label].values())
+                for label in ("front", "back")
+            }
+
+        def score_to(limit: int) -> None:
+            nonlocal matching_ms
+            for label in ("front", "back"):
+                for index in rankings[label][:min(limit, available_counts[label])]:
+                    if index in score_cache[label]:
+                        continue
+                    started = time.perf_counter()
+                    score_cache[label][index] = float(self._score_feature_pair(
+                        query_features[label],
+                        _move_tensors(local_features[label][index], self.device),
+                        image_shape,
+                        self.matcher,
+                    )["score"])
+                    matching_ms += (time.perf_counter() - started) * 1000.0
+
+        def record_stage(stage: str) -> tuple[dict[str, float], dict[str, object]]:
+            current_scores = scores()
+            fusion = self._fuse_scores(global_scores, current_scores, time.perf_counter())
+            trace["stages"].append({
+                "stage": stage,
+                "scores": dict(current_scores),
+                "fusion": fusion,
+            })
+            return current_scores, fusion
+
+        ordered_globals = sorted(global_scores, key=global_scores.get, reverse=True)
+        global_margin = float(
+            global_scores[ordered_globals[0]] - global_scores[ordered_globals[1]]
+        )
+        global_margin_gate = (
+            "adaptive_low_margin"
+            if self.local_search_mode == "adaptive" and global_margin <= GLOBAL_MARGIN_THRESHOLD
+            else "preserve_review_semantics"
+        )
+        direct_full = (
+            self.local_search_mode == "exhaustive"
+            or global_margin > GLOBAL_MARGIN_THRESHOLD
+        )
+        expanded_because: str | None = (
+            "exhaustive_mode" if self.local_search_mode == "exhaustive"
+            else "preserve_review_semantics" if direct_full else None
+        )
+
+        if direct_full:
+            score_to(max(available_counts.values()))
+            stage = "full"
+            current_scores, _ = record_stage(stage)
+        else:
+            stage, limit = LOCAL_SEARCH_STAGE_LIMITS[0]
+            score_to(limit)
+            current_scores, fusion = record_stage(stage)
+            if bool(fusion["needs_review"]) and not all(
+                len(score_cache[label]) == available_counts[label]
+                for label in ("front", "back")
+            ):
+                expanded_because = self._local_expansion_reason(global_scores, current_scores)
+                stage, limit = LOCAL_SEARCH_STAGE_LIMITS[1]
+                score_to(limit)
+                current_scores, fusion = record_stage(stage)
+                if bool(fusion["needs_review"]) and not all(
+                    len(score_cache[label]) == available_counts[label]
+                    for label in ("front", "back")
+                ):
+                    expanded_because = self._local_expansion_reason(global_scores, current_scores)
+                    score_to(max(available_counts.values()))
+                    stage = "full"
+                    current_scores, _ = record_stage(stage)
+
+        diagnostics = {
+            "stage": stage,
+            "mode": self.local_search_mode,
+            "matched_counts": {
+                label: len(score_cache[label]) for label in ("front", "back")
+            },
+            "available_counts": available_counts,
+            "expanded_because": expanded_because,
+            "exhaustive": all(
+                len(score_cache[label]) == available_counts[label]
+                for label in ("front", "back")
+            ),
+            "global_margin_gate": global_margin_gate,
+        }
+        return LocalSearchResult(current_scores, diagnostics, matching_ms, trace)
 
     def _score_local(self, query_features: dict[str, Any], candidates: Sequence[dict[str, Any]],
                      image_shape: tuple[int, int]) -> float:

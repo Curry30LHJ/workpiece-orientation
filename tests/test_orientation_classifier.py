@@ -10,6 +10,7 @@ import pytest
 from src.orientation_classifier import (
     ImageUnreadableError,
     OrientationClassifier,
+    OrientationClassifierError,
     PropagationModelError,
     WorkpieceNotFoundError,
 )
@@ -386,3 +387,217 @@ def test_corrupt_template_cache_is_ignored(classifier, tmp_path):
     (record.root / ".template_cache.pkl").write_bytes(b"not a pickle")
 
     assert classifier.load_template_cache(record) is None
+
+def make_search_inputs(front_count, back_count, score_for):
+    global_vectors = {}
+    local_features = {}
+    for label, count in (("front", front_count), ("back", back_count)):
+        similarities = np.linspace(1.0, 0.1, count, dtype=np.float32)
+        global_vectors[label] = similarities.reshape(-1, 1)
+        local_features[label] = [
+            {"label": label, "index": index, "score": float(score_for(label, index))}
+            for index in range(count)
+        ]
+    return global_vectors, local_features
+
+
+def run_local_search(classifier, global_vectors, local_features, global_scores):
+    return classifier._search_local(
+        query_features_by_label={
+            "front": {"label": "front"},
+            "back": {"label": "back"},
+        },
+        global_vectors=global_vectors,
+        query_embeddings={
+            "front": np.asarray([1.0], dtype=np.float32),
+            "back": np.asarray([1.0], dtype=np.float32),
+        },
+        local_features=local_features,
+        image_shape=(8, 8),
+        global_scores=global_scores,
+    )
+
+
+def test_adaptive_local_search_stops_at_top5_without_reordering_features(classifier):
+    calls = []
+    global_vectors, local_features = make_search_inputs(
+        12, 13, lambda label, index: 8.0 if label == "front" else 5.0
+    )
+
+    def score_pair(query, template, image_shape, matcher):
+        calls.append((template["label"], template["index"]))
+        return {"score": template["score"]}
+
+    classifier._score_feature_pair = score_pair
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.51, "back": 0.50},
+    )
+
+    assert result.scores == {"front": 8.0, "back": 5.0}
+    assert result.diagnostics["stage"] == "top5"
+    assert result.diagnostics["matched_counts"] == {"front": 5, "back": 5}
+    assert result.diagnostics["available_counts"] == {"front": 12, "back": 13}
+    assert result.diagnostics["expanded_because"] is None
+    assert result.diagnostics["exhaustive"] is False
+    assert calls == [
+        (label, index)
+        for label in ("front", "back")
+        for index in range(5)
+    ]
+    assert result.trace["ranked_indices"]["front"] == list(range(12))
+
+
+def test_adaptive_local_search_expands_to_top10_without_rematching(classifier):
+    calls = []
+    global_vectors, local_features = make_search_inputs(
+        12, 13,
+        lambda label, index: 8.0 if label == "front" and index == 5 else 5.0,
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.51, "back": 0.50},
+    )
+
+    assert result.diagnostics["stage"] == "top10"
+    assert result.diagnostics["matched_counts"] == {"front": 10, "back": 10}
+    assert result.diagnostics["expanded_because"] == "local_margin_low"
+    assert len(calls) == 20
+    assert len(set(calls)) == 20
+    assert [item["stage"] for item in result.trace["stages"]] == ["top5", "top10"]
+
+
+def test_adaptive_local_search_reaches_full_once_when_still_uncertain(classifier):
+    calls = []
+    global_vectors, local_features = make_search_inputs(
+        12, 13, lambda label, index: 5.0
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.51, "back": 0.50},
+    )
+
+    assert result.diagnostics["stage"] == "full"
+    assert result.diagnostics["matched_counts"] == {"front": 12, "back": 13}
+    assert result.diagnostics["exhaustive"] is True
+    assert result.diagnostics["expanded_because"] == "local_margin_low"
+    assert len(calls) == 25
+    assert len(set(calls)) == 25
+
+
+@pytest.mark.parametrize(
+    ("front_count", "back_count", "expected_stage", "expected_calls"),
+    [(1, 1, "top5", 2), (5, 10, "top5", 10), (10, 15, "top5", 10)],
+)
+def test_adaptive_local_search_supports_unequal_counts(
+    classifier, front_count, back_count, expected_stage, expected_calls
+):
+    calls = []
+    global_vectors, local_features = make_search_inputs(
+        front_count, back_count,
+        lambda label, index: 8.0 if label == "front" else 5.0,
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.51, "back": 0.50},
+    )
+
+    assert result.diagnostics["stage"] == expected_stage
+    assert len(calls) == expected_calls
+
+
+def test_local_search_rejects_misaligned_cache(classifier):
+    global_vectors, local_features = make_search_inputs(
+        5, 5, lambda label, index: 5.0
+    )
+    local_features["back"].pop()
+
+    with pytest.raises(OrientationClassifierError, match="alignment error for back"):
+        run_local_search(
+            classifier, global_vectors, local_features,
+            {"front": 0.51, "back": 0.50},
+        )
+
+
+def test_adaptive_high_global_margin_searches_every_template_once(classifier):
+    calls = []
+    global_vectors, local_features = make_search_inputs(
+        12, 13, lambda label, index: 8.0 if label == "front" else 5.0
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: (
+        calls.append((template["label"], template["index"]))
+        or {"score": template["score"]}
+    )
+
+    result = run_local_search(
+        classifier, global_vectors, local_features,
+        {"front": 0.90, "back": 0.20},
+    )
+
+    assert result.diagnostics["stage"] == "full"
+    assert result.diagnostics["global_margin_gate"] == "preserve_review_semantics"
+    assert len(calls) == 25
+    assert len(set(calls)) == 25
+
+
+def test_exhaustive_local_search_matches_all_template_scores_and_fusion():
+    classifier = OrientationClassifier(
+        global_predictor=FakeGlobalPredictor(),
+        extractor=FakeExtractor(),
+        matcher=FakeMatcher(),
+        device="cpu",
+        extract_features_fn=fake_extract_features,
+        score_feature_pair_fn=fake_score_feature_pair,
+        local_search_mode="exhaustive",
+    )
+    global_vectors, local_features = make_search_inputs(
+        12, 13, lambda label, index: 8.0 if label == "front" else 5.0
+    )
+    classifier._score_feature_pair = lambda query, template, shape, matcher: {
+        "score": template["score"]
+    }
+    global_scores = {"front": 0.51, "back": 0.50}
+
+    result = run_local_search(classifier, global_vectors, local_features, global_scores)
+    expected_fusion = classifier._fuse_scores(
+        global_scores, {"front": 8.0, "back": 5.0}, 0.0
+    )
+
+    assert result.scores == {"front": 8.0, "back": 5.0}
+    assert result.diagnostics["stage"] == "full"
+    assert result.diagnostics["mode"] == "exhaustive"
+    assert result.diagnostics["matched_counts"] == {"front": 12, "back": 13}
+    assert result.diagnostics["expanded_because"] == "exhaustive_mode"
+    fusion = result.trace["stages"][-1]["fusion"]
+    for key in (
+        "label", "global_prediction", "global_scores", "global_margin",
+        "local_prediction", "local_scores", "local_margin", "decision_source",
+        "needs_review",
+    ):
+        assert fusion[key] == expected_fusion[key]
+
+
+def test_local_search_mode_rejects_unsupported_values():
+    with pytest.raises(ValueError, match="local_search_mode"):
+        OrientationClassifier(
+            global_predictor=FakeGlobalPredictor(),
+            extractor=FakeExtractor(),
+            matcher=FakeMatcher(),
+            device="cpu",
+            local_search_mode="fast",
+        )
