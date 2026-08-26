@@ -7,6 +7,7 @@
 #include <QColor>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
+#include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -17,8 +18,10 @@
 #include <QMessageBox>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSpinBox>
 #include <QSplitter>
+#include <QStyle>
 #include <QTableWidget>
 #include <QAbstractItemView>
 #include <QSignalBlocker>
@@ -30,6 +33,13 @@
 #include <QtMath>
 
 namespace {
+void setSemanticMessage(QLabel *label, const QString &kind) {
+    if (label == nullptr) return;
+    label->setProperty("messageKind", kind);
+    label->style()->unpolish(label);
+    label->style()->polish(label);
+}
+
 QJsonObject emptyDirection() {
     return QJsonObject{{QStringLiteral("anchor"), QJsonValue()},
                        {QStringLiteral("rules"), QJsonArray()}};
@@ -103,12 +113,21 @@ QString validationReasonText(const QString &code) {
 }
 
 GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
+    setProperty("pageRoot", true);
     auto *root = new QVBoxLayout(this);
+    root->setContentsMargins(24, 24, 24, 24);
+    root->setSpacing(16);
     auto *splitter = new QSplitter(Qt::Horizontal, this);
+    splitter->setObjectName(QStringLiteral("geometryWorkspaceSplitter"));
+    splitter->setChildrenCollapsible(false);
     root->addWidget(splitter);
 
     auto *left = new QWidget(splitter);
+    left->setObjectName(QStringLiteral("geometryRulePanel"));
+    left->setProperty("panel", true);
     auto *leftLayout = new QVBoxLayout(left);
+    leftLayout->setContentsMargins(16, 16, 16, 16);
+    leftLayout->setSpacing(8);
     revisionLabel_ = new QLabel(left);
     statusLabel_ = new QLabel(left);
     statusLabel_->setObjectName(QStringLiteral("geometryStatusLabel"));
@@ -176,7 +195,11 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     manualAnchorButton_->setVisible(false);
 
     auto *center = new QWidget(splitter);
+    center->setObjectName(QStringLiteral("geometryCanvasPanel"));
+    center->setProperty("panel", true);
     auto *centerLayout = new QVBoxLayout(center);
+    centerLayout->setContentsMargins(16, 16, 16, 16);
+    centerLayout->setSpacing(8);
     auto *previewSelectors = new QFormLayout();
     previewSelectors->addRow(QStringLiteral("方向"), directionCombo_);
     previewSelectors->addRow(QStringLiteral("模板"), templateCombo_);
@@ -209,7 +232,11 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     centerLayout->addWidget(help);
 
     auto *right = new QWidget(splitter);
+    right->setObjectName(QStringLiteral("geometryValidationPanel"));
+    right->setProperty("panel", true);
     auto *rightLayout = new QVBoxLayout(right);
+    rightLayout->setContentsMargins(16, 16, 16, 16);
+    rightLayout->setSpacing(8);
     rightLayout->addWidget(statusLabel_);
     progressBar_ = new QProgressBar(right);
     progressBar_->setRange(0, 1);
@@ -220,7 +247,7 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     validationHintLabel_ = new QLabel(QStringLiteral("点击表格中的模板行可定位预览；低置信度/未配置模板请在左侧选择“排除”并填写原因，再重新验证。"), right);
     validationHintLabel_->setObjectName(QStringLiteral("validationHintLabel"));
     validationHintLabel_->setWordWrap(true);
-    validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
+    validationHintLabel_->setProperty("messageKind", QStringLiteral("warning"));
     rightLayout->addWidget(validationHintLabel_);
     validationTable_ = new QTableWidget(right);
     validationTable_->setObjectName(QStringLiteral("validationTable"));
@@ -279,10 +306,15 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     migrationPanelLayout->addLayout(migrationForm);
     migrationPanelLayout->addWidget(resolveMigrationButton_);
     advancedContentLayout->addWidget(migrationPanel_);
-    advancedLayout->addWidget(advancedGeometryContent_);
-    advancedGeometryContent_->setVisible(false);
+    auto *advancedScroll = new QScrollArea(advancedGeometryGroup_);
+    advancedScroll->setObjectName(QStringLiteral("advancedGeometryScrollArea"));
+    advancedScroll->setWidgetResizable(true);
+    advancedScroll->setFrameShape(QFrame::NoFrame);
+    advancedScroll->setWidget(advancedGeometryContent_);
+    advancedScroll->setVisible(false);
+    advancedLayout->addWidget(advancedScroll);
     connect(advancedGeometryGroup_, &QGroupBox::toggled,
-            advancedGeometryContent_, &QWidget::setVisible);
+            advancedScroll, &QWidget::setVisible);
     rightLayout->addWidget(advancedGeometryGroup_);
     auto *overrideReasonLabel = new QLabel(QStringLiteral("发布覆盖原因（有告警或回归时必填）"), right);
     overrideReasonLabel->setObjectName(QStringLiteral("overrideReasonLabel"));
@@ -312,7 +344,7 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     publishDisabledReasonLabel_ = new QLabel(this);
     publishDisabledReasonLabel_->setObjectName(QStringLiteral("publishDisabledReasonLabel"));
     publishDisabledReasonLabel_->setWordWrap(true);
-    publishDisabledReasonLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
+    publishDisabledReasonLabel_->setProperty("messageKind", QStringLiteral("error"));
     rightLayout->addWidget(publishDisabledReasonLabel_);
     rightLayout->addWidget(publishWorkflowButton_);
 
@@ -341,6 +373,11 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     copyActiveToDraftButton_->setObjectName(QStringLiteral("copyActiveToDraftButton"));
     advancedContentLayout->addWidget(versionCombo_);
     advancedContentLayout->addWidget(copyActiveToDraftButton_);
+
+    splitter->setStretchFactor(0, 24);
+    splitter->setStretchFactor(1, 52);
+    splitter->setStretchFactor(2, 24);
+    splitter->setSizes({240, 520, 240});
 
     connect(addButton, &QPushButton::clicked, this, &GeometryRulesPage::addRule);
     connect(deleteButton, &QPushButton::clicked, this, &GeometryRulesPage::deleteRule);
@@ -814,7 +851,7 @@ void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     refreshDiagnostics();
     if (validationHintLabel_ != nullptr) {
         validationHintLabel_->setText(QStringLiteral("点击表格中的模板行可定位预览；低置信度/未配置模板请在左侧选择“排除”并填写原因，再重新验证。"));
-        validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
+        setSemanticMessage(validationHintLabel_, QStringLiteral("warning"));
     }
     revisionLabel_->setText(QStringLiteral("库修订 %1，草稿修订 %2，活动 %3")
                                 .arg(snapshot.value(QStringLiteral("library_revision")).toInt())
@@ -823,7 +860,7 @@ void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     statusLabel_->setText(snapshot.value(QStringLiteral("legacy_archived")).toBool()
                               ? QStringLiteral("旧位置标注已归档，请使用几何规则重新标定")
                               : QString());
-    statusLabel_->setStyleSheet(QString());
+    setSemanticMessage(statusLabel_, QStringLiteral("neutral"));
     refreshMigrationPanel();
     refreshRuleList();
     refreshTemplatePreview();
@@ -901,14 +938,14 @@ void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
                    .value(QStringLiteral("correct_to_wrong")).toInt() > 0);
     if (validationHintLabel_ != nullptr) {
         validationHintLabel_->setText(QStringLiteral("点击表格中的模板行可定位预览；低置信度/未配置模板请在左侧选择“排除”并填写原因，再重新验证。"));
-        validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
+        setSemanticMessage(validationHintLabel_, QStringLiteral("warning"));
     }
     const QJsonObject progress = job.value(QStringLiteral("progress")).toObject();
     const int total = qMax(1, progress.value(QStringLiteral("total")).toInt(1));
     progressBar_->setRange(0, total);
     progressBar_->setValue(qBound(0, progress.value(QStringLiteral("completed")).toInt(), total));
     statusLabel_->setText(QStringLiteral("验证任务：%1").arg(job.value(QStringLiteral("state")).toString()));
-    statusLabel_->setStyleSheet(QString());
+    setSemanticMessage(statusLabel_, QStringLiteral("neutral"));
     const QJsonArray warnings = job.value(QStringLiteral("warnings")).toArray();
     const QJsonArray blocking = job.value(QStringLiteral("blocking_issues")).toArray();
     QStringList validationLines;
@@ -1263,11 +1300,11 @@ void GeometryRulesPage::markDraftDirty() {
         if (validationHintLabel_ != nullptr) {
             validationHintLabel_->setText(
                 QStringLiteral("草稿已修改：旧验证结果已失效，保存后请重新验证。"));
-            validationHintLabel_->setStyleSheet(QStringLiteral("color: #b35c00; font-weight: 600;"));
+            setSemanticMessage(validationHintLabel_, QStringLiteral("warning"));
         }
         if (statusLabel_ != nullptr) {
             statusLabel_->setText(QStringLiteral("草稿已修改：请先保存，再重新验证"));
-            statusLabel_->setStyleSheet(QStringLiteral("color: #b35c00;"));
+            setSemanticMessage(statusLabel_, QStringLiteral("warning"));
         }
     }
     setDirty(true);
@@ -1296,7 +1333,7 @@ void GeometryRulesPage::refreshEditor() {
 
 void GeometryRulesPage::setOperationError(const QString &message) {
     statusLabel_->setText(message);
-    statusLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
+    setSemanticMessage(statusLabel_, QStringLiteral("error"));
 }
 
 void GeometryRulesPage::refreshRuleList() {
@@ -1357,6 +1394,8 @@ void GeometryRulesPage::refreshTemplatePreview() {
                                 item.value(QStringLiteral("path")).toString());
         templateCombo_->setItemData(templateCombo_->count() - 1,
                                      item.value(QStringLiteral("template_id")).toString(), Qt::UserRole + 1);
+        templateCombo_->setItemData(templateCombo_->count() - 1,
+                                     item.value(QStringLiteral("path")).toString(), Qt::ToolTipRole);
     }
     int index = templateCombo_->findData(previous);
     if (index < 0) index = 0;
@@ -1845,10 +1884,10 @@ void GeometryRulesPage::setRulePreview(const QJsonObject &preview) {
     const bool active = previewStatus == QStringLiteral("active");
     if (active) {
         statusLabel_->setText(QStringLiteral("当前模板拟合成功，请检查绿色边界"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #008000;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("success"));
     } else if (previewStatus == QStringLiteral("low_confidence")) {
         statusLabel_->setText(QStringLiteral("当前模板未拟合出有效边界，请在当前方向重新粗画；必要时重设基准边界"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #b35c00;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("warning"));
     }
     manualAnchorButton_->setVisible(!active);
     setPreviewBusy(false);
@@ -1950,7 +1989,7 @@ void GeometryRulesPage::publishWorkflow() {
                                      .value(QStringLiteral("conflicts")).toArray();
     if (!conflicts.isEmpty()) {
         statusLabel_->setText(QStringLiteral("请先在右侧处理迁移冲突，再保存、验证并发布"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("error"));
         return;
     }
     const MissingCalibration missing = firstMissingEnabledCalibration();
@@ -1960,7 +1999,7 @@ void GeometryRulesPage::publishWorkflow() {
         selectRuleById(missing.ruleId);
         statusLabel_->setText(missing.direction == QStringLiteral("front")
             ? QStringLiteral("请先完成正面标定") : QStringLiteral("请先完成反面标定"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("error"));
         return;
     }
     emit publishWorkflowRequested(draft_,
@@ -2028,16 +2067,16 @@ void GeometryRulesPage::updatePublishState() {
     }
     if (needsOverrideReason) {
         statusLabel_->setText(QStringLiteral("验证完成：存在可覆盖告警，请填写发布覆盖原因"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #b35c00;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("warning"));
         publishButton_->setToolTip(QStringLiteral("请先填写“发布覆盖原因（有告警或回归时必填）”"));
         overrideReasonEdit_->setToolTip(QStringLiteral("告警允许覆盖，但必须记录人工确认原因"));
     } else if (completed && hasBlocking) {
         statusLabel_->setText(QStringLiteral("验证完成：存在阻断项，处理后才能发布"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #c00000;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("error"));
         publishButton_->setToolTip(QStringLiteral("存在阻断项，当前不能发布"));
     } else if (completed && hasWarning && hasOverrideReason) {
         statusLabel_->setText(QStringLiteral("验证完成：覆盖原因已填写，可以发布"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #008000;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("success"));
         publishButton_->setToolTip(QString());
     } else {
         publishButton_->setToolTip(QString());
@@ -2114,11 +2153,11 @@ void GeometryRulesPage::reloadDraft() {
     refreshDiagnostics();
     if (validationHintLabel_ != nullptr) {
         validationHintLabel_->setText(QStringLiteral("已恢复保存的草稿；请重新验证以生成最新结果。"));
-        validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
+        setSemanticMessage(validationHintLabel_, QStringLiteral("warning"));
     }
     if (statusLabel_ != nullptr) {
         statusLabel_->setText(QStringLiteral("已重新载入已保存草稿，请重新验证"));
-        statusLabel_->setStyleSheet(QString());
+        setSemanticMessage(statusLabel_, QStringLiteral("neutral"));
     }
     refreshEditor();
 }

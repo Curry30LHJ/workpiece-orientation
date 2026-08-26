@@ -13,7 +13,9 @@
 #include <QMessageBox>
 #include <QSet>
 #include <QSignalBlocker>
+#include <QStyle>
 #include <QTableWidgetItem>
+#include <QTabWidget>
 #include <QUuid>
 
 namespace {
@@ -69,6 +71,13 @@ bool shouldReplaceSelectedJob(const QJsonObject &selected,
     return candidateAt.isValid() && selectedAt.isValid() && candidateAt > selectedAt;
 }
 
+QString templatePathSummary(const QStringList &paths) {
+    if (paths.isEmpty()) return QStringLiteral("未选择");
+    const QString firstName = QFileInfo(paths.constFirst()).fileName();
+    if (paths.size() == 1) return firstName;
+    return QStringLiteral("%1 等 %2 张").arg(firstName).arg(paths.size());
+}
+
 } // namespace
 
 WorkpieceLibraryPage::WorkpieceLibraryPage(QWidget *parent)
@@ -76,6 +85,7 @@ WorkpieceLibraryPage::WorkpieceLibraryPage(QWidget *parent)
     ui->setupUi(this);
     ui->librarySplitter->setStretchFactor(0, 1);
     ui->librarySplitter->setStretchFactor(1, 3);
+    ui->librarySplitter->setChildrenCollapsible(false);
     ui->templateDetailsTable->horizontalHeader()->setStretchLastSection(true);
     ui->evolutionJobsTable->horizontalHeader()->setStretchLastSection(true);
     ui->registrationProgressBar->setRange(0, 1);
@@ -108,6 +118,31 @@ WorkpieceLibraryPage::WorkpieceLibraryPage(QWidget *parent)
         setDirty(true);
         updateControlStates();
     });
+    auto updatePrimaryRole = [this](int tabIndex) {
+        for (QPushButton *button : {ui->setCurrentWorkpieceButton,
+                                    ui->refreshWorkpiecesButton,
+                                    ui->registerButton}) {
+            button->setProperty("role", QStringLiteral("secondary"));
+            button->style()->unpolish(button);
+            button->style()->polish(button);
+        }
+        QPushButton *primary = tabIndex == 1 ? ui->registerButton
+            : (tabIndex == 2 ? ui->refreshWorkpiecesButton
+                             : ui->setCurrentWorkpieceButton);
+        primary->setProperty("role", QStringLiteral("primary"));
+        primary->style()->unpolish(primary);
+        primary->style()->polish(primary);
+    };
+    connect(ui->libraryTabWidget, &QTabWidget::currentChanged,
+            this, updatePrimaryRole);
+    updatePrimaryRole(ui->libraryTabWidget->currentIndex());
+    ui->deleteWorkpieceButton->setProperty("role", QStringLiteral("danger"));
+    ui->templateWarningLabel->setProperty("messageKind", QStringLiteral("warning"));
+    ui->libraryMessageLabel->setProperty("messageKind", QStringLiteral("neutral"));
+    QWidget::setTabOrder(ui->librarySearchEdit, ui->libraryWorkpieceList);
+    QWidget::setTabOrder(ui->libraryWorkpieceList, ui->setCurrentWorkpieceButton);
+    QWidget::setTabOrder(ui->setCurrentWorkpieceButton, ui->refreshWorkpiecesButton);
+    QWidget::setTabOrder(ui->refreshWorkpiecesButton, ui->libraryTabWidget);
 
     updateTemplateUi();
     updateControlStates();
@@ -362,6 +397,21 @@ bool WorkpieceLibraryPage::hasUnsavedChanges() const {
     return dirty_;
 }
 
+bool WorkpieceLibraryPage::hasActiveRegistration() const {
+    return registrationInFlight_;
+}
+
+bool WorkpieceLibraryPage::hasActiveEvolutionTask() const {
+    for (const QJsonObject &job : evolutionJobsById_) {
+        const QString state = job.value(QStringLiteral("state")).toString();
+        if (state == QStringLiteral("queued") || state == QStringLiteral("building")
+            || state == QStringLiteral("running")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void WorkpieceLibraryPage::discardEditingDraft() {
     const QSignalBlocker blocker(ui->workpieceNameEdit);
     ui->workpieceNameEdit->clear();
@@ -549,8 +599,10 @@ void WorkpieceLibraryPage::updateTemplateUi() {
         QStringLiteral("正面已选择 %1 张").arg(frontTemplatePaths_.size()));
     ui->backTemplatesLabel->setText(
         QStringLiteral("反面已选择 %1 张").arg(backTemplatePaths_.size()));
-    ui->frontTemplatesFilesLabel->setText(frontTemplatePaths_.join(QLatin1Char('\n')));
-    ui->backTemplatesFilesLabel->setText(backTemplatePaths_.join(QLatin1Char('\n')));
+    ui->frontTemplatesFilesLabel->setText(templatePathSummary(frontTemplatePaths_));
+    ui->backTemplatesFilesLabel->setText(templatePathSummary(backTemplatePaths_));
+    ui->frontTemplatesFilesLabel->setToolTip(frontTemplatePaths_.join(QLatin1Char('\n')));
+    ui->backTemplatesFilesLabel->setToolTip(backTemplatePaths_.join(QLatin1Char('\n')));
     QStringList warnings;
     if (frontTemplatePaths_.size() < 3 || backTemplatePaths_.size() < 3) {
         warnings.append(QStringLiteral("模板较少，建议补充更多角度，但仍可建库"));
@@ -559,6 +611,7 @@ void WorkpieceLibraryPage::updateTemplateUi() {
         warnings.append(QStringLiteral("模板较多，建库和检测耗时可能增加"));
     }
     ui->templateWarningLabel->setText(warnings.join(QLatin1Char('\n')));
+    ui->templateWarningLabel->setVisible(!warnings.isEmpty());
 }
 
 void WorkpieceLibraryPage::updateControlStates() {
@@ -576,9 +629,13 @@ void WorkpieceLibraryPage::updateControlStates() {
     ui->deleteWorkpieceButton->setEnabled(
         interactive && !browsedWorkpieceId_.isEmpty()
         && ui->recycleNameConfirmationEdit->text() == browsedDisplayName());
-    ui->annotationEditorButton->setEnabled(
-        interactive && (!browsedWorkpieceId_.isEmpty()
-                        || !currentDetectionWorkpieceId_.isEmpty()));
+    ui->registerButton->setToolTip(!ready
+        ? QStringLiteral("后端未就绪")
+        : (registrationInFlight_ ? QStringLiteral("建库任务正在运行")
+                                 : QStringLiteral("使用全部已选模板建立工件库")));
+    ui->deleteWorkpieceButton->setToolTip(ui->deleteWorkpieceButton->isEnabled()
+        ? QStringLiteral("将当前浏览工件移入可恢复回收区")
+        : QStringLiteral("请输入完整工件名称后才能移入回收区"));
 }
 
 void WorkpieceLibraryPage::setDirty(bool dirty) {
@@ -588,8 +645,10 @@ void WorkpieceLibraryPage::setDirty(bool dirty) {
 }
 
 void WorkpieceLibraryPage::showMessage(const QString &message, bool error) {
-    ui->libraryMessageLabel->setStyleSheet(
-        error ? QStringLiteral("color: #b00020;") : QString());
+    ui->libraryMessageLabel->setProperty(
+        "messageKind", error ? QStringLiteral("error") : QStringLiteral("neutral"));
+    ui->libraryMessageLabel->style()->unpolish(ui->libraryMessageLabel);
+    ui->libraryMessageLabel->style()->polish(ui->libraryMessageLabel);
     ui->libraryMessageLabel->setText(message);
 }
 

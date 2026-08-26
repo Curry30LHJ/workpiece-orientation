@@ -23,6 +23,7 @@ signals:
     void actionRequested();
 
 private:
+    QLabel *iconLabel_;
     QLabel *titleLabel_;
     QLabel *detailLabel_;
     QProgressBar *progressBar_;

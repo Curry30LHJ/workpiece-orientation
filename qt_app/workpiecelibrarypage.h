@@ -41,6 +41,8 @@ public:
     void setWorkpieceName(const QString &name);
     void setReplaceConfirmationHandler(std::function<bool(const QString &)> handler);
     bool hasUnsavedChanges() const;
+    bool hasActiveRegistration() const;
+    bool hasActiveEvolutionTask() const;
     void discardEditingDraft();
     QString browsedWorkpieceId() const;
 

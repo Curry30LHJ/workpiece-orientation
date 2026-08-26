@@ -6,10 +6,15 @@
    <string>工件正反面检测</string>
   </property>
   <property name="minimumSize">
-   <size><width>1100</width><height>720</height></size>
+   <size><width>1024</width><height>640</height></size>
   </property>
   <widget class="QWidget" name="centralwidget">
    <layout class="QVBoxLayout" name="applicationShellLayout">
+    <property name="leftMargin"><number>0</number></property>
+    <property name="topMargin"><number>0</number></property>
+    <property name="rightMargin"><number>0</number></property>
+    <property name="bottomMargin"><number>0</number></property>
+    <property name="spacing"><number>0</number></property>
     <item>
      <layout class="QVBoxLayout" name="appHeaderHostLayout">
       <property name="leftMargin"><number>0</number></property>

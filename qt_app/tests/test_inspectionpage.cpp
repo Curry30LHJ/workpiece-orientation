@@ -4,6 +4,8 @@
 #include <QDateTime>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QFileInfo>
+#include <QGraphicsScene>
 #include <QGroupBox>
 #include <QImage>
 #include <QLabel>
@@ -21,6 +23,7 @@
 #include "../inspectionimageview.h"
 #include "../inspectionpage.h"
 #include "../inspectiontypes.h"
+#include "../apptheme.h"
 
 static QString writeImage(QTemporaryDir &directory, const QString &name) {
     const QString path = directory.filePath(name);
@@ -62,6 +65,7 @@ class TestInspectionPage : public QObject {
     Q_OBJECT
 
 private slots:
+    void initTestCase() { AppTheme::apply(qApp); }
     void batchIdsAreNonEmptyAndUnique() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -662,6 +666,141 @@ private slots:
         QCOMPARE(page.singleImagePath(), batchPath);
         QVERIFY(page.findChild<QLabel *>(QStringLiteral("resultMessageLabel"))->text()
                     .contains(QStringLiteral("批量预测失败")));
+    }
+
+    void visibleModeToggleChangesRealInspectionMode() {
+        InspectionPage page;
+        page.show();
+        auto *single = page.findChild<QPushButton *>(QStringLiteral("singleModeButton"));
+        auto *batch = page.findChild<QPushButton *>(QStringLiteral("batchModeButton"));
+        QVERIFY(single != nullptr);
+        QVERIFY(batch != nullptr);
+        QVERIFY(single->isVisible());
+        QVERIFY(batch->isVisible());
+        QVERIFY(single->isChecked());
+
+        QTest::mouseClick(batch, Qt::LeftButton);
+        QCOMPARE(page.mode(), InspectionMode::Batch);
+        QVERIFY(batch->isChecked());
+        QTest::mouseClick(single, Qt::LeftButton);
+        QCOMPARE(page.mode(), InspectionMode::Single);
+    }
+
+    void runningBatchPreventsModeSwitch() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString first = writeImage(directory, QStringLiteral("batch-one.png"));
+        const QString second = writeImage(directory, QStringLiteral("batch-two.png"));
+        QVERIFY(!first.isEmpty());
+        QVERIFY(!second.isEmpty());
+        InspectionPage page;
+        page.setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("M1"));
+        page.setBackendAvailable(true, false, QString());
+        page.beginBatch({first, second}, QStringLiteral("m1"));
+        QCOMPARE(page.mode(), InspectionMode::Batch);
+        auto *single = page.findChild<QPushButton *>(QStringLiteral("singleModeButton"));
+        auto *batch = page.findChild<QPushButton *>(QStringLiteral("batchModeButton"));
+        QVERIFY(single != nullptr);
+        QVERIFY(batch != nullptr);
+        QVERIFY(!single->isEnabled());
+        QTest::mouseClick(single, Qt::LeftButton);
+        QCOMPARE(page.mode(), InspectionMode::Batch);
+    }
+
+    void longImagePathIsElidedAndRetainedInTooltip() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(
+            directory, QStringLiteral("这是一个非常非常长的中文待检测工件图片文件名用于验证省略显示.png"));
+        QVERIFY(!path.isEmpty());
+        InspectionPage page;
+        page.resize(720, 520);
+        page.setSingleImagePath(path);
+        page.show();
+        QCoreApplication::processEvents();
+
+        auto *label = page.findChild<QLabel *>(QStringLiteral("currentImageLabel"));
+        QVERIFY(label != nullptr);
+        QCOMPARE(label->toolTip(), QFileInfo(path).absoluteFilePath());
+        QVERIFY(label->text().size() < label->toolTip().size());
+    }
+
+    void normalModeExposesExactlyOneVisiblePrimaryAction() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(directory, QStringLiteral("primary.png"));
+        QVERIFY(!path.isEmpty());
+        InspectionPage page;
+        page.resize(1280, 720);
+        page.setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("M1"));
+        page.setBackendAvailable(true, false, QString());
+        page.setSingleImagePath(path);
+        page.show();
+        QCoreApplication::processEvents();
+
+        int visiblePrimary = 0;
+        for (QPushButton *button : page.findChildren<QPushButton *>()) {
+            if (button->property("role").toString() == QStringLiteral("primary")
+                && button->isVisibleTo(&page)) {
+                ++visiblePrimary;
+            }
+        }
+        QCOMPARE(visiblePrimary, 1);
+        auto *predict = page.findChild<QPushButton *>(QStringLiteral("predictButton"));
+        QVERIFY(predict != nullptr);
+        QVERIFY(predict->isVisibleTo(&page));
+        const QRect buttonRect(predict->mapTo(&page, QPoint(0, 0)), predict->size());
+        QVERIFY(page.rect().contains(buttonRect));
+    }
+
+    void inspectionTabOrderReachesModeInputResultAndConfirmation() {
+        InspectionPage page;
+        auto *single = page.findChild<QPushButton *>(QStringLiteral("singleModeButton"));
+        auto *batch = page.findChild<QPushButton *>(QStringLiteral("batchModeButton"));
+        auto *choose = page.findChild<QPushButton *>(QStringLiteral("chooseImageButton"));
+        auto *predict = page.findChild<QPushButton *>(QStringLiteral("predictButton"));
+        auto *confirm = page.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
+        QVERIFY(single != nullptr);
+        QVERIFY(batch != nullptr);
+        QVERIFY(choose != nullptr);
+        QVERIFY(predict != nullptr);
+        QVERIFY(confirm != nullptr);
+        QCOMPARE(single->nextInFocusChain(), batch);
+        QCOMPARE(batch->nextInFocusChain(), choose);
+        QCOMPARE(choose->nextInFocusChain(), predict);
+        QCOMPARE(predict->nextInFocusChain(), confirm);
+    }
+
+    void modeSelectorDoesNotConsumeVerticalWorkspace() {
+        InspectionPage page;
+        QWidget *modeBar = page.findChild<QWidget *>(QStringLiteral("inspectionModeBar"));
+        QVERIFY(modeBar != nullptr);
+        QCOMPARE(modeBar->sizePolicy().verticalPolicy(), QSizePolicy::Maximum);
+    }
+
+    void imageSelectedBeforeFirstLayoutFitsAfterShowAndResize() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString imagePath = writeImage(directory, QStringLiteral("before-layout.png"));
+        QVERIFY(!imagePath.isEmpty());
+        InspectionPage page;
+        page.setSingleImagePath(imagePath);
+        page.resize(1280, 720);
+        page.show();
+        QCoreApplication::processEvents();
+
+        auto *view = page.findChild<InspectionImageView *>(
+            QStringLiteral("inspectionImageView"));
+        QVERIFY(view != nullptr);
+        const QRect rendered = view->mapFromScene(view->scene()->sceneRect()).boundingRect();
+        const int limitingViewportSide = qMin(view->viewport()->width(),
+                                              view->viewport()->height());
+        QVERIFY2(qMin(rendered.width(), rendered.height())
+                     >= limitingViewportSide * 0.45,
+                 qPrintable(QStringLiteral("rendered=%1x%2 viewport=%3x%4")
+                                .arg(rendered.width()).arg(rendered.height())
+                                .arg(view->viewport()->width())
+                                .arg(view->viewport()->height())));
     }
 };
 

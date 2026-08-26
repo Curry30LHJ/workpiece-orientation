@@ -7,6 +7,7 @@
 #include <QImageReader>
 #include <QMimeData>
 #include <QPixmap>
+#include <QResizeEvent>
 #include <QUrl>
 #include <QWheelEvent>
 
@@ -103,6 +104,15 @@ void InspectionImageView::dropEvent(QDropEvent *event) {
     }
     event->acceptProposedAction();
     emit imageDropped(path);
+}
+
+void InspectionImageView::resizeEvent(QResizeEvent *event) {
+    QGraphicsView::resizeEvent(event);
+    if (pixmapItem_ != nullptr && !pixmapItem_->pixmap().isNull()
+        && qFuzzyCompare(zoomFactor_, 1.0)) {
+        resetTransform();
+        fitInView(pixmapItem_, Qt::KeepAspectRatio);
+    }
 }
 
 void InspectionImageView::wheelEvent(QWheelEvent *event) {

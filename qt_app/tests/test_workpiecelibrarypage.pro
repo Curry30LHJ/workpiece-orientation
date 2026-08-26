@@ -6,8 +6,11 @@ QMAKE_CXXFLAGS += /utf-8
 TARGET = test_workpiecelibrarypage
 SOURCES += test_workpiecelibrarypage.cpp \
            ../workpiecelibrarypage.cpp \
-           ../taskstatuswidget.cpp
+           ../taskstatuswidget.cpp \
+           ../apptheme.cpp
 HEADERS += ../workpiecelibrarypage.h \
            ../appheader.h \
-           ../taskstatuswidget.h
+           ../taskstatuswidget.h \
+           ../apptheme.h
 FORMS += ../workpiecelibrarypage.ui
+RESOURCES += ../resources.qrc

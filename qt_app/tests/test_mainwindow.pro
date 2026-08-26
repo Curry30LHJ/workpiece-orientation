@@ -6,6 +6,7 @@ QMAKE_CXXFLAGS += /utf-8
 TARGET = test_mainwindow
 SOURCES += test_mainwindow.cpp \
            ../appheader.cpp \
+           ../apptheme.cpp \
            ../appconfig.cpp \
            ../backendclient.cpp \
            ../backendprocessmanager.cpp \
@@ -21,6 +22,7 @@ SOURCES += test_mainwindow.cpp \
            ../annotationeditor.cpp \
            ../taskstatuswidget.cpp
 HEADERS += ../appheader.h \
+           ../apptheme.h \
            ../appconfig.h \
            ../backendclient.h \
            ../backendprocessmanager.h \
@@ -39,3 +41,4 @@ HEADERS += ../appheader.h \
 FORMS += ../mainwindow.ui \
          ../inspectionpage.ui \
          ../workpiecelibrarypage.ui
+RESOURCES += ../resources.qrc

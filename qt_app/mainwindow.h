@@ -3,7 +3,6 @@
 #include <QMainWindow>
 #include <QHash>
 #include <QJsonObject>
-#include <QPointer>
 #include <QQueue>
 #include <QJsonArray>
 #include <QStringList>
@@ -21,7 +20,6 @@ class QLabel;
 class QPushButton;
 class QTableWidget;
 class QTextEdit;
-class AnnotationManagerDialog;
 class GeometryRulesPage;
 class TaskStatusWidget;
 class QCloseEvent;
@@ -62,13 +60,6 @@ private slots:
     void confirmFrontTemplate();
     void confirmBackTemplate();
     void rejectTemplateConfirmation();
-    void openAnnotationEditor();
-    void openAnnotationManager();
-    void saveAnnotationGroups(const QJsonArray &groups, int baseRevision);
-    void setAnnotationGroupEnabled(const QString &groupId, bool enabled, int baseRevision);
-    void deleteAnnotationGroup(const QString &groupId, int baseRevision);
-    void reviewAnnotation(const QString &groupId, const QString &templateId,
-                          const QString &action, const QJsonArray &regions, int baseRevision);
     void restartBackend();
     void pollEvolutionJobs();
     void pollGeometryValidation();
@@ -96,6 +87,7 @@ private slots:
 private:
     enum class CommandOwner { None, System, UserRefresh, Inspection, Library, Geometry };
     enum class GeometryDirtyDecision { Save, Discard, Cancel };
+    enum class ActiveTaskCloseDecision { ExitApplication, ContinueRunning };
     enum class PendingNavigationKind { None, Page, Workpiece, CloseWindow };
     enum class GeometrySaveIntent { None, Normal, Navigation, PublishWorkflow };
 
@@ -145,8 +137,6 @@ private:
     QString selectedWorkpieceId() const;
     QString orientationText(const QString &label) const;
     void showLibraryMessage(const QString &message, bool error = false);
-    void requestAnnotationSnapshot(const QString &workpieceId);
-    void sendAnnotationMutation(const QString &command, const QJsonObject &fields);
     void requestGeometryProfile(const QString &workpieceId);
     bool startGeometryDraftSave(const QJsonObject &draft, int libraryRevision,
                                 int draftRevision, GeometrySaveIntent intent);
@@ -159,6 +149,8 @@ private:
     void clearGeometryValidationContext();
     bool geometryValidationMatchesPage(const QJsonObject &job) const;
     GeometryDirtyDecision promptForDirtyGeometry();
+    ActiveTaskCloseDecision promptForActiveTaskClose();
+    bool hasActiveTask() const;
     bool beginPendingGeometryNavigation(PendingNavigationKind kind,
                                         AppPage page = AppPage::Inspection,
                                         const QString &workpieceId = QString());
@@ -219,7 +211,6 @@ private:
     QPushButton *confirmFrontButton_ = nullptr;
     QPushButton *confirmBackButton_ = nullptr;
     QPushButton *rejectConfirmationButton_ = nullptr;
-    QPushButton *annotationEditorButton_ = nullptr;
     QLabel *currentImageLabel_ = nullptr;
     QLabel *resultLabel_ = nullptr;
     QLabel *reviewLabel_ = nullptr;
@@ -237,8 +228,6 @@ private:
     QJsonObject pendingConfirmationMutation_;
     QHash<QString, QJsonObject> uncertainConfirmationMutations_;
     ResultContext resultContext_ = ResultContext::None;
-    QPointer<AnnotationManagerDialog> annotationManagerDialog_;
-    QString annotationWorkpieceId_;
     GeometryRulesPage *geometryRulesPage_ = nullptr;
     QString geometryWorkpieceId_;
     QString geometryRequestedWorkpieceId_;
@@ -260,7 +249,7 @@ private:
     QJsonObject pendingNavigationWorkpieceListResponse_;
     quint64 pendingNavigationRefreshTransactionId_ = 0;
     bool pendingNavigationResponseIncludedMandatory_ = false;
-    bool bypassCloseGuard_ = false;
+    bool skipDirtyCloseGuardOnce_ = false;
     GeometrySaveIntent geometrySaveIntent_ = GeometrySaveIntent::None;
     GeometrySaveIntent stagedGeometrySaveIntent_ = GeometrySaveIntent::None;
     QString stagedGeometrySaveWorkpieceId_;

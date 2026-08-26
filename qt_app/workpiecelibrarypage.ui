@@ -2,17 +2,21 @@
 <ui version="4.0">
  <class>WorkpieceLibraryPage</class>
  <widget class="QWidget" name="WorkpieceLibraryPage">
+  <property name="pageRoot" stdset="0"><bool>true</bool></property>
   <layout class="QVBoxLayout" name="verticalLayout">
-   <property name="leftMargin"><number>0</number></property>
-   <property name="topMargin"><number>0</number></property>
-   <property name="rightMargin"><number>0</number></property>
-   <property name="bottomMargin"><number>0</number></property>
+   <property name="leftMargin"><number>24</number></property>
+   <property name="topMargin"><number>24</number></property>
+   <property name="rightMargin"><number>24</number></property>
+   <property name="bottomMargin"><number>24</number></property>
+   <property name="spacing"><number>16</number></property>
    <item>
     <widget class="QSplitter" name="librarySplitter">
      <property name="orientation"><enum>Qt::Horizontal</enum></property>
      <widget class="QWidget" name="browserPanel">
+      <property name="panel" stdset="0"><bool>true</bool></property>
       <layout class="QVBoxLayout" name="browserLayout">
-       <item><widget class="QLabel" name="browserTitleLabel"><property name="text"><string>工件浏览</string></property></widget></item>
+       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>16</number></property><property name="spacing"><number>8</number></property>
+       <item><widget class="QLabel" name="browserTitleLabel"><property name="text"><string>工件浏览</string></property><property name="sectionHeading" stdset="0"><bool>true</bool></property></widget></item>
        <item><widget class="QLineEdit" name="librarySearchEdit"><property name="placeholderText"><string>搜索工件名称或编号</string></property></widget></item>
        <item><widget class="QListWidget" name="libraryWorkpieceList"/></item>
        <item><widget class="QPushButton" name="setCurrentWorkpieceButton"><property name="text"><string>设为当前检测工件</string></property></widget></item>
@@ -20,7 +24,9 @@
       </layout>
      </widget>
      <widget class="QWidget" name="contentPanel">
+      <property name="panel" stdset="0"><bool>true</bool></property>
       <layout class="QVBoxLayout" name="contentLayout">
+       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>16</number></property>
        <item>
         <widget class="QTabWidget" name="libraryTabWidget">
          <widget class="QWidget" name="detailsTab">
@@ -80,7 +86,6 @@
          <widget class="QWidget" name="dangerTab">
           <attribute name="title"><string>管理</string></attribute>
           <layout class="QVBoxLayout" name="dangerLayout">
-           <item><widget class="QPushButton" name="annotationEditorButton"><property name="text"><string>管理几何干扰规则</string></property></widget></item>
            <item><widget class="QLabel" name="recycleHelpLabel"><property name="text"><string>将工件移入可恢复回收区前，请准确输入当前浏览工件名称。</string></property></widget></item>
            <item><widget class="QLineEdit" name="recycleNameConfirmationEdit"><property name="placeholderText"><string>输入工件名称确认</string></property></widget></item>
            <item><widget class="QPushButton" name="deleteWorkpieceButton"><property name="text"><string>移入回收区</string></property></widget></item>

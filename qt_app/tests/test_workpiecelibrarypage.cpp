@@ -10,9 +10,11 @@
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QTableWidget>
+#include <QTabWidget>
 #include <QTemporaryDir>
 
 #include "../workpiecelibrarypage.h"
+#include "../apptheme.h"
 
 namespace {
 
@@ -60,6 +62,7 @@ class TestWorkpieceLibraryPage : public QObject {
     Q_OBJECT
 
 private slots:
+    void initTestCase() { AppTheme::apply(qApp); }
     void unequalCountsAndWarningsDoNotBlockRegistration() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -642,6 +645,104 @@ private slots:
                  QJsonArray::fromStringList(submittedFront));
         QCOMPARE(replacement.value(QStringLiteral("back_images")).toArray(),
                  QJsonArray::fromStringList(submittedBack));
+    }
+
+    void largeTemplateSelectionUsesCompactSummariesAndFullTooltips() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList front = writeImages(
+            directory.path(), QStringLiteral("正面超长模板文件"), 35, 10);
+        const QStringList back = writeImages(
+            directory.path(), QStringLiteral("反面超长模板文件"), 35, 80);
+        QCOMPARE(front.size(), 35);
+        QCOMPARE(back.size(), 35);
+        WorkpieceLibraryPage page;
+        page.resize(1280, 720);
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieceName(QStringLiteral("M-large"));
+        page.setTemplatePaths(front, back);
+        auto *tabs = page.findChild<QTabWidget *>(QStringLiteral("libraryTabWidget"));
+        QVERIFY(tabs != nullptr);
+        tabs->setCurrentIndex(1);
+        page.show();
+        QCoreApplication::processEvents();
+
+        auto *frontFiles = page.findChild<QLabel *>(QStringLiteral("frontTemplatesFilesLabel"));
+        auto *backFiles = page.findChild<QLabel *>(QStringLiteral("backTemplatesFilesLabel"));
+        auto *submit = page.findChild<QPushButton *>(QStringLiteral("registerButton"));
+        QVERIFY(frontFiles != nullptr);
+        QVERIFY(backFiles != nullptr);
+        QVERIFY(submit != nullptr);
+        QVERIFY(frontFiles->text().size() < frontFiles->toolTip().size());
+        QVERIFY(backFiles->text().size() < backFiles->toolTip().size());
+        QVERIFY(frontFiles->toolTip().contains(front.first()));
+        QVERIFY(frontFiles->toolTip().contains(front.last()));
+        QVERIFY(backFiles->toolTip().contains(back.first()));
+        QVERIFY(backFiles->toolTip().contains(back.last()));
+        QVERIFY(submit->isVisibleTo(&page));
+        const QRect submitRect(submit->mapTo(&page, QPoint(0, 0)), submit->size());
+        QVERIFY(page.rect().contains(submitRect));
+    }
+
+    void obsoleteAnnotationForwardingControlIsAbsent() {
+        WorkpieceLibraryPage page;
+        QVERIFY(page.findChild<QPushButton *>(QStringLiteral("annotationEditorButton")) == nullptr);
+    }
+
+    void libraryPageUsesSemanticPanelsAndOnePrimaryPerActiveTab() {
+        WorkpieceLibraryPage page;
+        page.resize(1280, 720);
+        page.show();
+        QCoreApplication::processEvents();
+        QCOMPARE(page.property("pageRoot").toBool(), true);
+        auto *browser = page.findChild<QWidget *>(QStringLiteral("browserPanel"));
+        auto *content = page.findChild<QWidget *>(QStringLiteral("contentPanel"));
+        QVERIFY(browser != nullptr && browser->property("panel").toBool());
+        QVERIFY(content != nullptr && content->property("panel").toBool());
+
+        auto countPrimary = [&page]() {
+            int result = 0;
+            for (QPushButton *button : page.findChildren<QPushButton *>()) {
+                if (button->isVisibleTo(&page)
+                    && button->property("role").toString() == QStringLiteral("primary")) {
+                    ++result;
+                }
+            }
+            return result;
+        };
+        QCOMPARE(countPrimary(), 1);
+        auto *tabs = page.findChild<QTabWidget *>(QStringLiteral("libraryTabWidget"));
+        QVERIFY(tabs != nullptr);
+        tabs->setCurrentIndex(1);
+        QCoreApplication::processEvents();
+        QCOMPARE(countPrimary(), 1);
+        auto *danger = page.findChild<QPushButton *>(QStringLiteral("deleteWorkpieceButton"));
+        QVERIFY(danger != nullptr);
+        QCOMPARE(danger->property("role").toString(), QStringLiteral("danger"));
+    }
+
+    void libraryTabOrderReachesSearchSelectionAndPrimaryAction() {
+        WorkpieceLibraryPage page;
+        auto *search = page.findChild<QLineEdit *>(QStringLiteral("librarySearchEdit"));
+        auto *list = page.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *activate = page.findChild<QPushButton *>(
+            QStringLiteral("setCurrentWorkpieceButton"));
+        QVERIFY(search != nullptr);
+        QVERIFY(list != nullptr);
+        QVERIFY(activate != nullptr);
+        page.setBackendState(BackendUiState::Ready, QString());
+        page.setWorkpieces(
+            QJsonArray{summary(QStringLiteral("m1"), QStringLiteral("泵体 A"), 5, 5)},
+            QString());
+        list->setCurrentRow(0);
+        QVERIFY(activate->isEnabled());
+        page.show();
+        search->setFocus();
+        QTRY_COMPARE(QApplication::focusWidget(), search);
+        QTest::keyClick(search, Qt::Key_Tab);
+        QTRY_COMPARE(QApplication::focusWidget(), list);
+        QTest::keyClick(list, Qt::Key_Tab);
+        QTRY_COMPARE(QApplication::focusWidget(), activate);
     }
 };
 

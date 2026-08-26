@@ -9,6 +9,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSignalSpy>
+#include <QToolButton>
 #include "apptheme.h"
 #include "appheader.h"
 #include "taskstatuswidget.h"
@@ -97,6 +98,75 @@ private slots:
                           QStringLiteral("后端断开"), QStringLiteral("重试"));
         QCOMPARE(widget.property("messageKind").toString(),
                  QStringLiteral("error"));
+    }
+
+    void navigationAndStatusUseSemanticIcons() {
+        AppHeader header;
+        for (const QString &name : {QStringLiteral("inspectionNavButton"),
+                                    QStringLiteral("workpieceLibraryNavButton"),
+                                    QStringLiteral("geometryRulesNavButton")}) {
+            auto *button = header.findChild<QPushButton *>(name);
+            QVERIFY(button != nullptr);
+            QVERIFY2(!button->icon().isNull(), qPrintable(name));
+        }
+
+        TaskStatusWidget status;
+        auto *icon = status.findChild<QLabel *>(QStringLiteral("globalTaskIconLabel"));
+        QVERIFY(icon != nullptr);
+        status.setMessage(TaskStatusWidget::MessageKind::Warning,
+                          QStringLiteral("请检查模板"));
+        QVERIFY(icon->pixmap() != nullptr && !icon->pixmap()->isNull());
+    }
+
+    void warningAndErrorMessagesNeverBecomeTextless() {
+        TaskStatusWidget status;
+        auto *detail = status.findChild<QLabel *>(QStringLiteral("globalTaskDetailLabel"));
+        QVERIFY(detail != nullptr);
+
+        status.setMessage(TaskStatusWidget::MessageKind::Warning, QString());
+        QVERIFY(!detail->text().trimmed().isEmpty());
+        status.setMessage(TaskStatusWidget::MessageKind::Error, QString());
+        QVERIFY(!detail->text().trimmed().isEmpty());
+    }
+
+    void longBackendStatusKeepsFullTextInTooltip() {
+        AppHeader header;
+        header.resize(760, 160);
+        const QString detail = QStringLiteral(
+            "连接到 E:/一个非常长的中文目录/模型目录/推理服务，并等待模型初始化完成");
+        header.setBackendState(BackendUiState::Loading, detail);
+        header.show();
+        QCoreApplication::processEvents();
+
+        auto *label = header.findChild<QLabel *>(QStringLiteral("backendStatusLabel"));
+        QVERIFY(label != nullptr);
+        QVERIFY(label->toolTip().contains(detail));
+        QVERIFY(label->text().size() < label->toolTip().size());
+    }
+
+    void headerTabOrderReachesNavigationAndTargetSelection() {
+        AppHeader header;
+        auto *inspection = header.findChild<QPushButton *>(
+            QStringLiteral("inspectionNavButton"));
+        auto *library = header.findChild<QPushButton *>(
+            QStringLiteral("workpieceLibraryNavButton"));
+        auto *geometry = header.findChild<QPushButton *>(
+            QStringLiteral("geometryRulesNavButton"));
+        auto *workpiece = header.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        QVERIFY(inspection != nullptr);
+        QVERIFY(library != nullptr);
+        QVERIFY(geometry != nullptr);
+        QVERIFY(workpiece != nullptr);
+        QCOMPARE(inspection->nextInFocusChain(), library);
+        QCOMPARE(library->nextInFocusChain(), geometry);
+        QCOMPARE(geometry->nextInFocusChain(), workpiece);
+    }
+
+    void shellChromeKeepsPageContentAsTheVerticalExpansionTarget() {
+        AppHeader header;
+        TaskStatusWidget status;
+        QCOMPARE(header.sizePolicy().verticalPolicy(), QSizePolicy::Maximum);
+        QCOMPARE(status.sizePolicy().verticalPolicy(), QSizePolicy::Maximum);
     }
 
     void taskStatusMessageColors_data() {

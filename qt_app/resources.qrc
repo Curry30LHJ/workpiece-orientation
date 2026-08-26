@@ -2,4 +2,12 @@
     <qresource prefix="/theme">
         <file alias="theme.qss">resources/theme.qss</file>
     </qresource>
+    <qresource prefix="/icons">
+        <file alias="nav-inspection.svg">resources/icons/nav-inspection.svg</file>
+        <file alias="nav-library.svg">resources/icons/nav-library.svg</file>
+        <file alias="nav-geometry.svg">resources/icons/nav-geometry.svg</file>
+        <file alias="status-success.svg">resources/icons/status-success.svg</file>
+        <file alias="status-warning.svg">resources/icons/status-warning.svg</file>
+        <file alias="status-error.svg">resources/icons/status-error.svg</file>
+    </qresource>
 </RCC>

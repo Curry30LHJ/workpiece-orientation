@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QComboBox>
+#include <QDir>
 #include <QGroupBox>
 #include <QLabel>
 #include <QListWidget>
@@ -22,15 +23,18 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QImage>
+#include <QPainter>
 
 #include "../backendclient.h"
 #include "../backendprocessmanager.h"
+#include "../apptheme.h"
 #include "../geometryrulespage.h"
 #include "../inspectionimageview.h"
 #include "../inspectionpage.h"
 #include "../inspectiontypes.h"
 #include "../mainwindow.h"
 #include "../processlauncher.h"
+#include "../taskstatuswidget.h"
 #include "../workpiecelibrarypage.h"
 
 class MessageBoxButtonChooser : public QObject {
@@ -61,6 +65,77 @@ protected:
 
 private:
     QString text_;
+};
+
+class ObservedMessageBoxButtonChooser : public QObject {
+public:
+    ObservedMessageBoxButtonChooser(const QString &text, int *showCount)
+        : QObject(qApp), text_(text), showCount_(showCount) {
+        qApp->installEventFilter(this);
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override {
+        auto *dialog = qobject_cast<QMessageBox *>(watched);
+        if (dialog == nullptr || event->type() != QEvent::Show) return false;
+        qApp->removeEventFilter(this);
+        if (showCount_ != nullptr) ++(*showCount_);
+        const QString text = text_;
+        QTimer::singleShot(0, dialog, [dialog, text]() {
+            for (QAbstractButton *button : dialog->buttons()) {
+                if (button->text() == text) {
+                    button->click();
+                    return;
+                }
+            }
+            dialog->reject();
+        });
+        deleteLater();
+        return true;
+    }
+
+private:
+    QString text_;
+    int *showCount_ = nullptr;
+};
+
+class MessageBoxButtonSequenceChooser : public QObject {
+public:
+    explicit MessageBoxButtonSequenceChooser(const QStringList &texts,
+                                              int *showCount = nullptr)
+        : QObject(qApp), texts_(texts), showCount_(showCount) {
+        qApp->installEventFilter(this);
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override {
+        auto *dialog = qobject_cast<QMessageBox *>(watched);
+        if (dialog == nullptr || event->type() != QEvent::Show
+            || next_ >= texts_.size()) {
+            return false;
+        }
+        if (showCount_ != nullptr) ++(*showCount_);
+        const QString text = texts_.at(next_++);
+        QTimer::singleShot(0, dialog, [this, dialog, text]() {
+            for (QAbstractButton *button : dialog->buttons()) {
+                if (button->text() == text) {
+                    button->click();
+                    if (next_ >= texts_.size()) {
+                        qApp->removeEventFilter(this);
+                        deleteLater();
+                    }
+                    return;
+                }
+            }
+            dialog->reject();
+        });
+        return true;
+    }
+
+private:
+    QStringList texts_;
+    int next_ = 0;
+    int *showCount_ = nullptr;
 };
 
 class SnapshotBeforeEnableObserver : public QObject {
@@ -894,6 +969,11 @@ private:
     }
 
 private slots:
+    void initTestCase() {
+        AppTheme::apply(qApp);
+        QVERIFY(!qApp->styleSheet().isEmpty());
+    }
+
     void geometryPageIsEmbeddedAndPersistent() {
         BackendClient client;
         MainWindow window(&client, nullptr);
@@ -2159,7 +2239,7 @@ private slots:
         QVERIFY(window.findChild<QPushButton *>(QStringLiteral("registerButton"))->isEnabled());
     }
 
-    void exposesLifecycleConfirmationAndAnnotationControls() {
+    void exposesLifecycleConfirmationAndGeometryNavigation() {
         BackendClient client;
         PassiveLauncher launcher;
         BackendProcessManager manager(configFor(37651), &client, &launcher);
@@ -2167,9 +2247,10 @@ private slots:
         QVERIFY(window.findChild<QPushButton *>(QStringLiteral("deleteWorkpieceButton")) != nullptr);
         QVERIFY(window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton")) != nullptr);
         QVERIFY(window.findChild<QPushButton *>(QStringLiteral("confirmBackButton")) != nullptr);
-        auto *geometryButton = window.findChild<QPushButton *>(QStringLiteral("annotationEditorButton"));
+        auto *geometryButton = window.findChild<QPushButton *>(QStringLiteral("geometryRulesNavButton"));
         QVERIFY(geometryButton != nullptr);
-        QCOMPARE(geometryButton->text(), QStringLiteral("管理几何干扰规则"));
+        QCOMPARE(geometryButton->text(), QStringLiteral("几何规则"));
+        QVERIFY(window.findChild<QPushButton *>(QStringLiteral("annotationEditorButton")) == nullptr);
     }
 
     void allowsMoreThanThirtyTemplatesWithPerformanceWarning() {
@@ -3994,7 +4075,8 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1500);
         QCOMPARE(page->draft(), localDraft);
         QVERIFY(page->hasUnsavedChanges());
-        QCOMPARE(page->snapshot().value(QStringLiteral("library_revision")).toInt(), 5);
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("library_revision")).toInt(), 5, 1000);
         QCOMPARE(page->snapshot().value(QStringLiteral("draft_revision")).toInt(), 6);
         QVERIFY(status->text().contains(QStringLiteral("结果未知")));
         page->requestSaveDraft();
@@ -4250,7 +4332,7 @@ private slots:
         });
         client.connectToService(QHostAddress::LocalHost, server.port(), 500);
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
-        auto *geometryButton = window.findChild<QPushButton *>(QStringLiteral("annotationEditorButton"));
+        auto *geometryButton = window.findChild<QPushButton *>(QStringLiteral("geometryRulesNavButton"));
         QTRY_VERIFY_WITH_TIMEOUT(geometryButton != nullptr && geometryButton->isEnabled(), 1000);
         geometryButton->click();
         auto *workflowButton = window.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
@@ -4392,6 +4474,9 @@ private slots:
 
         primary->click();
         QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 5, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(page->findChild<QLabel *>(
+            QStringLiteral("publishDisabledReasonLabel"))->text().contains(
+                QStringLiteral("发布覆盖原因")), 1000);
         QVERIFY(reason->text().isEmpty());
         QVERIFY(!primary->isEnabled());
         reason->setText(QStringLiteral("第二次告警已重新人工复核"));
@@ -4403,7 +4488,272 @@ private slots:
             QStringLiteral("validate_geometry_mask_draft"),
             QStringLiteral("publish_geometry_mask_profile")}));
     }
+
+    void captureFixedUiEvidenceWhenRequested() {
+        const QString captureDirectory = QString::fromLocal8Bit(
+            qgetenv("QT_UI_CAPTURE_DIR"));
+        if (captureDirectory.isEmpty()) return;
+        QVERIFY2(QDir().mkpath(captureDirectory),
+                 qPrintable(QStringLiteral("无法创建截图目录：%1").arg(captureDirectory)));
+
+        QTemporaryDir fixtureDirectory;
+        QVERIFY(fixtureDirectory.isValid());
+        const QString imagePath = fixtureDirectory.filePath(QStringLiteral("工业圆形工件.png"));
+        QImage fixture(720, 720, QImage::Format_RGB32);
+        fixture.fill(Qt::white);
+        QPainter painter(&fixture);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QPen(QColor(QStringLiteral("#5F6B76")), 18));
+        painter.setBrush(QColor(QStringLiteral("#252A30")));
+        painter.drawEllipse(QRectF(72, 72, 576, 576));
+        painter.setPen(QPen(QColor(QStringLiteral("#9AA5B1")), 7));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawEllipse(QRectF(112, 112, 496, 496));
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#AEB7C0")));
+        painter.drawRoundedRect(QRectF(250, 290, 220, 110), 44, 44);
+        painter.end();
+        QVERIFY(fixture.save(imagePath));
+
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        window.setWindowFlag(Qt::FramelessWindowHint, true);
+        window.resize(1920, 1080);
+        auto *header = window.findChild<AppHeader *>();
+        auto *inspection = window.findChild<InspectionPage *>();
+        auto *library = window.findChild<WorkpieceLibraryPage *>();
+        auto *geometry = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(header != nullptr);
+        QVERIFY(inspection != nullptr);
+        QVERIFY(library != nullptr);
+        QVERIFY(geometry != nullptr);
+        header->setWorkpieces(
+            QList<QPair<QString, QString>>{{QStringLiteral("m1"),
+                                            QStringLiteral("圆形端盖 A")}},
+            QStringLiteral("m1"));
+        inspection->setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("圆形端盖 A"));
+        inspection->setBackendAvailable(true, false, QString());
+        inspection->setSingleImagePath(imagePath);
+        InspectionRecord record;
+        record.id = QStringLiteral("capture-single");
+        record.imagePath = imagePath;
+        record.workpieceId = QStringLiteral("m1");
+        record.label = QStringLiteral("front");
+        record.elapsedMs = 186.0;
+        record.response = QJsonObject{
+            {QStringLiteral("label"), QStringLiteral("front")},
+            {QStringLiteral("score"), 0.94},
+            {QStringLiteral("needs_review"), false}};
+        inspection->showSingleResult(record);
+
+        window.show();
+        QCoreApplication::processEvents();
+        auto *imageView = window.findChild<InspectionImageView *>();
+        QVERIFY(imageView != nullptr);
+        imageView->resetView();
+        auto capture = [&](const QString &fileName) {
+            QCoreApplication::processEvents();
+            const QImage image = window.grab().toImage();
+            QVERIFY2(!image.isNull(), qPrintable(fileName));
+            const qreal devicePixelRatio = image.devicePixelRatio();
+            const QSize logicalSize(qRound(image.width() / devicePixelRatio),
+                                    qRound(image.height() / devicePixelRatio));
+            QCOMPARE(logicalSize, QSize(1920, 1080));
+            if (qFuzzyCompare(devicePixelRatio, 1.0)) {
+                QCOMPARE(image.size(), QSize(1920, 1080));
+            }
+            QVERIFY2(image.save(QDir(captureDirectory).filePath(fileName)),
+                     qPrintable(fileName));
+        };
+        capture(QStringLiteral("qt-ui-inspection.png"));
+
+        QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
+        library->setBackendState(BackendUiState::Ready, QString());
+        library->setWorkpieces(QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                        {QStringLiteral("name"), QStringLiteral("圆形端盖 A")},
+                        {QStringLiteral("detectable"), true},
+                        {QStringLiteral("template_counts"), QJsonObject{
+                            {QStringLiteral("front"), 35},
+                            {QStringLiteral("back"), 35}}}},
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                        {QStringLiteral("name"), QStringLiteral("法兰盘 B")},
+                        {QStringLiteral("detectable"), true},
+                        {QStringLiteral("template_counts"), QJsonObject{
+                            {QStringLiteral("front"), 12},
+                            {QStringLiteral("back"), 18}}}}},
+            QStringLiteral("m1"));
+        library->setWorkpieceDetails(QJsonObject{
+            {QStringLiteral("id"), QStringLiteral("m1")},
+            {QStringLiteral("name"), QStringLiteral("圆形端盖 A")},
+            {QStringLiteral("detectable"), true},
+            {QStringLiteral("geometry_rule_count"), 2},
+            {QStringLiteral("template_counts"), QJsonObject{
+                {QStringLiteral("front"), 35}, {QStringLiteral("back"), 35}}},
+            {QStringLiteral("templates"), QJsonArray{
+                QJsonObject{{QStringLiteral("template_id"), QStringLiteral("front:00.png")},
+                            {QStringLiteral("direction"), QStringLiteral("front")},
+                            {QStringLiteral("source"), QStringLiteral("人工模板")},
+                            {QStringLiteral("added_at"), QStringLiteral("2026-08-26 19:30")},
+                            {QStringLiteral("readable"), true},
+                            {QStringLiteral("preview_path"), imagePath}},
+                QJsonObject{{QStringLiteral("template_id"), QStringLiteral("back:00.png")},
+                            {QStringLiteral("direction"), QStringLiteral("back")},
+                            {QStringLiteral("source"), QStringLiteral("人工模板")},
+                            {QStringLiteral("added_at"), QStringLiteral("2026-08-26 19:31")},
+                            {QStringLiteral("readable"), true},
+                            {QStringLiteral("preview_path"), imagePath}}}}});
+        capture(QStringLiteral("qt-ui-library.png"));
+
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QJsonObject snapshot{
+            {QStringLiteral("workpiece_id"), QStringLiteral("m1")},
+            {QStringLiteral("library_revision"), 7},
+            {QStringLiteral("draft_revision"), 3},
+            {QStringLiteral("active_revision"), 2},
+            {QStringLiteral("templates"), QJsonArray{
+                QJsonObject{{QStringLiteral("template_id"), QStringLiteral("front:00.png")},
+                            {QStringLiteral("direction"), QStringLiteral("front")},
+                            {QStringLiteral("path"), imagePath}}}},
+            {QStringLiteral("draft"), QJsonObject{
+                {QStringLiteral("schema_version"), 1},
+                {QStringLiteral("directions"), QJsonObject{
+                    {QStringLiteral("front"), QJsonObject{
+                        {QStringLiteral("anchor"), QJsonObject{
+                            {QStringLiteral("shape"), QStringLiteral("circle")},
+                            {QStringLiteral("coarse"), QJsonObject{
+                                {QStringLiteral("cx"), 0.5},
+                                {QStringLiteral("cy"), 0.5},
+                                {QStringLiteral("r"), 0.44},
+                                {QStringLiteral("angle_deg"), 0.0}}}}},
+                        {QStringLiteral("rules"), QJsonArray{
+                            QJsonObject{{QStringLiteral("rule_id"), QStringLiteral("inner-glare")},
+                                        {QStringLiteral("name"), QStringLiteral("中心反光")},
+                                        {QStringLiteral("shape"), QStringLiteral("circle")},
+                                        {QStringLiteral("mode"), QStringLiteral("inside")},
+                                        {QStringLiteral("margin_ratio"), -0.04},
+                                        {QStringLiteral("enabled"), true},
+                                        {QStringLiteral("geometry"), QJsonObject{
+                                            {QStringLiteral("cx"), 0.0},
+                                            {QStringLiteral("cy"), 0.0},
+                                            {QStringLiteral("r"), 0.70},
+                                            {QStringLiteral("angle_deg"), 0.0}}}}}}}},
+                    {QStringLiteral("back"), QJsonObject{
+                        {QStringLiteral("anchor"), QJsonValue()},
+                        {QStringLiteral("rules"), QJsonArray()}}}}}}}};
+        geometry->setSnapshot(snapshot);
+        capture(QStringLiteral("qt-ui-geometry.png"));
+    }
+
+    void minimumSizeSupportsScaled720pDisplays() {
+        MainWindow window;
+        QVERIFY(window.minimumWidth() <= 1024);
+        QVERIFY(window.minimumHeight() <= 640);
+    }
+
+    void embeddedPagesRetainMainWindowAncestry() {
+        MainWindow window;
+        for (const QString &name : {QStringLiteral("inspectionPageHost"),
+                                    QStringLiteral("libraryPageHost"),
+                                    QStringLiteral("geometryPageHost")}) {
+            QWidget *host = window.findChild<QWidget *>(name);
+            QVERIFY(host != nullptr);
+            QVERIFY(window.isAncestorOf(host));
+        }
+        QVERIFY(window.findChild<InspectionPage *>() != nullptr);
+        QVERIFY(window.findChild<WorkpieceLibraryPage *>() != nullptr);
+        QVERIFY(window.findChild<GeometryRulesPage *>(
+                    QStringLiteral("geometryRulesPage")) != nullptr);
+    }
+
+    void closeWithActiveTaskRequiresConfirmation() {
+        RegistrationServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        window.show();
+        QCoreApplication::processEvents();
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientStateChanged", Qt::DirectConnection,
+            Q_ARG(BackendClient::State, BackendClient::State::Busy),
+            Q_ARG(QString, QStringLiteral("正在处理"))));
+
+        const int requestsBeforeClose = server.requests().size();
+        int promptCount = 0;
+        new ObservedMessageBoxButtonChooser(QStringLiteral("退出应用"), &promptCount);
+        QVERIFY(window.close());
+        QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 500);
+        QCOMPARE(promptCount, 1);
+        QCOMPARE(server.requests().size(), requestsBeforeClose);
+    }
+
+    void cancelClosePreservesWindowAndTaskState() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        window.show();
+        QCoreApplication::processEvents();
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientStateChanged", Qt::DirectConnection,
+            Q_ARG(BackendClient::State, BackendClient::State::Busy),
+            Q_ARG(QString, QStringLiteral("正在处理"))));
+        auto *task = window.findChild<TaskStatusWidget *>();
+        QVERIFY(task != nullptr);
+        const QString taskTitle = task->findChild<QLabel *>(
+            QStringLiteral("globalTaskTitleLabel"))->text();
+
+        chooseDirtyNavigationOption(QStringLiteral("继续运行"));
+        QVERIFY(!window.close());
+
+        QVERIFY(window.isVisible());
+        QCOMPARE(task->findChild<QLabel *>(QStringLiteral("globalTaskTitleLabel"))->text(),
+                 taskTitle);
+    }
+
+    void savedDirtyGeometryStillChecksConcurrentActiveTask() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        emit client.responseReceived(QStringLiteral("list_evolution_jobs"), QJsonObject{
+            {QStringLiteral("jobs"), QJsonArray{QJsonObject{
+                {QStringLiteral("job_id"), QStringLiteral("evolution-active")},
+                {QStringLiteral("state"), QStringLiteral("building")},
+                {QStringLiteral("phase"), QStringLiteral("features")}}}}});
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        QVERIFY(page->hasUnsavedChanges());
+        window.show();
+        QCoreApplication::processEvents();
+
+        int promptCount = 0;
+        new MessageBoxButtonSequenceChooser({QStringLiteral("保存并继续"),
+                                             QStringLiteral("继续运行")},
+                                            &promptCount);
+        QVERIFY(!window.close());
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(server.replyGeometrySaveSuccess());
+        QTRY_VERIFY_WITH_TIMEOUT(!page->hasUnsavedChanges(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(promptCount, 2, 1000);
+        QVERIFY(window.isVisible());
+    }
 };
 
-QTEST_MAIN(TestMainWindow)
+int main(int argc, char **argv) {
+    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+    QCoreApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
+    QApplication application(argc, argv);
+    TestMainWindow test;
+    return QTest::qExec(&test, argc, argv);
+}
 #include "test_mainwindow.moc"

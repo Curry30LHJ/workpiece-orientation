@@ -2,17 +2,37 @@
 <ui version="4.0">
  <class>InspectionPage</class>
  <widget class="QWidget" name="InspectionPage">
+  <property name="pageRoot" stdset="0"><bool>true</bool></property>
   <layout class="QVBoxLayout" name="inspectionPageLayout">
-   <property name="leftMargin"><number>0</number></property>
-   <property name="topMargin"><number>0</number></property>
-   <property name="rightMargin"><number>0</number></property>
-   <property name="bottomMargin"><number>0</number></property>
+   <property name="leftMargin"><number>24</number></property>
+   <property name="topMargin"><number>24</number></property>
+   <property name="rightMargin"><number>24</number></property>
+   <property name="bottomMargin"><number>24</number></property>
+   <property name="spacing"><number>16</number></property>
+   <item>
+    <widget class="QWidget" name="inspectionModeBar">
+     <property name="sizePolicy"><sizepolicy hsizetype="Preferred" vsizetype="Maximum"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy></property>
+     <layout class="QHBoxLayout" name="inspectionModeLayout">
+      <property name="leftMargin"><number>0</number></property>
+      <property name="topMargin"><number>0</number></property>
+      <property name="rightMargin"><number>0</number></property>
+      <property name="bottomMargin"><number>0</number></property>
+      <property name="spacing"><number>8</number></property>
+      <item><widget class="QLabel" name="inspectionModeLabel"><property name="text"><string>检测方式</string></property><property name="sectionHeading" stdset="0"><bool>true</bool></property></widget></item>
+      <item><widget class="QPushButton" name="singleModeButton"><property name="text"><string>单张检测</string></property><property name="checkable"><bool>true</bool></property><property name="checked"><bool>true</bool></property><property name="role" stdset="0"><string>segment</string></property></widget></item>
+      <item><widget class="QPushButton" name="batchModeButton"><property name="text"><string>批量检测</string></property><property name="checkable"><bool>true</bool></property><property name="role" stdset="0"><string>segment</string></property></widget></item>
+      <item><spacer name="inspectionModeSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+     </layout>
+    </widget>
+   </item>
    <item>
     <widget class="QSplitter" name="inspectionSplitter">
      <property name="orientation"><enum>Qt::Horizontal</enum></property>
      <widget class="QWidget" name="imagePane">
+      <property name="panel" stdset="0"><bool>true</bool></property>
       <layout class="QVBoxLayout" name="imagePaneLayout">
-       <item><widget class="InspectionImageView" name="inspectionImageView"><property name="minimumSize"><size><width>520</width><height>360</height></size></property></widget></item>
+       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>16</number></property><property name="spacing"><number>8</number></property>
+       <item><widget class="InspectionImageView" name="inspectionImageView"><property name="minimumSize"><size><width>320</width><height>240</height></size></property></widget></item>
        <item><widget class="QLabel" name="currentImageLabel"><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string>请选择待测图片或拖放图片到此处</string></property></widget></item>
        <item>
         <layout class="QHBoxLayout" name="imageActionsLayout">
@@ -33,7 +53,9 @@
       </layout>
      </widget>
      <widget class="QWidget" name="resultPane">
+      <property name="panel" stdset="0"><bool>true</bool></property>
       <layout class="QVBoxLayout" name="resultPaneLayout">
+       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>16</number></property><property name="spacing"><number>8</number></property>
        <item><widget class="QLabel" name="batchSummaryLabel"><property name="text"><string/></property></widget></item>
        <item><widget class="QProgressBar" name="batchProgressBar"><property name="value"><number>0</number></property><property name="textVisible"><bool>true</bool></property></widget></item>
        <item>
@@ -51,7 +73,7 @@
           <layout class="QVBoxLayout" name="resultDetailLayout">
            <item><widget class="QLabel" name="resultLabel"><property name="text"><string>尚未检测</string></property></widget></item>
            <item><widget class="QLabel" name="resultMessageLabel"><property name="wordWrap"><bool>true</bool></property><property name="text"><string/></property></widget></item>
-           <item><widget class="QLabel" name="reviewLabel"><property name="styleSheet"><string notr="true">color: #b00020; font-weight: bold;</string></property><property name="text"><string/></property></widget></item>
+           <item><widget class="QLabel" name="reviewLabel"><property name="messageKind" stdset="0"><string>warning</string></property><property name="text"><string/></property></widget></item>
            <item><widget class="QTextEdit" name="evidenceTextEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumHeight"><number>130</number></property></widget></item>
            <item>
             <widget class="QGroupBox" name="rawEvidenceContainer">
@@ -76,7 +98,7 @@
          <widget class="QTableWidget" name="batchResultsTableWidget"/>
         </widget>
        </item>
-       <item><widget class="QLabel" name="recentInspectionTitleLabel"><property name="text"><string>最近检测</string></property></widget></item>
+       <item><widget class="QLabel" name="recentInspectionTitleLabel"><property name="text"><string>最近检测</string></property><property name="sectionHeading" stdset="0"><bool>true</bool></property></widget></item>
        <item><widget class="QListWidget" name="recentInspectionList"><property name="maximumHeight"><number>180</number></property><property name="iconSize"><size><width>64</width><height>48</height></size></property></widget></item>
       </layout>
      </widget>

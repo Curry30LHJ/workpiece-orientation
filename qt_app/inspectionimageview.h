@@ -7,6 +7,7 @@ class QDropEvent;
 class QGraphicsPixmapItem;
 class QGraphicsScene;
 class QMimeData;
+class QResizeEvent;
 class QWheelEvent;
 
 class InspectionImageView : public QGraphicsView {
@@ -27,6 +28,7 @@ signals:
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
 
 private:

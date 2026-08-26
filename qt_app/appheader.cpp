@@ -4,9 +4,13 @@
 #include <QComboBox>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QSize>
+#include <QSizePolicy>
+#include <QStyle>
 #include <QVBoxLayout>
 
 namespace {
@@ -44,6 +48,7 @@ AppHeader::AppHeader(QWidget *parent)
       recentErrorLabel_(new QLabel(backendDetailsPanel_)),
       restartBackendButton_(new QPushButton(QStringLiteral("重启后端"), backendDetailsPanel_)) {
     setObjectName(QStringLiteral("appHeader"));
+    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
     inspectionButton_->setObjectName(QStringLiteral("inspectionNavButton"));
     workpieceLibraryButton_->setObjectName(QStringLiteral("workpieceLibraryNavButton"));
     geometryRulesButton_->setObjectName(QStringLiteral("geometryRulesNavButton"));
@@ -57,6 +62,17 @@ AppHeader::AppHeader(QWidget *parent)
     recentErrorLabel_->setObjectName(QStringLiteral("backendRecentErrorLabel"));
     restartBackendButton_->setObjectName(QStringLiteral("restartBackendButton"));
 
+    inspectionButton_->setIcon(QIcon(QStringLiteral(":/icons/nav-inspection.svg")));
+    workpieceLibraryButton_->setIcon(QIcon(QStringLiteral(":/icons/nav-library.svg")));
+    geometryRulesButton_->setIcon(QIcon(QStringLiteral(":/icons/nav-geometry.svg")));
+    for (QPushButton *button : {inspectionButton_, workpieceLibraryButton_, geometryRulesButton_}) {
+        button->setProperty("role", QStringLiteral("nav"));
+        button->setIconSize(QSize(20, 20));
+    }
+    backendDetailsPanel_->setProperty("panel", true);
+    backendStatusLabel_->setMaximumWidth(300);
+    backendStatusLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+
     QButtonGroup *navigationGroup = new QButtonGroup(this);
     navigationGroup->setExclusive(true);
     for (QPushButton *button : {inspectionButton_, workpieceLibraryButton_, geometryRulesButton_}) {
@@ -65,7 +81,8 @@ AppHeader::AppHeader(QWidget *parent)
     }
 
     QHBoxLayout *headerLayout = new QHBoxLayout;
-    headerLayout->setContentsMargins(0, 0, 0, 0);
+    headerLayout->setContentsMargins(16, 12, 16, 12);
+    headerLayout->setSpacing(8);
     headerLayout->addWidget(inspectionButton_);
     headerLayout->addWidget(workpieceLibraryButton_);
     headerLayout->addWidget(geometryRulesButton_);
@@ -77,7 +94,8 @@ AppHeader::AppHeader(QWidget *parent)
     headerLayout->addWidget(backendDetailsButton_);
 
     QVBoxLayout *detailsLayout = new QVBoxLayout(backendDetailsPanel_);
-    detailsLayout->setContentsMargins(12, 8, 12, 8);
+    detailsLayout->setContentsMargins(16, 12, 16, 12);
+    detailsLayout->setSpacing(8);
     detailsLayout->addWidget(connectionDetailLabel_);
     detailsLayout->addWidget(modelDetailLabel_);
     detailsLayout->addWidget(currentTaskLabel_);
@@ -104,6 +122,11 @@ AppHeader::AppHeader(QWidget *parent)
     });
     connect(restartBackendButton_, &QPushButton::clicked,
             this, &AppHeader::restartBackendRequested);
+
+    QWidget::setTabOrder(inspectionButton_, workpieceLibraryButton_);
+    QWidget::setTabOrder(workpieceLibraryButton_, geometryRulesButton_);
+    QWidget::setTabOrder(geometryRulesButton_, workpieceComboBox_);
+    QWidget::setTabOrder(workpieceComboBox_, backendDetailsButton_);
 
     setCurrentPage(AppPage::Inspection);
     setBackendState(BackendUiState::Disconnected, QString());
@@ -146,9 +169,22 @@ QString AppHeader::currentWorkpieceName() const {
 
 void AppHeader::setBackendState(BackendUiState state, const QString &detail) {
     const QString baseText = backendStateText(state);
-    backendStatusLabel_->setText(detail.isEmpty()
-                                     ? baseText
-                                     : QStringLiteral("%1 · %2").arg(baseText, detail));
+    const QString fullText = detail.isEmpty()
+        ? baseText : QStringLiteral("%1 · %2").arg(baseText, detail);
+    backendStatusLabel_->setToolTip(fullText);
+    backendStatusLabel_->setText(
+        backendStatusLabel_->fontMetrics().elidedText(fullText, Qt::ElideMiddle, 290));
+    QString messageKind = QStringLiteral("neutral");
+    if (state == BackendUiState::Ready) messageKind = QStringLiteral("success");
+    if (state == BackendUiState::Loading || state == BackendUiState::Busy) {
+        messageKind = QStringLiteral("warning");
+    }
+    if (state == BackendUiState::Error || state == BackendUiState::Disconnected) {
+        messageKind = QStringLiteral("error");
+    }
+    backendStatusLabel_->setProperty("messageKind", messageKind);
+    backendStatusLabel_->style()->unpolish(backendStatusLabel_);
+    backendStatusLabel_->style()->polish(backendStatusLabel_);
 }
 
 void AppHeader::setBackendDetails(const BackendStatusDetails &details) {
@@ -157,6 +193,10 @@ void AppHeader::setBackendDetails(const BackendStatusDetails &details) {
     modelDetailLabel_->setText(QStringLiteral("模型：%1").arg(details.modelDetail));
     currentTaskLabel_->setText(QStringLiteral("当前任务：%1").arg(details.currentTask));
     recentErrorLabel_->setText(QStringLiteral("最近错误：%1").arg(details.recentError));
+    connectionDetailLabel_->setToolTip(connectionDetailLabel_->text());
+    modelDetailLabel_->setToolTip(modelDetailLabel_->text());
+    currentTaskLabel_->setToolTip(currentTaskLabel_->text());
+    recentErrorLabel_->setToolTip(recentErrorLabel_->text());
     restartBackendButton_->setEnabled(details.canRestart);
     restartBackendButton_->setVisible(details.canRestart);
 

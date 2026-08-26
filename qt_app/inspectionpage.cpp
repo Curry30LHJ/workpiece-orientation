@@ -12,6 +12,7 @@
 #include <QListWidgetItem>
 #include <QPixmap>
 #include <QPushButton>
+#include <QStyle>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QUuid>
@@ -33,7 +34,12 @@ QString geometryDescription(const QJsonObject &response) {
 InspectionPage::InspectionPage(QWidget *parent)
     : QWidget(parent), ui(new Ui::InspectionPage) {
     ui->setupUi(this);
+    ui->inspectionPageLayout->setStretch(0, 0);
+    ui->inspectionPageLayout->setStretch(1, 1);
     ui->inspectionSplitter->setSizes({650, 350});
+    ui->inspectionSplitter->setStretchFactor(0, 65);
+    ui->inspectionSplitter->setStretchFactor(1, 35);
+    ui->inspectionSplitter->setChildrenCollapsible(false);
     ui->batchReviewSplitter->setSizes({430, 230});
     ui->batchResultsTableWidget->setColumnCount(5);
     ui->batchResultsTableWidget->setHorizontalHeaderLabels({
@@ -54,6 +60,14 @@ InspectionPage::InspectionPage(QWidget *parent)
     filterGroup->addButton(ui->needsReviewBatchFilterButton);
     filterGroup->addButton(ui->unprocessedBatchFilterButton);
     filterGroup->addButton(ui->failedBatchFilterButton);
+    auto *modeGroup = new QButtonGroup(this);
+    modeGroup->setExclusive(true);
+    modeGroup->addButton(ui->singleModeButton);
+    modeGroup->addButton(ui->batchModeButton);
+    connect(ui->singleModeButton, &QPushButton::clicked, this,
+            [this]() { setMode(InspectionMode::Single); });
+    connect(ui->batchModeButton, &QPushButton::clicked, this,
+            [this]() { setMode(InspectionMode::Batch); });
     ui->rawEvidenceContainer->setChecked(false);
     ui->rawEvidenceTextEdit->setVisible(false);
     connect(ui->rawEvidenceContainer, &QGroupBox::toggled,
@@ -115,8 +129,14 @@ InspectionPage::InspectionPage(QWidget *parent)
     connect(ui->resetViewButton, &QPushButton::clicked,
             ui->inspectionImageView, &InspectionImageView::resetView);
     ui->rejectConfirmationButton->setProperty("role", QStringLiteral("secondary"));
-    ui->rejectConfirmationButton->setStyleSheet(
-        QStringLiteral("background: transparent; border: 1px solid #6B7280;"));
+    ui->reviewLabel->setProperty("messageKind", QStringLiteral("warning"));
+    ui->resultMessageLabel->setProperty("messageKind", QStringLiteral("neutral"));
+    QWidget::setTabOrder(ui->singleModeButton, ui->batchModeButton);
+    QWidget::setTabOrder(ui->batchModeButton, ui->chooseImageButton);
+    QWidget::setTabOrder(ui->chooseImageButton, ui->predictButton);
+    QWidget::setTabOrder(ui->predictButton, ui->confirmFrontButton);
+    QWidget::setTabOrder(ui->confirmFrontButton, ui->confirmBackButton);
+    QWidget::setTabOrder(ui->confirmBackButton, ui->rejectConfirmationButton);
     renderActiveState();
 }
 
@@ -133,8 +153,12 @@ const InspectionPage::ModeState &InspectionPage::activeState() const {
 }
 
 void InspectionPage::setMode(InspectionMode mode) {
-    if (mode_ == mode) return;
     if (batchRunning_ && mode != InspectionMode::Batch) return;
+    if (mode_ == mode) {
+        ui->singleModeButton->setChecked(mode == InspectionMode::Single);
+        ui->batchModeButton->setChecked(mode == InspectionMode::Batch);
+        return;
+    }
     mode_ = mode;
     renderActiveState();
 }
@@ -294,6 +318,10 @@ int InspectionPage::failedBatchCount() const {
         }
     }
     return failed;
+}
+
+bool InspectionPage::batchRunning() const {
+    return batchRunning_;
 }
 
 void InspectionPage::setRecordDisposition(const QString &recordId,
@@ -840,6 +868,10 @@ void InspectionPage::updateBatchSummary() {
 
 void InspectionPage::renderActiveState() {
     const bool batchMode = mode_ == InspectionMode::Batch;
+    ui->singleModeButton->setChecked(!batchMode);
+    ui->batchModeButton->setChecked(batchMode);
+    ui->singleModeButton->setEnabled(!batchRunning_);
+    ui->batchModeButton->setEnabled(!batchRunning_ || batchMode);
     ui->chooseImageButton->setVisible(!batchMode);
     ui->predictButton->setVisible(!batchMode);
     ui->chooseBatchImagesButton->setVisible(batchMode);
@@ -858,10 +890,15 @@ void InspectionPage::renderActiveState() {
     if (state.imagePath.isEmpty()) {
         ui->inspectionImageView->setImagePath(QString());
         ui->currentImageLabel->setText(QStringLiteral("请选择待测图片或拖放图片到此处"));
+        ui->currentImageLabel->setToolTip(QString());
     } else if (ui->inspectionImageView->setImagePath(state.imagePath)) {
+        const QString absolutePath = QFileInfo(state.imagePath).absoluteFilePath();
+        ui->currentImageLabel->setToolTip(absolutePath);
         ui->currentImageLabel->setText(
-            QStringLiteral("当前图片：%1").arg(QFileInfo(state.imagePath).fileName()));
+            QStringLiteral("当前图片：%1").arg(ui->currentImageLabel->fontMetrics().elidedText(
+                QFileInfo(state.imagePath).fileName(), Qt::ElideMiddle, 420)));
     } else {
+        ui->currentImageLabel->setToolTip(QFileInfo(state.imagePath).absoluteFilePath());
         ui->currentImageLabel->setText(
             QStringLiteral("图片无法读取：%1").arg(QFileInfo(state.imagePath).fileName()));
     }
@@ -965,6 +1002,32 @@ void InspectionPage::updateActionAvailability() {
         ui->confirmBackButton->setEnabled(batchRecordReady);
         ui->rejectConfirmationButton->setEnabled(batchRecordReady);
     }
+
+    for (QPushButton *button : {ui->predictButton, ui->batchPredictButton,
+                                ui->confirmFrontButton, ui->confirmBackButton}) {
+        button->setProperty("role", QStringLiteral("secondary"));
+        button->style()->unpolish(button);
+        button->style()->polish(button);
+    }
+    QPushButton *primary = mode_ == InspectionMode::Batch
+        ? ui->batchPredictButton : ui->predictButton;
+    if (state.hasRecord && !state.visibleRecord.label.isEmpty()) {
+        primary = state.visibleRecord.label == QStringLiteral("back")
+            ? ui->confirmBackButton : ui->confirmFrontButton;
+    }
+    primary->setProperty("role", QStringLiteral("primary"));
+    primary->style()->unpolish(primary);
+    primary->style()->polish(primary);
+
+    ui->chooseImageButton->setToolTip(interactive
+        ? QStringLiteral("选择一张待检测图片") : QStringLiteral("后端未就绪"));
+    ui->predictButton->setToolTip(!interactive
+        ? QStringLiteral("后端未就绪")
+        : (state.imagePath.isEmpty() ? QStringLiteral("请先选择待检测图片")
+                                     : QStringLiteral("使用当前检测工件开始识别")));
+    ui->chooseBatchImagesButton->setToolTip(batchRunning_
+        ? QStringLiteral("批量检测运行中，暂不能更换图片")
+        : QStringLiteral("选择一组待检测图片"));
 }
 
 void InspectionPage::updateRecordDisposition(const QString &recordId,

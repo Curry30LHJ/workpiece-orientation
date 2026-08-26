@@ -14,13 +14,12 @@
 #include <QAbstractButton>
 #include <QTableWidget>
 #include <QTextEdit>
+#include <QStyle>
 #include <QTimer>
 #include <QUuid>
 
 #include "backendclient.h"
 #include "backendprocessmanager.h"
-#include "annotationeditor.h"
-#include "annotationmanager.h"
 #include "geometryrulespage.h"
 #include "inspectionpage.h"
 #include "inspectiontypes.h"
@@ -116,8 +115,6 @@ void MainWindow::initializeUi() {
     initialBackendDetails.canRestart = manager_ != nullptr;
     appHeader_->setBackendDetails(initialBackendDetails);
 
-    annotationEditorButton_ = workpieceLibraryPage_->findChild<QPushButton *>(
-        QStringLiteral("annotationEditorButton"));
     predictButton_->setEnabled(false);
     chooseImageButton_->setEnabled(false);
     chooseBatchImagesButton_->setEnabled(false);
@@ -204,14 +201,7 @@ void MainWindow::initializeUi() {
     connect(appHeader_, &AppHeader::currentWorkpieceRequested, this,
             [this](const QString &workpieceId) {
         if (!applyDetectionWorkpieceChange(workpieceId)) return;
-        if (annotationManagerDialog_ != nullptr) {
-            annotationManagerDialog_->close();
-            annotationManagerDialog_.clear();
-            annotationWorkpieceId_.clear();
-        }
     });
-    connect(annotationEditorButton_, &QPushButton::clicked,
-            this, &MainWindow::openAnnotationManager);
     confirmFrontButton_->setEnabled(false);
     confirmBackButton_->setEnabled(false);
     rejectConfirmationButton_->setEnabled(false);
@@ -234,29 +224,66 @@ MainWindow::GeometryDirtyDecision MainWindow::promptForDirtyGeometry() {
     return GeometryDirtyDecision::Cancel;
 }
 
+MainWindow::ActiveTaskCloseDecision MainWindow::promptForActiveTaskClose() {
+    QMessageBox prompt(this);
+    prompt.setWindowTitle(QStringLiteral("任务仍在运行"));
+    prompt.setText(QStringLiteral("当前仍有建库、批量检测、规则验证或后端请求正在运行。"));
+    prompt.setInformativeText(QStringLiteral("直接退出不会向后端发送取消命令，未完成结果可能不会显示。"));
+    QAbstractButton *exitApplication = prompt.addButton(
+        QStringLiteral("退出应用"), QMessageBox::DestructiveRole);
+    QAbstractButton *continueRunning = prompt.addButton(
+        QStringLiteral("继续运行"), QMessageBox::RejectRole);
+    prompt.setDefaultButton(qobject_cast<QPushButton *>(continueRunning));
+    prompt.exec();
+    return prompt.clickedButton() == exitApplication
+        ? ActiveTaskCloseDecision::ExitApplication
+        : ActiveTaskCloseDecision::ContinueRunning;
+}
+
+bool MainWindow::hasActiveTask() const {
+    const bool connectionOrRequestActive = clientBusy_ || !pendingCommand_.isEmpty()
+        || (client_ != nullptr
+            && (client_->state() == BackendClient::State::Connecting
+                || client_->state() == BackendClient::State::Handshaking
+                || client_->state() == BackendClient::State::Busy));
+    const bool registrationOrEvolutionActive = workpieceLibraryPage_ != nullptr
+        && (workpieceLibraryPage_->hasActiveRegistration()
+            || workpieceLibraryPage_->hasActiveEvolutionTask());
+    const bool batchActive = batchInFlight_
+        || (inspectionPage_ != nullptr && inspectionPage_->batchRunning());
+    const bool geometryActive = !geometryValidationJobId_.isEmpty()
+        || geometryPublishAfterValidation_
+        || !geometryWorkflowWorkpieceId_.isEmpty()
+        || geometrySaveIntent_ != GeometrySaveIntent::None
+        || stagedGeometrySaveIntent_ != GeometrySaveIntent::None;
+    return connectionOrRequestActive || registrationOrEvolutionActive
+        || batchActive || geometryActive;
+}
+
 void MainWindow::closeEvent(QCloseEvent *event) {
-    if (bypassCloseGuard_) {
-        bypassCloseGuard_ = false;
-        QMainWindow::closeEvent(event);
-        return;
-    }
     if (pendingNavigationKind_ != PendingNavigationKind::None) {
         event->ignore();
         return;
     }
-    if (geometryRulesPage_ == nullptr || !geometryRulesPage_->hasUnsavedChanges()) {
-        QMainWindow::closeEvent(event);
-        return;
+    const bool skipDirtyGuard = skipDirtyCloseGuardOnce_;
+    skipDirtyCloseGuardOnce_ = false;
+    if (!skipDirtyGuard && geometryRulesPage_ != nullptr
+        && geometryRulesPage_->hasUnsavedChanges()) {
+        const GeometryDirtyDecision decision = promptForDirtyGeometry();
+        if (decision == GeometryDirtyDecision::Cancel) {
+            event->ignore();
+            return;
+        }
+        if (decision == GeometryDirtyDecision::Discard) {
+            geometryRulesPage_->discardUnsavedChanges();
+        } else if (decision == GeometryDirtyDecision::Save) {
+            beginPendingGeometryNavigation(PendingNavigationKind::CloseWindow);
+            event->ignore();
+            return;
+        }
     }
-    const GeometryDirtyDecision decision = promptForDirtyGeometry();
-    if (decision == GeometryDirtyDecision::Cancel) {
-        event->ignore();
-        return;
-    }
-    if (decision == GeometryDirtyDecision::Discard) {
-        geometryRulesPage_->discardUnsavedChanges();
-    } else if (decision == GeometryDirtyDecision::Save) {
-        beginPendingGeometryNavigation(PendingNavigationKind::CloseWindow);
+    if (hasActiveTask()
+        && promptForActiveTaskClose() == ActiveTaskCloseDecision::ContinueRunning) {
         event->ignore();
         return;
     }
@@ -348,8 +375,14 @@ void MainWindow::completePendingGeometryNavigation() {
             applyDetectionWorkpieceChange(workpieceId);
         }
     } else if (kind == PendingNavigationKind::CloseWindow) {
-        bypassCloseGuard_ = true;
-        close();
+        // The save response is delivered before BackendClient publishes its Ready
+        // state. Re-enter the close guard on the next event turn so the completed
+        // save is not mistaken for an active request; concurrent tasks are still
+        // evaluated by closeEvent().
+        QTimer::singleShot(0, this, [this]() {
+            skipDirtyCloseGuardOnce_ = true;
+            close();
+        });
     }
     setGeometryOperationEditingLocked(false);
 }
@@ -477,11 +510,6 @@ bool MainWindow::applyDetectionWorkpieceChange(const QString &workpieceId) {
     currentDetectionWorkpieceId_ = workpieceId;
     ++geometryTargetGeneration_;
     if (!workpieceId.isEmpty()) appHeader_->setCurrentWorkpieceId(workpieceId);
-    if (annotationManagerDialog_ != nullptr) {
-        annotationManagerDialog_->close();
-        annotationManagerDialog_.clear();
-        annotationWorkpieceId_.clear();
-    }
     refreshDetectionWorkpieceConsumers();
     if (currentPage_ == AppPage::GeometryRules
         && !geometryRulesPage_->hasUnsavedChanges()) {
@@ -965,14 +993,6 @@ void MainWindow::rejectTemplateConfirmation() {
     reviewLabel_->setText(QStringLiteral("本次结果不入库"));
 }
 
-void MainWindow::openAnnotationEditor() {
-    openAnnotationManager();
-}
-
-void MainWindow::openAnnotationManager() {
-    showGeometryRules();
-}
-
 void MainWindow::ensureGeometryProfileForCurrentWorkpiece() {
     const QString workpieceId = currentDetectionWorkpieceId_.isEmpty()
         ? appHeader_->currentWorkpieceId() : currentDetectionWorkpieceId_;
@@ -1378,78 +1398,6 @@ void MainWindow::resolveGeometryMigration(const QString &conflictId, const QJson
     });
 }
 
-void MainWindow::requestAnnotationSnapshot(const QString &workpieceId) {
-    if (workpieceId.isEmpty() || client_ == nullptr || !backendReady_) {
-        return;
-    }
-    if (client_->state() != BackendClient::State::Ready || clientBusy_) {
-        QTimer::singleShot(20, this, [this, workpieceId]() { requestAnnotationSnapshot(workpieceId); });
-        return;
-    }
-    annotationWorkpieceId_ = workpieceId;
-    sendPageCommand(CommandOwner::Geometry, QStringLiteral("get_workpiece_annotations"), {
-        {QStringLiteral("workpiece_id"), workpieceId},
-    });
-}
-
-void MainWindow::sendAnnotationMutation(const QString &command, const QJsonObject &fields) {
-    if (client_ == nullptr || !backendReady_ || clientBusy_
-        || client_->state() != BackendClient::State::Ready) {
-        return;
-    }
-    sendPageCommand(CommandOwner::Geometry, command, fields);
-    if (annotationManagerDialog_ != nullptr) {
-        annotationManagerDialog_->setBusy(true);
-    }
-    showLibraryMessage(QStringLiteral("干扰标注正在保存…"));
-}
-
-void MainWindow::saveAnnotationGroups(const QJsonArray &groups, int baseRevision) {
-    if (annotationWorkpieceId_.isEmpty()) return;
-    sendAnnotationMutation(QStringLiteral("save_workpiece_annotations"), {
-        {QStringLiteral("workpiece_id"), annotationWorkpieceId_},
-        {QStringLiteral("groups"), groups},
-        {QStringLiteral("base_revision"), baseRevision},
-        {QStringLiteral("operation_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
-        {QStringLiteral("progress_events"), true},
-    });
-}
-
-void MainWindow::setAnnotationGroupEnabled(const QString &groupId, bool enabled, int baseRevision) {
-    if (annotationWorkpieceId_.isEmpty()) return;
-    sendAnnotationMutation(QStringLiteral("set_workpiece_annotation_group_enabled"), {
-        {QStringLiteral("workpiece_id"), annotationWorkpieceId_},
-        {QStringLiteral("group_id"), groupId},
-        {QStringLiteral("enabled"), enabled},
-        {QStringLiteral("base_revision"), baseRevision},
-        {QStringLiteral("operation_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
-    });
-}
-
-void MainWindow::deleteAnnotationGroup(const QString &groupId, int baseRevision) {
-    if (annotationWorkpieceId_.isEmpty()) return;
-    sendAnnotationMutation(QStringLiteral("delete_workpiece_annotation_group"), {
-        {QStringLiteral("workpiece_id"), annotationWorkpieceId_},
-        {QStringLiteral("group_id"), groupId},
-        {QStringLiteral("base_revision"), baseRevision},
-        {QStringLiteral("operation_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
-    });
-}
-
-void MainWindow::reviewAnnotation(const QString &groupId, const QString &templateId,
-                                  const QString &action, const QJsonArray &regions, int baseRevision) {
-    if (annotationWorkpieceId_.isEmpty()) return;
-    const QJsonObject annotation{
-        {QStringLiteral("template_id"), templateId},
-        {QStringLiteral("review_action"), action},
-        {QStringLiteral("regions"), regions},
-    };
-    saveAnnotationGroups(QJsonArray{QJsonObject{
-        {QStringLiteral("group_id"), groupId},
-        {QStringLiteral("annotations"), QJsonArray{annotation}},
-    }}, baseRevision);
-}
-
 void MainWindow::submitTemplateConfirmation(const QString &workpieceId, const QString &imagePath,
                                             const QString &orientation) {
     if (imagePath.isEmpty() || workpieceId.isEmpty()
@@ -1507,9 +1455,6 @@ void MainWindow::onBackendReady() {
     backendReadyHandled_ = true;
     backendReady_ = true;
     clientBusy_ = false;
-    if (annotationManagerDialog_ != nullptr) {
-        annotationManagerDialog_->setBusy(false);
-    }
     if (geometryRulesPage_ != nullptr) {
         geometryRulesPage_->setBackendAvailable(true, QString());
         geometryRulesPage_->setBusy(false);
@@ -1542,9 +1487,6 @@ void MainWindow::onBackendLoading(const QString &message) {
     backendReadyHandled_ = false;
     backendReady_ = false;
     clientBusy_ = false;
-    if (annotationManagerDialog_ != nullptr) {
-        annotationManagerDialog_->setBusy(true);
-    }
     if (geometryRulesPage_ != nullptr) {
         geometryRulesPage_->setBackendAvailable(false,
             message.isEmpty() ? QStringLiteral("后端模型加载中") : message);
@@ -1586,7 +1528,6 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
         || batchInFlight_ || clientBusy_
         || !pendingCommand_.isEmpty() || !inspectionImagePath_.isEmpty()
         || (batchResultsTableWidget_ != nullptr && batchResultsTableWidget_->rowCount() > 0)
-        || annotationManagerDialog_ != nullptr
         || (geometryRulesPage_ != nullptr && geometryRulesPage_->hasUnsavedChanges())
         || !geometryValidationJobId_.isEmpty() || geometryPublishAfterValidation_
         || pendingNavigationKind_ != PendingNavigationKind::None
@@ -1607,11 +1548,6 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
         queuedMandatoryRefreshTransactionId_ = interruptedRefreshTransactionId;
         mandatoryDetailsRetryRequired_ = false;
         activeMandatoryDetailsWorkpieceId_.clear();
-    }
-    if (annotationManagerDialog_ != nullptr) {
-        annotationManagerDialog_->setBusy(false);
-        annotationManagerDialog_->setOperationError(
-            QStringLiteral("后端连接中断，操作结果未知；请重连后刷新"));
     }
     cancelPendingGeometryNavigation();
     geometrySaveIntent_ = GeometrySaveIntent::None;
@@ -1745,14 +1681,6 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
 }
 
 void MainWindow::onClientProgress(const QString &command, const QJsonObject &progress) {
-    if (command == QStringLiteral("save_workpiece_annotations")) {
-        if (annotationManagerDialog_ != nullptr) {
-            annotationManagerDialog_->setProgress(progress.value(QStringLiteral("phase")).toString(),
-                                                  progress.value(QStringLiteral("completed")).toInt(),
-                                                  progress.value(QStringLiteral("total")).toInt());
-        }
-        return;
-    }
     if (command == QStringLiteral("register")) {
         workpieceLibraryPage_->setRegistrationProgress(progress, -1);
     }
@@ -1990,46 +1918,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         }
         return;
     }
-    if (command == QStringLiteral("get_workpiece_annotations")) {
-        const QJsonObject annotations = response.value(QStringLiteral("annotations")).toObject();
-        if (annotations.isEmpty()) {
-            showLibraryMessage(QStringLiteral("后端返回的干扰标注快照为空"), true);
-            return;
-        }
-        if (annotationManagerDialog_ == nullptr) {
-            annotationManagerDialog_ = new AnnotationManagerDialog(this);
-            annotationManagerDialog_->setAttribute(Qt::WA_DeleteOnClose);
-            connect(annotationManagerDialog_, &AnnotationManagerDialog::saveRequested,
-                    this, &MainWindow::saveAnnotationGroups);
-            connect(annotationManagerDialog_, &AnnotationManagerDialog::setEnabledRequested,
-                    this, &MainWindow::setAnnotationGroupEnabled);
-            connect(annotationManagerDialog_, &AnnotationManagerDialog::deleteRequested,
-                    this, &MainWindow::deleteAnnotationGroup);
-            connect(annotationManagerDialog_, &AnnotationManagerDialog::reviewRequested,
-                    this, &MainWindow::reviewAnnotation);
-            connect(annotationManagerDialog_, &AnnotationManagerDialog::refreshRequested,
-                    this, [this]() { requestAnnotationSnapshot(annotationWorkpieceId_); });
-        }
-        annotationWorkpieceId_ = annotations.value(QStringLiteral("workpiece_id")).toString(annotationWorkpieceId_);
-        annotationManagerDialog_->setSnapshot(annotations);
-        annotationManagerDialog_->setBusy(false);
-        annotationManagerDialog_->show();
-        annotationManagerDialog_->raise();
-        annotationManagerDialog_->activateWindow();
-        showLibraryMessage(QStringLiteral("干扰标注快照已加载"));
-        return;
-    }
-    if (command == QStringLiteral("save_workpiece_annotations")
-        || command == QStringLiteral("set_workpiece_annotation_group_enabled")
-        || command == QStringLiteral("delete_workpiece_annotation_group")) {
-        showLibraryMessage(QStringLiteral("干扰标注已保存，正在刷新生效状态…"));
-        if (annotationManagerDialog_ != nullptr) {
-            annotationManagerDialog_->setBusy(true);
-        }
-        const QString workpieceId = annotationWorkpieceId_;
-        QTimer::singleShot(0, this, [this, workpieceId]() { requestAnnotationSnapshot(workpieceId); });
-        return;
-    }
     if (command == QStringLiteral("list_evolution_jobs")) {
         const QJsonArray jobs = response.value(QStringLiteral("jobs")).toArray();
         inspectionPage_->handleBackendResponse(command, response);
@@ -2214,33 +2102,6 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
     } else if (failedCommand == QStringLiteral("recycle_workpiece")
                && matchesOwner(CommandOwner::Library)) {
         workpieceLibraryPage_->handleBackendFailure(failedCommand, code, message);
-    } else if (failedCommand == QStringLiteral("get_workpiece_annotations")
-               && matchesOwner(CommandOwner::Geometry)) {
-        showLibraryMessage(QStringLiteral("干扰标注加载失败：%1").arg(message), true);
-    } else if (matchesOwner(CommandOwner::Geometry)
-               && (failedCommand == QStringLiteral("save_workpiece_annotations")
-                   || failedCommand == QStringLiteral("set_workpiece_annotation_group_enabled")
-                   || failedCommand == QStringLiteral("delete_workpiece_annotation_group"))) {
-        const QString workpieceId = annotationWorkpieceId_;
-        const bool stale = code == QStringLiteral("STALE_WORKPIECE_REVISION");
-        if (annotationManagerDialog_ != nullptr) {
-            annotationManagerDialog_->setBusy(stale);
-            if (!stale) {
-                QString detail = message;
-                if (code == QStringLiteral("MODEL_ERROR")) {
-                    detail = QStringLiteral("局部特征递推失败，草稿未提交：%1").arg(message);
-                } else if (code == QStringLiteral("INTERNAL_ERROR")) {
-                    detail = QStringLiteral("后端递推异常，草稿未提交，请查看诊断日志：%1").arg(message);
-                }
-                annotationManagerDialog_->setOperationError(detail);
-            }
-        }
-        if (stale) {
-            showLibraryMessage(QStringLiteral("标注已在其他操作中更新，已重新加载"), true);
-            QTimer::singleShot(0, this, [this, workpieceId]() { requestAnnotationSnapshot(workpieceId); });
-        } else {
-            showLibraryMessage(QStringLiteral("干扰标注保存失败：%1").arg(message), true);
-        }
     } else {
         showLibraryMessage(message, true);
     }
@@ -2354,6 +2215,9 @@ void MainWindow::showLibraryMessage(const QString &message, bool error) {
     QLabel *label = workpieceLibraryPage_ == nullptr ? nullptr
         : workpieceLibraryPage_->findChild<QLabel *>(QStringLiteral("libraryMessageLabel"));
     if (label == nullptr) return;
-    label->setStyleSheet(error ? QStringLiteral("color: #b00020;") : QString());
+    label->setProperty("messageKind",
+                       error ? QStringLiteral("error") : QStringLiteral("neutral"));
+    label->style()->unpolish(label);
+    label->style()->polish(label);
     label->setText(message);
 }

@@ -1,7 +1,9 @@
 #include "apptheme.h"
 
 #include <QApplication>
+#include <QColor>
 #include <QFile>
+#include <QPalette>
 
 namespace AppTheme {
 
@@ -17,9 +19,17 @@ QString styleSheet() {
 }
 
 void apply(QApplication *application) {
-    if (application) {
-        application->setStyleSheet(styleSheet());
-    }
+    if (application == nullptr || application->property("appThemeApplied").toBool()) return;
+    QPalette palette = application->palette();
+    palette.setColor(QPalette::Window, QColor(QStringLiteral("#F4F6F8")));
+    palette.setColor(QPalette::WindowText, QColor(QStringLiteral("#17212B")));
+    palette.setColor(QPalette::Base, QColor(QStringLiteral("#FFFFFF")));
+    palette.setColor(QPalette::Text, QColor(QStringLiteral("#17212B")));
+    palette.setColor(QPalette::Highlight, QColor(QStringLiteral("#DCE9FF")));
+    palette.setColor(QPalette::HighlightedText, QColor(QStringLiteral("#17212B")));
+    application->setPalette(palette);
+    application->setStyleSheet(styleSheet());
+    application->setProperty("appThemeApplied", true);
 }
 
 } // namespace AppTheme

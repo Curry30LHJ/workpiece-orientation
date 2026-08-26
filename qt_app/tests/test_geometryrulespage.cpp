@@ -11,6 +11,8 @@
 #include <QListWidget>
 #include <QProgressBar>
 #include <QSignalSpy>
+#include <QScrollArea>
+#include <QSplitter>
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QTemporaryDir>
@@ -18,6 +20,7 @@
 
 #include "../geometryrulespage.h"
 #include "../geometryrulecanvas.h"
+#include "../apptheme.h"
 
 QJsonObject profileSnapshot(int libraryRevision, int draftRevision, int activeRevision);
 QJsonObject configuredProfileSnapshot(const QString &imagePath, int draftRevision = 0);
@@ -27,6 +30,7 @@ class TestGeometryRulesPage : public QObject {
     Q_OBJECT
 
 private slots:
+    void initTestCase() { AppTheme::apply(qApp); }
     void pageIsAChildWidgetAndHasNoDialogCloseAction();
     void dirtyStateEmitsOnlyOnChangeAndDiscardRestoresSnapshot();
     void editorFieldChangeMarksDirtyAndDiscardRestores_data();
@@ -94,6 +98,9 @@ private slots:
     void numericShapeProducesBackendCompatiblePayload();
     void emptyDraftHasNoDefaultDrawingTool();
     void signedMarginKeepsItsSignForInsideAndOutside();
+    void finalWorkspaceUsesSemanticPanelsAndCenterWeightedSplitter();
+    void advancedOptionsRemainScrollableAtReducedHeight();
+    void geometryWarningsUseSemanticMessageKinds();
 };
 
 void TestGeometryRulesPage::pageIsAChildWidgetAndHasNoDialogCloseAction() {
@@ -2130,6 +2137,52 @@ void TestGeometryRulesPage::signedMarginKeepsItsSignForInsideAndOutside() {
                      QStringLiteral("signed_boundary_v2"));
         }
     }
+}
+
+void TestGeometryRulesPage::finalWorkspaceUsesSemanticPanelsAndCenterWeightedSplitter() {
+    GeometryRulesPage page;
+    page.resize(1280, 720);
+    page.show();
+    QCoreApplication::processEvents();
+    QCOMPARE(page.property("pageRoot").toBool(), true);
+    auto *splitter = page.findChild<QSplitter *>(QStringLiteral("geometryWorkspaceSplitter"));
+    QVERIFY(splitter != nullptr);
+    QCOMPARE(splitter->count(), 3);
+    const QList<int> sizes = splitter->sizes();
+    QCOMPARE(sizes.size(), 3);
+    QVERIFY(sizes.at(1) > sizes.at(0));
+    QVERIFY(sizes.at(1) > sizes.at(2));
+    for (int index = 0; index < splitter->count(); ++index) {
+        QVERIFY(splitter->widget(index)->property("panel").toBool());
+    }
+}
+
+void TestGeometryRulesPage::advancedOptionsRemainScrollableAtReducedHeight() {
+    GeometryRulesPage page;
+    page.resize(1024, 640);
+    page.show();
+    auto *advanced = page.findChild<QGroupBox *>(QStringLiteral("advancedGeometryGroup"));
+    auto *scroll = page.findChild<QScrollArea *>(QStringLiteral("advancedGeometryScrollArea"));
+    auto *primary = page.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+    QVERIFY(advanced != nullptr);
+    QVERIFY(scroll != nullptr);
+    QVERIFY(primary != nullptr);
+    advanced->setChecked(true);
+    QCoreApplication::processEvents();
+    QVERIFY(scroll->isVisibleTo(&page));
+    QVERIFY(scroll->widgetResizable());
+    QVERIFY(primary->isVisibleTo(&page));
+}
+
+void TestGeometryRulesPage::geometryWarningsUseSemanticMessageKinds() {
+    GeometryRulesPage page;
+    auto *hint = page.findChild<QLabel *>(QStringLiteral("validationHintLabel"));
+    auto *reason = page.findChild<QLabel *>(QStringLiteral("publishDisabledReasonLabel"));
+    QVERIFY(hint != nullptr);
+    QVERIFY(reason != nullptr);
+    QCOMPARE(hint->property("messageKind").toString(), QStringLiteral("warning"));
+    QCOMPARE(reason->property("messageKind").toString(), QStringLiteral("error"));
+    QVERIFY(!hint->text().trimmed().isEmpty());
 }
 
 QTEST_MAIN(TestGeometryRulesPage)

@@ -34,6 +34,7 @@ public:
     void requestBatchStop();
     int completedBatchCount() const;
     int failedBatchCount() const;
+    bool batchRunning() const;
     void setRecordDisposition(const QString &recordId,
                               BatchDisposition disposition,
                               const QString &evolutionJobId = QString(),
