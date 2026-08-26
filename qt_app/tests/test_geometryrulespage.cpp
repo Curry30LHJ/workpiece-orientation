@@ -57,6 +57,10 @@ private slots:
     void publishWorkflowNavigatesToMissingDirectionCalibration();
     void migrationConflictKeepOnlyEmitsExplicitResolution();
     void allSupportedShapesUseTheSavePath();
+    void shapeChangeDoesNotSaveStaleGeometry_data();
+    void shapeChangeDoesNotSaveStaleGeometry();
+    void numericShapeProducesBackendCompatiblePayload_data();
+    void numericShapeProducesBackendCompatiblePayload();
     void emptyDraftHasNoDefaultDrawingTool();
     void signedMarginKeepsItsSignForInsideAndOutside();
 };
@@ -1144,6 +1148,159 @@ void TestGeometryRulesPage::allSupportedShapesUseTheSavePath() {
             .toArray().first().toObject();
         QCOMPARE(savedRule.value(QStringLiteral("shape")).toString(), shapeName);
     }
+}
+
+namespace {
+bool geometryMatchesBackendShapeContract(const QJsonObject &geometry,
+                                         const QString &shape) {
+    if (geometry.isEmpty()) return false;
+    if (shape == QStringLiteral("circle")) {
+        return geometry.value(QStringLiteral("r")).toDouble() > 0.0;
+    }
+    if (shape == QStringLiteral("ellipse")) {
+        return geometry.value(QStringLiteral("rx")).toDouble() > 0.0
+            && geometry.value(QStringLiteral("ry")).toDouble() > 0.0;
+    }
+    if (shape == QStringLiteral("rotated_rectangle")) {
+        return geometry.value(QStringLiteral("half_width")).toDouble() > 0.0
+            && geometry.value(QStringLiteral("half_height")).toDouble() > 0.0;
+    }
+    return false;
+}
+
+bool draftGeometryMatchesBackendContract(const QJsonObject &draft) {
+    const QJsonArray rules = draft.value(QStringLiteral("rules")).toArray();
+    const QJsonObject directions = draft.value(QStringLiteral("directions")).toObject();
+    for (const QJsonValue &ruleValue : rules) {
+        const QJsonObject rule = ruleValue.toObject();
+        const QString ruleId = rule.value(QStringLiteral("rule_id")).toString();
+        const QString shape = rule.value(QStringLiteral("shape")).toString();
+        for (const QString &sideName : {QStringLiteral("front"), QStringLiteral("back")}) {
+            const QJsonObject calibration = directions.value(sideName).toObject()
+                .value(QStringLiteral("calibrations")).toObject().value(ruleId).toObject();
+            if (calibration.isEmpty()) continue;
+            const QJsonObject geometry = calibration.value(QStringLiteral("geometry")).toObject();
+            const QJsonObject seed = calibration.value(QStringLiteral("seed_geometry")).toObject();
+            if (calibration.value(QStringLiteral("state")).toString() == QStringLiteral("ready")
+                && geometry.isEmpty()) {
+                return false;
+            }
+            if (!geometry.isEmpty() && !geometryMatchesBackendShapeContract(geometry, shape)) {
+                return false;
+            }
+            if (!seed.isEmpty() && !geometryMatchesBackendShapeContract(seed, shape)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+}
+
+void TestGeometryRulesPage::shapeChangeDoesNotSaveStaleGeometry_data() {
+    QTest::addColumn<QString>("shape");
+    QTest::newRow("ellipse") << QStringLiteral("ellipse");
+    QTest::newRow("rotated rectangle") << QStringLiteral("rotated_rectangle");
+}
+
+void TestGeometryRulesPage::shapeChangeDoesNotSaveStaleGeometry() {
+    QFETCH(QString, shape);
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(QString(), QString()));
+    const QJsonObject originalDraft = page.draft();
+    QVERIFY(draftGeometryMatchesBackendContract(page.draft()));
+    auto *shapeCombo = page.findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+    QVERIFY(shapeCombo != nullptr);
+    shapeCombo->setCurrentIndex(shapeCombo->findData(shape));
+    QSignalSpy saveSpy(&page, &GeometryRulesPage::saveDraftRequested);
+
+    page.requestSaveDraft();
+
+    QCOMPARE(saveSpy.count(), 1);
+    const QJsonObject savedDraft = saveSpy.takeFirst().at(0).toJsonObject();
+    QVERIFY2(draftGeometryMatchesBackendContract(savedDraft),
+             "saved geometry fields must match the selected shape as required by the backend");
+    const QJsonObject directions = savedDraft.value(QStringLiteral("directions")).toObject();
+    for (const QString &sideName : {QStringLiteral("front"), QStringLiteral("back")}) {
+        const QJsonObject calibration = directions.value(sideName).toObject()
+            .value(QStringLiteral("calibrations")).toObject()
+            .value(QStringLiteral("glare")).toObject();
+        QVERIFY2(calibration.isEmpty(),
+                 "changing a logical shape must require both directions to be recalibrated");
+    }
+
+    auto *undoButton = page.findChild<QPushButton *>(QStringLiteral("undoButton"));
+    QVERIFY(undoButton != nullptr);
+    QVERIFY(undoButton->isEnabled());
+    undoButton->click();
+    QCOMPARE(page.draft(), originalDraft);
+
+    auto *redoButton = page.findChild<QPushButton *>(QStringLiteral("redoButton"));
+    QVERIFY(redoButton != nullptr);
+    QVERIFY(redoButton->isEnabled());
+    redoButton->click();
+    QVERIFY(draftGeometryMatchesBackendContract(page.draft()));
+    undoButton->click();
+    QCOMPARE(page.draft(), originalDraft);
+
+    shapeCombo->setCurrentIndex(shapeCombo->findData(shape));
+    page.discardUnsavedChanges();
+    QCOMPARE(page.draft(), originalDraft);
+}
+
+void TestGeometryRulesPage::numericShapeProducesBackendCompatiblePayload_data() {
+    QTest::addColumn<QString>("shape");
+    QTest::addColumn<QJsonObject>("numericShape");
+    QTest::newRow("ellipse")
+        << QStringLiteral("ellipse")
+        << QJsonObject{{QStringLiteral("shape"), QStringLiteral("ellipse")},
+                       {QStringLiteral("cx"), 60.0}, {QStringLiteral("cy"), 60.0},
+                       {QStringLiteral("rx"), 30.0}, {QStringLiteral("ry"), 20.0},
+                       {QStringLiteral("angle_deg"), 0.0}};
+    QTest::newRow("rotated rectangle")
+        << QStringLiteral("rotated_rectangle")
+        << QJsonObject{{QStringLiteral("shape"), QStringLiteral("rotated_rectangle")},
+                       {QStringLiteral("cx"), 60.0}, {QStringLiteral("cy"), 60.0},
+                       {QStringLiteral("half_width"), 30.0},
+                       {QStringLiteral("half_height"), 20.0},
+                       {QStringLiteral("angle_deg"), 15.0}};
+}
+
+void TestGeometryRulesPage::numericShapeProducesBackendCompatiblePayload() {
+    QFETCH(QString, shape);
+    QFETCH(QJsonObject, numericShape);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString frontPath = directory.filePath(QStringLiteral("front.png"));
+    const QString backPath = directory.filePath(QStringLiteral("back.png"));
+    QImage image(120, 120, QImage::Format_RGB32);
+    image.fill(Qt::white);
+    QVERIFY(image.save(frontPath));
+    QVERIFY(image.save(backPath));
+
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(frontPath, backPath));
+    auto *shapeCombo = page.findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+    auto *canvas = page.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
+    QVERIFY(shapeCombo != nullptr);
+    QVERIFY(canvas != nullptr);
+    shapeCombo->setCurrentIndex(shapeCombo->findData(shape));
+    canvas->setNumericShape(numericShape);
+    QSignalSpy saveSpy(&page, &GeometryRulesPage::saveDraftRequested);
+
+    page.requestSaveDraft();
+
+    QCOMPARE(saveSpy.count(), 1);
+    const QJsonObject savedDraft = saveSpy.takeFirst().at(0).toJsonObject();
+    QVERIFY(draftGeometryMatchesBackendContract(savedDraft));
+    const QJsonObject frontCalibration = savedDraft.value(QStringLiteral("directions")).toObject()
+        .value(QStringLiteral("front")).toObject()
+        .value(QStringLiteral("calibrations")).toObject()
+        .value(QStringLiteral("glare")).toObject();
+    QCOMPARE(frontCalibration.value(QStringLiteral("state")).toString(),
+             QStringLiteral("needs_review"));
+    QVERIFY(geometryMatchesBackendShapeContract(
+        frontCalibration.value(QStringLiteral("seed_geometry")).toObject(), shape));
 }
 
 void TestGeometryRulesPage::emptyDraftHasNoDefaultDrawingTool() {

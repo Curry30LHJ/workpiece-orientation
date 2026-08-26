@@ -1216,9 +1216,10 @@ void GeometryRulesPage::setCurrentRuleFromEditor() {
     const QString selectedShape = shapeCombo_->currentData().toString();
     const QString selectedMode = modeCombo_->currentData().toString();
     const int selectedMarginPercent = marginSpin_->value();
+    const bool shapeChanged = !selectedShape.isEmpty()
+        && selectedShape != rule.value(QStringLiteral("shape")).toString();
     const bool editorChanged = editedName != rule.value(QStringLiteral("name")).toString()
-        || (!selectedShape.isEmpty()
-            && selectedShape != rule.value(QStringLiteral("shape")).toString())
+        || shapeChanged
         || selectedMode != rule.value(QStringLiteral("mode")).toString()
         || selectedMarginPercent
             != qRound(rule.value(QStringLiteral("margin_ratio")).toDouble(0.0) * 100.0);
@@ -1232,6 +1233,18 @@ void GeometryRulesPage::setCurrentRuleFromEditor() {
     QJsonObject next = draft_;
     if (usesLogicalRuleSchema()) {
         next.insert(QStringLiteral("rules"), rules);
+        if (shapeChanged) {
+            QJsonObject directions = next.value(QStringLiteral("directions")).toObject();
+            const QString ruleId = rule.value(QStringLiteral("rule_id")).toString();
+            for (const QString &sideName : {QStringLiteral("front"), QStringLiteral("back")}) {
+                QJsonObject side = directions.value(sideName).toObject();
+                QJsonObject calibrations = side.value(QStringLiteral("calibrations")).toObject();
+                calibrations.remove(ruleId);
+                side.insert(QStringLiteral("calibrations"), calibrations);
+                directions.insert(sideName, side);
+            }
+            next.insert(QStringLiteral("directions"), directions);
+        }
     } else {
         if (!rule.contains(QStringLiteral("seed_geometry"))) {
             rule.insert(QStringLiteral("seed_geometry"), rule.value(QStringLiteral("geometry")));
@@ -1246,6 +1259,10 @@ void GeometryRulesPage::setCurrentRuleFromEditor() {
         next.insert(QStringLiteral("directions"), directions);
     }
     if (next == draft_) return;
+    if (shapeChanged && usesLogicalRuleSchema()) {
+        applyDraftMutation(next);
+        return;
+    }
     draft_ = next;
     markDraftDirty();
 }
@@ -1638,6 +1655,7 @@ void GeometryRulesPage::undoDraft() {
     if (undoHistory_.isEmpty()) return;
     redoHistory_.append(draft_);
     draft_ = undoHistory_.takeLast();
+    editorDirection_.clear();
     markDraftDirty();
     refreshEditor();
 }
@@ -1646,6 +1664,7 @@ void GeometryRulesPage::redoDraft() {
     if (redoHistory_.isEmpty()) return;
     undoHistory_.append(draft_);
     draft_ = redoHistory_.takeLast();
+    editorDirection_.clear();
     markDraftDirty();
     refreshEditor();
 }
