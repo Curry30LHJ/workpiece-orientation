@@ -24,6 +24,8 @@
 #include <QTcpSocket>
 #include <QImage>
 #include <QPainter>
+#include <QAbstractScrollArea>
+#include <QScrollBar>
 
 #include "../backendclient.h"
 #include "../backendprocessmanager.h"
@@ -4518,7 +4520,17 @@ private slots:
         BackendClient client;
         MainWindow window(&client, nullptr);
         window.setWindowFlag(Qt::FramelessWindowHint, true);
-        window.resize(1920, 1080);
+        const QSize physicalTargetSize(1920, 1080);
+        const qreal devicePixelRatio = qApp->devicePixelRatio();
+        QVERIFY(devicePixelRatio > 0.0);
+        const QSize logicalTargetSize(
+            qRound(physicalTargetSize.width() / devicePixelRatio),
+            qRound(physicalTargetSize.height() / devicePixelRatio));
+        QCOMPARE(qRound(logicalTargetSize.width() * devicePixelRatio),
+                 physicalTargetSize.width());
+        QCOMPARE(qRound(logicalTargetSize.height() * devicePixelRatio),
+                 physicalTargetSize.height());
+        window.resize(logicalTargetSize);
         auto *header = window.findChild<AppHeader *>();
         auto *inspection = window.findChild<InspectionPage *>();
         auto *library = window.findChild<WorkpieceLibraryPage *>();
@@ -4549,24 +4561,37 @@ private slots:
 
         window.show();
         QCoreApplication::processEvents();
+        QCOMPARE(window.size(), logicalTargetSize);
         auto *imageView = window.findChild<InspectionImageView *>();
         QVERIFY(imageView != nullptr);
         imageView->resetView();
-        auto capture = [&](const QString &fileName) {
+        auto capture = [&](const QString &fileName, QWidget *page,
+                           QWidget *primaryAction) {
             QCoreApplication::processEvents();
+            QVERIFY(page != nullptr);
+            QVERIFY(primaryAction != nullptr);
+            QVERIFY(page->isVisibleTo(&window));
+            QVERIFY(primaryAction->isVisibleTo(&window));
+            const QRect actionRect(primaryAction->mapTo(&window, QPoint()),
+                                   primaryAction->size());
+            QVERIFY2(window.rect().contains(actionRect),
+                     qPrintable(QStringLiteral("主操作被裁切：%1").arg(fileName)));
+            for (QAbstractScrollArea *area
+                 : page->findChildren<QAbstractScrollArea *>()) {
+                if (!area->isVisibleTo(page)) continue;
+                QVERIFY2(!area->horizontalScrollBar()->isVisible(),
+                         qPrintable(QStringLiteral("出现水平滚动条：%1/%2")
+                                        .arg(fileName, area->objectName())));
+            }
             const QImage image = window.grab().toImage();
             QVERIFY2(!image.isNull(), qPrintable(fileName));
-            const qreal devicePixelRatio = image.devicePixelRatio();
-            const QSize logicalSize(qRound(image.width() / devicePixelRatio),
-                                    qRound(image.height() / devicePixelRatio));
-            QCOMPARE(logicalSize, QSize(1920, 1080));
-            if (qFuzzyCompare(devicePixelRatio, 1.0)) {
-                QCOMPARE(image.size(), QSize(1920, 1080));
-            }
+            QCOMPARE(image.size(), physicalTargetSize);
             QVERIFY2(image.save(QDir(captureDirectory).filePath(fileName)),
                      qPrintable(fileName));
         };
-        capture(QStringLiteral("qt-ui-inspection.png"));
+        capture(QStringLiteral("qt-ui-inspection.png"), inspection,
+                inspection->findChild<QPushButton *>(
+                    QStringLiteral("confirmFrontButton")));
 
         QVERIFY(window.requestPage(AppPage::WorkpieceLibrary));
         library->setBackendState(BackendUiState::Ready, QString());
@@ -4604,7 +4629,9 @@ private slots:
                             {QStringLiteral("added_at"), QStringLiteral("2026-08-26 19:31")},
                             {QStringLiteral("readable"), true},
                             {QStringLiteral("preview_path"), imagePath}}}}});
-        capture(QStringLiteral("qt-ui-library.png"));
+        capture(QStringLiteral("qt-ui-library.png"), library,
+                library->findChild<QPushButton *>(
+                    QStringLiteral("setCurrentWorkpieceButton")));
 
         QVERIFY(window.requestPage(AppPage::GeometryRules));
         QJsonObject snapshot{
@@ -4643,7 +4670,9 @@ private slots:
                         {QStringLiteral("anchor"), QJsonValue()},
                         {QStringLiteral("rules"), QJsonArray()}}}}}}}};
         geometry->setSnapshot(snapshot);
-        capture(QStringLiteral("qt-ui-geometry.png"));
+        capture(QStringLiteral("qt-ui-geometry.png"), geometry,
+                geometry->findChild<QPushButton *>(
+                    QStringLiteral("publishWorkflowButton")));
     }
 
     void minimumSizeSupportsScaled720pDisplays() {

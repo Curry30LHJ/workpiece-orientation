@@ -569,6 +569,37 @@ private slots:
         QCOMPARE(front->text(), QStringLiteral("修正为正面"));
     }
 
+    void predictedOrientationKeepsKeyboardOrderAlignedWithVisualActions() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString frontPath = writeImage(directory, QStringLiteral("focus-front.png"));
+        const QString backPath = writeImage(directory, QStringLiteral("focus-back.png"));
+        QVERIFY(!frontPath.isEmpty());
+        QVERIFY(!backPath.isEmpty());
+        InspectionPage page;
+        auto *predict = page.findChild<QPushButton *>(QStringLiteral("predictButton"));
+        auto *front = page.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
+        auto *back = page.findChild<QPushButton *>(QStringLiteral("confirmBackButton"));
+        auto *reject = page.findChild<QPushButton *>(QStringLiteral("rejectConfirmationButton"));
+        QVERIFY(predict != nullptr);
+        QVERIFY(front != nullptr);
+        QVERIFY(back != nullptr);
+        QVERIFY(reject != nullptr);
+
+        InspectionRecord backRecord = resultRecord(QStringLiteral("focus-back"), backPath);
+        backRecord.label = QStringLiteral("back");
+        backRecord.response.insert(QStringLiteral("label"), QStringLiteral("back"));
+        page.showSingleResult(backRecord);
+        QCOMPARE(predict->nextInFocusChain(), back);
+        QCOMPARE(back->nextInFocusChain(), front);
+        QCOMPARE(front->nextInFocusChain(), reject);
+
+        page.showSingleResult(resultRecord(QStringLiteral("focus-front"), frontPath));
+        QCOMPARE(predict->nextInFocusChain(), front);
+        QCOMPARE(front->nextInFocusChain(), back);
+        QCOMPARE(back->nextInFocusChain(), reject);
+    }
+
     void submitFailureKeepsPredictionAndCanRetry() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());

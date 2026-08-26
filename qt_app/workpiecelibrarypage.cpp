@@ -86,6 +86,8 @@ WorkpieceLibraryPage::WorkpieceLibraryPage(QWidget *parent)
     ui->librarySplitter->setStretchFactor(0, 1);
     ui->librarySplitter->setStretchFactor(1, 3);
     ui->librarySplitter->setChildrenCollapsible(false);
+    ui->libraryWorkpieceList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    ui->libraryWorkpieceList->setTextElideMode(Qt::ElideRight);
     ui->templateDetailsTable->horizontalHeader()->setStretchLastSection(true);
     ui->evolutionJobsTable->horizontalHeader()->setStretchLastSection(true);
     ui->registrationProgressBar->setRange(0, 1);
@@ -678,7 +680,7 @@ void WorkpieceLibraryPage::rebuildWorkpieceList() {
                                  .arg(item.value(QStringLiteral("updated_at")).toString());
         auto *listItem = new QListWidgetItem(text, ui->libraryWorkpieceList);
         listItem->setData(Qt::UserRole, id);
-        listItem->setToolTip(id);
+        listItem->setToolTip(QStringLiteral("%1\nID: %2").arg(text, id));
         if (id == browsedWorkpieceId_) selectedRow = ui->libraryWorkpieceList->count() - 1;
     }
     ui->libraryWorkpieceList->setCurrentRow(selectedRow);

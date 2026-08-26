@@ -41,6 +41,8 @@ InspectionPage::InspectionPage(QWidget *parent)
     ui->inspectionSplitter->setStretchFactor(1, 35);
     ui->inspectionSplitter->setChildrenCollapsible(false);
     ui->batchReviewSplitter->setSizes({430, 230});
+    ui->recentInspectionList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    ui->recentInspectionList->setTextElideMode(Qt::ElideRight);
     ui->batchResultsTableWidget->setColumnCount(5);
     ui->batchResultsTableWidget->setHorizontalHeaderLabels({
         QStringLiteral("文件"), QStringLiteral("结果"), QStringLiteral("复检"),
@@ -953,10 +955,14 @@ void InspectionPage::renderRecord(const InspectionRecord &record) {
 
 void InspectionPage::updateActionOrder(const QString &predictedOrientation) {
     QVBoxLayout *layout = ui->confirmationActionsLayout;
+    QPushButton *firstAction = ui->confirmFrontButton;
+    QPushButton *secondAction = ui->confirmBackButton;
     layout->removeWidget(ui->confirmFrontButton);
     layout->removeWidget(ui->confirmBackButton);
     layout->removeWidget(ui->rejectConfirmationButton);
     if (predictedOrientation == QStringLiteral("back")) {
+        firstAction = ui->confirmBackButton;
+        secondAction = ui->confirmFrontButton;
         ui->confirmBackButton->setText(QStringLiteral("确认反面"));
         ui->confirmFrontButton->setText(QStringLiteral("修正为正面"));
         layout->insertWidget(0, ui->confirmBackButton);
@@ -968,6 +974,9 @@ void InspectionPage::updateActionOrder(const QString &predictedOrientation) {
         layout->insertWidget(1, ui->confirmBackButton);
     }
     layout->insertWidget(2, ui->rejectConfirmationButton);
+    QWidget::setTabOrder(ui->predictButton, firstAction);
+    QWidget::setTabOrder(firstAction, secondAction);
+    QWidget::setTabOrder(secondAction, ui->rejectConfirmationButton);
 }
 
 void InspectionPage::updateActionAvailability() {

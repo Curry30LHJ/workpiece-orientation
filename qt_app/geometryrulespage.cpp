@@ -9,6 +9,7 @@
 #include <QFormLayout>
 #include <QFrame>
 #include <QGroupBox>
+#include <QHeaderView>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -258,6 +259,8 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     validationTable_->setSelectionMode(QAbstractItemView::SingleSelection);
     validationTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     validationTable_->setCursor(Qt::PointingHandCursor);
+    validationTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    validationTable_->horizontalHeader()->setMinimumSectionSize(48);
     rightLayout->addWidget(validationTable_, 1);
 
     advancedGeometryGroup_ = new QGroupBox(QStringLiteral("高级选项"), right);
