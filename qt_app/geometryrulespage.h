@@ -128,6 +128,7 @@ private:
     void selectRuleById(const QString &ruleId);
     void refreshMigrationPanel();
     QJsonObject selectedMigrationConflict() const;
+    void invalidatePublishContinuation(bool clearReason = true);
 
     QJsonObject snapshot_;
     QJsonObject draft_;

@@ -64,6 +64,8 @@ QString orientationName(const QString &value) {
 
 QString validationStatusText(const QString &state) {
     if (state == QStringLiteral("active")) return QStringLiteral("通过");
+    if (state == QStringLiteral("warning")) return QStringLiteral("告警");
+    if (state == QStringLiteral("blocking_issue")) return QStringLiteral("阻断");
     if (state == QStringLiteral("low_confidence")) return QStringLiteral("低置信度");
     if (state == QStringLiteral("not_configured")) return QStringLiteral("未配置");
     if (state == QStringLiteral("needs_reseed") || state == QStringLiteral("failed")) {
@@ -74,12 +76,29 @@ QString validationStatusText(const QString &state) {
 }
 
 QString validationReasonText(const QString &code) {
+    if (code.isEmpty()) return QString();
     if (code == QStringLiteral("edge_support_low")) return QStringLiteral("边缘支持不足");
     if (code == QStringLiteral("source_disagreement")) return QStringLiteral("来源投票不一致");
     if (code == QStringLiteral("effective_area_low")) return QStringLiteral("有效区域过小");
+    if (code == QStringLiteral("keypoint_retention_low")) return QStringLiteral("关键点保留率偏低");
+    if (code == QStringLiteral("fit_not_active")) return QStringLiteral("拟合结果未生效");
+    if (code == QStringLiteral("geometry_mask_too_large")) return QStringLiteral("忽略区域过大");
+    if (code == QStringLiteral("keypoint_retention_critical")) return QStringLiteral("关键点保留率过低");
+    if (code == QStringLiteral("leave_one_out_incomplete")) return QStringLiteral("留一验证未完成");
+    if (code == QStringLiteral("leave_one_out_failed")) return QStringLiteral("留一验证失败");
+    if (code == QStringLiteral("geometry_regression")) return QStringLiteral("识别结果回归");
     if (code == QStringLiteral("geometry_fusion_regression")) return QStringLiteral("融合结果回归");
     if (code == QStringLiteral("missing_direction_calibration")) return QStringLiteral("方向标定缺失");
-    return code;
+    if (code == QStringLiteral("MISSING_DIRECTION_CALIBRATION")) return QStringLiteral("方向标定缺失");
+    if (code == QStringLiteral("FITTED_GEOMETRY_MISSING")) return QStringLiteral("拟合边界缺失");
+    if (code == QStringLiteral("MIGRATION_CONFLICT")) return QStringLiteral("存在迁移冲突");
+    if (code == QStringLiteral("PROFILE_CACHE_REVISION_MISMATCH")) return QStringLiteral("规则缓存修订不一致");
+    if (code == QStringLiteral("template_needs_review")) return QStringLiteral("模板需要人工复核");
+    if (code == QStringLiteral("template_excluded")) return QStringLiteral("模板已人工排除");
+    for (const QChar character : code) {
+        if (character.unicode() > 0x7f) return code;
+    }
+    return QStringLiteral("未识别问题（%1）").arg(code);
 }
 }
 
@@ -94,7 +113,6 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     statusLabel_ = new QLabel(left);
     statusLabel_->setObjectName(QStringLiteral("geometryStatusLabel"));
     leftLayout->addWidget(revisionLabel_);
-    leftLayout->addWidget(statusLabel_);
     directionCombo_ = new QComboBox(left);
     directionCombo_->setObjectName(QStringLiteral("directionCombo"));
     directionCombo_->addItem(QStringLiteral("正面"), QStringLiteral("front"));
@@ -192,6 +210,7 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
 
     auto *right = new QWidget(splitter);
     auto *rightLayout = new QVBoxLayout(right);
+    rightLayout->addWidget(statusLabel_);
     progressBar_ = new QProgressBar(right);
     progressBar_->setRange(0, 1);
     diagnostics_ = new QTextEdit(right);
@@ -290,14 +309,12 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     advancedWorkflowButtons->addWidget(validateButton_);
     advancedWorkflowButtons->addWidget(rollbackButton_);
     advancedContentLayout->addLayout(advancedWorkflowButtons);
-    auto *buttons = new QHBoxLayout();
-    buttons->addWidget(publishWorkflowButton_);
     publishDisabledReasonLabel_ = new QLabel(this);
     publishDisabledReasonLabel_->setObjectName(QStringLiteral("publishDisabledReasonLabel"));
     publishDisabledReasonLabel_->setWordWrap(true);
     publishDisabledReasonLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
-    root->addWidget(publishDisabledReasonLabel_);
-    root->addLayout(buttons);
+    rightLayout->addWidget(publishDisabledReasonLabel_);
+    rightLayout->addWidget(publishWorkflowButton_);
 
     auto *editButtons = new QHBoxLayout();
     undoButton_ = new QPushButton(QStringLiteral("撤销"), left);
@@ -771,6 +788,7 @@ QJsonObject GeometryRulesPage::canvasShapeForRule(const QJsonObject &rule) const
 void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     const QString nextWorkpieceId = snapshot.value(QStringLiteral("workpiece_id")).toString();
     Q_UNUSED(nextWorkpieceId);
+    invalidatePublishContinuation();
     lastRulePreview_ = QJsonObject();
     lastPreviewRuleSignature_ = QJsonObject();
     lastPreviewWorkpieceId_.clear();
@@ -784,7 +802,6 @@ void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     snapshot_ = snapshot;
     restoreSnapshotDraft();
     job_ = QJsonObject();
-    warningContinuationAvailable_ = false;
     editorDirection_.clear();
     setDirty(false);
     undoHistory_.clear();
@@ -860,6 +877,21 @@ void GeometryRulesPage::restoreSnapshotDraft() {
 
 void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
     if (dirty_) return;
+    const bool sameCompletedContinuation = warningContinuationAvailable_
+        && job_.value(QStringLiteral("state")).toString() == QStringLiteral("completed")
+        && job.value(QStringLiteral("state")).toString() == QStringLiteral("completed")
+        && !job.value(QStringLiteral("job_id")).toString().isEmpty()
+        && job_.value(QStringLiteral("job_id")).toString()
+            == job.value(QStringLiteral("job_id")).toString()
+        && job_.value(QStringLiteral("base_library_revision")).toInt(-1)
+            == job.value(QStringLiteral("base_library_revision")).toInt(-1)
+        && job_.value(QStringLiteral("base_draft_revision")).toInt(-1)
+            == job.value(QStringLiteral("base_draft_revision")).toInt(-1)
+        && job.value(QStringLiteral("base_library_revision")).toInt(-1)
+            == snapshot_.value(QStringLiteral("library_revision")).toInt()
+        && job.value(QStringLiteral("base_draft_revision")).toInt(-1)
+            == snapshot_.value(QStringLiteral("draft_revision")).toInt();
+    if (!sameCompletedContinuation) invalidatePublishContinuation();
     job_ = job;
     warningContinuationAvailable_ = !job.value(QStringLiteral("job_id")).toString().isEmpty()
         && job.value(QStringLiteral("state")).toString() == QStringLiteral("completed")
@@ -901,7 +933,8 @@ void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
                          change.value(QStringLiteral("candidate_decision_source")).toString()));
             }
         } else {
-            validationLines.append(QStringLiteral("发布阻断：%1").arg(code));
+            validationLines.append(QStringLiteral("发布阻断：%1")
+                .arg(validationReasonText(code)));
         }
     }
     if (validationLines.isEmpty()) validationLines.append(QStringLiteral("暂无告警"));
@@ -930,13 +963,15 @@ void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
     }
 
     const auto issueDirection = [](const QJsonObject &issue) {
-        const QString direct = issue.value(QStringLiteral("direction")).toString();
-        if (!direct.isEmpty()) return direct;
-        const QString orientation = issue.value(QStringLiteral("orientation")).toString();
-        if (!orientation.isEmpty()) return orientation;
-        const QString expected = issue.value(QStringLiteral("expected")).toString();
-        return expected == QStringLiteral("front") || expected == QStringLiteral("back")
-            ? expected : QString();
+        for (const QString &key : {QStringLiteral("direction"),
+                                   QStringLiteral("orientation"),
+                                   QStringLiteral("expected")}) {
+            const QString value = issue.value(key).toString();
+            if (value == QStringLiteral("front") || value == QStringLiteral("back")) {
+                return value;
+            }
+        }
+        return QString();
     };
     const auto templateIdAt = [this](const QString &side, int index) {
         if (side.isEmpty() || index < 0) return QString();
@@ -957,6 +992,17 @@ void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
             return QString();
         }
         return templateIdAt(issueDirection(issue), issue.value(QStringLiteral("index")).toInt(-1));
+    };
+    const auto templateDirection = [this](const QString &templateId) {
+        if (templateId.isEmpty()) return QString();
+        for (const QJsonValue &value : snapshot_.value(QStringLiteral("templates")).toArray()) {
+            const QJsonObject item = value.toObject();
+            if (item.value(QStringLiteral("template_id")).toString() != templateId) continue;
+            const QString side = item.value(QStringLiteral("direction")).toString();
+            return side == QStringLiteral("front") || side == QStringLiteral("back")
+                ? side : QString();
+        }
+        return QString();
     };
     QSet<QString> insertedIssues;
     const auto appendIssue = [this, &insertedIssues](const QString &side,
@@ -1036,21 +1082,46 @@ void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
             }
         }
     }
-    const auto appendStandaloneIssue = [&appendIssue, &issueDirection, &issueTemplateId](
+    const auto appendStandaloneIssue = [&appendIssue, &issueDirection, &issueTemplateId,
+                                        &templateDirection](
                                            const QJsonObject &issue, bool blocked) {
         const QString code = issue.value(QStringLiteral("code")).toString();
-        const QString side = issueDirection(issue);
         const QString templateId = issueTemplateId(issue);
+        QString side = issueDirection(issue);
+        if (side.isEmpty()) side = templateDirection(templateId);
         const QString ruleId = issue.value(QStringLiteral("rule_id")).toString();
-        appendIssue(side, templateId, ruleId, QStringLiteral("issue"), code,
+        appendIssue(side, templateId, ruleId,
+                    blocked ? QStringLiteral("blocking_issue") : QStringLiteral("warning"), code,
                     blocked, code == QStringLiteral("geometry_fusion_regression"));
     };
-    for (const QJsonValue &value : warnings) appendStandaloneIssue(value.toObject(), false);
+    const auto appendStandaloneTemplates = [&appendStandaloneIssue, &issueDirection,
+                                            &templateDirection](const QJsonObject &issue,
+                                                                bool blocked) {
+        bool appended = false;
+        for (const QJsonValue &templateValue : issue.value(QStringLiteral("templates")).toArray()) {
+            if (!templateValue.isString()) continue;
+            const QString templateId = templateValue.toString();
+            if (templateId.isEmpty()) continue;
+            QJsonObject templateIssue = issue;
+            templateIssue.remove(QStringLiteral("templates"));
+            templateIssue.insert(QStringLiteral("template_id"), templateId);
+            if (issueDirection(templateIssue).isEmpty()) {
+                const QString side = templateDirection(templateId);
+                if (!side.isEmpty()) templateIssue.insert(QStringLiteral("direction"), side);
+            }
+            appendStandaloneIssue(templateIssue, blocked);
+            appended = true;
+        }
+        if (!appended) appendStandaloneIssue(issue, blocked);
+    };
+    for (const QJsonValue &value : warnings) {
+        appendStandaloneTemplates(value.toObject(), false);
+    }
     for (const QJsonValue &value : blocking) {
         const QJsonObject issue = value.toObject();
         const QJsonArray changed = issue.value(QStringLiteral("changed_predictions")).toArray();
         if (changed.isEmpty()) {
-            appendStandaloneIssue(issue, true);
+            appendStandaloneTemplates(issue, true);
             continue;
         }
         for (const QJsonValue &changeValue : changed) {
@@ -1178,9 +1249,9 @@ void GeometryRulesPage::setDirty(bool dirty) {
 }
 
 void GeometryRulesPage::markDraftDirty() {
+    invalidatePublishContinuation();
     if (!dirty_) {
         job_ = QJsonObject();
-        warningContinuationAvailable_ = false;
         if (validationTable_ != nullptr) validationTable_->setRowCount(0);
         if (progressBar_ != nullptr) {
             progressBar_->setRange(0, 1);
@@ -1821,6 +1892,7 @@ void GeometryRulesPage::discardUnsavedChanges() {
 
 void GeometryRulesPage::validateDraft() {
     if (!backendAvailable_ || busy_) return;
+    invalidatePublishContinuation();
     setCurrentRuleFromEditor();
     emit validateRequested(snapshot_.value(QStringLiteral("library_revision")).toInt(),
                           snapshot_.value(QStringLiteral("draft_revision")).toInt());
@@ -1835,8 +1907,17 @@ void GeometryRulesPage::publishDraft() {
 }
 
 void GeometryRulesPage::clearPublishContinuation() {
-    warningContinuationAvailable_ = false;
+    invalidatePublishContinuation();
     updatePublishState();
+}
+
+void GeometryRulesPage::invalidatePublishContinuation(bool clearReason) {
+    warningContinuationAvailable_ = false;
+    if (clearReason && overrideReasonEdit_ != nullptr
+        && !overrideReasonEdit_->text().isEmpty()) {
+        const QSignalBlocker blocker(overrideReasonEdit_);
+        overrideReasonEdit_->clear();
+    }
 }
 
 void GeometryRulesPage::publishWorkflow() {
@@ -1863,6 +1944,7 @@ void GeometryRulesPage::publishWorkflow() {
                               snapshot_.value(QStringLiteral("draft_revision")).toInt(), reason);
         return;
     }
+    invalidatePublishContinuation();
     setCurrentRuleFromEditor();
     const QJsonArray conflicts = draft_.value(QStringLiteral("migration")).toObject()
                                      .value(QStringLiteral("conflicts")).toArray();
@@ -1884,7 +1966,7 @@ void GeometryRulesPage::publishWorkflow() {
     emit publishWorkflowRequested(draft_,
                                   snapshot_.value(QStringLiteral("library_revision")).toInt(),
                                   snapshot_.value(QStringLiteral("draft_revision")).toInt(),
-                                  overrideReasonEdit_->text().trimmed());
+                                  QString());
 }
 
 void GeometryRulesPage::rollbackDraft() {
@@ -2021,7 +2103,7 @@ void GeometryRulesPage::reloadDraft() {
     redoHistory_.clear();
     setDirty(false);
     job_ = QJsonObject();
-    warningContinuationAvailable_ = false;
+    invalidatePublishContinuation();
     if (validationTable_ != nullptr) validationTable_->setRowCount(0);
     if (progressBar_ != nullptr) {
         progressBar_->setRange(0, 1);

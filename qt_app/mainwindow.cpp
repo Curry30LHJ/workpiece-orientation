@@ -268,7 +268,8 @@ bool MainWindow::beginPendingGeometryNavigation(PendingNavigationKind kind,
                                                 const QString &workpieceId) {
     if (pendingNavigationKind_ != PendingNavigationKind::None
         || geometryRulesPage_ == nullptr || client_ == nullptr || !backendReady_
-        || !pendingCommand_.isEmpty()) {
+        || (client_->state() != BackendClient::State::Ready
+            && client_->state() != BackendClient::State::Busy)) {
         if (geometryRulesPage_ != nullptr) {
             geometryRulesPage_->setOperationError(
                 QStringLiteral("当前无法保存草稿，请检查后端连接后重试"));
@@ -278,31 +279,33 @@ bool MainWindow::beginPendingGeometryNavigation(PendingNavigationKind kind,
     pendingNavigationKind_ = kind;
     pendingNavigationPage_ = page;
     pendingNavigationWorkpieceId_ = workpieceId;
-    if (client_->state() != BackendClient::State::Ready) return true;
-    return tryStartPendingGeometrySave();
+    setGeometryOperationEditingLocked(true);
+    geometryRulesPage_->setEnabled(false);
+    if (tryStartPendingGeometrySave()) return true;
+    cancelPendingGeometryNavigation();
+    setGeometryOperationEditingLocked(false);
+    return false;
 }
 
 bool MainWindow::tryStartPendingGeometrySave() {
     if (pendingNavigationKind_ == PendingNavigationKind::None) return false;
+    if (stagedGeometrySaveIntent_ == GeometrySaveIntent::Navigation) {
+        dispatchStagedGeometryDraftSave();
+        return true;
+    }
     if (geometrySaveIntent_ == GeometrySaveIntent::Navigation
         && pendingCommand_ == QStringLiteral("save_geometry_mask_draft")) {
         return true;
     }
     if (geometryRulesPage_ == nullptr || client_ == nullptr || !backendReady_
-        || clientBusy_ || !pendingCommand_.isEmpty()
-        || client_->state() != BackendClient::State::Ready) {
+        || (client_->state() != BackendClient::State::Ready
+            && client_->state() != BackendClient::State::Busy)) {
         return false;
     }
-    geometrySaveIntent_ = GeometrySaveIntent::Navigation;
     geometryRulesPage_->requestSaveDraft();
-    if (geometrySaveIntent_ != GeometrySaveIntent::Navigation
-        || pendingCommand_ != QStringLiteral("save_geometry_mask_draft")) {
-        cancelPendingGeometryNavigation();
-        return false;
-    }
-    setGeometryOperationEditingLocked(true);
-    geometryRulesPage_->setEnabled(false);
-    return true;
+    return stagedGeometrySaveIntent_ == GeometrySaveIntent::Navigation
+        || (geometrySaveIntent_ == GeometrySaveIntent::Navigation
+            && pendingCommand_ == QStringLiteral("save_geometry_mask_draft"));
 }
 
 void MainWindow::cancelPendingGeometryNavigation() {
@@ -312,6 +315,9 @@ void MainWindow::cancelPendingGeometryNavigation() {
     pendingNavigationWorkpieceListResponse_ = QJsonObject();
     pendingNavigationRefreshTransactionId_ = 0;
     pendingNavigationResponseIncludedMandatory_ = false;
+    if (stagedGeometrySaveIntent_ == GeometrySaveIntent::Navigation) {
+        clearStagedGeometryDraftSave();
+    }
     if (geometrySaveIntent_ == GeometrySaveIntent::Navigation) {
         geometrySaveIntent_ = GeometrySaveIntent::None;
     }
@@ -329,6 +335,10 @@ void MainWindow::completePendingGeometryNavigation() {
 
     if (kind == PendingNavigationKind::Page) {
         setCurrentPageUnchecked(page);
+        if (!listResponse.isEmpty()) {
+            applyWorkpieceListResponse(listResponse, refreshTransactionId,
+                                       includedMandatory);
+        }
         if (page == AppPage::GeometryRules) ensureGeometryProfileForCurrentWorkpiece();
     } else if (kind == PendingNavigationKind::Workpiece) {
         if (!listResponse.isEmpty()) {
@@ -1005,40 +1015,82 @@ void MainWindow::requestGeometryProfile(const QString &workpieceId) {
 }
 
 void MainWindow::saveGeometryDraft(const QJsonObject &draft, int libraryRevision, int draftRevision) {
-    const GeometrySaveIntent intent = geometrySaveIntent_ == GeometrySaveIntent::Navigation
+    const GeometrySaveIntent intent = pendingNavigationKind_ != PendingNavigationKind::None
         ? GeometrySaveIntent::Navigation : GeometrySaveIntent::Normal;
     startGeometryDraftSave(draft, libraryRevision, draftRevision, intent);
 }
 
 bool MainWindow::startGeometryDraftSave(const QJsonObject &draft, int libraryRevision,
                                         int draftRevision, GeometrySaveIntent intent) {
-    if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
-        || !pendingCommand_.isEmpty()
-        || client_->state() != BackendClient::State::Ready) return false;
-    geometrySaveIntent_ = intent;
-    if (geometryRulesPage_ != nullptr) {
-        setGeometryOperationEditingLocked(true);
-        geometryRulesPage_->setBusy(true);
+    const QString workpieceId = intent == GeometrySaveIntent::PublishWorkflow
+        ? geometryWorkflowWorkpieceId_ : geometryWorkpieceId_;
+    if (workpieceId.isEmpty() || client_ == nullptr || !backendReady_
+        || stagedGeometrySaveIntent_ != GeometrySaveIntent::None
+        || geometrySaveIntent_ != GeometrySaveIntent::None
+        || (client_->state() != BackendClient::State::Ready
+            && client_->state() != BackendClient::State::Busy)) {
+        return false;
     }
-    sendPageCommand(CommandOwner::Geometry, QStringLiteral("save_geometry_mask_draft"), {
-        {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
-        {QStringLiteral("base_library_revision"), libraryRevision},
-        {QStringLiteral("base_draft_revision"), draftRevision},
-        {QStringLiteral("draft"), draft},
-        {QStringLiteral("operation_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
-    });
+    stagedGeometrySaveIntent_ = intent;
+    stagedGeometrySaveWorkpieceId_ = workpieceId;
+    stagedGeometrySaveDraft_ = draft;
+    stagedGeometrySaveLibraryRevision_ = libraryRevision;
+    stagedGeometrySaveDraftRevision_ = draftRevision;
+    setGeometryOperationEditingLocked(true);
+    dispatchStagedGeometryDraftSave();
     return true;
+}
+
+bool MainWindow::dispatchStagedGeometryDraftSave() {
+    if (stagedGeometrySaveIntent_ == GeometrySaveIntent::None
+        || client_ == nullptr || clientBusy_ || !pendingCommand_.isEmpty()
+        || client_->state() != BackendClient::State::Ready) {
+        return false;
+    }
+    const GeometrySaveIntent intent = stagedGeometrySaveIntent_;
+    const QJsonObject fields{
+        {QStringLiteral("workpiece_id"), stagedGeometrySaveWorkpieceId_},
+        {QStringLiteral("base_library_revision"), stagedGeometrySaveLibraryRevision_},
+        {QStringLiteral("base_draft_revision"), stagedGeometrySaveDraftRevision_},
+        {QStringLiteral("draft"), stagedGeometrySaveDraft_},
+        {QStringLiteral("operation_id"),
+         QUuid::createUuid().toString(QUuid::WithoutBraces)},
+    };
+    geometrySaveIntent_ = intent;
+    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(true);
+    issuePageCommand({CommandOwner::Geometry,
+                      QStringLiteral("save_geometry_mask_draft"), fields});
+    if (pendingCommand_ != QStringLiteral("save_geometry_mask_draft")) {
+        geometrySaveIntent_ = GeometrySaveIntent::None;
+        if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(false);
+        return false;
+    }
+    clearStagedGeometryDraftSave();
+    return true;
+}
+
+void MainWindow::clearStagedGeometryDraftSave() {
+    stagedGeometrySaveIntent_ = GeometrySaveIntent::None;
+    stagedGeometrySaveWorkpieceId_.clear();
+    stagedGeometrySaveDraft_ = QJsonObject();
+    stagedGeometrySaveLibraryRevision_ = -1;
+    stagedGeometrySaveDraftRevision_ = -1;
 }
 
 void MainWindow::publishGeometryWorkflow(const QJsonObject &draft, int libraryRevision, int draftRevision,
                                          const QString &overrideReason) {
-    if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
-        || client_->state() != BackendClient::State::Ready) return;
+    Q_UNUSED(overrideReason);
+    if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || !backendReady_
+        || !geometryWorkflowWorkpieceId_.isEmpty()
+        || stagedGeometrySaveIntent_ != GeometrySaveIntent::None
+        || (client_->state() != BackendClient::State::Ready
+            && client_->state() != BackendClient::State::Busy)) return;
     geometryWorkflowWorkpieceId_ = geometryWorkpieceId_;
     geometryWorkflowLibraryRevision_ = libraryRevision;
     geometryWorkflowDraftRevision_ = draftRevision;
     geometryWorkflowJobId_.clear();
-    geometryPublishOverrideReason_ = overrideReason.trimmed();
+    geometryPublishAfterValidation_ = false;
+    geometryPublishOverrideReason_.clear();
     if (!startGeometryDraftSave(draft, libraryRevision, draftRevision,
                                 GeometrySaveIntent::PublishWorkflow)) {
         geometryPublishOverrideReason_.clear();
@@ -1051,7 +1103,10 @@ void MainWindow::validateGeometryDraft(int libraryRevision, int draftRevision) {
         || client_->state() != BackendClient::State::Ready) return;
     bindGeometryValidationContext(geometryWorkpieceId_, libraryRevision,
                                   draftRevision);
-    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(true);
+    if (geometryRulesPage_ != nullptr) {
+        geometryRulesPage_->clearPublishContinuation();
+        geometryRulesPage_->setBusy(true);
+    }
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("validate_geometry_mask_draft"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("base_library_revision"), libraryRevision},
@@ -1554,6 +1609,7 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     }
     cancelPendingGeometryNavigation();
     geometrySaveIntent_ = GeometrySaveIntent::None;
+    clearStagedGeometryDraftSave();
     geometryWorkflowContinuationCommand_.clear();
     geometryWorkflowContinuationFields_ = QJsonObject();
     setGeometryProfileLoadGeneration(0);
@@ -1666,6 +1722,10 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
     workpieceLibraryPage_->setBackendState(details.state, detail);
     updateButtonStates();
     if (state == BackendClient::State::Ready
+        && dispatchStagedGeometryDraftSave()) {
+        return;
+    }
+    if (state == BackendClient::State::Ready
         && dispatchGeometryWorkflowContinuation()) {
         return;
     }
@@ -1704,6 +1764,13 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("list_workpieces")) {
+        if (pendingNavigationKind_ != PendingNavigationKind::None) {
+            pendingNavigationWorkpieceListResponse_ = response;
+            pendingNavigationRefreshTransactionId_ = responseRefreshTransactionId;
+            pendingNavigationResponseIncludedMandatory_ =
+                responseIncludedMandatoryRefresh;
+            return;
+        }
         applyWorkpieceListResponse(response, responseRefreshTransactionId,
                                    responseIncludedMandatoryRefresh);
         return;

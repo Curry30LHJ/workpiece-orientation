@@ -949,9 +949,9 @@ private slots:
         MainWindow window(&client, nullptr);
         auto *page = window.findChild<GeometryRulesPage *>(
             QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
         auto *stack = window.findChild<QStackedWidget *>(
             QStringLiteral("mainPageStack"));
-        QVERIFY(page != nullptr);
         QVERIFY(stack != nullptr);
         page->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
         QVERIFY(window.requestPage(AppPage::GeometryRules));
@@ -1117,6 +1117,62 @@ private slots:
                     ->text().contains(QStringLiteral("synthetic save failure")));
     }
 
+    void dirtyNavigationSaveWaitsForAnInFlightBackendCommand() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        auto *workpieces = window.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(page != nullptr);
+        QVERIFY(stack != nullptr);
+        QVERIFY(workpieces != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        QVERIFY(page->hasUnsavedChanges());
+
+        server.holdWorkpieceRefresh();
+        server.holdGeometrySave();
+        server.setWorkpieces(QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                        {QStringLiteral("name"), QStringLiteral("M2")}}});
+        const int refreshCount = server.listWorkpieceCount();
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), refreshCount + 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Busy, 1000);
+
+        chooseDirtyNavigationOption(QStringLiteral("保存并继续"));
+        QVERIFY(!window.requestPage(AppPage::Inspection));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(!shape->isEnabled());
+        QVERIFY(!window.requestPage(AppPage::WorkpieceLibrary));
+
+        QVERIFY(server.replyWorkpieceRefresh());
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands(),
+                                  QStringList({QStringLiteral("save_geometry_mask_draft")}),
+                                  1000);
+        QCOMPARE(server.workflowWorkpieceIds().first(), QStringLiteral("m1"));
+        QCOMPARE(workpieces->currentData().toString(), QStringLiteral("m1"));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(server.replyGeometrySaveSuccess());
+        QTRY_COMPARE_WITH_TIMEOUT(stack->currentIndex(),
+                                  static_cast<int>(AppPage::Inspection), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(workpieces->currentData().toString(),
+                                  QStringLiteral("m2"), 1000);
+        QVERIFY(!page->hasUnsavedChanges());
+    }
+
     void listRefreshSaveStagesFullResponseUntilSuccess() {
         GeometryWorkflowServer server;
         QVERIFY(server.listen());
@@ -1275,6 +1331,9 @@ private slots:
 
         primary->click();
         QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(page->findChild<QLabel *>(
+            QStringLiteral("publishDisabledReasonLabel"))->text().contains(
+                QStringLiteral("发布覆盖原因")), 1000);
         reason->setText(QStringLiteral("已人工复核告警"));
         QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
 
@@ -1317,6 +1376,9 @@ private slots:
 
         primary->click();
         QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(page->findChild<QLabel *>(
+            QStringLiteral("publishDisabledReasonLabel"))->text().contains(
+                QStringLiteral("发布覆盖原因")), 1000);
         reason->setText(QStringLiteral("已人工复核告警"));
         QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
         server.holdWorkpieceRefresh();
@@ -1331,6 +1393,46 @@ private slots:
         QVERIFY(server.replyWorkpieceRefresh());
 
         QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 1500);
+        QCOMPARE(server.workflowCommands(), QStringList({
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft"),
+            QStringLiteral("publish_geometry_mask_profile")}));
+    }
+
+    void firstPublishWorkflowWaitsForAnInFlightBackendCommand() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        auto *primary = page->findChild<QPushButton *>(
+            QStringLiteral("publishWorkflowButton"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(primary != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        server.holdWorkpieceRefresh();
+        const int refreshCount = server.listWorkpieceCount();
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), refreshCount + 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Busy, 1000);
+
+        QVERIFY(primary->isEnabled());
+        primary->click();
+        QCOMPARE(server.workflowCommands().size(), 0);
+        QVERIFY(!shape->isEnabled());
+        primary->click();
+
+        QVERIFY(server.replyWorkpieceRefresh());
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 2000);
         QCOMPARE(server.workflowCommands(), QStringList({
             QStringLiteral("save_geometry_mask_draft"),
             QStringLiteral("validate_geometry_mask_draft"),
@@ -4107,6 +4209,9 @@ private slots:
         QVERIFY(!shape->isEnabled());
         QVERIFY(reason->isEnabled());
 
+        QTRY_VERIFY_WITH_TIMEOUT(page->findChild<QLabel *>(
+            QStringLiteral("publishDisabledReasonLabel"))->text().contains(
+                QStringLiteral("发布覆盖原因")), 1000);
         reason->setText(QStringLiteral("已人工复核告警"));
         QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
         primary->click();
@@ -4118,7 +4223,53 @@ private slots:
             QStringLiteral("publish_geometry_mask_profile")}));
     }
 
-    void failedWarningPublishClearsTheContinuation() {
+    void publishedWarningReasonDoesNotAuthorizeTheNextWarning() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setValidationWarnings(QJsonArray{
+            QJsonObject{{QStringLiteral("code"), QStringLiteral("effective_area_low")}}});
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *primary = window.findChild<QPushButton *>(
+            QStringLiteral("publishWorkflowButton"));
+        auto *reason = window.findChild<QLineEdit *>(QStringLiteral("overrideReasonEdit"));
+        QVERIFY(page != nullptr);
+        QVERIFY(primary != nullptr);
+        QVERIFY(reason != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(page->findChild<QLabel *>(
+            QStringLiteral("publishDisabledReasonLabel"))->text().contains(
+                QStringLiteral("发布覆盖原因")), 1000);
+        reason->setText(QStringLiteral("仅复核第一次告警"));
+        QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Ready, 1000);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 5, 1000);
+        QTest::qWait(100);
+
+        QCOMPARE(server.workflowCommands(), QStringList({
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft"),
+            QStringLiteral("publish_geometry_mask_profile"),
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft")}));
+        QVERIFY(reason->text().isEmpty());
+        QVERIFY(!primary->isEnabled());
+    }
+
+    void failedWarningPublishRequiresFreshReasonForTheNextWarning() {
         GeometryWorkflowServer server;
         QVERIFY(server.listen());
         server.setValidationWarnings(QJsonArray{
@@ -4142,6 +4293,9 @@ private slots:
 
         primary->click();
         QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(page->findChild<QLabel *>(
+            QStringLiteral("publishDisabledReasonLabel"))->text().contains(
+                QStringLiteral("发布覆盖原因")), 1000);
         reason->setText(QStringLiteral("已人工复核告警"));
         QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
         primary->click();
@@ -4150,6 +4304,12 @@ private slots:
             QStringLiteral("geometryStatusLabel"))->text().contains(
                 QStringLiteral("synthetic publish failure")), 1000);
 
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 5, 1000);
+        QVERIFY(reason->text().isEmpty());
+        QVERIFY(!primary->isEnabled());
+        reason->setText(QStringLiteral("第二次告警已重新人工复核"));
+        QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
         primary->click();
         QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 6, 1000);
         QCOMPARE(server.workflowCommands().mid(3), QStringList({

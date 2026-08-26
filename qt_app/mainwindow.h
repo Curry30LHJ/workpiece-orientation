@@ -150,6 +150,8 @@ private:
     void requestGeometryProfile(const QString &workpieceId);
     bool startGeometryDraftSave(const QJsonObject &draft, int libraryRevision,
                                 int draftRevision, GeometrySaveIntent intent);
+    bool dispatchStagedGeometryDraftSave();
+    void clearStagedGeometryDraftSave();
     bool maybeContinueGeometryPublish(const QJsonObject &job);
     void applyGeometryValidationJob(const QJsonObject &job);
     void bindGeometryValidationContext(const QString &workpieceId,
@@ -259,6 +261,11 @@ private:
     bool pendingNavigationResponseIncludedMandatory_ = false;
     bool bypassCloseGuard_ = false;
     GeometrySaveIntent geometrySaveIntent_ = GeometrySaveIntent::None;
+    GeometrySaveIntent stagedGeometrySaveIntent_ = GeometrySaveIntent::None;
+    QString stagedGeometrySaveWorkpieceId_;
+    QJsonObject stagedGeometrySaveDraft_;
+    int stagedGeometrySaveLibraryRevision_ = -1;
+    int stagedGeometrySaveDraftRevision_ = -1;
     bool geometryPublishAfterValidation_ = false;
     QString geometryPublishOverrideReason_;
     QString geometryWorkflowWorkpieceId_;
