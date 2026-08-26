@@ -3,7 +3,9 @@
 ## 交付范围
 
 - 基线：`219b4152c4812589f2d26e7c4361260e1325ce2f`
-- 交付范围：`219b4152..HEAD`（包含本报告的 Task 11 提交）
+- 交付范围：`219b4152..HEAD`
+- 生产代码与 benchmark 对应提交：`ba09e4e7a85bf6d45ddb4f9d35877b01fab2c850`（benchmark 启动时工作树为 clean）
+- 最终证据提交：`HEAD`（本报告所在提交；只增加/更新验证报告、benchmark 结果和固定截图，不再修改生产代码）
 - Qt：5.14.2 Widgets / MSVC x64
 - Python：3.10.20（`shitu` 环境）
 - 后端识别模型、PP-ShiTu、ALIKED、LightGlue、融合阈值及协议均未修改。
@@ -38,6 +40,8 @@
 - `qt_app/tests/test_workpiecelibrarypage.cpp`, `qt_app/tests/test_workpiecelibrarypage.pro`
 - `qt_app/tests/test_geometryrulespage.cpp`, `qt_app/tests/test_geometryrulespage.pro`
 - `qt_app/tests/test_mainwindow.cpp`, `qt_app/tests/test_mainwindow.pro`
+- `scripts/benchmark_adaptive_local_search.py`
+- `tests/test_benchmark_adaptive_local_search.py`
 - `docs/verification/qt-ui-redesign-benchmark.json`
 - `docs/verification/qt-ui-redesign-benchmark.md`
 - `docs/verification/screenshots/qt-ui-inspection.png`
@@ -48,9 +52,9 @@
 
 ## TDD 结果
 
-RED 阶段覆盖了：缺失语义图标、空警告文本、不可见模式切换、运行批量时仍可切换、长路径丢失、主按钮重复、焦点顺序、35+35 模板布局、几何页 splitter/高级区、旧标注入口、窗口最小尺寸、关闭确认以及 dirty-save-active 连续保护。最终截图又复现了两个视图缺陷：模式栏占用过多纵向空间，以及图片在首次布局后只显示为约 25×25 像素。
+RED 阶段覆盖了：缺失语义图标、空警告文本、不可见模式切换、运行批量时仍可切换、长路径丢失、主按钮重复、焦点顺序、35+35 模板布局、几何页 splitter/高级区、旧标注入口、窗口最小尺寸、关闭确认以及 dirty-save-active 连续保护。最终截图又复现了模式栏占用过多纵向空间和图片首次布局后仅约 25×25 像素；独立复审进一步复现了反面预测后键盘焦点仍按正面顺序、DPI 截图误用固定逻辑尺寸，以及 125%/150% 下三个真实水平滚动问题。
 
-GREEN 阶段增加了条件驱动的回归断言，并修复上述行为。主窗口全套测试发现的两处既有异步测试竞态也改为等待真实页面完成条件，不使用固定延时掩盖结果；连续两轮主窗口全量均通过。
+GREEN 阶段增加了条件驱动的回归断言，并修复上述行为：预测按钮后的 Tab 顺序随正反面视觉顺序同步；截图客户区按 DPR 反算；每张图均断言物理 1920×1080、主操作完整位于窗口内且页面无水平滚动条；benchmark 报告写入精确可复制命令。主窗口全套测试发现的两处既有异步测试竞态也改为等待真实页面完成条件，不使用固定延时掩盖结果。
 
 ## Qt 测试
 
@@ -65,12 +69,12 @@ GREEN 阶段增加了条件驱动的回归断言，并修复上述行为。主�
 | `test_backendprocessmanager` | 11 | 0 |
 | `test_annotationmanager` | 10 | 0 |
 | `test_appfoundation` | 15 | 0 |
-| `test_inspectionpage` | 30 | 0 |
+| `test_inspectionpage` | 31 | 0 |
 | `test_workpiecelibrarypage` | 24 | 0 |
 | `test_geometryrulecanvas` | 18 | 0 |
 | `test_geometryrulespage` | 78 | 0 |
 | `test_mainwindow` | 110 | 0 |
-| **合计** | **318** | **0** |
+| **合计** | **319** | **0** |
 
 `test_mainwindow` 在最终修正后额外连续运行两轮，均为 `110 passed, 0 failed`。
 
@@ -82,7 +86,7 @@ GREEN 阶段增加了条件驱动的回归断言，并修复上述行为。主�
 E:\python\anaconda3\envs\shitu\python.exe -m pytest tests -m "not integration" -q -p no:cacheprovider --basetemp="$env:TEMP\pytest-ui-redesign"
 ```
 
-结果：`374 passed, 3 deselected in 53.36s`。临时目录位于系统 `%TEMP%`，仓库内未生成 pytest 缓存或 basetemp。
+结果：`375 passed, 3 deselected in 14.78s`。临时目录位于系统 `%TEMP%`，仓库内未生成 pytest 缓存或 basetemp。
 
 ## Release 构建
 
@@ -92,7 +96,7 @@ E:\python\anaconda3\envs\shitu\python.exe -m pytest tests -m "not integration" -
 
 ## 固定截图与 DPI 矩阵
 
-截图由 `test_mainwindow::captureFixedUiEvidenceWhenRequested` 通过 `QT_UI_CAPTURE_DIR` 可复现生成。测试显式应用生产 `AppTheme`，使用 Windows 平台插件、无边框固定客户区，并断言逻辑客户区为 1920×1080；100% 时额外直接断言 `QImage::size()` 为 1920×1080。
+截图由 `test_mainwindow::captureFixedUiEvidenceWhenRequested` 通过 `QT_UI_CAPTURE_DIR` 可复现生成。测试显式应用生产 `AppTheme`，使用 Windows 平台插件、无边框客户区，并固定目标物理屏为 1920×1080；逻辑客户区由 `devicePixelRatio` 反算。三档均直接断言 `QImage::size()` 为 1920×1080，同时断言当前页主操作完整可见且所有可见滚动区域没有水平滚动条。
 
 - [检测工作台](screenshots/qt-ui-inspection.png) — 1920×1080
 - [工件库](screenshots/qt-ui-library.png) — 1920×1080
@@ -101,8 +105,8 @@ E:\python\anaconda3\envs\shitu\python.exe -m pytest tests -m "not integration" -
 | `QT_SCALE_FACTOR` | 进程 | 每页物理 PNG | 逻辑客户区 | 视觉结果 |
 | ---: | --- | --- | --- | --- |
 | 1.00 | 独立 Windows 进程 | 1920×1080 | 1920×1080 | 通过；正式三张截图入库 |
-| 1.25 | 独立 Windows 进程 | 2400×1350 | 1920×1080 | 通过；无截断、重叠或异常空白 |
-| 1.50 | 独立 Windows 进程 | 2880×1620 | 1920×1080 | 通过；三页主操作与内容均可见 |
+| 1.25 | 独立 Windows 进程 | 1920×1080 | 1536×864 | 通过；三页主操作完整可见，无水平滚动或裁切 |
+| 1.50 | 独立 Windows 进程 | 1920×1080 | 1280×720 | 通过；三页主操作完整可见，无水平滚动或裁切 |
 
 人工查看三档截图确认：检测模式栏保持紧凑，主图首次显示和 resize 后合理填充视口；35+35 摘要不挤坏工件库；几何页中心画布获得主要空间，高级区域仍可滚动；生产 primary 蓝色、面板、间距和焦点样式已生效。
 
@@ -117,17 +121,16 @@ E:\python\anaconda3\envs\shitu\python.exe -m pytest tests -m "not integration" -
 | 几何正反面、拟合边界、验证/发布/回滚及高级区 | `test_geometryrulespage`、`test_mainwindow` geometry workflow 用例；几何页截图 | 通过 |
 | 断线/重连/loading/timeout/restart | BackendClient/ProcessManager/MainWindow 用例 | 通过 |
 | 长中文路径、不可读图片、缩略文字保留完整 tooltip | Inspection/Library/MainWindow 用例 | 通过 |
-| 键盘主流程与清晰焦点 | AppFoundation/Inspection/Library 焦点顺序用例 | 通过 |
+| 键盘主流程与清晰焦点；正反预测后焦点顺序与视觉顺序一致 | AppFoundation/Inspection/Library 焦点顺序用例 | 通过 |
 | dirty 草稿后保存仍继续检查真实活动任务；取消关闭保留状态 | `test_mainwindow` 四个关闭保护用例 | 通过 |
 
 ## 推理性能与语义门禁
 
-命令及完整结果见 [qt-ui-redesign-benchmark.md](qt-ui-redesign-benchmark.md)，机器可读结果见 [qt-ui-redesign-benchmark.json](qt-ui-redesign-benchmark.json)。
+精确可复制命令及完整结果见 [qt-ui-redesign-benchmark.md](qt-ui-redesign-benchmark.md)，机器可读结果见 [qt-ui-redesign-benchmark.json](qt-ui-redesign-benchmark.json)。报告记录的代码提交为 `ba09e4e7a85bf6d45ddb4f9d35877b01fab2c850`，工作树为 clean；因此结果可直接映射到本次生产代码。
 
 - M1/M2/M7 共 120 个查询，标签不一致 0，复检状态不一致 0。
 - 发布门禁：通过；正式默认模式仍为 `adaptive`。
-- 查询 wall time 自适应相对穷举加速 1.380×；含加载/建库/warmup 的总进程时长加速 1.722×。
-- 相对历史基线，自适应总进程时间由 77.59s 降为 71.58s。M1/M2 单次 P50/P95 有小幅运行波动，M7 P50/P95 下降；没有系统性后端耗时增加。
+- 查询 wall time 自适应相对穷举加速 1.318×；含加载、建库和 warmup 的总进程时长加速 1.240×（84.18s → 67.90s）。
 
 ## 已知限制
 
