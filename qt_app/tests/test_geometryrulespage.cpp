@@ -1,5 +1,6 @@
 #include <QtTest/QtTest>
 
+#include <QDialog>
 #include <QPushButton>
 #include <QComboBox>
 #include <QImage>
@@ -13,13 +14,18 @@
 #include <QTemporaryDir>
 #include <QTextEdit>
 
-#include "../geometrymaskmanager.h"
+#include "../geometryrulespage.h"
 #include "../geometryrulecanvas.h"
 
-class TestGeometryMaskManager : public QObject {
+QJsonObject profileSnapshot(int libraryRevision, int draftRevision, int activeRevision);
+
+class TestGeometryRulesPage : public QObject {
     Q_OBJECT
 
 private slots:
+    void pageIsAChildWidgetAndHasNoDialogCloseAction();
+    void dirtyStateEmitsOnlyOnChangeAndDiscardRestoresSnapshot();
+    void requestSaveDraftUsesExistingSavePath();
     void publishDisabledUntilCompletedValidationMatchesDraft();
     void draftEditInvalidatesVisibleValidationResult();
     void lateValidationUpdateStaysHiddenAfterDraftEdit();
@@ -47,6 +53,60 @@ private slots:
     void publishWorkflowNavigatesToMissingDirectionCalibration();
     void migrationConflictKeepOnlyEmitsExplicitResolution();
 };
+
+void TestGeometryRulesPage::pageIsAChildWidgetAndHasNoDialogCloseAction() {
+    QWidget host;
+    GeometryRulesPage page(&host);
+    QVERIFY(qobject_cast<QDialog *>(&page) == nullptr);
+    QVERIFY(!page.isWindow());
+    const auto buttons = page.findChildren<QPushButton *>();
+    for (QPushButton *button : buttons) {
+        QVERIFY2(button->text() != QStringLiteral("关闭"),
+                 "embedded page must not retain the dialog close button");
+    }
+}
+
+void TestGeometryRulesPage::dirtyStateEmitsOnlyOnChangeAndDiscardRestoresSnapshot() {
+    GeometryRulesPage page;
+    const QJsonObject saved = profileSnapshot(3, 4, 1);
+    QSignalSpy dirtySpy(&page, &GeometryRulesPage::unsavedChangesChanged);
+    QSignalSpy saveSpy(&page, &GeometryRulesPage::saveDraftRequested);
+    page.setSnapshot(saved);
+    QVERIFY(!page.hasUnsavedChanges());
+    QCOMPARE(dirtySpy.count(), 0);
+
+    page.findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+    QVERIFY(page.hasUnsavedChanges());
+    QCOMPARE(dirtySpy.count(), 1);
+    QCOMPARE(dirtySpy.at(0).at(0).toBool(), true);
+    page.findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+    QCOMPARE(dirtySpy.count(), 1);
+
+    page.discardUnsavedChanges();
+    QVERIFY(!page.hasUnsavedChanges());
+    QCOMPARE(page.draft(), saved.value(QStringLiteral("draft")).toObject());
+    QCOMPARE(dirtySpy.count(), 2);
+    QCOMPARE(dirtySpy.at(1).at(0).toBool(), false);
+    QCOMPARE(saveSpy.count(), 0);
+
+    page.discardUnsavedChanges();
+    QCOMPARE(dirtySpy.count(), 2);
+}
+
+void TestGeometryRulesPage::requestSaveDraftUsesExistingSavePath() {
+    GeometryRulesPage page;
+    page.setSnapshot(profileSnapshot(7, 8, 1));
+    page.findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+    QSignalSpy saveSpy(&page, &GeometryRulesPage::saveDraftRequested);
+
+    page.requestSaveDraft();
+
+    QCOMPARE(saveSpy.count(), 1);
+    const QList<QVariant> arguments = saveSpy.takeFirst();
+    QCOMPARE(arguments.at(0).toJsonObject(), page.draft());
+    QCOMPARE(arguments.at(1).toInt(), 7);
+    QCOMPARE(arguments.at(2).toInt(), 8);
+}
 
 QJsonObject profileSnapshot(int libraryRevision, int draftRevision, int activeRevision) {
     return QJsonObject{
@@ -168,8 +228,8 @@ QJsonObject configuredV2ProfileSnapshot(const QString &frontPath, const QString 
     return snapshot;
 }
 
-void TestGeometryMaskManager::publishDisabledUntilCompletedValidationMatchesDraft() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::publishDisabledUntilCompletedValidationMatchesDraft() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(4, 2, 1));
     QVERIFY(!dialog.findChild<QPushButton *>(QStringLiteral("publishButton"))->isEnabled());
     dialog.setValidationJob(QJsonObject{{"job_id", "job-1"}, {"state", "completed"},
@@ -178,8 +238,8 @@ void TestGeometryMaskManager::publishDisabledUntilCompletedValidationMatchesDraf
     QVERIFY(dialog.findChild<QPushButton *>(QStringLiteral("publishButton"))->isEnabled());
 }
 
-void TestGeometryMaskManager::draftEditInvalidatesVisibleValidationResult() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::draftEditInvalidatesVisibleValidationResult() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(4, 2, 1));
     const QJsonObject job{
         {QStringLiteral("job_id"), QStringLiteral("job-1")},
@@ -216,8 +276,8 @@ void TestGeometryMaskManager::draftEditInvalidatesVisibleValidationResult() {
     QVERIFY(!publish->isEnabled());
 }
 
-void TestGeometryMaskManager::lateValidationUpdateStaysHiddenAfterDraftEdit() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::lateValidationUpdateStaysHiddenAfterDraftEdit() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(4, 2, 1));
     const QJsonObject job{
         {QStringLiteral("job_id"), QStringLiteral("job-1")},
@@ -242,20 +302,20 @@ void TestGeometryMaskManager::lateValidationUpdateStaysHiddenAfterDraftEdit() {
     QVERIFY(validationHint->text().contains(QStringLiteral("旧验证结果已失效")));
 }
 
-void TestGeometryMaskManager::warningPublishRequiresOverrideReason() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::warningPublishRequiresOverrideReason() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(4, 2, 1));
     dialog.setValidationJob(QJsonObject{{"job_id", "job-1"}, {"state", "completed"},
                                         {"base_library_revision", 4}, {"base_draft_revision", 2},
                                         {"warnings", QJsonArray{QJsonObject{{"code", "effective_area_low"}}}},
                                         {"progress", QJsonObject{{"completed", 2}, {"total", 2}}}});
-    QSignalSpy spy(&dialog, &GeometryMaskManagerDialog::publishRequested);
+    QSignalSpy spy(&dialog, &GeometryRulesPage::publishRequested);
     dialog.findChild<QPushButton *>(QStringLiteral("publishButton"))->click();
     QCOMPARE(spy.count(), 0);
 }
 
-void TestGeometryMaskManager::warningPublishRequirementIsVisible() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::warningPublishRequirementIsVisible() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(4, 2, 1));
     dialog.setValidationJob(QJsonObject{{"job_id", "job-1"}, {"state", "completed"},
                                         {"base_library_revision", 4}, {"base_draft_revision", 2},
@@ -272,8 +332,8 @@ void TestGeometryMaskManager::warningPublishRequirementIsVisible() {
     QVERIFY(dialog.findChild<QPushButton *>(QStringLiteral("publishButton"))->isEnabled());
 }
 
-void TestGeometryMaskManager::saveAndDeleteRulesUpdateDraft() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::saveAndDeleteRulesUpdateDraft() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(1, 0, 0));
     auto *add = dialog.findChild<QPushButton *>(QStringLiteral("addRuleButton"));
     auto *remove = dialog.findChild<QPushButton *>(QStringLiteral("deleteRuleButton"));
@@ -287,7 +347,7 @@ void TestGeometryMaskManager::saveAndDeleteRulesUpdateDraft() {
                 .value("rules").toArray().isEmpty());
 }
 
-void TestGeometryMaskManager::templatePreviewLoadsRepresentativeImage() {
+void TestGeometryRulesPage::templatePreviewLoadsRepresentativeImage() {
     QTemporaryDir directory;
     const QString imagePath = directory.filePath(QStringLiteral("front.png"));
     QImage image(80, 60, QImage::Format_RGB32);
@@ -300,7 +360,7 @@ void TestGeometryMaskManager::templatePreviewLoadsRepresentativeImage() {
                     {QStringLiteral("path"), imagePath}}
     });
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
     auto *combo = dialog.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
     auto *canvas = dialog.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
@@ -310,7 +370,7 @@ void TestGeometryMaskManager::templatePreviewLoadsRepresentativeImage() {
     QCOMPARE(canvas->image().size(), QSize(80, 60));
 }
 
-void TestGeometryMaskManager::validationRowSelectsTemplateForReview() {
+void TestGeometryRulesPage::validationRowSelectsTemplateForReview() {
     QTemporaryDir directory;
     const QString firstPath = directory.filePath(QStringLiteral("front-00.png"));
     const QString secondPath = directory.filePath(QStringLiteral("front-01.png"));
@@ -329,7 +389,7 @@ void TestGeometryMaskManager::validationRowSelectsTemplateForReview() {
                     {QStringLiteral("path"), secondPath}}
     });
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
     dialog.setValidationJob(QJsonObject{
         {QStringLiteral("job_id"), QStringLiteral("job-1")},
@@ -360,13 +420,13 @@ void TestGeometryMaskManager::validationRowSelectsTemplateForReview() {
     QCOMPARE(templates->currentData(Qt::UserRole + 1).toString(), QStringLiteral("front:front-01.png"));
 }
 
-void TestGeometryMaskManager::publishWorkflowButtonEmitsDraft() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::publishWorkflowButtonEmitsDraft() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(4, 2, 0));
     auto *button = dialog.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
     QVERIFY(button != nullptr);
     QVERIFY(button->isEnabled());
-    QSignalSpy spy(&dialog, &GeometryMaskManagerDialog::publishWorkflowRequested);
+    QSignalSpy spy(&dialog, &GeometryRulesPage::publishWorkflowRequested);
     button->click();
     QCOMPARE(spy.count(), 1);
     const QList<QVariant> arguments = spy.takeFirst();
@@ -374,7 +434,7 @@ void TestGeometryMaskManager::publishWorkflowButtonEmitsDraft() {
     QCOMPARE(arguments.at(2).toInt(), 2);
 }
 
-void TestGeometryMaskManager::validationRowSelectsTemplateAcrossDirections() {
+void TestGeometryRulesPage::validationRowSelectsTemplateAcrossDirections() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -393,9 +453,9 @@ void TestGeometryMaskManager::validationRowSelectsTemplateAcrossDirections() {
                     {QStringLiteral("path"), backPath}}
     });
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
-    QSignalSpy previewSpy(&dialog, &GeometryMaskManagerDialog::previewRequested);
+    QSignalSpy previewSpy(&dialog, &GeometryRulesPage::previewRequested);
     dialog.setValidationJob(QJsonObject{
         {QStringLiteral("state"), QStringLiteral("completed")},
         {QStringLiteral("base_library_revision"), 4},
@@ -417,7 +477,7 @@ void TestGeometryMaskManager::validationRowSelectsTemplateAcrossDirections() {
     QCOMPARE(previewSpy.count(), 0);
 }
 
-void TestGeometryMaskManager::ruleInventoryDoesNotChangeAcrossValidationDirections() {
+void TestGeometryRulesPage::ruleInventoryDoesNotChangeAcrossValidationDirections() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -426,7 +486,7 @@ void TestGeometryMaskManager::ruleInventoryDoesNotChangeAcrossValidationDirectio
     QVERIFY(image.save(frontPath));
     QVERIFY(image.save(backPath));
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(configuredV2ProfileSnapshot(frontPath, backPath));
     dialog.setValidationJob(QJsonObject{
         {QStringLiteral("state"), QStringLiteral("completed")},
@@ -449,7 +509,7 @@ void TestGeometryMaskManager::ruleInventoryDoesNotChangeAcrossValidationDirectio
     QCOMPARE(rules->item(0)->data(Qt::UserRole).toString(), firstId);
 }
 
-void TestGeometryMaskManager::logicalRuleWithOnlyFrontCalibrationRemainsVisibleOnBack() {
+void TestGeometryRulesPage::logicalRuleWithOnlyFrontCalibrationRemainsVisibleOnBack() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -475,7 +535,7 @@ void TestGeometryMaskManager::logicalRuleWithOnlyFrontCalibrationRemainsVisibleO
     draft.insert(QStringLiteral("directions"), directions);
     snapshot.insert(QStringLiteral("draft"), draft);
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
     auto *rulesWidget = dialog.findChild<QListWidget *>(QStringLiteral("ruleList"));
     auto *direction = dialog.findChild<QComboBox *>(QStringLiteral("directionCombo"));
@@ -494,7 +554,7 @@ void TestGeometryMaskManager::logicalRuleWithOnlyFrontCalibrationRemainsVisibleO
     QVERIFY(rulesWidget->item(0)->text().contains(QStringLiteral("反面:缺失")));
 }
 
-void TestGeometryMaskManager::deleteLogicalRuleRemovesBothCalibrations() {
+void TestGeometryRulesPage::deleteLogicalRuleRemovesBothCalibrations() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -503,7 +563,7 @@ void TestGeometryMaskManager::deleteLogicalRuleRemovesBothCalibrations() {
     QVERIFY(image.save(frontPath));
     QVERIFY(image.save(backPath));
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(configuredV2ProfileSnapshot(frontPath, backPath));
     auto *rules = dialog.findChild<QListWidget *>(QStringLiteral("ruleList"));
     QVERIFY(rules != nullptr);
@@ -518,8 +578,8 @@ void TestGeometryMaskManager::deleteLogicalRuleRemovesBothCalibrations() {
                  .value(QStringLiteral("calibrations")).toObject().contains(QStringLiteral("glare")));
 }
 
-void TestGeometryMaskManager::signedMarginSpinBoxAcceptsNegativeZeroAndPositive() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::signedMarginSpinBoxAcceptsNegativeZeroAndPositive() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(1, 0, 0));
     auto *spin = dialog.findChild<QSpinBox *>(QStringLiteral("marginSpinBox"));
     QVERIFY(spin != nullptr);
@@ -533,8 +593,8 @@ void TestGeometryMaskManager::signedMarginSpinBoxAcceptsNegativeZeroAndPositive(
     QCOMPARE(spin->value(), 2);
 }
 
-void TestGeometryMaskManager::newRuleUsesSignedMarkerAndZeroDefault() {
-    GeometryMaskManagerDialog dialog;
+void TestGeometryRulesPage::newRuleUsesSignedMarkerAndZeroDefault() {
+    GeometryRulesPage dialog;
     dialog.setSnapshot(profileSnapshot(1, 0, 0));
     dialog.findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
     const QJsonObject rule = dialog.draft().value("directions").toObject()
@@ -543,7 +603,7 @@ void TestGeometryMaskManager::newRuleUsesSignedMarkerAndZeroDefault() {
     QCOMPARE(rule.value("margin_semantics").toString(), QStringLiteral("signed_boundary_v2"));
 }
 
-void TestGeometryMaskManager::savedSnapshotShowsFittedBoundaryInsteadOfCoarseGuide() {
+void TestGeometryRulesPage::savedSnapshotShowsFittedBoundaryInsteadOfCoarseGuide() {
     QTemporaryDir directory;
     const QString imagePath = directory.filePath(QStringLiteral("front.png"));
     QImage image(120, 120, QImage::Format_RGB32);
@@ -551,7 +611,7 @@ void TestGeometryMaskManager::savedSnapshotShowsFittedBoundaryInsteadOfCoarseGui
     QVERIFY(image.save(imagePath));
 
     QJsonObject snapshot = configuredProfileSnapshot(imagePath);
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
     auto *canvas = dialog.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
     QVERIFY(canvas != nullptr);
@@ -594,14 +654,14 @@ void TestGeometryMaskManager::savedSnapshotShowsFittedBoundaryInsteadOfCoarseGui
     QCOMPARE(canvas->fitShape().value(QStringLiteral("r")).toDouble(), 31.0);
 }
 
-void TestGeometryMaskManager::validationTemplateShowsFittedBoundaryInsteadOfCoarseGuide() {
+void TestGeometryRulesPage::validationTemplateShowsFittedBoundaryInsteadOfCoarseGuide() {
     QTemporaryDir directory;
     const QString imagePath = directory.filePath(QStringLiteral("front.png"));
     QImage image(120, 120, QImage::Format_RGB32);
     image.fill(Qt::black);
     QVERIFY(image.save(imagePath));
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(configuredProfileSnapshot(imagePath, 1));
     const QJsonObject effective{{QStringLiteral("shape"), QStringLiteral("ellipse")},
                                 {QStringLiteral("cx"), 60.0}, {QStringLiteral("cy"), 60.0},
@@ -628,14 +688,14 @@ void TestGeometryMaskManager::validationTemplateShowsFittedBoundaryInsteadOfCoar
     QCOMPARE(canvas->fitShape().value(QStringLiteral("rx")).toDouble(), 31.0);
 }
 
-void TestGeometryMaskManager::failedValidationTemplateDoesNotFallBackToCoarseGuide() {
+void TestGeometryRulesPage::failedValidationTemplateDoesNotFallBackToCoarseGuide() {
     QTemporaryDir directory;
     const QString imagePath = directory.filePath(QStringLiteral("front.png"));
     QImage image(120, 120, QImage::Format_RGB32);
     image.fill(Qt::black);
     QVERIFY(image.save(imagePath));
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(configuredProfileSnapshot(imagePath, 1));
     dialog.setValidationJob(QJsonObject{
         {QStringLiteral("state"), QStringLiteral("completed")},
@@ -662,7 +722,7 @@ void TestGeometryMaskManager::failedValidationTemplateDoesNotFallBackToCoarseGui
     QVERIFY(diagnostics->toPlainText().contains(QStringLiteral("topology_constraint_failed")));
 }
 
-void TestGeometryMaskManager::selectingTemplateRequestsPreviewWhileSavedGuideStaysHidden() {
+void TestGeometryRulesPage::selectingTemplateRequestsPreviewWhileSavedGuideStaysHidden() {
     QTemporaryDir directory;
     const QString firstPath = directory.filePath(QStringLiteral("front.png"));
     const QString secondPath = directory.filePath(QStringLiteral("front-01.png"));
@@ -677,14 +737,14 @@ void TestGeometryMaskManager::selectingTemplateRequestsPreviewWhileSavedGuideSta
                                  {QStringLiteral("direction"), QStringLiteral("front")},
                                  {QStringLiteral("path"), secondPath}});
     snapshot.insert(QStringLiteral("templates"), templates);
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
     auto *canvas = dialog.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
     auto *combo = dialog.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
     QVERIFY(canvas != nullptr);
     QVERIFY(combo != nullptr);
     QVERIFY(canvas->coarseShape().isEmpty());
-    QSignalSpy previewSpy(&dialog, &GeometryMaskManagerDialog::previewRequested);
+    QSignalSpy previewSpy(&dialog, &GeometryRulesPage::previewRequested);
 
     combo->setCurrentIndex(1);
 
@@ -696,7 +756,7 @@ void TestGeometryMaskManager::selectingTemplateRequestsPreviewWhileSavedGuideSta
     QVERIFY(canvas->coarseShape().isEmpty());
 }
 
-void TestGeometryMaskManager::lowConfidenceBackPreviewExplainsHowToRetry() {
+void TestGeometryRulesPage::lowConfidenceBackPreviewExplainsHowToRetry() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -706,7 +766,7 @@ void TestGeometryMaskManager::lowConfidenceBackPreviewExplainsHowToRetry() {
     QVERIFY(image.save(backPath));
 
     QJsonObject snapshot = configuredV2ProfileSnapshot(frontPath, backPath);
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
     auto *direction = dialog.findChild<QComboBox *>(QStringLiteral("directionCombo"));
     QVERIFY(direction != nullptr);
@@ -735,7 +795,7 @@ void TestGeometryMaskManager::lowConfidenceBackPreviewExplainsHowToRetry() {
     QVERIFY(foundRetryGuidance);
 }
 
-void TestGeometryMaskManager::noSelectedRuleClearsEveryRuleOverlay() {
+void TestGeometryRulesPage::noSelectedRuleClearsEveryRuleOverlay() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -744,7 +804,7 @@ void TestGeometryMaskManager::noSelectedRuleClearsEveryRuleOverlay() {
     QVERIFY(image.save(frontPath));
     QVERIFY(image.save(backPath));
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(configuredV2ProfileSnapshot(frontPath, backPath));
     const QJsonObject effective{{QStringLiteral("shape"), QStringLiteral("circle")},
                                 {QStringLiteral("cx"), 60.0}, {QStringLiteral("cy"), 60.0},
@@ -773,7 +833,7 @@ void TestGeometryMaskManager::noSelectedRuleClearsEveryRuleOverlay() {
     QVERIFY(canvas->fitShape().isEmpty());
 }
 
-void TestGeometryMaskManager::savedCalibrationShowsFittedBoundaryOnlyForReferenceTemplate() {
+void TestGeometryRulesPage::savedCalibrationShowsFittedBoundaryOnlyForReferenceTemplate() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString secondPath = directory.filePath(QStringLiteral("front-01.png"));
@@ -790,7 +850,7 @@ void TestGeometryMaskManager::savedCalibrationShowsFittedBoundaryOnlyForReferenc
                                  {QStringLiteral("direction"), QStringLiteral("front")},
                                  {QStringLiteral("path"), secondPath}});
     snapshot.insert(QStringLiteral("templates"), templates);
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
     auto *canvas = dialog.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
     auto *templatesCombo = dialog.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
@@ -804,7 +864,7 @@ void TestGeometryMaskManager::savedCalibrationShowsFittedBoundaryOnlyForReferenc
     QVERIFY(canvas->fitShape().isEmpty());
 }
 
-void TestGeometryMaskManager::validationDiagnosticsComeFromSelectedNestedRule() {
+void TestGeometryRulesPage::validationDiagnosticsComeFromSelectedNestedRule() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -813,7 +873,7 @@ void TestGeometryMaskManager::validationDiagnosticsComeFromSelectedNestedRule() 
     QVERIFY(image.save(frontPath));
     QVERIFY(image.save(backPath));
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(configuredV2ProfileSnapshot(frontPath, backPath));
     dialog.setValidationJob(QJsonObject{
         {QStringLiteral("state"), QStringLiteral("completed")},
@@ -844,7 +904,7 @@ void TestGeometryMaskManager::validationDiagnosticsComeFromSelectedNestedRule() 
     QVERIFY(text.contains(QStringLiteral("残差: 0.013")));
 }
 
-void TestGeometryMaskManager::fusionRegressionRemainsVisibleWhileInspectingTemplateFit() {
+void TestGeometryRulesPage::fusionRegressionRemainsVisibleWhileInspectingTemplateFit() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -863,7 +923,7 @@ void TestGeometryMaskManager::fusionRegressionRemainsVisibleWhileInspectingTempl
         {QStringLiteral("candidate_decision_source"), QStringLiteral("local_override")},
         {QStringLiteral("cause"), QStringLiteral("geometry_local_override")}
     };
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(configuredV2ProfileSnapshot(frontPath, backPath));
     dialog.setValidationJob(QJsonObject{
         {QStringLiteral("state"), QStringLiteral("completed")},
@@ -904,7 +964,7 @@ void TestGeometryMaskManager::fusionRegressionRemainsVisibleWhileInspectingTempl
     QVERIFY(text.contains(QStringLiteral("当前规则的验证拟合结果")));
 }
 
-void TestGeometryMaskManager::publishWorkflowNavigatesToMissingDirectionCalibration() {
+void TestGeometryRulesPage::publishWorkflowNavigatesToMissingDirectionCalibration() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -923,7 +983,7 @@ void TestGeometryMaskManager::publishWorkflowNavigatesToMissingDirectionCalibrat
     draft.insert(QStringLiteral("directions"), directions);
     snapshot.insert(QStringLiteral("draft"), draft);
 
-    GeometryMaskManagerDialog dialog;
+    GeometryRulesPage dialog;
     dialog.setSnapshot(snapshot);
     dialog.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"))->click();
     auto *direction = dialog.findChild<QComboBox *>(QStringLiteral("directionCombo"));
@@ -934,7 +994,7 @@ void TestGeometryMaskManager::publishWorkflowNavigatesToMissingDirectionCalibrat
     QVERIFY(status->text().contains(QStringLiteral("请先完成反面标定")));
 }
 
-void TestGeometryMaskManager::migrationConflictKeepOnlyEmitsExplicitResolution() {
+void TestGeometryRulesPage::migrationConflictKeepOnlyEmitsExplicitResolution() {
     QTemporaryDir directory;
     const QString frontPath = directory.filePath(QStringLiteral("front.png"));
     const QString backPath = directory.filePath(QStringLiteral("back.png"));
@@ -964,8 +1024,8 @@ void TestGeometryMaskManager::migrationConflictKeepOnlyEmitsExplicitResolution()
     });
     snapshot.insert(QStringLiteral("draft"), draft);
 
-    GeometryMaskManagerDialog dialog;
-    QSignalSpy spy(&dialog, &GeometryMaskManagerDialog::migrationResolutionRequested);
+    GeometryRulesPage dialog;
+    QSignalSpy spy(&dialog, &GeometryRulesPage::migrationResolutionRequested);
     dialog.setSnapshot(snapshot);
     auto *conflicts = dialog.findChild<QComboBox *>(QStringLiteral("migrationConflictCombo"));
     auto *actions = dialog.findChild<QComboBox *>(QStringLiteral("migrationActionCombo"));
@@ -988,5 +1048,5 @@ void TestGeometryMaskManager::migrationConflictKeepOnlyEmitsExplicitResolution()
     QCOMPARE(resolution.value(QStringLiteral("survivor_rule_id")).toString(), QStringLiteral("back-glare-a"));
 }
 
-QTEST_MAIN(TestGeometryMaskManager)
-#include "test_geometrymaskmanager.moc"
+QTEST_MAIN(TestGeometryRulesPage)
+#include "test_geometryrulespage.moc"

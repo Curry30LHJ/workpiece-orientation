@@ -24,6 +24,7 @@
 
 #include "../backendclient.h"
 #include "../backendprocessmanager.h"
+#include "../geometryrulespage.h"
 #include "../inspectionimageview.h"
 #include "../inspectionpage.h"
 #include "../inspectiontypes.h"
@@ -447,6 +448,18 @@ public:
     bool listen() { return server_.listen(QHostAddress::LocalHost, 0); }
     quint16 port() const { return server_.serverPort(); }
     QStringList workflowCommands() const { return workflowCommands_; }
+    QStringList geometryProfileWorkpieceIds() const {
+        return geometryProfileWorkpieceIds_;
+    }
+    QStringList validationPollJobIds() const { return validationPollJobIds_; }
+    void holdGeometryProfiles(bool hold = true) { holdGeometryProfiles_ = hold; }
+    bool replyNextGeometryProfile() {
+        if (heldGeometryProfiles_.isEmpty()) return false;
+        const QPair<QString, QString> pending = heldGeometryProfiles_.dequeue();
+        sendSuccess(pending.first, QJsonObject{{QStringLiteral("profile"),
+            profile(1, 1, 0, pending.second)}});
+        return true;
+    }
 
 private slots:
     void acceptConnection() {
@@ -469,15 +482,24 @@ private slots:
                                  {QStringLiteral("ok"), true}, {QStringLiteral("service"), QStringLiteral("workpiece-orientation")},
                                  {QStringLiteral("ready"), true}});
             } else if (command == QStringLiteral("list_workpieces")) {
-                const QJsonArray workpieces{QJsonObject{
-                    {QStringLiteral("id"), QStringLiteral("m1")},
-                    {QStringLiteral("name"), QStringLiteral("M1")}}};
+                const QJsonArray workpieces{
+                    QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                                {QStringLiteral("name"), QStringLiteral("M1")}},
+                    QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                                {QStringLiteral("name"), QStringLiteral("M2")}}};
                 send(QJsonObject{{QStringLiteral("version"), 1},
                                  {QStringLiteral("request_id"), requestId},
                                  {QStringLiteral("ok"), true},
                                  {QStringLiteral("workpieces"), workpieces}});
             } else if (command == QStringLiteral("get_geometry_mask_profile")) {
-                sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"), profile(1, 1, 0)}});
+                const QString workpieceId = request.value(QStringLiteral("workpiece_id")).toString();
+                geometryProfileWorkpieceIds_.append(workpieceId);
+                if (holdGeometryProfiles_) {
+                    heldGeometryProfiles_.enqueue(qMakePair(requestId, workpieceId));
+                } else {
+                    sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"),
+                        profile(1, 1, 0, workpieceId)}});
+                }
             } else if (command == QStringLiteral("save_geometry_mask_draft")) {
                 workflowCommands_.append(command);
                 sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"), profile(1, 2, 0)}});
@@ -490,6 +512,15 @@ private slots:
                     {QStringLiteral("base_draft_revision"), 2},
                     {QStringLiteral("blocking_issues"), QJsonArray()},
                     {QStringLiteral("warnings"), QJsonArray()}}}});
+            } else if (command == QStringLiteral("get_geometry_mask_validation_job")) {
+                const QString jobId = request.value(QStringLiteral("job_id")).toString();
+                validationPollJobIds_.append(jobId);
+                sendSuccess(requestId, QJsonObject{{QStringLiteral("job"), QJsonObject{
+                    {QStringLiteral("job_id"), jobId},
+                    {QStringLiteral("state"), QStringLiteral("running")},
+                    {QStringLiteral("progress"), QJsonObject{
+                        {QStringLiteral("completed"), 2},
+                        {QStringLiteral("total"), 5}}}}}});
             } else if (command == QStringLiteral("publish_geometry_mask_profile")) {
                 workflowCommands_.append(command);
                 sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"), profile(1, 2, 1)}});
@@ -497,8 +528,9 @@ private slots:
         }
     }
 
-private:
-    static QJsonObject profile(int libraryRevision, int draftRevision, int activeRevision) {
+public:
+    static QJsonObject profile(int libraryRevision, int draftRevision, int activeRevision,
+                               const QString &workpieceId = QStringLiteral("m1")) {
         const QJsonObject geometry{{QStringLiteral("cx"), 0.0}, {QStringLiteral("cy"), 0.0},
                                    {QStringLiteral("r"), 0.7}, {QStringLiteral("angle_deg"), 0.0}};
         const QJsonObject calibration{{QStringLiteral("state"), QStringLiteral("ready")},
@@ -531,13 +563,14 @@ private:
                     {QStringLiteral("template_reviews"), QJsonObject()}}}}},
             {QStringLiteral("migration"), QJsonObject{{QStringLiteral("conflicts"), QJsonArray()},
                                                         {QStringLiteral("resolutions"), QJsonArray()}}}};
-        return QJsonObject{{QStringLiteral("workpiece_id"), QStringLiteral("m1")},
+        return QJsonObject{{QStringLiteral("workpiece_id"), workpieceId},
                            {QStringLiteral("library_revision"), libraryRevision},
                            {QStringLiteral("draft_revision"), draftRevision},
                            {QStringLiteral("active_revision"), activeRevision},
                            {QStringLiteral("draft"), draft}, {QStringLiteral("templates"), QJsonArray()}};
     }
 
+private:
     void sendSuccess(const QString &requestId, const QJsonObject &fields) {
         QJsonObject response = fields;
         response.insert(QStringLiteral("version"), 1);
@@ -555,6 +588,10 @@ private:
     QTcpSocket *socket_ = nullptr;
     QByteArray buffer_;
     QStringList workflowCommands_;
+    QStringList geometryProfileWorkpieceIds_;
+    QStringList validationPollJobIds_;
+    QQueue<QPair<QString, QString>> heldGeometryProfiles_;
+    bool holdGeometryProfiles_ = false;
 };
 
 class TestMainWindow : public QObject {
@@ -610,7 +647,162 @@ private:
         new MessageBoxButtonChooser(text);
     }
 
+    static QTimer *geometryValidationTimer(MainWindow &window) {
+        for (QTimer *timer : window.findChildren<QTimer *>()) {
+            if (timer->interval() == 1000) return timer;
+        }
+        return nullptr;
+    }
+
+    static QJsonObject validationJob(const QString &state, int completed = 2,
+                                     int total = 5) {
+        return QJsonObject{
+            {QStringLiteral("job_id"), QStringLiteral("job-lifecycle")},
+            {QStringLiteral("state"), state},
+            {QStringLiteral("base_library_revision"), 1},
+            {QStringLiteral("base_draft_revision"), 2},
+            {QStringLiteral("progress"), QJsonObject{
+                {QStringLiteral("completed"), completed},
+                {QStringLiteral("total"), total}}},
+            {QStringLiteral("blocking_issues"), QJsonArray()},
+            {QStringLiteral("warnings"), QJsonArray()}};
+    }
+
+    static bool deliverValidationJob(MainWindow &window, const QString &command,
+                                     const QJsonObject &job) {
+        const QJsonObject response{{QStringLiteral("job"), job}};
+        return QMetaObject::invokeMethod(
+            &window, "onClientResponse", Qt::DirectConnection,
+            Q_ARG(QString, command), Q_ARG(QJsonObject, response));
+    }
+
 private slots:
+    void geometryPageIsEmbeddedAndPersistent() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        auto *host = window.findChild<QWidget *>(
+            QStringLiteral("geometryPageHost"));
+        QVERIFY(stack != nullptr);
+        QVERIFY(host != nullptr);
+        QCOMPARE(stack->count(), 3);
+
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        auto *page = window.findChild<QWidget *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(host->isAncestorOf(page));
+        QVERIFY(!page->isWindow());
+
+        QVERIFY(window.requestPage(AppPage::Inspection));
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QCOMPARE(window.findChild<QWidget *>(QStringLiteral("geometryRulesPage")), page);
+        QCOMPARE(stack->count(), 3);
+    }
+
+    void geometrySnapshotLoadsOnlyOnFirstEntryForSameWorkpiece() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(window.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"))->currentData().toString()
+            == QStringLiteral("m1"), 1000);
+
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 1, 1000);
+        QCOMPARE(server.geometryProfileWorkpieceIds().first(), QStringLiteral("m1"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        QVERIFY(window.requestPage(AppPage::Inspection));
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTest::qWait(50);
+        QCOMPARE(server.geometryProfileWorkpieceIds().size(), 1);
+    }
+
+    void dirtyGeometryPageGuardsNavigationChoices() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        QVERIFY(page != nullptr);
+        QVERIFY(stack != nullptr);
+        page->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        QVERIFY(page->hasUnsavedChanges());
+
+        chooseDirtyNavigationOption(QStringLiteral("取消"));
+        QVERIFY(!window.requestPage(AppPage::Inspection));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(page->hasUnsavedChanges());
+
+        chooseDirtyNavigationOption(QStringLiteral("放弃修改"));
+        QVERIFY(window.requestPage(AppPage::Inspection));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::Inspection));
+        QVERIFY(!page->hasUnsavedChanges());
+
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        chooseDirtyNavigationOption(QStringLiteral("保留并离开"));
+        QVERIFY(window.requestPage(AppPage::Inspection));
+        QVERIFY(page->hasUnsavedChanges());
+    }
+
+    void dirtyGeometryPageGuardsDetectionTargetChoices() {
+        const QJsonObject workpieces{{QStringLiteral("workpieces"), QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                        {QStringLiteral("name"), QStringLiteral("M1")}},
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                        {QStringLiteral("name"), QStringLiteral("M2")}}
+        }}};
+
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        emit client.responseReceived(QStringLiteral("list_workpieces"), workpieces);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QVERIFY(stack != nullptr);
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("m1"));
+        page->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        chooseDirtyNavigationOption(QStringLiteral("取消"));
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("m1"));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(page->hasUnsavedChanges());
+
+        chooseDirtyNavigationOption(QStringLiteral("放弃修改"));
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("m2"));
+        QVERIFY(!page->hasUnsavedChanges());
+
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m1")));
+        page->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        chooseDirtyNavigationOption(QStringLiteral("保留并离开"));
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("m2"));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::Inspection));
+        QVERIFY(page->hasUnsavedChanges());
+    }
+
     void browsingLibraryDoesNotRetargetInspection() {
         BackendClient client;
         MainWindow window(&client, nullptr);
@@ -2296,6 +2488,229 @@ private slots:
         QCOMPARE(inspectionPage->singleImagePath(), batchPath);
         QVERIFY(inspectionPage->findChild<QLabel *>(QStringLiteral("resultLabel"))
                     ->text().contains(QStringLiteral("反面")));
+    }
+
+    void hiddenGeometryPageKeepsValidationPolling() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        QTimer *timer = geometryValidationTimer(window);
+        QVERIFY(timer != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QVERIFY(deliverValidationJob(
+            window, QStringLiteral("validate_geometry_mask_draft"),
+            validationJob(QStringLiteral("running"))));
+        QVERIFY(timer->isActive());
+
+        QVERIFY(window.requestPage(AppPage::Inspection));
+
+        QVERIFY(timer->isActive());
+    }
+
+    void reconnectResumesTheSameGeometryValidationJob() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTimer *timer = geometryValidationTimer(window);
+        QVERIFY(timer != nullptr);
+        QVERIFY(deliverValidationJob(
+            window, QStringLiteral("validate_geometry_mask_draft"),
+            validationJob(QStringLiteral("running"))));
+        QVERIFY(timer->isActive());
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onBackendUnavailable", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("lost"))));
+        QVERIFY(!timer->isActive());
+        QVERIFY(QMetaObject::invokeMethod(&window, "onBackendReady", Qt::DirectConnection));
+
+        QVERIFY(timer->isActive());
+        QTRY_VERIFY_WITH_TIMEOUT(
+            server.validationPollJobIds().contains(QStringLiteral("job-lifecycle")), 1500);
+    }
+
+    void terminalAndCancelledGeometryValidationStopPolling() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        QTimer *timer = geometryValidationTimer(window);
+        QVERIFY(timer != nullptr);
+        QVERIFY(deliverValidationJob(
+            window, QStringLiteral("validate_geometry_mask_draft"),
+            validationJob(QStringLiteral("running"))));
+        QVERIFY(timer->isActive());
+        QVERIFY(deliverValidationJob(
+            window, QStringLiteral("get_geometry_mask_validation_job"),
+            validationJob(QStringLiteral("completed"), 5, 5)));
+        QVERIFY(!timer->isActive());
+
+        QVERIFY(deliverValidationJob(
+            window, QStringLiteral("validate_geometry_mask_draft"),
+            validationJob(QStringLiteral("running"))));
+        QVERIFY(timer->isActive());
+        QVERIFY(deliverValidationJob(
+            window, QStringLiteral("geometry_mask_validation_job_action"),
+            validationJob(QStringLiteral("cancelled"))));
+        QVERIFY(!timer->isActive());
+    }
+
+    void geometryValidationProgressUsesGlobalTaskStatus() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        QVERIFY(deliverValidationJob(
+            window, QStringLiteral("validate_geometry_mask_draft"),
+            validationJob(QStringLiteral("running"), 2, 5)));
+
+        auto *title = window.findChild<QLabel *>(QStringLiteral("globalTaskTitleLabel"));
+        auto *detail = window.findChild<QLabel *>(QStringLiteral("globalTaskDetailLabel"));
+        auto *progress = window.findChild<QProgressBar *>(
+            QStringLiteral("globalTaskProgressBar"));
+        QVERIFY(title != nullptr);
+        QVERIFY(detail != nullptr);
+        QVERIFY(progress != nullptr);
+        QVERIFY(title->text().contains(QStringLiteral("几何规则验证")));
+        QVERIFY(detail->text().contains(QStringLiteral("2/5")));
+        QCOMPARE(progress->maximum(), 5);
+        QCOMPARE(progress->value(), 2);
+    }
+
+    void idleGeometryPageDoesNotCountAsPreservedDisconnectWork() {
+        BackendClient idleClient;
+        MainWindow idleWindow(&idleClient, nullptr);
+        QVERIFY(QMetaObject::invokeMethod(
+            &idleWindow, "onBackendUnavailable", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("lost"))));
+        auto *idleMessage = idleWindow.findChild<QLabel *>(
+            QStringLiteral("libraryMessageLabel"));
+        QVERIFY(idleMessage != nullptr);
+        QVERIFY(!idleMessage->text().contains(QStringLiteral("未完成操作结果未知")));
+
+        BackendClient dirtyClient;
+        MainWindow dirtyWindow(&dirtyClient, nullptr);
+        auto *dirtyPage = dirtyWindow.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(dirtyPage != nullptr);
+        dirtyPage->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
+        dirtyPage->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        QVERIFY(dirtyPage->hasUnsavedChanges());
+        QVERIFY(QMetaObject::invokeMethod(
+            &dirtyWindow, "onBackendUnavailable", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("lost"))));
+        QVERIFY(dirtyWindow.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
+                    ->text().contains(QStringLiteral("未完成操作结果未知")));
+
+        BackendClient activeClient;
+        MainWindow activeWindow(&activeClient, nullptr);
+        QVERIFY(deliverValidationJob(
+            activeWindow, QStringLiteral("validate_geometry_mask_draft"),
+            validationJob(QStringLiteral("running"))));
+        QVERIFY(QMetaObject::invokeMethod(
+            &activeWindow, "onBackendUnavailable", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("lost"))));
+        QVERIFY(activeWindow.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
+                    ->text().contains(QStringLiteral("未完成操作结果未知")));
+    }
+
+    void staleGeometryProfileCannotOverwriteAcceptedTarget() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryProfiles();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(combo->currentData().toString(), QStringLiteral("m1"), 1000);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 1, 1000);
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        page->setSnapshot(GeometryWorkflowServer::profile(2, 2, 0, QStringLiteral("m2")));
+
+        QVERIFY(server.replyNextGeometryProfile());
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1000);
+
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("m2"));
+        QCOMPARE(page->snapshot().value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m2"));
+    }
+
+    void reconnectRetriesUnloadedGeometryProfileForCurrentTargetOnce() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryProfiles();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(window.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"))->currentData().toString()
+            == QStringLiteral("m1"), 1000);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 1, 1000);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onBackendUnavailable", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("lost"))));
+        client.disconnectFromService();
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            client.state() == BackendClient::State::Ready
+                || client.state() == BackendClient::State::Busy,
+            1000);
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1500);
+        QCOMPARE(server.geometryProfileWorkpieceIds(),
+                 QStringList({QStringLiteral("m1"), QStringLiteral("m1")}));
+    }
+
+    void listRefreshRemovingCurrentTargetHonorsGeometryDirtyChoice() {
+        const QJsonObject initial{{QStringLiteral("workpieces"), QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                        {QStringLiteral("name"), QStringLiteral("M1")}},
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                        {QStringLiteral("name"), QStringLiteral("M2")}}}}};
+        const QJsonObject removed{{QStringLiteral("workpieces"), QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                        {QStringLiteral("name"), QStringLiteral("M2")}}}}};
+
+        BackendClient cancelClient;
+        MainWindow cancelWindow(&cancelClient, nullptr);
+        emit cancelClient.responseReceived(QStringLiteral("list_workpieces"), initial);
+        auto *cancelCombo = cancelWindow.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"));
+        auto *cancelPage = cancelWindow.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(cancelCombo != nullptr);
+        QVERIFY(cancelPage != nullptr);
+        cancelPage->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
+        QVERIFY(cancelWindow.requestPage(AppPage::GeometryRules));
+        cancelPage->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        chooseDirtyNavigationOption(QStringLiteral("取消"));
+        emit cancelClient.responseReceived(QStringLiteral("list_workpieces"), removed);
+        QCOMPARE(cancelCombo->currentData().toString(), QStringLiteral("m1"));
+        QVERIFY(cancelPage->hasUnsavedChanges());
+
+        BackendClient discardClient;
+        MainWindow discardWindow(&discardClient, nullptr);
+        emit discardClient.responseReceived(QStringLiteral("list_workpieces"), initial);
+        auto *discardCombo = discardWindow.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"));
+        auto *discardPage = discardWindow.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(discardCombo != nullptr);
+        QVERIFY(discardPage != nullptr);
+        discardPage->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
+        QVERIFY(discardWindow.requestPage(AppPage::GeometryRules));
+        discardPage->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        chooseDirtyNavigationOption(QStringLiteral("放弃修改"));
+        emit discardClient.responseReceived(QStringLiteral("list_workpieces"), removed);
+        QCOMPARE(discardCombo->currentData().toString(), QStringLiteral("m2"));
+        QVERIFY(!discardPage->hasUnsavedChanges());
     }
 
     void geometryPublishWorkflowSendsSaveValidatePublishInOrder() {

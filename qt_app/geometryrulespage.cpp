@@ -1,4 +1,4 @@
-#include "geometrymaskmanager.h"
+#include "geometryrulespage.h"
 
 #include "geometryrulecanvas.h"
 
@@ -61,9 +61,7 @@ QString orientationName(const QString &value) {
 }
 }
 
-GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(parent) {
-    setWindowTitle(QStringLiteral("几何干扰规则管理"));
-    resize(1100, 700);
+GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     auto *root = new QVBoxLayout(this);
     auto *splitter = new QSplitter(Qt::Horizontal, this);
     root->addWidget(splitter);
@@ -216,7 +214,6 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     publishButton_ = new QPushButton(QStringLiteral("发布规则"), this);
     publishWorkflowButton_ = new QPushButton(QStringLiteral("保存、验证并发布"), this);
     rollbackButton_ = new QPushButton(QStringLiteral("回退上一版本"), this);
-    cancelButton_ = new QPushButton(QStringLiteral("关闭"), this);
     saveButton_->setObjectName(QStringLiteral("saveButton"));
     validateButton_->setObjectName(QStringLiteral("validateButton"));
     publishButton_->setObjectName(QStringLiteral("publishButton"));
@@ -228,7 +225,6 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     buttons->addWidget(publishButton_);
     buttons->addWidget(publishWorkflowButton_);
     buttons->addWidget(rollbackButton_);
-    buttons->addWidget(cancelButton_);
     root->addLayout(buttons);
 
     auto *editButtons = new QHBoxLayout();
@@ -257,26 +253,25 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     leftLayout->addWidget(versionCombo_);
     leftLayout->addWidget(copyActiveToDraftButton_);
 
-    connect(addButton, &QPushButton::clicked, this, &GeometryMaskManagerDialog::addRule);
-    connect(deleteButton, &QPushButton::clicked, this, &GeometryMaskManagerDialog::deleteRule);
-    connect(setAnchorButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::setAnchorFromCanvas);
-    connect(saveButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::saveDraft);
-    connect(validateButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::validateDraft);
-    connect(publishButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::publishDraft);
-    connect(publishWorkflowButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::publishWorkflow);
+    connect(addButton, &QPushButton::clicked, this, &GeometryRulesPage::addRule);
+    connect(deleteButton, &QPushButton::clicked, this, &GeometryRulesPage::deleteRule);
+    connect(setAnchorButton_, &QPushButton::clicked, this, &GeometryRulesPage::setAnchorFromCanvas);
+    connect(saveButton_, &QPushButton::clicked, this, &GeometryRulesPage::saveDraft);
+    connect(validateButton_, &QPushButton::clicked, this, &GeometryRulesPage::validateDraft);
+    connect(publishButton_, &QPushButton::clicked, this, &GeometryRulesPage::publishDraft);
+    connect(publishWorkflowButton_, &QPushButton::clicked, this, &GeometryRulesPage::publishWorkflow);
     connect(resolveMigrationButton_, &QPushButton::clicked, this,
-            &GeometryMaskManagerDialog::resolveMigrationConflict);
+            &GeometryRulesPage::resolveMigrationConflict);
     connect(migrationConflictCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) { refreshMigrationPanel(); });
     connect(migrationActionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) { refreshMigrationPanel(); });
-    connect(rollbackButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::rollbackDraft);
-    connect(cancelButton_, &QPushButton::clicked, this, &QDialog::reject);
-    connect(undoButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::undoDraft);
-    connect(redoButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::redoDraft);
-    connect(resetRuleButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::resetCurrentRule);
-    connect(reloadDraftButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::reloadDraft);
-    connect(copyActiveToDraftButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::copyActiveToDraft);
+    connect(rollbackButton_, &QPushButton::clicked, this, &GeometryRulesPage::rollbackDraft);
+    connect(undoButton_, &QPushButton::clicked, this, &GeometryRulesPage::undoDraft);
+    connect(redoButton_, &QPushButton::clicked, this, &GeometryRulesPage::redoDraft);
+    connect(resetRuleButton_, &QPushButton::clicked, this, &GeometryRulesPage::resetCurrentRule);
+    connect(reloadDraftButton_, &QPushButton::clicked, this, &GeometryRulesPage::reloadDraft);
+    connect(copyActiveToDraftButton_, &QPushButton::clicked, this, &GeometryRulesPage::copyActiveToDraft);
     connect(directionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) {
                 refreshRuleList();
@@ -324,7 +319,7 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
                 }
                 copyActiveToDraftButton_->setEnabled(readOnly);
             });
-    connect(overrideReasonEdit_, &QLineEdit::textChanged, this, &GeometryMaskManagerDialog::updatePublishState);
+    connect(overrideReasonEdit_, &QLineEdit::textChanged, this, &GeometryRulesPage::updatePublishState);
     connect(rotationSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             [this](double value) { canvas_->setRotationDegrees(value); });
     connect(canvas_, &GeometryRuleCanvas::shapeChanged, this, [this](const QJsonObject &shape) {
@@ -352,7 +347,7 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
         markDraftDirty();
     });
     connect(canvas_, &GeometryRuleCanvas::shapeCommitted, this,
-            &GeometryMaskManagerDialog::requestPreviewFromShape);
+            &GeometryRulesPage::requestPreviewFromShape);
     connect(manualAnchorButton_, &QPushButton::clicked, this, [this]() {
         manualAnchorCapture_ = true;
         manualAnchorButton_->setText(QStringLiteral("请在画布中绘制基准边界"));
@@ -363,36 +358,36 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     updatePublishState();
 }
 
-QString GeometryMaskManagerDialog::direction() const {
+QString GeometryRulesPage::direction() const {
     return directionCombo_ ? directionCombo_->currentData().toString() : QStringLiteral("front");
 }
 
-QString GeometryMaskManagerDialog::currentTemplateId() const {
+QString GeometryRulesPage::currentTemplateId() const {
     return templateCombo_ ? templateCombo_->currentData(Qt::UserRole + 1).toString() : QString();
 }
 
-QString GeometryMaskManagerDialog::currentEditContextKey() const {
+QString GeometryRulesPage::currentEditContextKey() const {
     return QStringLiteral("%1|%2|%3|%4")
         .arg(currentRuleId(), direction(), currentTemplateId())
         .arg(snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
-QJsonObject GeometryMaskManagerDialog::directionObject() const {
+QJsonObject GeometryRulesPage::directionObject() const {
     const QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
     return directions.value(direction()).toObject();
 }
 
-bool GeometryMaskManagerDialog::usesLogicalRuleSchema() const {
+bool GeometryRulesPage::usesLogicalRuleSchema() const {
     return draft_.value(QStringLiteral("schema_version")).toInt(1) == 2;
 }
 
-QJsonArray GeometryMaskManagerDialog::logicalRules() const {
+QJsonArray GeometryRulesPage::logicalRules() const {
     return usesLogicalRuleSchema()
         ? draft_.value(QStringLiteral("rules")).toArray()
         : rulesFor(directionObject());
 }
 
-QString GeometryMaskManagerDialog::currentRuleId() const {
+QString GeometryRulesPage::currentRuleId() const {
     if (ruleList_ != nullptr && ruleList_->currentItem() != nullptr) {
         const QString stored = ruleList_->currentItem()->data(Qt::UserRole).toString();
         if (!stored.isEmpty()) return stored;
@@ -404,13 +399,13 @@ QString GeometryMaskManagerDialog::currentRuleId() const {
         : QString();
 }
 
-QJsonObject GeometryMaskManagerDialog::currentCalibration() const {
+QJsonObject GeometryRulesPage::currentCalibration() const {
     if (!usesLogicalRuleSchema()) return {};
     return directionObject().value(QStringLiteral("calibrations")).toObject()
         .value(currentRuleId()).toObject();
 }
 
-void GeometryMaskManagerDialog::setCurrentCalibration(const QJsonObject &calibration) {
+void GeometryRulesPage::setCurrentCalibration(const QJsonObject &calibration) {
     if (!usesLogicalRuleSchema()) return;
     const QString ruleId = currentRuleId();
     if (ruleId.isEmpty()) return;
@@ -427,7 +422,7 @@ void GeometryMaskManagerDialog::setCurrentCalibration(const QJsonObject &calibra
     markDraftDirty();
 }
 
-QString GeometryMaskManagerDialog::calibrationState(const QString &sideName, const QString &ruleId) const {
+QString GeometryRulesPage::calibrationState(const QString &sideName, const QString &ruleId) const {
     const QJsonObject side = draft_.value(QStringLiteral("directions")).toObject()
         .value(sideName).toObject();
     const QJsonObject calibration = side.value(QStringLiteral("calibrations")).toObject()
@@ -439,8 +434,8 @@ QString GeometryMaskManagerDialog::calibrationState(const QString &sideName, con
     return QStringLiteral("缺失");
 }
 
-GeometryMaskManagerDialog::MissingCalibration
-GeometryMaskManagerDialog::firstMissingEnabledCalibration() const {
+GeometryRulesPage::MissingCalibration
+GeometryRulesPage::firstMissingEnabledCalibration() const {
     if (!usesLogicalRuleSchema()) return {};
     const QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
     for (const QJsonValue &value : logicalRules()) {
@@ -459,7 +454,7 @@ GeometryMaskManagerDialog::firstMissingEnabledCalibration() const {
     return {};
 }
 
-void GeometryMaskManagerDialog::selectRuleById(const QString &ruleId) {
+void GeometryRulesPage::selectRuleById(const QString &ruleId) {
     if (ruleList_ == nullptr) return;
     for (int row = 0; row < ruleList_->count(); ++row) {
         if (ruleList_->item(row)->data(Qt::UserRole).toString() == ruleId) {
@@ -469,7 +464,7 @@ void GeometryMaskManagerDialog::selectRuleById(const QString &ruleId) {
     }
 }
 
-QJsonObject GeometryMaskManagerDialog::selectedMigrationConflict() const {
+QJsonObject GeometryRulesPage::selectedMigrationConflict() const {
     if (migrationConflictCombo_ == nullptr) return {};
     const QString conflictId = migrationConflictCombo_->currentData().toString();
     for (const QJsonValue &value : draft_.value(QStringLiteral("migration")).toObject()
@@ -480,7 +475,7 @@ QJsonObject GeometryMaskManagerDialog::selectedMigrationConflict() const {
     return {};
 }
 
-void GeometryMaskManagerDialog::refreshMigrationPanel() {
+void GeometryRulesPage::refreshMigrationPanel() {
     if (migrationConflictCombo_ == nullptr || migrationActionCombo_ == nullptr) return;
     const QString previousConflict = migrationConflictCombo_->currentData().toString();
     const QString previousAction = migrationActionCombo_->currentData().toString();
@@ -529,7 +524,7 @@ void GeometryMaskManagerDialog::refreshMigrationPanel() {
     resolveMigrationButton_->setEnabled(hasConflict);
 }
 
-void GeometryMaskManagerDialog::resolveMigrationConflict() {
+void GeometryRulesPage::resolveMigrationConflict() {
     const QJsonObject conflict = selectedMigrationConflict();
     if (conflict.isEmpty()) return;
     const QString action = migrationActionCombo_->currentData().toString();
@@ -551,7 +546,7 @@ void GeometryMaskManagerDialog::resolveMigrationConflict() {
         snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
-void GeometryMaskManagerDialog::ensureDirectionObject(const QString &name) {
+void GeometryRulesPage::ensureDirectionObject(const QString &name) {
     QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
     if (!directions.contains(name)) {
         directions.insert(name, usesLogicalRuleSchema() ? emptyLogicalDirection() : emptyDirection());
@@ -559,11 +554,11 @@ void GeometryMaskManagerDialog::ensureDirectionObject(const QString &name) {
     draft_.insert(QStringLiteral("directions"), directions);
 }
 
-int GeometryMaskManagerDialog::currentRuleIndex() const {
+int GeometryRulesPage::currentRuleIndex() const {
     return ruleList_ ? ruleList_->currentRow() : -1;
 }
 
-QJsonObject GeometryMaskManagerDialog::currentRule() const {
+QJsonObject GeometryRulesPage::currentRule() const {
     const QJsonArray rules = logicalRules();
     const int index = currentRuleIndex();
     if (index < 0 || index >= rules.size()) return {};
@@ -583,11 +578,11 @@ QJsonObject GeometryMaskManagerDialog::currentRule() const {
     return rule;
 }
 
-QJsonObject GeometryMaskManagerDialog::currentDirectionAnchor() const {
+QJsonObject GeometryRulesPage::currentDirectionAnchor() const {
     return directionObject().value(QStringLiteral("anchor")).toObject();
 }
 
-QJsonObject GeometryMaskManagerDialog::anchorFromCanvasShape(const QJsonObject &shape) const {
+QJsonObject GeometryRulesPage::anchorFromCanvasShape(const QJsonObject &shape) const {
     if (canvas_ == nullptr || canvas_->image().isNull()) return {};
     const qreal width = canvas_->image().width();
     const qreal height = canvas_->image().height();
@@ -609,7 +604,7 @@ QJsonObject GeometryMaskManagerDialog::anchorFromCanvasShape(const QJsonObject &
     return QJsonObject{{QStringLiteral("shape"), type}, {QStringLiteral("coarse"), coarse}};
 }
 
-QJsonObject GeometryMaskManagerDialog::ruleGeometryFromCanvasShape(const QJsonObject &shape) const {
+QJsonObject GeometryRulesPage::ruleGeometryFromCanvasShape(const QJsonObject &shape) const {
     if (canvas_ == nullptr || canvas_->image().isNull()) return {};
     const QJsonObject anchor = currentDirectionAnchor();
     const QJsonObject coarse = anchor.value(QStringLiteral("coarse")).toObject();
@@ -654,7 +649,7 @@ QJsonObject GeometryMaskManagerDialog::ruleGeometryFromCanvasShape(const QJsonOb
     return geometry;
 }
 
-QJsonObject GeometryMaskManagerDialog::canvasShapeForRule(const QJsonObject &rule) const {
+QJsonObject GeometryRulesPage::canvasShapeForRule(const QJsonObject &rule) const {
     if (canvas_ == nullptr || canvas_->image().isNull()) return {};
     const QJsonObject anchor = currentDirectionAnchor();
     const QJsonObject coarse = anchor.value(QStringLiteral("coarse")).toObject();
@@ -690,7 +685,7 @@ QJsonObject GeometryMaskManagerDialog::canvasShapeForRule(const QJsonObject &rul
     return shape;
 }
 
-void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
+void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     const QString nextWorkpieceId = snapshot.value(QStringLiteral("workpiece_id")).toString();
     Q_UNUSED(nextWorkpieceId);
     lastRulePreview_ = QJsonObject();
@@ -714,7 +709,7 @@ void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
     ensureDirectionObject(QStringLiteral("back"));
     job_ = QJsonObject();
     editorDirection_.clear();
-    dirty_ = false;
+    setDirty(false);
     undoHistory_.clear();
     redoHistory_.clear();
     if (versionCombo_ != nullptr) versionCombo_->setCurrentIndex(0);
@@ -742,7 +737,7 @@ void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::setValidationJob(const QJsonObject &job) {
+void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
     if (dirty_) return;
     job_ = job;
     if (validationHintLabel_ != nullptr) {
@@ -858,7 +853,7 @@ void GeometryMaskManagerDialog::setValidationJob(const QJsonObject &job) {
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::selectValidationTemplate(int row) {
+void GeometryRulesPage::selectValidationTemplate(int row) {
     if (validationTable_ == nullptr || templateCombo_ == nullptr || directionCombo_ == nullptr
         || row < 0 || row >= validationTable_->rowCount()) {
         return;
@@ -896,7 +891,7 @@ void GeometryMaskManagerDialog::selectValidationTemplate(int row) {
     applyFittedBoundaryForCurrentTemplate();
 }
 
-void GeometryMaskManagerDialog::setBusy(bool busy) {
+void GeometryRulesPage::setBusy(bool busy) {
     busy_ = busy;
     saveButton_->setEnabled(!busy);
     validateButton_->setEnabled(!busy);
@@ -904,7 +899,7 @@ void GeometryMaskManagerDialog::setBusy(bool busy) {
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::setPreviewBusy(bool busy) {
+void GeometryRulesPage::setPreviewBusy(bool busy) {
     previewBusy_ = busy;
     if (directionCombo_) directionCombo_->setEnabled(!busy);
     if (templateCombo_) templateCombo_->setEnabled(!busy);
@@ -913,7 +908,13 @@ void GeometryMaskManagerDialog::setPreviewBusy(bool busy) {
     if (shapeCombo_) shapeCombo_->setEnabled(!busy);
 }
 
-void GeometryMaskManagerDialog::markDraftDirty() {
+void GeometryRulesPage::setDirty(bool dirty) {
+    if (dirty_ == dirty) return;
+    dirty_ = dirty;
+    emit unsavedChangesChanged(dirty_);
+}
+
+void GeometryRulesPage::markDraftDirty() {
     if (!dirty_) {
         job_ = QJsonObject();
         if (validationTable_ != nullptr) validationTable_->setRowCount(0);
@@ -934,12 +935,12 @@ void GeometryMaskManagerDialog::markDraftDirty() {
             statusLabel_->setStyleSheet(QStringLiteral("color: #b35c00;"));
         }
     }
-    dirty_ = true;
+    setDirty(true);
     if (dirtyLabel_ != nullptr) dirtyLabel_->setText(QStringLiteral("草稿有未保存修改"));
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::applyDraftMutation(const QJsonObject &next) {
+void GeometryRulesPage::applyDraftMutation(const QJsonObject &next) {
     if (next == draft_) return;
     undoHistory_.append(draft_);
     if (undoHistory_.size() > 100) undoHistory_.removeFirst();
@@ -949,7 +950,7 @@ void GeometryMaskManagerDialog::applyDraftMutation(const QJsonObject &next) {
     refreshEditor();
 }
 
-void GeometryMaskManagerDialog::refreshEditor() {
+void GeometryRulesPage::refreshEditor() {
     refreshRuleList();
     refreshTemplatePreview();
     dirtyLabel_->setText(dirty_ ? QStringLiteral("草稿有未保存修改") : QStringLiteral("草稿已保存"));
@@ -958,12 +959,12 @@ void GeometryMaskManagerDialog::refreshEditor() {
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::setOperationError(const QString &message) {
+void GeometryRulesPage::setOperationError(const QString &message) {
     statusLabel_->setText(message);
     statusLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
 }
 
-void GeometryMaskManagerDialog::refreshRuleList() {
+void GeometryRulesPage::refreshRuleList() {
     if (!ruleList_) return;
     if (editorDirection_ == direction()) setCurrentRuleFromEditor();
     const QString previousId = currentRuleId();
@@ -1006,7 +1007,7 @@ void GeometryMaskManagerDialog::refreshRuleList() {
     loadCurrentRuleIntoEditor();
 }
 
-void GeometryMaskManagerDialog::refreshTemplatePreview() {
+void GeometryRulesPage::refreshTemplatePreview() {
     if (!templateCombo_ || !canvas_) return;
     const QSignalBlocker canvasBlocker(canvas_);
     const QString side = direction();
@@ -1052,7 +1053,7 @@ void GeometryMaskManagerDialog::refreshTemplatePreview() {
     refreshTemplateReview();
 }
 
-bool GeometryMaskManagerDialog::applyFittedBoundaryForCurrentTemplate() {
+bool GeometryRulesPage::applyFittedBoundaryForCurrentTemplate() {
     if (canvas_ == nullptr || templateCombo_ == nullptr) return false;
     canvas_->setFitOverlay(QJsonObject());
     const QString side = direction();
@@ -1153,12 +1154,12 @@ bool GeometryMaskManagerDialog::applyFittedBoundaryForCurrentTemplate() {
     return false;
 }
 
-void GeometryMaskManagerDialog::setTemplateDiagnostics(const QString &text) {
+void GeometryRulesPage::setTemplateDiagnostics(const QString &text) {
     templateDiagnostics_ = text;
     refreshDiagnostics();
 }
 
-void GeometryMaskManagerDialog::refreshDiagnostics() {
+void GeometryRulesPage::refreshDiagnostics() {
     if (diagnostics_ == nullptr) return;
     QStringList sections;
     if (!validationDiagnostics_.isEmpty()) sections.append(validationDiagnostics_);
@@ -1166,7 +1167,7 @@ void GeometryMaskManagerDialog::refreshDiagnostics() {
     diagnostics_->setPlainText(sections.join(QStringLiteral("\n\n----------------\n\n")));
 }
 
-void GeometryMaskManagerDialog::refreshTemplateReview() {
+void GeometryRulesPage::refreshTemplateReview() {
     if (templateCombo_ == nullptr || reviewStateCombo_ == nullptr || reviewReasonEdit_ == nullptr) return;
     const QString templateId = templateCombo_->currentData(Qt::UserRole + 1).toString();
     const QJsonObject reviews = directionObject().value(QStringLiteral("template_reviews")).toObject();
@@ -1178,7 +1179,7 @@ void GeometryMaskManagerDialog::refreshTemplateReview() {
     reviewReasonEdit_->setText(review.value(QStringLiteral("reason")).toString());
 }
 
-void GeometryMaskManagerDialog::setAnchorFromCanvas() {
+void GeometryRulesPage::setAnchorFromCanvas() {
     QJsonObject anchor = anchorFromCanvasShape(canvas_->coarseShape());
     if (anchor.isEmpty()) return;
     ensureDirectionObject(direction());
@@ -1192,7 +1193,7 @@ void GeometryMaskManagerDialog::setAnchorFromCanvas() {
     refreshRuleList();
 }
 
-void GeometryMaskManagerDialog::setCurrentRuleFromEditor() {
+void GeometryRulesPage::setCurrentRuleFromEditor() {
     if (!editorDirection_.isEmpty() && editorDirection_ != direction()) return;
     const int index = currentRuleIndex();
     if (index < 0) return;
@@ -1238,7 +1239,7 @@ void GeometryMaskManagerDialog::setCurrentRuleFromEditor() {
     markDraftDirty();
 }
 
-void GeometryMaskManagerDialog::loadCurrentRuleIntoEditor() {
+void GeometryRulesPage::loadCurrentRuleIntoEditor() {
     editorDirection_ = direction();
     const QJsonObject rule = currentRule();
     if (rule.isEmpty()) return;
@@ -1259,7 +1260,7 @@ void GeometryMaskManagerDialog::loadCurrentRuleIntoEditor() {
     refreshTemplatePreview();
 }
 
-void GeometryMaskManagerDialog::addRule() {
+void GeometryRulesPage::addRule() {
     ensureDirectionObject(direction());
     if (usesLogicalRuleSchema()) {
         QJsonArray rules = logicalRules();
@@ -1302,7 +1303,7 @@ void GeometryMaskManagerDialog::addRule() {
     ruleList_->setCurrentRow(rules.size() - 1);
 }
 
-void GeometryMaskManagerDialog::deleteRule() {
+void GeometryRulesPage::deleteRule() {
     setCurrentRuleFromEditor();
     const int index = currentRuleIndex();
     if (index < 0) return;
@@ -1339,7 +1340,7 @@ void GeometryMaskManagerDialog::deleteRule() {
     refreshRuleList();
 }
 
-void GeometryMaskManagerDialog::requestPreviewFromShape(const QJsonObject &shape) {
+void GeometryRulesPage::requestPreviewFromShape(const QJsonObject &shape) {
     if (shape.isEmpty() || previewBusy_) return;
     if (manualAnchorCapture_) {
         const QJsonObject anchor = anchorFromCanvasShape(shape);
@@ -1364,7 +1365,7 @@ void GeometryMaskManagerDialog::requestPreviewFromShape(const QJsonObject &shape
     emit previewRequested(request);
 }
 
-QJsonObject GeometryMaskManagerDialog::previewRequest(int anchorCandidateIndex, int ruleCandidateIndex,
+QJsonObject GeometryRulesPage::previewRequest(int anchorCandidateIndex, int ruleCandidateIndex,
                                                       const QJsonObject &seedShape) const {
     const QString templateId = templateCombo_->currentData(Qt::UserRole + 1).toString().isEmpty()
         ? templateCombo_->currentText() : templateCombo_->currentData(Qt::UserRole + 1).toString();
@@ -1386,7 +1387,7 @@ QJsonObject GeometryMaskManagerDialog::previewRequest(int anchorCandidateIndex, 
     return request;
 }
 
-void GeometryMaskManagerDialog::candidateChanged(int index) {
+void GeometryRulesPage::candidateChanged(int index) {
     Q_UNUSED(index);
     if (previewBusy_) return;
     const QJsonObject request = previewRequest(anchorCandidateCombo_->currentIndex(), ruleCandidateCombo_->currentIndex());
@@ -1396,7 +1397,7 @@ void GeometryMaskManagerDialog::candidateChanged(int index) {
     emit previewRequested(request);
 }
 
-void GeometryMaskManagerDialog::setRulePreview(const QJsonObject &preview) {
+void GeometryRulesPage::setRulePreview(const QJsonObject &preview) {
     if (preview.value(QStringLiteral("direction")).toString() != direction()) return;
     const QString expectedTemplate = templateCombo_->currentData(Qt::UserRole + 1).toString();
     if (!expectedTemplate.isEmpty() && preview.value(QStringLiteral("template_id")).toString() != expectedTemplate) return;
@@ -1502,7 +1503,7 @@ void GeometryMaskManagerDialog::setRulePreview(const QJsonObject &preview) {
     setPreviewBusy(false);
 }
 
-void GeometryMaskManagerDialog::setTemplateReview(const QString &state, const QString &reason) {
+void GeometryRulesPage::setTemplateReview(const QString &state, const QString &reason) {
     const QString templateId = templateCombo_->currentData(Qt::UserRole + 1).toString();
     if (templateId.isEmpty() || state.isEmpty()) return;
     QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
@@ -1523,19 +1524,27 @@ void GeometryMaskManagerDialog::setTemplateReview(const QString &state, const QS
     markDraftDirty();
 }
 
-void GeometryMaskManagerDialog::saveDraft() {
+void GeometryRulesPage::saveDraft() {
     setCurrentRuleFromEditor();
     emit saveDraftRequested(draft_, snapshot_.value(QStringLiteral("library_revision")).toInt(),
                              snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
-void GeometryMaskManagerDialog::validateDraft() {
+void GeometryRulesPage::requestSaveDraft() {
+    saveDraft();
+}
+
+void GeometryRulesPage::discardUnsavedChanges() {
+    reloadDraft();
+}
+
+void GeometryRulesPage::validateDraft() {
     setCurrentRuleFromEditor();
     emit validateRequested(snapshot_.value(QStringLiteral("library_revision")).toInt(),
                           snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
-void GeometryMaskManagerDialog::publishDraft() {
+void GeometryRulesPage::publishDraft() {
     if (!publishButton_->isEnabled()) return;
     emit publishRequested(job_.value(QStringLiteral("job_id")).toString(),
                           snapshot_.value(QStringLiteral("library_revision")).toInt(),
@@ -1543,7 +1552,7 @@ void GeometryMaskManagerDialog::publishDraft() {
                           overrideReasonEdit_->text().trimmed());
 }
 
-void GeometryMaskManagerDialog::publishWorkflow() {
+void GeometryRulesPage::publishWorkflow() {
     if (publishWorkflowButton_ == nullptr || !publishWorkflowButton_->isEnabled()) return;
     setCurrentRuleFromEditor();
     const QJsonArray conflicts = draft_.value(QStringLiteral("migration")).toObject()
@@ -1569,12 +1578,12 @@ void GeometryMaskManagerDialog::publishWorkflow() {
                                   overrideReasonEdit_->text().trimmed());
 }
 
-void GeometryMaskManagerDialog::rollbackDraft() {
+void GeometryRulesPage::rollbackDraft() {
     if (busy_) return;
     emit rollbackRequested(snapshot_.value(QStringLiteral("library_revision")).toInt());
 }
 
-void GeometryMaskManagerDialog::updatePublishState() {
+void GeometryRulesPage::updatePublishState() {
     const QString state = job_.value(QStringLiteral("state")).toString();
     const bool completed = state == QStringLiteral("completed")
         && job_.value(QStringLiteral("base_library_revision")).toInt() == snapshot_.value(QStringLiteral("library_revision")).toInt()
@@ -1614,7 +1623,7 @@ void GeometryMaskManagerDialog::updatePublishState() {
     }
 }
 
-void GeometryMaskManagerDialog::undoDraft() {
+void GeometryRulesPage::undoDraft() {
     if (undoHistory_.isEmpty()) return;
     redoHistory_.append(draft_);
     draft_ = undoHistory_.takeLast();
@@ -1622,7 +1631,7 @@ void GeometryMaskManagerDialog::undoDraft() {
     refreshEditor();
 }
 
-void GeometryMaskManagerDialog::redoDraft() {
+void GeometryRulesPage::redoDraft() {
     if (redoHistory_.isEmpty()) return;
     undoHistory_.append(draft_);
     draft_ = redoHistory_.takeLast();
@@ -1630,7 +1639,7 @@ void GeometryMaskManagerDialog::redoDraft() {
     refreshEditor();
 }
 
-void GeometryMaskManagerDialog::resetCurrentRule() {
+void GeometryRulesPage::resetCurrentRule() {
     const int index = currentRuleIndex();
     if (index < 0) return;
     if (usesLogicalRuleSchema()) {
@@ -1664,11 +1673,11 @@ void GeometryMaskManagerDialog::resetCurrentRule() {
     applyDraftMutation(next);
 }
 
-void GeometryMaskManagerDialog::reloadDraft() {
+void GeometryRulesPage::reloadDraft() {
     draft_ = snapshot_.value(QStringLiteral("draft")).toObject();
     undoHistory_.clear();
     redoHistory_.clear();
-    dirty_ = false;
+    setDirty(false);
     job_ = QJsonObject();
     if (validationTable_ != nullptr) validationTable_->setRowCount(0);
     if (progressBar_ != nullptr) {
@@ -1689,7 +1698,7 @@ void GeometryMaskManagerDialog::reloadDraft() {
     refreshEditor();
 }
 
-void GeometryMaskManagerDialog::copyActiveToDraft() {
+void GeometryRulesPage::copyActiveToDraft() {
     const QJsonObject active = snapshot_.value(QStringLiteral("active")).toObject();
     if (active.isEmpty()) return;
     applyDraftMutation(active);

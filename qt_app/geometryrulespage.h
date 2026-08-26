@@ -1,6 +1,6 @@
 #pragma once
 
-#include <QDialog>
+#include <QWidget>
 #include <QList>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -17,11 +17,11 @@ class QTableWidget;
 class QTextEdit;
 class GeometryRuleCanvas;
 
-class GeometryMaskManagerDialog : public QDialog {
+class GeometryRulesPage : public QWidget {
     Q_OBJECT
 
 public:
-    explicit GeometryMaskManagerDialog(QWidget *parent = nullptr);
+    explicit GeometryRulesPage(QWidget *parent = nullptr);
 
     void setSnapshot(const QJsonObject &snapshot);
     void setValidationJob(const QJsonObject &job);
@@ -31,8 +31,12 @@ public:
     void setOperationError(const QString &message);
     QJsonObject draft() const { return draft_; }
     QJsonObject snapshot() const { return snapshot_; }
+    bool hasUnsavedChanges() const { return dirty_; }
+    void discardUnsavedChanges();
+    void requestSaveDraft();
 
 signals:
+    void unsavedChangesChanged(bool dirty);
     void snapshotRequested(const QString &workpieceId);
     void saveDraftRequested(const QJsonObject &draft, int libraryRevision, int draftRevision);
     void publishWorkflowRequested(const QJsonObject &draft, int libraryRevision, int draftRevision,
@@ -96,6 +100,7 @@ private:
     QJsonObject canvasShapeForRule(const QJsonObject &rule) const;
     QJsonObject anchorFromCanvasShape(const QJsonObject &shape) const;
     QJsonObject ruleGeometryFromCanvasShape(const QJsonObject &shape) const;
+    void setDirty(bool dirty);
     void markDraftDirty();
     void applyDraftMutation(const QJsonObject &next);
     void refreshEditor();
@@ -147,7 +152,6 @@ private:
     QPushButton *publishButton_ = nullptr;
     QPushButton *publishWorkflowButton_ = nullptr;
     QPushButton *rollbackButton_ = nullptr;
-    QPushButton *cancelButton_ = nullptr;
     QPushButton *setAnchorButton_ = nullptr;
     QPushButton *manualAnchorButton_ = nullptr;
     QPushButton *undoButton_ = nullptr;

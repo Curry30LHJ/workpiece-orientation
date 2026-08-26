@@ -43,7 +43,6 @@
         <property name="topMargin"><number>0</number></property>
         <property name="rightMargin"><number>0</number></property>
         <property name="bottomMargin"><number>0</number></property>
-        <item><widget class="QLabel" name="geometryPagePlaceholderLabel"><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string>几何规则页面将在 Task 9 接入</string></property></widget></item>
        </layout>
       </widget>
      </widget>

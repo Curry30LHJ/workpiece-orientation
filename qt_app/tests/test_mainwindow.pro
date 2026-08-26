@@ -15,7 +15,7 @@ SOURCES += test_mainwindow.cpp \
            ../inspectionpage.cpp \
            ../workpiecelibrarypage.cpp \
            ../geometryrulecanvas.cpp \
-           ../geometrymaskmanager.cpp \
+           ../geometryrulespage.cpp \
            ../annotationcanvas.cpp \
            ../annotationmanager.cpp \
            ../annotationeditor.cpp \
@@ -31,7 +31,7 @@ HEADERS += ../appheader.h \
            ../inspectionpage.h \
            ../workpiecelibrarypage.h \
            ../geometryrulecanvas.h \
-           ../geometrymaskmanager.h \
+           ../geometryrulespage.h \
            ../annotationcanvas.h \
            ../annotationmanager.h \
            ../annotationeditor.h \

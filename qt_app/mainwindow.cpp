@@ -7,6 +7,7 @@
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QAbstractButton>
@@ -19,7 +20,7 @@
 #include "backendprocessmanager.h"
 #include "annotationeditor.h"
 #include "annotationmanager.h"
-#include "geometrymaskmanager.h"
+#include "geometryrulespage.h"
 #include "inspectionpage.h"
 #include "inspectiontypes.h"
 #include "taskstatuswidget.h"
@@ -55,6 +56,27 @@ void MainWindow::initializeUi() {
     ui->inspectionPageHostLayout->addWidget(inspectionPage_);
     workpieceLibraryPage_ = new WorkpieceLibraryPage(ui->libraryPageHost);
     ui->libraryPageHostLayout->addWidget(workpieceLibraryPage_);
+    geometryRulesPage_ = new GeometryRulesPage(ui->geometryPageHost);
+    geometryRulesPage_->setObjectName(QStringLiteral("geometryRulesPage"));
+    ui->geometryPageHostLayout->addWidget(geometryRulesPage_);
+    connect(geometryRulesPage_, &GeometryRulesPage::saveDraftRequested,
+            this, &MainWindow::saveGeometryDraft);
+    connect(geometryRulesPage_, &GeometryRulesPage::validateRequested,
+            this, &MainWindow::validateGeometryDraft);
+    connect(geometryRulesPage_, &GeometryRulesPage::validationJobActionRequested,
+            this, &MainWindow::geometryJobAction);
+    connect(geometryRulesPage_, &GeometryRulesPage::publishRequested,
+            this, &MainWindow::publishGeometryProfile);
+    connect(geometryRulesPage_, &GeometryRulesPage::publishWorkflowRequested,
+            this, &MainWindow::publishGeometryWorkflow);
+    connect(geometryRulesPage_, &GeometryRulesPage::rollbackRequested,
+            this, &MainWindow::rollbackGeometryProfile);
+    connect(geometryRulesPage_, &GeometryRulesPage::previewRequested,
+            this, &MainWindow::previewGeometryRule);
+    connect(geometryRulesPage_, &GeometryRulesPage::migrationResolutionRequested,
+            this, &MainWindow::resolveGeometryMigration);
+    connect(geometryRulesPage_, &GeometryRulesPage::snapshotRequested,
+            this, &MainWindow::requestGeometryProfile);
     chooseImageButton_ = inspectionPage_->findChild<QPushButton *>(
         QStringLiteral("chooseImageButton"));
     predictButton_ = inspectionPage_->findChild<QPushButton *>(
@@ -143,17 +165,7 @@ void MainWindow::initializeUi() {
             });
     connect(workpieceLibraryPage_, &WorkpieceLibraryPage::setCurrentWorkpieceRequested,
             this, [this](const QString &workpieceId) {
-                appHeader_->setCurrentWorkpieceId(workpieceId);
-                inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
-                                                     appHeader_->currentWorkpieceName());
-                workpieceLibraryPage_->setWorkpieces(
-                    workpieceSummaries_, appHeader_->currentWorkpieceId());
-                if (resultContext_ != ResultContext::Batch) {
-                    lastPredictionWorkpieceId_.clear();
-                    lastPredictionImagePath_.clear();
-                    lastPredictionResponse_ = QJsonObject();
-                }
-                updateButtonStates();
+                applyDetectionWorkpieceChange(workpieceId);
             });
     connect(workpieceLibraryPage_, &WorkpieceLibraryPage::taskStatusChanged,
             this, [this](const QString &title, const QString &phase,
@@ -187,22 +199,14 @@ void MainWindow::initializeUi() {
             this, [this](AppPage page) { requestPage(page); });
     connect(appHeader_, &AppHeader::restartBackendRequested,
             this, &MainWindow::restartBackend);
-    connect(appHeader_, &AppHeader::currentWorkpieceRequested, this, [this](const QString &) {
+    connect(appHeader_, &AppHeader::currentWorkpieceRequested, this,
+            [this](const QString &workpieceId) {
+        if (!applyDetectionWorkpieceChange(workpieceId)) return;
         if (annotationManagerDialog_ != nullptr) {
             annotationManagerDialog_->close();
             annotationManagerDialog_.clear();
             annotationWorkpieceId_.clear();
         }
-        inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
-                                             appHeader_->currentWorkpieceName());
-        workpieceLibraryPage_->setWorkpieces(
-            workpieceSummaries_, appHeader_->currentWorkpieceId());
-        if (resultContext_ != ResultContext::Batch) {
-            lastPredictionWorkpieceId_.clear();
-            lastPredictionImagePath_.clear();
-            lastPredictionResponse_ = QJsonObject();
-        }
-        updateButtonStates();
     });
     connect(annotationEditorButton_, &QPushButton::clicked,
             this, &MainWindow::openAnnotationManager);
@@ -211,8 +215,104 @@ void MainWindow::initializeUi() {
     rejectConfirmationButton_->setEnabled(false);
 }
 
+MainWindow::GeometryDirtyDecision MainWindow::promptForDirtyGeometry() {
+    QMessageBox prompt(this);
+    prompt.setWindowTitle(QStringLiteral("未保存的几何草稿"));
+    prompt.setText(QStringLiteral("几何规则中有未保存的修改，如何处理？"));
+    QAbstractButton *keep = prompt.addButton(
+        QStringLiteral("保留并离开"), QMessageBox::AcceptRole);
+    QAbstractButton *discard = prompt.addButton(
+        QStringLiteral("放弃修改"), QMessageBox::DestructiveRole);
+    QAbstractButton *cancel = prompt.addButton(
+        QStringLiteral("取消"), QMessageBox::RejectRole);
+    prompt.exec();
+    if (prompt.clickedButton() == discard) return GeometryDirtyDecision::Discard;
+    if (prompt.clickedButton() == keep) return GeometryDirtyDecision::Keep;
+    Q_UNUSED(cancel)
+    return GeometryDirtyDecision::Cancel;
+}
+
+void MainWindow::setCurrentPageUnchecked(AppPage page) {
+    ui->mainPageStack->setCurrentIndex(static_cast<int>(page));
+    currentPage_ = page;
+    appHeader_->setCurrentPage(page);
+}
+
+void MainWindow::refreshDetectionWorkpieceConsumers() {
+    if (!currentDetectionWorkpieceId_.isEmpty()) {
+        appHeader_->setCurrentWorkpieceId(currentDetectionWorkpieceId_);
+    }
+    inspectionPage_->setCurrentWorkpiece(appHeader_->currentWorkpieceId(),
+                                         appHeader_->currentWorkpieceName());
+    workpieceLibraryPage_->setWorkpieces(workpieceSummaries_,
+                                         appHeader_->currentWorkpieceId());
+    if (resultContext_ != ResultContext::Batch) {
+        lastPredictionWorkpieceId_.clear();
+        lastPredictionImagePath_.clear();
+        lastPredictionResponse_ = QJsonObject();
+    }
+    updateButtonStates();
+}
+
+bool MainWindow::applyDetectionWorkpieceChange(const QString &workpieceId) {
+    if (workpieceId == currentDetectionWorkpieceId_) {
+        if (!workpieceId.isEmpty()) appHeader_->setCurrentWorkpieceId(workpieceId);
+        return true;
+    }
+    if (geometryRulesPage_ != nullptr && geometryRulesPage_->hasUnsavedChanges()
+        && workpieceId != geometryWorkpieceId_) {
+        const GeometryDirtyDecision decision = promptForDirtyGeometry();
+        if (decision == GeometryDirtyDecision::Cancel) {
+            if (!currentDetectionWorkpieceId_.isEmpty()) {
+                appHeader_->setCurrentWorkpieceId(currentDetectionWorkpieceId_);
+            }
+            return false;
+        }
+        if (decision == GeometryDirtyDecision::Discard) {
+            geometryRulesPage_->discardUnsavedChanges();
+        } else if (currentPage_ == AppPage::GeometryRules) {
+            setCurrentPageUnchecked(AppPage::Inspection);
+        }
+    }
+    currentDetectionWorkpieceId_ = workpieceId;
+    ++geometryTargetGeneration_;
+    if (!workpieceId.isEmpty()) appHeader_->setCurrentWorkpieceId(workpieceId);
+    if (annotationManagerDialog_ != nullptr) {
+        annotationManagerDialog_->close();
+        annotationManagerDialog_.clear();
+        annotationWorkpieceId_.clear();
+    }
+    refreshDetectionWorkpieceConsumers();
+    if (currentPage_ == AppPage::GeometryRules
+        && !geometryRulesPage_->hasUnsavedChanges()) {
+        ensureGeometryProfileForCurrentWorkpiece();
+    }
+    return true;
+}
+
 bool MainWindow::requestPage(AppPage page) {
-    if (page == currentPage_) return true;
+    if (page == currentPage_) {
+        if (page == AppPage::GeometryRules) ensureGeometryProfileForCurrentWorkpiece();
+        return true;
+    }
+    if (geometryRulesPage_ != nullptr && geometryRulesPage_->hasUnsavedChanges()) {
+        const bool leavingGeometry = currentPage_ == AppPage::GeometryRules
+            && page != AppPage::GeometryRules;
+        const bool enteringDifferentGeometry = page == AppPage::GeometryRules
+            && geometryWorkpieceId_ != currentDetectionWorkpieceId_;
+        if (leavingGeometry || enteringDifferentGeometry) {
+            const GeometryDirtyDecision decision = promptForDirtyGeometry();
+            if (decision == GeometryDirtyDecision::Cancel
+                || (enteringDifferentGeometry
+                    && decision == GeometryDirtyDecision::Keep)) {
+                appHeader_->setCurrentPage(currentPage_);
+                return false;
+            }
+            if (decision == GeometryDirtyDecision::Discard) {
+                geometryRulesPage_->discardUnsavedChanges();
+            }
+        }
+    }
     if (currentPage_ == AppPage::WorkpieceLibrary
         && workpieceLibraryPage_ != nullptr
         && workpieceLibraryPage_->hasUnsavedChanges()) {
@@ -235,9 +335,8 @@ bool MainWindow::requestPage(AppPage page) {
         }
         Q_UNUSED(keep)
     }
-    ui->mainPageStack->setCurrentIndex(static_cast<int>(page));
-    currentPage_ = page;
-    appHeader_->setCurrentPage(page);
+    setCurrentPageUnchecked(page);
+    if (page == AppPage::GeometryRules) ensureGeometryProfileForCurrentWorkpiece();
     return true;
 }
 
@@ -295,8 +394,13 @@ void MainWindow::sendPageCommand(CommandOwner owner, const QString &command,
         activeMandatoryDetailsWorkpieceId_ = fields.value(
             QStringLiteral("workpiece_id")).toString();
     }
+    const quint64 geometryTargetGeneration =
+        owner == CommandOwner::Geometry
+            && command == QStringLiteral("get_geometry_mask_profile")
+        ? geometryTargetGeneration_ : 0;
     const QueuedCommandIntent intent{
-        owner, command, fields, effectiveRefreshTransactionId};
+        owner, command, fields, effectiveRefreshTransactionId,
+        geometryTargetGeneration};
     if (owner == CommandOwner::Library
         && command == QStringLiteral("register")
         && fields.value(QStringLiteral("replace")).toBool()) {
@@ -400,6 +504,7 @@ void MainWindow::issuePageCommand(const QueuedCommandIntent &intent,
     pendingCommand_ = intent.command;
     pendingFields_ = intent.fields;
     pendingRefreshTransactionId_ = intent.refreshTransactionId;
+    pendingGeometryTargetGeneration_ = intent.geometryTargetGeneration;
     pendingRefreshIncludesMandatory_ = includesMandatoryRefresh;
     pendingRefreshIncludesUser_ = includesUserRefresh;
     client_->sendRequest(intent.command, intent.fields);
@@ -410,6 +515,7 @@ void MainWindow::clearPendingCommand() {
     pendingCommand_.clear();
     pendingFields_ = QJsonObject();
     pendingRefreshTransactionId_ = 0;
+    pendingGeometryTargetGeneration_ = 0;
     pendingRefreshIncludesMandatory_ = false;
     pendingRefreshIncludesUser_ = false;
 }
@@ -603,60 +709,36 @@ void MainWindow::openAnnotationEditor() {
 }
 
 void MainWindow::openAnnotationManager() {
-    openGeometryMaskManager();
+    showGeometryRules();
 }
 
-void MainWindow::openGeometryMaskManager() {
-    const QString workpieceId = workpieceLibraryPage_ != nullptr
-        && !workpieceLibraryPage_->browsedWorkpieceId().isEmpty()
-        ? workpieceLibraryPage_->browsedWorkpieceId() : selectedWorkpieceId();
-    if (workpieceId.isEmpty() || client_ == nullptr || !backendReady_ || clientBusy_
-        || client_->state() != BackendClient::State::Ready) {
-        showLibraryMessage(QStringLiteral("请先选择已建立的工件库，且等待后端空闲"), true);
+void MainWindow::ensureGeometryProfileForCurrentWorkpiece() {
+    const QString workpieceId = currentDetectionWorkpieceId_.isEmpty()
+        ? appHeader_->currentWorkpieceId() : currentDetectionWorkpieceId_;
+    if (workpieceId.isEmpty() || geometryRulesPage_ == nullptr
+        || geometryRulesPage_->hasUnsavedChanges()) {
         return;
     }
-    geometryWorkpieceId_ = workpieceId;
-    geometryPublishAfterValidation_ = false;
-    geometryPublishOverrideReason_.clear();
-    geometryValidationJobId_.clear();
-    if (geometryPollTimer_ != nullptr) geometryPollTimer_->stop();
-    if (geometryMaskManagerDialog_ == nullptr) {
-        geometryMaskManagerDialog_ = new GeometryMaskManagerDialog(this);
-        geometryMaskManagerDialog_->setAttribute(Qt::WA_DeleteOnClose);
-        connect(geometryMaskManagerDialog_, &GeometryMaskManagerDialog::saveDraftRequested,
-                this, &MainWindow::saveGeometryDraft);
-        connect(geometryMaskManagerDialog_, &GeometryMaskManagerDialog::validateRequested,
-                this, &MainWindow::validateGeometryDraft);
-        connect(geometryMaskManagerDialog_, &GeometryMaskManagerDialog::validationJobActionRequested,
-                this, &MainWindow::geometryJobAction);
-        connect(geometryMaskManagerDialog_, &GeometryMaskManagerDialog::publishRequested,
-                this, &MainWindow::publishGeometryProfile);
-        connect(geometryMaskManagerDialog_, &GeometryMaskManagerDialog::publishWorkflowRequested,
-                this, &MainWindow::publishGeometryWorkflow);
-        connect(geometryMaskManagerDialog_, &GeometryMaskManagerDialog::rollbackRequested,
-                this, &MainWindow::rollbackGeometryProfile);
-        connect(geometryMaskManagerDialog_, &GeometryMaskManagerDialog::previewRequested,
-                this, &MainWindow::previewGeometryRule);
-        connect(geometryMaskManagerDialog_, &GeometryMaskManagerDialog::migrationResolutionRequested,
-                this, &MainWindow::resolveGeometryMigration);
+    const QString snapshotWorkpieceId = geometryRulesPage_->snapshot()
+        .value(QStringLiteral("workpiece_id")).toString();
+    if (geometryWorkpieceId_ == workpieceId
+        && snapshotWorkpieceId == workpieceId) {
+        return;
     }
-    geometryMaskManagerDialog_->setBusy(true);
-    geometryMaskManagerDialog_->show();
-    geometryMaskManagerDialog_->raise();
-    geometryMaskManagerDialog_->activateWindow();
+    if (pendingCommand_ == QStringLiteral("get_geometry_mask_profile")
+        && pendingFields_.value(QStringLiteral("workpiece_id")).toString()
+            == workpieceId) {
+        return;
+    }
     requestGeometryProfile(workpieceId);
-    showLibraryMessage(QStringLiteral("正在加载几何干扰规则…"));
 }
 
 void MainWindow::requestGeometryProfile(const QString &workpieceId) {
     if (workpieceId.isEmpty() || client_ == nullptr || !backendReady_) {
         return;
     }
-    if (client_->state() != BackendClient::State::Ready || clientBusy_) {
-        QTimer::singleShot(20, this, [this, workpieceId]() { requestGeometryProfile(workpieceId); });
-        return;
-    }
     geometryWorkpieceId_ = workpieceId;
+    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(true);
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("get_geometry_mask_profile"), {
         {QStringLiteral("workpiece_id"), workpieceId},
     });
@@ -665,7 +747,7 @@ void MainWindow::requestGeometryProfile(const QString &workpieceId) {
 void MainWindow::saveGeometryDraft(const QJsonObject &draft, int libraryRevision, int draftRevision) {
     if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
         || client_->state() != BackendClient::State::Ready) return;
-    if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
+    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(true);
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("save_geometry_mask_draft"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("base_library_revision"), libraryRevision},
@@ -687,7 +769,7 @@ void MainWindow::publishGeometryWorkflow(const QJsonObject &draft, int libraryRe
 void MainWindow::validateGeometryDraft(int libraryRevision, int draftRevision) {
     if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
         || client_->state() != BackendClient::State::Ready) return;
-    if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
+    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(true);
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("validate_geometry_mask_draft"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("base_library_revision"), libraryRevision},
@@ -702,6 +784,55 @@ void MainWindow::pollGeometryValidation() {
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("get_geometry_mask_validation_job"), {
         {QStringLiteral("job_id"), geometryValidationJobId_},
     });
+}
+
+void MainWindow::applyGeometryValidationJob(const QJsonObject &job) {
+    const QString state = job.value(QStringLiteral("state")).toString();
+    const bool active = state == QStringLiteral("queued")
+        || state == QStringLiteral("running");
+    const QString jobId = job.value(QStringLiteral("job_id")).toString();
+    const QJsonObject progress = job.value(QStringLiteral("progress")).toObject();
+    const int total = qMax(1, progress.value(QStringLiteral("total")).toInt(1));
+    const int completed = qBound(0, progress.value(QStringLiteral("completed")).toInt(), total);
+    const qint64 elapsedMs = qMax<qint64>(
+        0, progress.value(QStringLiteral("elapsed_ms"))
+               .toVariant().toLongLong());
+
+    if (geometryRulesPage_ != nullptr) {
+        geometryRulesPage_->setValidationJob(job);
+        geometryRulesPage_->setBusy(false);
+    }
+    if (globalTaskStatus_ != nullptr) {
+        globalTaskStatus_->setRunning(
+            QStringLiteral("几何规则验证"),
+            state == QStringLiteral("queued") ? QStringLiteral("排队中")
+                                               : QStringLiteral("验证中"),
+            completed, total, elapsedMs);
+    }
+
+    if (active) {
+        if (!jobId.isEmpty()) geometryValidationJobId_ = jobId;
+        if (geometryPollTimer_ != nullptr) geometryPollTimer_->start();
+        return;
+    }
+
+    geometryValidationJobId_.clear();
+    if (geometryPollTimer_ != nullptr) geometryPollTimer_->stop();
+    if (globalTaskStatus_ == nullptr) return;
+    if (state == QStringLiteral("completed")) {
+        globalTaskStatus_->setMessage(
+            TaskStatusWidget::MessageKind::Success,
+            QStringLiteral("几何规则验证完成 · %1/%2").arg(completed).arg(total));
+    } else if (state == QStringLiteral("cancelled")
+               || state == QStringLiteral("canceled")) {
+        globalTaskStatus_->setMessage(
+            TaskStatusWidget::MessageKind::Warning,
+            QStringLiteral("几何规则验证已取消 · %1/%2").arg(completed).arg(total));
+    } else {
+        globalTaskStatus_->setMessage(
+            TaskStatusWidget::MessageKind::Error,
+            QStringLiteral("几何规则验证未完成 · %1/%2").arg(completed).arg(total));
+    }
 }
 
 bool MainWindow::maybeContinueGeometryPublish(const QJsonObject &job) {
@@ -753,7 +884,7 @@ void MainWindow::publishGeometryProfile(const QString &jobId, int libraryRevisio
         || client_->state() != BackendClient::State::Ready) return;
     geometryPublishAfterValidation_ = false;
     geometryPublishOverrideReason_.clear();
-    if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
+    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(true);
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("publish_geometry_mask_profile"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("job_id"), jobId},
@@ -767,7 +898,7 @@ void MainWindow::publishGeometryProfile(const QString &jobId, int libraryRevisio
 void MainWindow::rollbackGeometryProfile(int libraryRevision) {
     if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
         || client_->state() != BackendClient::State::Ready) return;
-    if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
+    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(true);
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("rollback_geometry_mask_profile"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("base_library_revision"), libraryRevision},
@@ -782,7 +913,7 @@ void MainWindow::previewGeometryRule(const QJsonObject &request) {
     }
     QJsonObject fields = request;
     fields.insert(QStringLiteral("workpiece_id"), geometryWorkpieceId_);
-    if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setPreviewBusy(true);
+    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setPreviewBusy(true);
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("preview_geometry_mask_rule"), fields);
 }
 
@@ -790,7 +921,7 @@ void MainWindow::resolveGeometryMigration(const QString &conflictId, const QJson
                                           int libraryRevision, int draftRevision) {
     if (geometryWorkpieceId_.isEmpty() || client_ == nullptr || clientBusy_
         || client_->state() != BackendClient::State::Ready) return;
-    if (geometryMaskManagerDialog_ != nullptr) geometryMaskManagerDialog_->setBusy(true);
+    if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(true);
     sendPageCommand(CommandOwner::Geometry, QStringLiteral("resolve_geometry_mask_migration"), {
         {QStringLiteral("workpiece_id"), geometryWorkpieceId_},
         {QStringLiteral("conflict_id"), conflictId},
@@ -933,8 +1064,8 @@ void MainWindow::onBackendReady() {
     if (annotationManagerDialog_ != nullptr) {
         annotationManagerDialog_->setBusy(false);
     }
-    if (geometryMaskManagerDialog_ != nullptr) {
-        geometryMaskManagerDialog_->setBusy(false);
+    if (geometryRulesPage_ != nullptr) {
+        geometryRulesPage_->setBusy(false);
     }
     BackendStatusDetails details;
     details.state = BackendUiState::Ready;
@@ -946,6 +1077,12 @@ void MainWindow::onBackendReady() {
     updateButtonStates();
     if (evolutionPollTimer_ != nullptr) {
         evolutionPollTimer_->start();
+    }
+    if (geometryPollTimer_ != nullptr && !geometryValidationJobId_.isEmpty()) {
+        geometryPollTimer_->start();
+    }
+    if (currentPage_ == AppPage::GeometryRules) {
+        ensureGeometryProfileForCurrentWorkpiece();
     }
     if (firstReadySignal) {
         QTimer::singleShot(0, this, [this]() {
@@ -961,8 +1098,8 @@ void MainWindow::onBackendLoading(const QString &message) {
     if (annotationManagerDialog_ != nullptr) {
         annotationManagerDialog_->setBusy(true);
     }
-    if (geometryMaskManagerDialog_ != nullptr) {
-        geometryMaskManagerDialog_->setBusy(true);
+    if (geometryRulesPage_ != nullptr) {
+        geometryRulesPage_->setBusy(true);
     }
     BackendStatusDetails details;
     details.state = BackendUiState::Loading;
@@ -985,7 +1122,9 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
         || batchInFlight_ || clientBusy_
         || !pendingCommand_.isEmpty() || !inspectionImagePath_.isEmpty()
         || (batchResultsTableWidget_ != nullptr && batchResultsTableWidget_->rowCount() > 0)
-        || annotationManagerDialog_ != nullptr || geometryMaskManagerDialog_ != nullptr;
+        || annotationManagerDialog_ != nullptr
+        || (geometryRulesPage_ != nullptr && geometryRulesPage_->hasUnsavedChanges())
+        || !geometryValidationJobId_.isEmpty() || geometryPublishAfterValidation_;
     if (interruptedTask == QStringLiteral("list_workpieces")) {
         mandatoryWorkpieceRefresh_ = mandatoryWorkpieceRefresh_
             || interruptedMandatoryRefresh;
@@ -1008,10 +1147,10 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
         annotationManagerDialog_->setOperationError(
             QStringLiteral("后端连接中断，操作结果未知；请重连后刷新"));
     }
-    if (geometryMaskManagerDialog_ != nullptr) {
-        geometryMaskManagerDialog_->setBusy(false);
-        geometryMaskManagerDialog_->setPreviewBusy(false);
-        geometryMaskManagerDialog_->setOperationError(
+    if (geometryRulesPage_ != nullptr) {
+        geometryRulesPage_->setBusy(false);
+        geometryRulesPage_->setPreviewBusy(false);
+        geometryRulesPage_->setOperationError(
             QStringLiteral("后端连接中断，操作结果未知；请重连后刷新"));
     }
     if (!pendingConfirmationRecordId_.isEmpty()) {
@@ -1127,6 +1266,7 @@ void MainWindow::onClientProgress(const QString &command, const QJsonObject &pro
 void MainWindow::onClientResponse(const QString &command, const QJsonObject &response) {
     const CommandOwner responseOwner = pendingOwner_;
     const QJsonObject issuedFields = pendingFields_;
+    const quint64 responseGeometryTargetGeneration = pendingGeometryTargetGeneration_;
     const quint64 responseRefreshTransactionId = pendingRefreshTransactionId_;
     const bool responseIncludedMandatoryRefresh = pendingRefreshIncludesMandatory_;
     clearPendingCommand();
@@ -1137,7 +1277,6 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     if (command == QStringLiteral("list_workpieces")) {
         const QString previousId = selectedWorkpieceId();
         const QJsonArray workpieces = response.value(QStringLiteral("workpieces")).toArray();
-        workpieceSummaries_ = workpieces;
         QList<QPair<QString, QString>> items;
         QString requestedId = previousId;
         bool previousStillExists = false;
@@ -1151,8 +1290,21 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         if (!previousStillExists) {
             requestedId.clear();
         }
+        const QString proposedId = requestedId.isEmpty() && !items.isEmpty()
+            ? items.constFirst().first : requestedId;
+        if (geometryRulesPage_ != nullptr && geometryRulesPage_->hasUnsavedChanges()
+            && proposedId != currentDetectionWorkpieceId_
+            && !applyDetectionWorkpieceChange(proposedId)) {
+            showLibraryMessage(QStringLiteral("已取消工件切换，几何规则草稿仍保留"));
+            return;
+        }
+        workpieceSummaries_ = workpieces;
         appHeader_->setWorkpieces(items, requestedId);
-        workpieceLibraryPage_->setWorkpieces(workpieces, appHeader_->currentWorkpieceId());
+        if (currentDetectionWorkpieceId_ != appHeader_->currentWorkpieceId()) {
+            applyDetectionWorkpieceChange(appHeader_->currentWorkpieceId());
+        } else {
+            refreshDetectionWorkpieceConsumers();
+        }
         if (responseIncludedMandatoryRefresh
             && responseRefreshTransactionId != 0
             && responseRefreshTransactionId
@@ -1239,26 +1391,39 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("get_geometry_mask_profile")) {
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
-            geometryMaskManagerDialog_->setBusy(false);
+        const QJsonObject profile = response.value(QStringLiteral("profile")).toObject();
+        const QString issuedWorkpieceId = issuedFields
+            .value(QStringLiteral("workpiece_id")).toString();
+        const QString profileWorkpieceId = profile
+            .value(QStringLiteral("workpiece_id")).toString();
+        const bool currentResponse = responseGeometryTargetGeneration != 0
+            && responseGeometryTargetGeneration == geometryTargetGeneration_
+            && issuedWorkpieceId == currentDetectionWorkpieceId_
+            && profileWorkpieceId == issuedWorkpieceId;
+        if (!currentResponse) {
+            if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(false);
+            return;
+        }
+        if (geometryRulesPage_ != nullptr) {
+            geometryRulesPage_->setSnapshot(profile);
+            geometryRulesPage_->setBusy(false);
         }
         showLibraryMessage(QStringLiteral("几何干扰规则已加载"));
         return;
     }
     if (command == QStringLiteral("preview_geometry_mask_rule")) {
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setRulePreview(response.value(QStringLiteral("preview")).toObject());
-            geometryMaskManagerDialog_->setPreviewBusy(false);
+        if (geometryRulesPage_ != nullptr) {
+            geometryRulesPage_->setRulePreview(response.value(QStringLiteral("preview")).toObject());
+            geometryRulesPage_->setPreviewBusy(false);
         }
         showLibraryMessage(QStringLiteral("几何规则预览已更新"));
         return;
     }
     if (command == QStringLiteral("save_geometry_mask_draft")) {
         const bool continuePublishWorkflow = geometryPublishAfterValidation_;
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
-            geometryMaskManagerDialog_->setBusy(false);
+        if (geometryRulesPage_ != nullptr) {
+            geometryRulesPage_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
+            geometryRulesPage_->setBusy(false);
         }
         const QJsonObject savedProfile = response.value(QStringLiteral("profile")).toObject();
         showLibraryMessage(continuePublishWorkflow
@@ -1274,27 +1439,17 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         return;
     }
     if (command == QStringLiteral("resolve_geometry_mask_migration")) {
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
-            geometryMaskManagerDialog_->setBusy(false);
+        if (geometryRulesPage_ != nullptr) {
+            geometryRulesPage_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
+            geometryRulesPage_->setBusy(false);
         }
         showLibraryMessage(QStringLiteral("迁移冲突处置已保存"));
         return;
     }
     if (command == QStringLiteral("validate_geometry_mask_draft")) {
         const QJsonObject job = response.value(QStringLiteral("job")).toObject();
-        geometryValidationJobId_ = job.value(QStringLiteral("job_id")).toString();
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setValidationJob(job);
-            geometryMaskManagerDialog_->setBusy(false);
-        }
+        applyGeometryValidationJob(job);
         const bool workflowHandled = maybeContinueGeometryPublish(job);
-        if (geometryPollTimer_ != nullptr && (job.value(QStringLiteral("state")).toString() == QStringLiteral("queued")
-                                               || job.value(QStringLiteral("state")).toString() == QStringLiteral("running"))) {
-            geometryPollTimer_->start();
-        } else if (workflowHandled && geometryPollTimer_ != nullptr) {
-            geometryPollTimer_->stop();
-        }
         if (!workflowHandled || job.value(QStringLiteral("state")).toString() == QStringLiteral("queued")
             || job.value(QStringLiteral("state")).toString() == QStringLiteral("running")) {
             showLibraryMessage(QStringLiteral("几何规则验证任务已启动"));
@@ -1303,31 +1458,23 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     }
     if (command == QStringLiteral("get_geometry_mask_validation_job")) {
         const QJsonObject job = response.value(QStringLiteral("job")).toObject();
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setValidationJob(job);
-            geometryMaskManagerDialog_->setBusy(false);
-        }
+        applyGeometryValidationJob(job);
         const bool workflowHandled = maybeContinueGeometryPublish(job);
-        const QString state = job.value(QStringLiteral("state")).toString();
-        if (state != QStringLiteral("queued") && state != QStringLiteral("running")) {
-            if (geometryPollTimer_ != nullptr) geometryPollTimer_->stop();
-        }
         Q_UNUSED(workflowHandled);
         return;
     }
     if (command == QStringLiteral("geometry_mask_validation_job_action")) {
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setValidationJob(response.value(QStringLiteral("job")).toObject());
-            geometryMaskManagerDialog_->setBusy(false);
-        }
+        const QJsonObject job = response.value(QStringLiteral("job")).toObject();
+        applyGeometryValidationJob(job);
+        maybeContinueGeometryPublish(job);
         return;
     }
     if (command == QStringLiteral("publish_geometry_mask_profile")
         || command == QStringLiteral("rollback_geometry_mask_profile")) {
         if (geometryPollTimer_ != nullptr) geometryPollTimer_->stop();
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
-            geometryMaskManagerDialog_->setBusy(false);
+        if (geometryRulesPage_ != nullptr) {
+            geometryRulesPage_->setSnapshot(response.value(QStringLiteral("profile")).toObject());
+            geometryRulesPage_->setBusy(false);
         }
         showLibraryMessage(command == QStringLiteral("publish_geometry_mask_profile")
                               ? QStringLiteral("几何干扰规则已发布") : QStringLiteral("几何干扰规则已回退"));
@@ -1501,10 +1648,10 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
             actionable = QStringLiteral("规则缓存修订不一致，请重新验证草稿后再发布");
         }
         const QString detail = QStringLiteral("几何干扰规则操作失败（%1）：%2").arg(code, actionable);
-        if (geometryMaskManagerDialog_ != nullptr) {
-            geometryMaskManagerDialog_->setBusy(false);
-            geometryMaskManagerDialog_->setPreviewBusy(false);
-            geometryMaskManagerDialog_->setOperationError(detail);
+        if (geometryRulesPage_ != nullptr) {
+            geometryRulesPage_->setBusy(false);
+            geometryRulesPage_->setPreviewBusy(false);
+            geometryRulesPage_->setOperationError(detail);
         }
         geometryPublishAfterValidation_ = false;
         geometryPublishOverrideReason_.clear();

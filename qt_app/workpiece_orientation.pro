@@ -17,7 +17,7 @@ SOURCES += \
     inspectionpage.cpp \
     workpiecelibrarypage.cpp \
     geometryrulecanvas.cpp \
-    geometrymaskmanager.cpp \
+    geometryrulespage.cpp \
     annotationcanvas.cpp \
     annotationmanager.cpp \
     annotationeditor.cpp \
@@ -36,7 +36,7 @@ HEADERS += \
     inspectionpage.h \
     workpiecelibrarypage.h \
     geometryrulecanvas.h \
-    geometrymaskmanager.h \
+    geometryrulespage.h \
     annotationcanvas.h \
     annotationmanager.h \
     annotationeditor.h \

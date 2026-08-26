@@ -22,7 +22,7 @@ class QPushButton;
 class QTableWidget;
 class QTextEdit;
 class AnnotationManagerDialog;
-class GeometryMaskManagerDialog;
+class GeometryRulesPage;
 class TaskStatusWidget;
 
 namespace Ui {
@@ -60,7 +60,6 @@ private slots:
     void rejectTemplateConfirmation();
     void openAnnotationEditor();
     void openAnnotationManager();
-    void openGeometryMaskManager();
     void saveAnnotationGroups(const QJsonArray &groups, int baseRevision);
     void setAnnotationGroupEnabled(const QString &groupId, bool enabled, int baseRevision);
     void deleteAnnotationGroup(const QString &groupId, int baseRevision);
@@ -92,12 +91,14 @@ private slots:
 
 private:
     enum class CommandOwner { None, System, UserRefresh, Inspection, Library, Geometry };
+    enum class GeometryDirtyDecision { Keep, Discard, Cancel };
 
     struct QueuedCommandIntent {
         CommandOwner owner = CommandOwner::None;
         QString command;
         QJsonObject fields;
         quint64 refreshTransactionId = 0;
+        quint64 geometryTargetGeneration = 0;
     };
 
     enum class ResultContext {
@@ -135,6 +136,12 @@ private:
     void sendAnnotationMutation(const QString &command, const QJsonObject &fields);
     void requestGeometryProfile(const QString &workpieceId);
     bool maybeContinueGeometryPublish(const QJsonObject &job);
+    void applyGeometryValidationJob(const QJsonObject &job);
+    GeometryDirtyDecision promptForDirtyGeometry();
+    void setCurrentPageUnchecked(AppPage page);
+    bool applyDetectionWorkpieceChange(const QString &workpieceId);
+    void refreshDetectionWorkpieceConsumers();
+    void ensureGeometryProfileForCurrentWorkpiece();
 
     Ui::MainWindow *ui;
     AppHeader *appHeader_ = nullptr;
@@ -201,8 +208,11 @@ private:
     ResultContext resultContext_ = ResultContext::None;
     QPointer<AnnotationManagerDialog> annotationManagerDialog_;
     QString annotationWorkpieceId_;
-    QPointer<GeometryMaskManagerDialog> geometryMaskManagerDialog_;
+    GeometryRulesPage *geometryRulesPage_ = nullptr;
     QString geometryWorkpieceId_;
+    QString currentDetectionWorkpieceId_;
+    quint64 geometryTargetGeneration_ = 0;
+    quint64 pendingGeometryTargetGeneration_ = 0;
     QString geometryValidationJobId_;
     bool geometryPublishAfterValidation_ = false;
     QString geometryPublishOverrideReason_;
