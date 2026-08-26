@@ -2,10 +2,12 @@
 
 #include "geometryrulecanvas.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QColor>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -59,6 +61,26 @@ QString orientationName(const QString &value) {
     if (value == QStringLiteral("uncertain")) return QStringLiteral("不确定");
     return value.isEmpty() ? QStringLiteral("未知") : value;
 }
+
+QString validationStatusText(const QString &state) {
+    if (state == QStringLiteral("active")) return QStringLiteral("通过");
+    if (state == QStringLiteral("low_confidence")) return QStringLiteral("低置信度");
+    if (state == QStringLiteral("not_configured")) return QStringLiteral("未配置");
+    if (state == QStringLiteral("needs_reseed") || state == QStringLiteral("failed")) {
+        return QStringLiteral("拟合失败");
+    }
+    if (state == QStringLiteral("excluded")) return QStringLiteral("已排除");
+    return state.isEmpty() ? QStringLiteral("需处理") : state;
+}
+
+QString validationReasonText(const QString &code) {
+    if (code == QStringLiteral("edge_support_low")) return QStringLiteral("边缘支持不足");
+    if (code == QStringLiteral("source_disagreement")) return QStringLiteral("来源投票不一致");
+    if (code == QStringLiteral("effective_area_low")) return QStringLiteral("有效区域过小");
+    if (code == QStringLiteral("geometry_fusion_regression")) return QStringLiteral("融合结果回归");
+    if (code == QStringLiteral("missing_direction_calibration")) return QStringLiteral("方向标定缺失");
+    return code;
+}
 }
 
 GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
@@ -77,10 +99,8 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     directionCombo_->setObjectName(QStringLiteral("directionCombo"));
     directionCombo_->addItem(QStringLiteral("正面"), QStringLiteral("front"));
     directionCombo_->addItem(QStringLiteral("反面"), QStringLiteral("back"));
-    leftLayout->addWidget(directionCombo_);
     templateCombo_ = new QComboBox(left);
     templateCombo_->setObjectName(QStringLiteral("templatePreviewCombo"));
-    leftLayout->addWidget(templateCombo_);
     ruleList_ = new QListWidget(left);
     ruleList_->setObjectName(QStringLiteral("ruleList"));
     leftLayout->addWidget(ruleList_, 1);
@@ -112,10 +132,8 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     ruleForm->addRow(QStringLiteral("旋转角度"), rotationSpin_);
     anchorCandidateCombo_ = new QComboBox(left);
     anchorCandidateCombo_->setObjectName(QStringLiteral("anchorCandidateCombo"));
-    ruleForm->addRow(QStringLiteral("基准候选"), anchorCandidateCombo_);
     ruleCandidateCombo_ = new QComboBox(left);
     ruleCandidateCombo_->setObjectName(QStringLiteral("ruleCandidateCombo"));
-    ruleForm->addRow(QStringLiteral("规则候选"), ruleCandidateCombo_);
     reviewStateCombo_ = new QComboBox(left);
     reviewStateCombo_->setObjectName(QStringLiteral("reviewStateCombo"));
     reviewStateCombo_->addItem(QStringLiteral("纳入"), QStringLiteral("included"));
@@ -123,8 +141,6 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     reviewStateCombo_->addItem(QStringLiteral("排除"), QStringLiteral("excluded"));
     reviewReasonEdit_ = new QLineEdit(left);
     reviewReasonEdit_->setObjectName(QStringLiteral("reviewReasonEdit"));
-    ruleForm->addRow(QStringLiteral("模板复核"), reviewStateCombo_);
-    ruleForm->addRow(QStringLiteral("复核原因"), reviewReasonEdit_);
     leftLayout->addLayout(ruleForm);
     auto *ruleButtons = new QHBoxLayout();
     auto *addButton = new QPushButton(QStringLiteral("新增规则"), left);
@@ -137,17 +153,39 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     setAnchorButton_ = new QPushButton(QStringLiteral("将画布设为基准边界"), left);
     setAnchorButton_->setVisible(false);
     setAnchorButton_->setObjectName(QStringLiteral("setAnchorButton"));
-    leftLayout->addWidget(setAnchorButton_);
     manualAnchorButton_ = new QPushButton(QStringLiteral("手动指定基准边界"), left);
     manualAnchorButton_->setObjectName(QStringLiteral("manualAnchorButton"));
     manualAnchorButton_->setVisible(false);
-    leftLayout->addWidget(manualAnchorButton_);
 
     auto *center = new QWidget(splitter);
     auto *centerLayout = new QVBoxLayout(center);
+    auto *previewSelectors = new QFormLayout();
+    previewSelectors->addRow(QStringLiteral("方向"), directionCombo_);
+    previewSelectors->addRow(QStringLiteral("模板"), templateCombo_);
+    centerLayout->addLayout(previewSelectors);
     canvas_ = new GeometryRuleCanvas(center);
     canvas_->setObjectName(QStringLiteral("geometryRuleCanvas"));
+    canvas_->setGuideVisible(false);
     centerLayout->addWidget(canvas_, 1);
+    auto *layerToggles = new QHBoxLayout();
+    auto *guideLayerToggle = new QCheckBox(QStringLiteral("手绘引导"), center);
+    auto *fittedLayerToggle = new QCheckBox(QStringLiteral("拟合边界"), center);
+    auto *effectiveLayerToggle = new QCheckBox(QStringLiteral("有效边界"), center);
+    auto *maskLayerToggle = new QCheckBox(QStringLiteral("忽略区域"), center);
+    guideLayerToggle->setObjectName(QStringLiteral("guideLayerToggle"));
+    fittedLayerToggle->setObjectName(QStringLiteral("fittedLayerToggle"));
+    effectiveLayerToggle->setObjectName(QStringLiteral("effectiveLayerToggle"));
+    maskLayerToggle->setObjectName(QStringLiteral("maskLayerToggle"));
+    guideLayerToggle->setChecked(false);
+    fittedLayerToggle->setChecked(true);
+    effectiveLayerToggle->setChecked(true);
+    maskLayerToggle->setChecked(true);
+    layerToggles->addWidget(guideLayerToggle);
+    layerToggles->addWidget(fittedLayerToggle);
+    layerToggles->addWidget(effectiveLayerToggle);
+    layerToggles->addWidget(maskLayerToggle);
+    layerToggles->addStretch(1);
+    centerLayout->addLayout(layerToggles);
     auto *help = new QLabel(QStringLiteral("先选择方向和规则，再在画布中粗画；坐标按原图保存。"), center);
     help->setWordWrap(true);
     centerLayout->addWidget(help);
@@ -158,9 +196,8 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     progressBar_->setRange(0, 1);
     diagnostics_ = new QTextEdit(right);
     diagnostics_->setReadOnly(true);
-    rightLayout->addWidget(new QLabel(QStringLiteral("验证进度/诊断"), right));
+    rightLayout->addWidget(new QLabel(QStringLiteral("验证进度"), right));
     rightLayout->addWidget(progressBar_);
-    rightLayout->addWidget(diagnostics_, 1);
     validationHintLabel_ = new QLabel(QStringLiteral("点击表格中的模板行可定位预览；低置信度/未配置模板请在左侧选择“排除”并填写原因，再重新验证。"), right);
     validationHintLabel_->setObjectName(QStringLiteral("validationHintLabel"));
     validationHintLabel_->setWordWrap(true);
@@ -170,36 +207,64 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     validationTable_->setObjectName(QStringLiteral("validationTable"));
     validationTable_->setColumnCount(4);
     validationTable_->setHorizontalHeaderLabels({QStringLiteral("方向"), QStringLiteral("模板"),
-                                                  QStringLiteral("状态"), QStringLiteral("待处理规则")});
+                                                  QStringLiteral("状态"), QStringLiteral("原因/规则")});
     validationTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     validationTable_->setSelectionMode(QAbstractItemView::SingleSelection);
     validationTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     validationTable_->setCursor(Qt::PointingHandCursor);
     rightLayout->addWidget(validationTable_, 1);
 
+    advancedGeometryGroup_ = new QGroupBox(QStringLiteral("高级选项"), right);
+    advancedGeometryGroup_->setObjectName(QStringLiteral("advancedGeometryGroup"));
+    advancedGeometryGroup_->setCheckable(true);
+    advancedGeometryGroup_->setChecked(false);
+    auto *advancedLayout = new QVBoxLayout(advancedGeometryGroup_);
+    advancedGeometryContent_ = new QWidget(advancedGeometryGroup_);
+    advancedGeometryContent_->setObjectName(QStringLiteral("advancedGeometryContent"));
+    auto *advancedContentLayout = new QVBoxLayout(advancedGeometryContent_);
+    auto *advancedFields = new QFormLayout();
+    advancedFields->addRow(QStringLiteral("基准候选"), anchorCandidateCombo_);
+    advancedFields->addRow(QStringLiteral("规则候选"), ruleCandidateCombo_);
+    advancedFields->addRow(QStringLiteral("模板复核"), reviewStateCombo_);
+    advancedFields->addRow(QStringLiteral("复核原因"), reviewReasonEdit_);
+    advancedContentLayout->addLayout(advancedFields);
+    advancedContentLayout->addWidget(setAnchorButton_);
+    advancedContentLayout->addWidget(manualAnchorButton_);
+    advancedContentLayout->addWidget(new QLabel(QStringLiteral("原始诊断"), advancedGeometryContent_));
+    advancedContentLayout->addWidget(diagnostics_);
+
+    migrationPanel_ = new QWidget(advancedGeometryContent_);
+    migrationPanel_->setObjectName(QStringLiteral("migrationPanel"));
+    auto *migrationPanelLayout = new QVBoxLayout(migrationPanel_);
     auto *migrationForm = new QFormLayout();
-    migrationConflictCombo_ = new QComboBox(right);
+    migrationConflictCombo_ = new QComboBox(migrationPanel_);
     migrationConflictCombo_->setObjectName(QStringLiteral("migrationConflictCombo"));
-    migrationActionCombo_ = new QComboBox(right);
+    migrationActionCombo_ = new QComboBox(migrationPanel_);
     migrationActionCombo_->setObjectName(QStringLiteral("migrationActionCombo"));
     migrationActionCombo_->addItem(QStringLiteral("仅保留所选来源"), QStringLiteral("keep_only"));
     migrationActionCombo_->addItem(QStringLiteral("正反来源配成一条规则"), QStringLiteral("pair"));
     migrationActionCombo_->addItem(QStringLiteral("分别保留"), QStringLiteral("keep_separate"));
-    migrationSurvivorCombo_ = new QComboBox(right);
+    migrationSurvivorCombo_ = new QComboBox(migrationPanel_);
     migrationSurvivorCombo_->setObjectName(QStringLiteral("migrationSurvivorCombo"));
-    migrationFrontCombo_ = new QComboBox(right);
+    migrationFrontCombo_ = new QComboBox(migrationPanel_);
     migrationFrontCombo_->setObjectName(QStringLiteral("migrationFrontCombo"));
-    migrationBackCombo_ = new QComboBox(right);
+    migrationBackCombo_ = new QComboBox(migrationPanel_);
     migrationBackCombo_->setObjectName(QStringLiteral("migrationBackCombo"));
-    resolveMigrationButton_ = new QPushButton(QStringLiteral("应用迁移处置"), right);
+    resolveMigrationButton_ = new QPushButton(QStringLiteral("应用迁移处置"), migrationPanel_);
     resolveMigrationButton_->setObjectName(QStringLiteral("resolveMigrationButton"));
     migrationForm->addRow(QStringLiteral("迁移冲突"), migrationConflictCombo_);
     migrationForm->addRow(QStringLiteral("处置方式"), migrationActionCombo_);
     migrationForm->addRow(QStringLiteral("保留来源"), migrationSurvivorCombo_);
     migrationForm->addRow(QStringLiteral("正面来源"), migrationFrontCombo_);
     migrationForm->addRow(QStringLiteral("反面来源"), migrationBackCombo_);
-    rightLayout->addLayout(migrationForm);
-    rightLayout->addWidget(resolveMigrationButton_);
+    migrationPanelLayout->addLayout(migrationForm);
+    migrationPanelLayout->addWidget(resolveMigrationButton_);
+    advancedContentLayout->addWidget(migrationPanel_);
+    advancedLayout->addWidget(advancedGeometryContent_);
+    advancedGeometryContent_->setVisible(false);
+    connect(advancedGeometryGroup_, &QGroupBox::toggled,
+            advancedGeometryContent_, &QWidget::setVisible);
+    rightLayout->addWidget(advancedGeometryGroup_);
     auto *overrideReasonLabel = new QLabel(QStringLiteral("发布覆盖原因（有告警或回归时必填）"), right);
     overrideReasonLabel->setObjectName(QStringLiteral("overrideReasonLabel"));
     rightLayout->addWidget(overrideReasonLabel);
@@ -208,7 +273,6 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     overrideReasonEdit_->setPlaceholderText(QStringLiteral("请说明已检查告警/回归并确认发布"));
     rightLayout->addWidget(overrideReasonEdit_);
 
-    auto *buttons = new QHBoxLayout();
     saveButton_ = new QPushButton(QStringLiteral("保存草稿"), this);
     validateButton_ = new QPushButton(QStringLiteral("验证草稿"), this);
     publishButton_ = new QPushButton(QStringLiteral("发布规则"), this);
@@ -219,12 +283,20 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     publishButton_->setObjectName(QStringLiteral("publishButton"));
     publishButton_->setVisible(false);
     publishWorkflowButton_->setObjectName(QStringLiteral("publishWorkflowButton"));
+    publishWorkflowButton_->setProperty("role", QStringLiteral("primary"));
     rollbackButton_->setObjectName(QStringLiteral("rollbackButton"));
-    buttons->addWidget(saveButton_);
-    buttons->addWidget(validateButton_);
-    buttons->addWidget(publishButton_);
+    auto *advancedWorkflowButtons = new QHBoxLayout();
+    advancedWorkflowButtons->addWidget(saveButton_);
+    advancedWorkflowButtons->addWidget(validateButton_);
+    advancedWorkflowButtons->addWidget(rollbackButton_);
+    advancedContentLayout->addLayout(advancedWorkflowButtons);
+    auto *buttons = new QHBoxLayout();
     buttons->addWidget(publishWorkflowButton_);
-    buttons->addWidget(rollbackButton_);
+    publishDisabledReasonLabel_ = new QLabel(this);
+    publishDisabledReasonLabel_->setObjectName(QStringLiteral("publishDisabledReasonLabel"));
+    publishDisabledReasonLabel_->setWordWrap(true);
+    publishDisabledReasonLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
+    root->addWidget(publishDisabledReasonLabel_);
     root->addLayout(buttons);
 
     auto *editButtons = new QHBoxLayout();
@@ -250,8 +322,8 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     versionCombo_->addItem(QStringLiteral("活动版本（只读）"), QStringLiteral("active"));
     copyActiveToDraftButton_ = new QPushButton(QStringLiteral("复制活动版本到草稿"), left);
     copyActiveToDraftButton_->setObjectName(QStringLiteral("copyActiveToDraftButton"));
-    leftLayout->addWidget(versionCombo_);
-    leftLayout->addWidget(copyActiveToDraftButton_);
+    advancedContentLayout->addWidget(versionCombo_);
+    advancedContentLayout->addWidget(copyActiveToDraftButton_);
 
     connect(addButton, &QPushButton::clicked, this, &GeometryRulesPage::addRule);
     connect(deleteButton, &QPushButton::clicked, this, &GeometryRulesPage::deleteRule);
@@ -283,6 +355,14 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
                 refreshTemplatePreview();
                 if (!suppressPreviewRequests_) requestPreviewFromShape(canvasShapeForRule(currentRule()));
             });
+    connect(guideLayerToggle, &QCheckBox::toggled,
+            canvas_, &GeometryRuleCanvas::setGuideVisible);
+    connect(fittedLayerToggle, &QCheckBox::toggled,
+            canvas_, &GeometryRuleCanvas::setFittedBoundaryVisible);
+    connect(effectiveLayerToggle, &QCheckBox::toggled,
+            canvas_, &GeometryRuleCanvas::setEffectiveBoundaryVisible);
+    connect(maskLayerToggle, &QCheckBox::toggled,
+            canvas_, &GeometryRuleCanvas::setMaskOverlayVisible);
     connect(ruleList_, &QListWidget::currentRowChanged, this, [this](int) { loadCurrentRuleIntoEditor(); });
     connect(validationTable_, &QTableWidget::cellClicked, this,
             [this](int row, int) { selectValidationTemplate(row); });
@@ -315,17 +395,7 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     connect(reviewReasonEdit_, &QLineEdit::textChanged, this,
             [this](const QString &text) { setTemplateReview(reviewStateCombo_->currentData().toString(), text); });
     connect(versionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-            [this, addButton, deleteButton](int index) {
-                const bool readOnly = index == 1;
-                for (QWidget *widget : {static_cast<QWidget *>(shapeCombo_), static_cast<QWidget *>(modeCombo_),
-                                        static_cast<QWidget *>(ruleNameEdit_), static_cast<QWidget *>(marginSpin_),
-                                        static_cast<QWidget *>(rotationSpin_), static_cast<QWidget *>(addButton),
-                                        static_cast<QWidget *>(deleteButton),
-                                        static_cast<QWidget *>(canvas_)}) {
-                    if (widget) widget->setEnabled(!readOnly);
-                }
-                copyActiveToDraftButton_->setEnabled(readOnly);
-            });
+            [this](int) { updateEditingControls(); });
     connect(overrideReasonEdit_, &QLineEdit::textChanged, this, &GeometryRulesPage::updatePublishState);
     connect(rotationSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             [this](double value) { canvas_->setRotationDegrees(value); });
@@ -362,6 +432,7 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
     });
     refreshRuleList();
     refreshTemplatePreview();
+    updateEditingControls();
     updatePublishState();
 }
 
@@ -527,8 +598,13 @@ void GeometryRulesPage::refreshMigrationPanel() {
     migrationFrontCombo_->setVisible(action == QStringLiteral("pair"));
     migrationBackCombo_->setVisible(action == QStringLiteral("pair"));
     const bool hasConflict = !conflict.isEmpty();
+    if (migrationPanel_ != nullptr) migrationPanel_->setVisible(hasConflict);
+    if (hasConflict && advancedGeometryGroup_ != nullptr) {
+        advancedGeometryGroup_->setChecked(true);
+    }
     migrationActionCombo_->setEnabled(hasConflict);
     resolveMigrationButton_->setEnabled(hasConflict);
+    updateEditingControls();
 }
 
 void GeometryRulesPage::resolveMigrationConflict() {
@@ -708,6 +784,7 @@ void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     snapshot_ = snapshot;
     restoreSnapshotDraft();
     job_ = QJsonObject();
+    warningContinuationAvailable_ = false;
     editorDirection_.clear();
     setDirty(false);
     undoHistory_.clear();
@@ -737,6 +814,39 @@ void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     updatePublishState();
 }
 
+void GeometryRulesPage::reconcileSnapshotKeepingDraft(const QJsonObject &snapshot) {
+    const QJsonObject localDraft = draft_;
+    const bool localDirty = dirty_;
+    const QList<QJsonObject> localUndoHistory = undoHistory_;
+    const QList<QJsonObject> localRedoHistory = redoHistory_;
+    const QString selectedDirection = direction();
+    const QString selectedTemplate = currentTemplateId();
+    const QString selectedRule = currentRuleId();
+    const bool previousSuppressPreview = suppressPreviewRequests_;
+
+    const QSignalBlocker pageBlocker(this);
+    suppressPreviewRequests_ = true;
+    setSnapshot(snapshot);
+    draft_ = localDraft;
+    dirty_ = localDirty;
+    undoHistory_ = localUndoHistory;
+    redoHistory_ = localRedoHistory;
+    editorDirection_.clear();
+    if (!selectedDirection.isEmpty() && directionCombo_ != nullptr) {
+        const int index = directionCombo_->findData(selectedDirection);
+        if (index >= 0) directionCombo_->setCurrentIndex(index);
+    }
+    refreshEditor();
+    if (!selectedRule.isEmpty()) selectRuleById(selectedRule);
+    if (!selectedTemplate.isEmpty() && templateCombo_ != nullptr) {
+        const int index = templateCombo_->findData(selectedTemplate,
+                                                    Qt::UserRole + 1);
+        if (index >= 0) templateCombo_->setCurrentIndex(index);
+    }
+    refreshTemplatePreview();
+    suppressPreviewRequests_ = previousSuppressPreview;
+}
+
 void GeometryRulesPage::restoreSnapshotDraft() {
     draft_ = snapshot_.value(QStringLiteral("draft")).toObject();
     if (draft_.isEmpty()) {
@@ -751,6 +861,12 @@ void GeometryRulesPage::restoreSnapshotDraft() {
 void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
     if (dirty_) return;
     job_ = job;
+    warningContinuationAvailable_ = !job.value(QStringLiteral("job_id")).toString().isEmpty()
+        && job.value(QStringLiteral("state")).toString() == QStringLiteral("completed")
+        && job.value(QStringLiteral("blocking_issues")).toArray().isEmpty()
+        && (!job.value(QStringLiteral("warnings")).toArray().isEmpty()
+            || job.value(QStringLiteral("regression")).toObject()
+                   .value(QStringLiteral("correct_to_wrong")).toInt() > 0);
     if (validationHintLabel_ != nullptr) {
         validationHintLabel_->setText(QStringLiteral("点击表格中的模板行可定位预览；低置信度/未配置模板请在左侧选择“排除”并填写原因，再重新验证。"));
         validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
@@ -812,53 +928,136 @@ void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
         const QString templateId = issue.value(QStringLiteral("template_id")).toString();
         if (!templateId.isEmpty()) blockedTemplateIds.insert(templateId);
     }
+
+    const auto issueDirection = [](const QJsonObject &issue) {
+        const QString direct = issue.value(QStringLiteral("direction")).toString();
+        if (!direct.isEmpty()) return direct;
+        const QString orientation = issue.value(QStringLiteral("orientation")).toString();
+        if (!orientation.isEmpty()) return orientation;
+        const QString expected = issue.value(QStringLiteral("expected")).toString();
+        return expected == QStringLiteral("front") || expected == QStringLiteral("back")
+            ? expected : QString();
+    };
+    const auto templateIdAt = [this](const QString &side, int index) {
+        if (side.isEmpty() || index < 0) return QString();
+        int current = 0;
+        for (const QJsonValue &value : snapshot_.value(QStringLiteral("templates")).toArray()) {
+            const QJsonObject item = value.toObject();
+            if (item.value(QStringLiteral("direction")).toString() != side) continue;
+            if (current == index) return item.value(QStringLiteral("template_id")).toString();
+            ++current;
+        }
+        return QString();
+    };
+    const auto issueTemplateId = [&issueDirection, &templateIdAt](const QJsonObject &issue) {
+        const QString direct = issue.value(QStringLiteral("template_id")).toString();
+        if (!direct.isEmpty()) return direct;
+        if (!issue.contains(QStringLiteral("index"))
+            || !issue.value(QStringLiteral("index")).isDouble()) {
+            return QString();
+        }
+        return templateIdAt(issueDirection(issue), issue.value(QStringLiteral("index")).toInt(-1));
+    };
+    QSet<QString> insertedIssues;
+    const auto appendIssue = [this, &insertedIssues](const QString &side,
+                                                     const QString &templateId,
+                                                     const QString &ruleId,
+                                                     const QString &state,
+                                                     const QString &reasonCode,
+                                                     bool blocked,
+                                                     bool fusionRegression) {
+        const QString key = QStringLiteral("%1|%2|%3|%4|%5")
+                                .arg(side, templateId, ruleId, state, reasonCode);
+        if (insertedIssues.contains(key)) return;
+        insertedIssues.insert(key);
+        const int target = validationTable_->rowCount();
+        validationTable_->insertRow(target);
+        const QString reasonText = validationReasonText(reasonCode);
+        QList<QTableWidgetItem *> items{
+            new QTableWidgetItem(side), new QTableWidgetItem(templateId),
+            new QTableWidgetItem(validationStatusText(state)),
+            new QTableWidgetItem(ruleId.isEmpty() ? reasonText
+                                                   : reasonText.isEmpty() ? ruleId
+                                                                          : QStringLiteral("%1 · %2").arg(ruleId, reasonText))};
+        for (QTableWidgetItem *item : items) {
+            item->setData(DirectionRole, side);
+            item->setData(TemplateIdRole, templateId);
+            item->setData(RuleIdRole, ruleId);
+            item->setData(ReasonCodeRole, reasonCode);
+        }
+        if (blocked) {
+            items.at(2)->setBackground(QColor(QStringLiteral("#f8d7da")));
+            items.at(2)->setToolTip(fusionRegression
+                ? QStringLiteral("融合结果回归：请检查全局与局部结论后重新验证")
+                : QStringLiteral("验证阻断：请定位并修正后重新验证"));
+        } else if (state != QStringLiteral("active")
+                   && state != QStringLiteral("not_configured")
+                   && state != QStringLiteral("excluded")) {
+            items.at(2)->setBackground(QColor(QStringLiteral("#fff3cd")));
+        }
+        if (!reasonText.isEmpty()) items.at(2)->setToolTip(reasonText);
+        for (int column = 0; column < items.size(); ++column) {
+            validationTable_->setItem(target, column, items.at(column));
+        }
+    };
+
     const QJsonObject report = job.value(QStringLiteral("report")).toObject();
     for (const QString &label : {QStringLiteral("front"), QStringLiteral("back")}) {
         const QJsonArray rows = report.value(label).toArray();
         for (const QJsonValue &value : rows) {
             const QJsonObject row = value.toObject();
-            const int target = validationTable_->rowCount();
-            validationTable_->insertRow(target);
-            const QString templateId = row.value(QStringLiteral("template_id")).toString();
-            auto *directionItem = new QTableWidgetItem(label);
-            directionItem->setData(Qt::UserRole, label);
-            auto *templateItem = new QTableWidgetItem(templateId);
-            templateItem->setData(Qt::UserRole, templateId);
-            validationTable_->setItem(target, 0, directionItem);
-            validationTable_->setItem(target, 1, templateItem);
-            auto *statusItem = new QTableWidgetItem(row.value(QStringLiteral("status")).toString());
-            const QString status = row.value(QStringLiteral("status")).toString();
-            const QString reason = row.value(QStringLiteral("reason_code")).toString();
-            const QString statusText = status == QStringLiteral("active") ? QStringLiteral("已通过")
-                : status == QStringLiteral("low_confidence") ? QStringLiteral("低置信度")
-                : status == QStringLiteral("not_configured") ? QStringLiteral("未配置")
-                : status == QStringLiteral("needs_reseed") ? QStringLiteral("需重新标定")
-                : status == QStringLiteral("excluded") ? QStringLiteral("已排除")
-                : status;
-            statusItem->setText(statusText);
-            statusItem->setToolTip(reason.isEmpty() ? QStringLiteral("点击此行定位模板，再在左侧完成复核") : reason);
-            if (blockedTemplateIds.contains(templateId)) {
-                statusItem->setBackground(QColor(QStringLiteral("#f8d7da")));
-                statusItem->setToolTip(fusionRegressionTemplateIds.contains(templateId)
-                    ? QStringLiteral("融合结果回归：候选全局与局部结论冲突，局部覆盖后造成误判；请查看右侧证据并重新验证")
-                    : QStringLiteral("验证阻断：请定位此模板并明确排除或修正后重新验证"));
-            } else if (status != QStringLiteral("active") && status != QStringLiteral("not_configured")) {
-                statusItem->setBackground(QColor(QStringLiteral("#fff3cd")));
+            QString templateId = row.value(QStringLiteral("template_id")).toString();
+            if (templateId.isEmpty() && row.contains(QStringLiteral("index"))
+                && row.value(QStringLiteral("index")).isDouble()) {
+                templateId = templateIdAt(label, row.value(QStringLiteral("index")).toInt(-1));
             }
-            validationTable_->setItem(target, 2, statusItem);
-            int pendingRules = 0;
+            bool hasRuleIssue = false;
             for (const QJsonValue &ruleValue : row.value(QStringLiteral("rules")).toArray()) {
-                const QString ruleStatus = ruleValue.toObject().value(QStringLiteral("status")).toString();
-                if (ruleStatus != QStringLiteral("active") && ruleStatus != QStringLiteral("excluded")) {
-                    ++pendingRules;
-                }
+                const QJsonObject rule = ruleValue.toObject();
+                const QString ruleStatus = rule.value(QStringLiteral("status")).toString();
+                if (ruleStatus == QStringLiteral("active") || ruleStatus == QStringLiteral("excluded")) continue;
+                hasRuleIssue = true;
+                appendIssue(label, templateId,
+                            rule.value(QStringLiteral("rule_id")).toString(), ruleStatus,
+                            rule.value(QStringLiteral("reason_code")).toString(),
+                            blockedTemplateIds.contains(templateId),
+                            fusionRegressionTemplateIds.contains(templateId));
             }
-            validationTable_->setItem(target, 3, new QTableWidgetItem(QString::number(pendingRules)));
+            if (!hasRuleIssue) {
+                QString reasonCode = row.value(QStringLiteral("reason_code")).toString();
+                if (reasonCode.isEmpty()) {
+                    reasonCode = row.value(QStringLiteral("review_reason")).toString();
+                }
+                appendIssue(label, templateId, QString(),
+                            row.value(QStringLiteral("status")).toString(),
+                            reasonCode,
+                            blockedTemplateIds.contains(templateId),
+                            fusionRegressionTemplateIds.contains(templateId));
+            }
         }
     }
-    if (!dirty_ && canvas_ != nullptr) {
-        const QSignalBlocker canvasBlocker(canvas_);
-        canvas_->setCoarseShape(QJsonObject());
+    const auto appendStandaloneIssue = [&appendIssue, &issueDirection, &issueTemplateId](
+                                           const QJsonObject &issue, bool blocked) {
+        const QString code = issue.value(QStringLiteral("code")).toString();
+        const QString side = issueDirection(issue);
+        const QString templateId = issueTemplateId(issue);
+        const QString ruleId = issue.value(QStringLiteral("rule_id")).toString();
+        appendIssue(side, templateId, ruleId, QStringLiteral("issue"), code,
+                    blocked, code == QStringLiteral("geometry_fusion_regression"));
+    };
+    for (const QJsonValue &value : warnings) appendStandaloneIssue(value.toObject(), false);
+    for (const QJsonValue &value : blocking) {
+        const QJsonObject issue = value.toObject();
+        const QJsonArray changed = issue.value(QStringLiteral("changed_predictions")).toArray();
+        if (changed.isEmpty()) {
+            appendStandaloneIssue(issue, true);
+            continue;
+        }
+        for (const QJsonValue &changeValue : changed) {
+            QJsonObject change = changeValue.toObject();
+            change.insert(QStringLiteral("code"), issue.value(QStringLiteral("code")));
+            appendStandaloneIssue(change, true);
+        }
     }
     applyFittedBoundaryForCurrentTemplate();
     updatePublishState();
@@ -869,54 +1068,107 @@ void GeometryRulesPage::selectValidationTemplate(int row) {
         || row < 0 || row >= validationTable_->rowCount()) {
         return;
     }
-    const QTableWidgetItem *directionItem = validationTable_->item(row, 0);
-    const QTableWidgetItem *templateItem = validationTable_->item(row, 1);
-    if (directionItem == nullptr || templateItem == nullptr) return;
-    const QString selectedDirection = directionItem->data(Qt::UserRole).toString();
-    const QString selectedTemplate = templateItem->data(Qt::UserRole).toString();
-    if (selectedDirection.isEmpty() || selectedTemplate.isEmpty()) return;
-    const int directionIndex = directionCombo_->findData(selectedDirection);
-    if (directionIndex < 0) return;
+    const QTableWidgetItem *identityItem = validationTable_->item(row, 0);
+    if (identityItem == nullptr) return;
+    const QString selectedDirection = identityItem->data(DirectionRole).toString();
+    const QString selectedTemplate = identityItem->data(TemplateIdRole).toString();
+    const QString selectedRule = identityItem->data(RuleIdRole).toString();
+    const int directionIndex = selectedDirection.isEmpty()
+        ? -1 : directionCombo_->findData(selectedDirection);
+    if (!selectedDirection.isEmpty() && directionIndex < 0) return;
     const QSignalBlocker directionBlocker(directionCombo_);
     const QSignalBlocker templateBlocker(templateCombo_);
     suppressPreviewRequests_ = true;
-    if (directionCombo_->currentIndex() != directionIndex) directionCombo_->setCurrentIndex(directionIndex);
-    refreshRuleList();
-    refreshTemplatePreview();
-    const int templateIndex = templateCombo_->findData(selectedTemplate, Qt::UserRole + 1);
-    if (templateIndex < 0) {
-        suppressPreviewRequests_ = false;
-        return;
+    if (directionIndex >= 0 && directionCombo_->currentIndex() != directionIndex) {
+        directionCombo_->setCurrentIndex(directionIndex);
     }
-    if (templateCombo_->currentIndex() != templateIndex) templateCombo_->setCurrentIndex(templateIndex);
     refreshRuleList();
     refreshTemplatePreview();
-    const int finalTemplateIndex = templateCombo_->findData(selectedTemplate, Qt::UserRole + 1);
-    if (finalTemplateIndex >= 0) templateCombo_->setCurrentIndex(finalTemplateIndex);
+    if (!selectedTemplate.isEmpty()) {
+        const int templateIndex = templateCombo_->findData(selectedTemplate, Qt::UserRole + 1);
+        if (templateIndex < 0) {
+            suppressPreviewRequests_ = false;
+            return;
+        }
+        if (templateCombo_->currentIndex() != templateIndex) templateCombo_->setCurrentIndex(templateIndex);
+        refreshRuleList();
+        refreshTemplatePreview();
+        const int finalTemplateIndex = templateCombo_->findData(selectedTemplate, Qt::UserRole + 1);
+        if (finalTemplateIndex >= 0) templateCombo_->setCurrentIndex(finalTemplateIndex);
+    }
+    if (selectedRule.isEmpty()) ruleList_->setCurrentRow(-1);
+    else selectRuleById(selectedRule);
     refreshTemplateReview();
     suppressPreviewRequests_ = false;
-    if (!dirty_) {
-        const QSignalBlocker canvasBlocker(canvas_);
-        canvas_->setCoarseShape(QJsonObject());
+    if (!selectedTemplate.isEmpty() && !selectedRule.isEmpty()) {
+        applyFittedBoundaryForCurrentTemplate();
     }
-    applyFittedBoundaryForCurrentTemplate();
 }
 
 void GeometryRulesPage::setBusy(bool busy) {
     busy_ = busy;
-    saveButton_->setEnabled(!busy);
-    validateButton_->setEnabled(!busy);
-    rollbackButton_->setEnabled(!busy && snapshot_.value(QStringLiteral("previous_active_revision")).toInt(0) > 0);
+    saveButton_->setEnabled(backendAvailable_ && !busy && !editingLocked_);
+    validateButton_->setEnabled(backendAvailable_ && !busy && !editingLocked_);
+    rollbackButton_->setEnabled(backendAvailable_ && !busy && !editingLocked_
+                                && snapshot_.value(QStringLiteral("previous_active_revision")).toInt(0) > 0);
     updatePublishState();
+}
+
+void GeometryRulesPage::setEditingLocked(bool locked) {
+    if (editingLocked_ == locked) return;
+    editingLocked_ = locked;
+    updateEditingControls();
+    setBusy(busy_);
+}
+
+void GeometryRulesPage::setBackendAvailable(bool available, const QString &reason) {
+    backendAvailable_ = available;
+    backendUnavailableReason_ = available ? QString() : reason.trimmed();
+    if (!available) setPreviewBusy(false);
+    setBusy(busy_);
 }
 
 void GeometryRulesPage::setPreviewBusy(bool busy) {
     previewBusy_ = busy;
-    if (directionCombo_) directionCombo_->setEnabled(!busy);
-    if (templateCombo_) templateCombo_->setEnabled(!busy);
-    if (anchorCandidateCombo_) anchorCandidateCombo_->setEnabled(!busy);
-    if (ruleCandidateCombo_) ruleCandidateCombo_->setEnabled(!busy);
-    if (shapeCombo_) shapeCombo_->setEnabled(!busy);
+    updateEditingControls();
+}
+
+void GeometryRulesPage::updateEditingControls() {
+    const bool readOnly = versionCombo_ != nullptr
+        && versionCombo_->currentData().toString() == QStringLiteral("active");
+    const bool editable = !editingLocked_ && !readOnly;
+    const bool previewEditable = editable && !previewBusy_;
+    if (directionCombo_) directionCombo_->setEnabled(!previewBusy_);
+    if (templateCombo_) templateCombo_->setEnabled(!previewBusy_);
+    if (shapeCombo_) shapeCombo_->setEnabled(previewEditable);
+    if (modeCombo_) modeCombo_->setEnabled(editable);
+    if (ruleNameEdit_) ruleNameEdit_->setEnabled(editable);
+    if (marginSpin_) marginSpin_->setEnabled(editable);
+    if (rotationSpin_) rotationSpin_->setEnabled(editable);
+    if (anchorCandidateCombo_) anchorCandidateCombo_->setEnabled(previewEditable);
+    if (ruleCandidateCombo_) ruleCandidateCombo_->setEnabled(previewEditable);
+    if (reviewStateCombo_) reviewStateCombo_->setEnabled(previewEditable);
+    if (reviewReasonEdit_) reviewReasonEdit_->setEnabled(previewEditable);
+    if (canvas_) canvas_->setEnabled(editable);
+    if (setAnchorButton_) setAnchorButton_->setEnabled(editable);
+    if (manualAnchorButton_) manualAnchorButton_->setEnabled(editable);
+    if (undoButton_) undoButton_->setEnabled(editable);
+    if (redoButton_) redoButton_->setEnabled(editable);
+    if (resetRuleButton_) resetRuleButton_->setEnabled(editable);
+    if (reloadDraftButton_) reloadDraftButton_->setEnabled(editable);
+    if (copyActiveToDraftButton_) copyActiveToDraftButton_->setEnabled(!editingLocked_ && readOnly);
+    if (QPushButton *button = findChild<QPushButton *>(QStringLiteral("addRuleButton"))) {
+        button->setEnabled(editable);
+    }
+    if (QPushButton *button = findChild<QPushButton *>(QStringLiteral("deleteRuleButton"))) {
+        button->setEnabled(editable);
+    }
+    const bool hasConflict = !selectedMigrationConflict().isEmpty();
+    for (QComboBox *combo : {migrationActionCombo_, migrationSurvivorCombo_,
+                             migrationFrontCombo_, migrationBackCombo_}) {
+        if (combo) combo->setEnabled(editable && hasConflict);
+    }
+    if (resolveMigrationButton_) resolveMigrationButton_->setEnabled(editable && hasConflict);
 }
 
 void GeometryRulesPage::setDirty(bool dirty) {
@@ -928,6 +1180,7 @@ void GeometryRulesPage::setDirty(bool dirty) {
 void GeometryRulesPage::markDraftDirty() {
     if (!dirty_) {
         job_ = QJsonObject();
+        warningContinuationAvailable_ = false;
         if (validationTable_ != nullptr) validationTable_->setRowCount(0);
         if (progressBar_ != nullptr) {
             progressBar_->setRange(0, 1);
@@ -1046,8 +1299,7 @@ void GeometryRulesPage::refreshTemplatePreview() {
     const QJsonObject rule = currentRule();
     if (!rule.isEmpty()) {
         const QJsonObject guideShape = canvasShapeForRule(rule);
-        canvas_->setCoarseShape(manualEditContextKey_ == currentEditContextKey()
-                                    ? guideShape : QJsonObject());
+        canvas_->setCoarseShape(guideShape);
         const QString shape = rule.value(QStringLiteral("shape")).toString();
         canvas_->setTool(shape == QStringLiteral("ellipse") ? GeometryRuleCanvas::Ellipse
                            : shape == QStringLiteral("rotated_rectangle") ? GeometryRuleCanvas::RotatedRectangle
@@ -1369,7 +1621,7 @@ void GeometryRulesPage::deleteRule() {
 }
 
 void GeometryRulesPage::requestPreviewFromShape(const QJsonObject &shape) {
-    if (shape.isEmpty() || previewBusy_) return;
+    if (!backendAvailable_ || editingLocked_ || shape.isEmpty() || previewBusy_) return;
     if (manualAnchorCapture_) {
         const QJsonObject anchor = anchorFromCanvasShape(shape);
         if (anchor.isEmpty()) return;
@@ -1417,7 +1669,7 @@ QJsonObject GeometryRulesPage::previewRequest(int anchorCandidateIndex, int rule
 
 void GeometryRulesPage::candidateChanged(int index) {
     Q_UNUSED(index);
-    if (previewBusy_) return;
+    if (!backendAvailable_ || previewBusy_) return;
     const QJsonObject request = previewRequest(anchorCandidateCombo_->currentIndex(), ruleCandidateCombo_->currentIndex());
     if (request.isEmpty()) return;
     pendingPreviewContextKey_ = currentEditContextKey();
@@ -1553,6 +1805,7 @@ void GeometryRulesPage::setTemplateReview(const QString &state, const QString &r
 }
 
 void GeometryRulesPage::saveDraft() {
+    if (!backendAvailable_ || busy_) return;
     setCurrentRuleFromEditor();
     emit saveDraftRequested(draft_, snapshot_.value(QStringLiteral("library_revision")).toInt(),
                              snapshot_.value(QStringLiteral("draft_revision")).toInt());
@@ -1567,21 +1820,49 @@ void GeometryRulesPage::discardUnsavedChanges() {
 }
 
 void GeometryRulesPage::validateDraft() {
+    if (!backendAvailable_ || busy_) return;
     setCurrentRuleFromEditor();
     emit validateRequested(snapshot_.value(QStringLiteral("library_revision")).toInt(),
                           snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
 void GeometryRulesPage::publishDraft() {
-    if (!publishButton_->isEnabled()) return;
+    if (!backendAvailable_ || !publishButton_->isEnabled()) return;
     emit publishRequested(job_.value(QStringLiteral("job_id")).toString(),
                           snapshot_.value(QStringLiteral("library_revision")).toInt(),
                           snapshot_.value(QStringLiteral("draft_revision")).toInt(),
                           overrideReasonEdit_->text().trimmed());
 }
 
+void GeometryRulesPage::clearPublishContinuation() {
+    warningContinuationAvailable_ = false;
+    updatePublishState();
+}
+
 void GeometryRulesPage::publishWorkflow() {
     if (publishWorkflowButton_ == nullptr || !publishWorkflowButton_->isEnabled()) return;
+    const bool completedCurrentValidation = job_.value(QStringLiteral("state")).toString()
+            == QStringLiteral("completed")
+        && job_.value(QStringLiteral("base_library_revision")).toInt(-1)
+            == snapshot_.value(QStringLiteral("library_revision")).toInt()
+        && job_.value(QStringLiteral("base_draft_revision")).toInt(-1)
+            == snapshot_.value(QStringLiteral("draft_revision")).toInt();
+    const bool hasWarning = !job_.value(QStringLiteral("warnings")).toArray().isEmpty()
+        || job_.value(QStringLiteral("regression")).toObject()
+               .value(QStringLiteral("correct_to_wrong")).toInt() > 0;
+    const bool hasBlocking = !job_.value(QStringLiteral("blocking_issues")).toArray().isEmpty();
+    if (warningContinuationAvailable_ && completedCurrentValidation
+        && hasWarning && !hasBlocking) {
+        const QString reason = overrideReasonEdit_->text().trimmed();
+        if (reason.isEmpty()) {
+            updatePublishState();
+            return;
+        }
+        emit publishRequested(job_.value(QStringLiteral("job_id")).toString(),
+                              snapshot_.value(QStringLiteral("library_revision")).toInt(),
+                              snapshot_.value(QStringLiteral("draft_revision")).toInt(), reason);
+        return;
+    }
     setCurrentRuleFromEditor();
     const QJsonArray conflicts = draft_.value(QStringLiteral("migration")).toObject()
                                      .value(QStringLiteral("conflicts")).toArray();
@@ -1607,7 +1888,7 @@ void GeometryRulesPage::publishWorkflow() {
 }
 
 void GeometryRulesPage::rollbackDraft() {
-    if (busy_) return;
+    if (!backendAvailable_ || busy_) return;
     emit rollbackRequested(snapshot_.value(QStringLiteral("library_revision")).toInt());
 }
 
@@ -1621,17 +1902,47 @@ void GeometryRulesPage::updatePublishState() {
     const bool hasBlocking = !job_.value(QStringLiteral("blocking_issues")).toArray().isEmpty();
     const bool readOnly = versionCombo_ != nullptr && versionCombo_->currentData().toString() == QStringLiteral("active");
     const bool hasOverrideReason = !overrideReasonEdit_->text().trimmed().isEmpty();
-    const bool needsOverrideReason = completed && hasWarning && !hasBlocking && !hasOverrideReason;
-    publishButton_->setEnabled(!busy_ && !readOnly && completed && !hasBlocking
+    const bool needsOverrideReason = warningContinuationAvailable_ && completed
+        && hasWarning && !hasBlocking && !hasOverrideReason;
+    const bool warningContinuationReady = warningContinuationAvailable_ && completed
+        && hasWarning && !hasBlocking && hasOverrideReason;
+    publishButton_->setEnabled(backendAvailable_ && !busy_ && !editingLocked_
+                               && !readOnly && completed && !hasBlocking
                                && (!hasWarning || hasOverrideReason));
     if (validateButton_ != nullptr) {
-        validateButton_->setEnabled(!busy_ && !readOnly && !dirty_);
+        validateButton_->setEnabled(backendAvailable_ && !busy_ && !editingLocked_
+                                    && !readOnly && !dirty_);
         validateButton_->setToolTip(dirty_
             ? QStringLiteral("请先保存当前草稿，再重新验证") : QString());
     }
     if (publishWorkflowButton_ != nullptr) {
-        publishWorkflowButton_->setEnabled(!busy_ && !readOnly);
-        publishWorkflowButton_->setToolTip(QStringLiteral("自动保存当前草稿并验证；无阻断项时继续发布"));
+        const bool workflowBlocked = completed && hasBlocking;
+        publishWorkflowButton_->setEnabled(backendAvailable_ && !busy_
+                                           && (!editingLocked_ || warningContinuationReady) && !readOnly
+                                           && !workflowBlocked && !needsOverrideReason);
+        publishWorkflowButton_->setToolTip(needsOverrideReason
+            ? QStringLiteral("请先填写发布覆盖原因")
+            : workflowBlocked ? QStringLiteral("存在阻断项，请先处理后重新验证")
+                              : QStringLiteral("自动保存当前草稿并验证；无阻断项时继续发布"));
+    }
+    if (publishDisabledReasonLabel_ != nullptr) {
+        QString disabledReason;
+        if (!backendAvailable_) {
+            disabledReason = backendUnavailableReason_.isEmpty()
+                ? QStringLiteral("后端不可用") : backendUnavailableReason_;
+        } else if (busy_) {
+            disabledReason = QStringLiteral("操作进行中，请稍候");
+        } else if (readOnly) {
+            disabledReason = QStringLiteral("活动版本为只读，请切换到编辑草稿");
+        } else if (completed && hasBlocking) {
+            disabledReason = QStringLiteral("验证存在阻断项，请先处理问题后重新验证");
+        } else if (needsOverrideReason) {
+            disabledReason = QStringLiteral("存在可覆盖告警，请先填写发布覆盖原因");
+        } else if (editingLocked_ && !warningContinuationReady) {
+            disabledReason = QStringLiteral("发布流程进行中，请等待当前步骤完成");
+        }
+        publishDisabledReasonLabel_->setText(disabledReason);
+        publishDisabledReasonLabel_->setVisible(!disabledReason.isEmpty());
     }
     if (needsOverrideReason) {
         statusLabel_->setText(QStringLiteral("验证完成：存在可覆盖告警，请填写发布覆盖原因"));
@@ -1710,6 +2021,7 @@ void GeometryRulesPage::reloadDraft() {
     redoHistory_.clear();
     setDirty(false);
     job_ = QJsonObject();
+    warningContinuationAvailable_ = false;
     if (validationTable_ != nullptr) validationTable_->setRowCount(0);
     if (progressBar_ != nullptr) {
         progressBar_->setRange(0, 1);

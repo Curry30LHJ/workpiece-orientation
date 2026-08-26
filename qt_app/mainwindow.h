@@ -24,6 +24,7 @@ class QTextEdit;
 class AnnotationManagerDialog;
 class GeometryRulesPage;
 class TaskStatusWidget;
+class QCloseEvent;
 
 namespace Ui {
 class MainWindow;
@@ -44,6 +45,9 @@ public:
     void setReplaceConfirmationHandler(std::function<bool(const QString &)> handler);
     void setBackendError(const QString &message);
     bool requestPage(AppPage page);
+
+protected:
+    void closeEvent(QCloseEvent *event) override;
 
 private slots:
     void showInspection();
@@ -91,7 +95,9 @@ private slots:
 
 private:
     enum class CommandOwner { None, System, UserRefresh, Inspection, Library, Geometry };
-    enum class GeometryDirtyDecision { Keep, Discard, Cancel };
+    enum class GeometryDirtyDecision { Save, Discard, Cancel };
+    enum class PendingNavigationKind { None, Page, Workpiece, CloseWindow };
+    enum class GeometrySaveIntent { None, Normal, Navigation, PublishWorkflow };
 
     struct QueuedCommandIntent {
         CommandOwner owner = CommandOwner::None;
@@ -113,6 +119,13 @@ private:
                          const QJsonObject &fields = QJsonObject(),
                          quint64 refreshTransactionId = 0);
     void dispatchQueuedCommand();
+    bool dispatchGeometryWorkflowContinuation();
+    void stageGeometryWorkflowContinuation(const QString &command,
+                                           const QJsonObject &fields);
+    void clearGeometryWorkflowTarget();
+    void setGeometryOperationEditingLocked(bool locked);
+    void setGeometryProfileLoadGeneration(quint64 generation);
+    void updateGeometryEditingLock();
     void issuePageCommand(const QueuedCommandIntent &intent,
                           bool includesMandatoryRefresh = false,
                           bool includesUserRefresh = false);
@@ -135,9 +148,24 @@ private:
     void requestAnnotationSnapshot(const QString &workpieceId);
     void sendAnnotationMutation(const QString &command, const QJsonObject &fields);
     void requestGeometryProfile(const QString &workpieceId);
+    bool startGeometryDraftSave(const QJsonObject &draft, int libraryRevision,
+                                int draftRevision, GeometrySaveIntent intent);
     bool maybeContinueGeometryPublish(const QJsonObject &job);
     void applyGeometryValidationJob(const QJsonObject &job);
+    void bindGeometryValidationContext(const QString &workpieceId,
+                                       int libraryRevision, int draftRevision);
+    void clearGeometryValidationContext();
+    bool geometryValidationMatchesPage(const QJsonObject &job) const;
     GeometryDirtyDecision promptForDirtyGeometry();
+    bool beginPendingGeometryNavigation(PendingNavigationKind kind,
+                                        AppPage page = AppPage::Inspection,
+                                        const QString &workpieceId = QString());
+    bool tryStartPendingGeometrySave();
+    void cancelPendingGeometryNavigation();
+    void completePendingGeometryNavigation();
+    void applyWorkpieceListResponse(const QJsonObject &response,
+                                    quint64 refreshTransactionId,
+                                    bool includedMandatoryRefresh);
     void setCurrentPageUnchecked(AppPage page);
     bool applyDetectionWorkpieceChange(const QString &workpieceId);
     void refreshDetectionWorkpieceConsumers();
@@ -210,10 +238,33 @@ private:
     QString annotationWorkpieceId_;
     GeometryRulesPage *geometryRulesPage_ = nullptr;
     QString geometryWorkpieceId_;
+    QString geometryRequestedWorkpieceId_;
     QString currentDetectionWorkpieceId_;
     quint64 geometryTargetGeneration_ = 0;
     quint64 pendingGeometryTargetGeneration_ = 0;
+    quint64 geometryProfileLoadGeneration_ = 0;
+    bool geometryOperationEditingLocked_ = false;
+    bool geometryForceProfileReload_ = false;
     QString geometryValidationJobId_;
+    QString geometryValidationContextWorkpieceId_;
+    int geometryValidationContextLibraryRevision_ = -1;
+    int geometryValidationContextDraftRevision_ = -1;
+    quint64 geometryValidationContextTargetGeneration_ = 0;
+    QString geometryValidationContextJobId_;
+    PendingNavigationKind pendingNavigationKind_ = PendingNavigationKind::None;
+    AppPage pendingNavigationPage_ = AppPage::Inspection;
+    QString pendingNavigationWorkpieceId_;
+    QJsonObject pendingNavigationWorkpieceListResponse_;
+    quint64 pendingNavigationRefreshTransactionId_ = 0;
+    bool pendingNavigationResponseIncludedMandatory_ = false;
+    bool bypassCloseGuard_ = false;
+    GeometrySaveIntent geometrySaveIntent_ = GeometrySaveIntent::None;
     bool geometryPublishAfterValidation_ = false;
     QString geometryPublishOverrideReason_;
+    QString geometryWorkflowWorkpieceId_;
+    int geometryWorkflowLibraryRevision_ = -1;
+    int geometryWorkflowDraftRevision_ = -1;
+    QString geometryWorkflowJobId_;
+    QString geometryWorkflowContinuationCommand_;
+    QJsonObject geometryWorkflowContinuationFields_;
 };

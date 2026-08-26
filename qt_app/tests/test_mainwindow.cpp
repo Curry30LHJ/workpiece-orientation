@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QComboBox>
+#include <QGroupBox>
 #include <QLabel>
 #include <QListWidget>
 #include <QLineEdit>
@@ -52,6 +53,7 @@ protected:
                     return;
                 }
             }
+            dialog->reject();
         });
         deleteLater();
         return true;
@@ -59,6 +61,42 @@ protected:
 
 private:
     QString text_;
+};
+
+class SnapshotBeforeEnableObserver : public QObject {
+public:
+    SnapshotBeforeEnableObserver(GeometryRulesPage *page, QWidget *watched,
+                                 int expectedLibraryRevision)
+        : page_(page), watched_(watched),
+          expectedLibraryRevision_(expectedLibraryRevision) {
+        watched_->installEventFilter(this);
+    }
+
+    ~SnapshotBeforeEnableObserver() override {
+        watched_->removeEventFilter(this);
+    }
+
+    bool observedEnable() const { return observedEnable_; }
+    bool snapshotWasCurrent() const { return snapshotWasCurrent_; }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override {
+        if (watched == watched_ && event->type() == QEvent::EnabledChange
+            && watched_->isEnabled()) {
+            observedEnable_ = true;
+            snapshotWasCurrent_ = page_->snapshot()
+                                      .value(QStringLiteral("library_revision"))
+                                      .toInt() == expectedLibraryRevision_;
+        }
+        return false;
+    }
+
+private:
+    GeometryRulesPage *page_ = nullptr;
+    QWidget *watched_ = nullptr;
+    int expectedLibraryRevision_ = -1;
+    bool observedEnable_ = false;
+    bool snapshotWasCurrent_ = false;
 };
 
 class PassiveLauncher : public ProcessLauncher {
@@ -443,21 +481,121 @@ class GeometryWorkflowServer : public QObject {
 public:
     explicit GeometryWorkflowServer(QObject *parent = nullptr) : QObject(parent) {
         connect(&server_, &QTcpServer::newConnection, this, &GeometryWorkflowServer::acceptConnection);
+        workpieces_ = QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                        {QStringLiteral("name"), QStringLiteral("M1")}},
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                        {QStringLiteral("name"), QStringLiteral("M2")}}};
     }
 
     bool listen() { return server_.listen(QHostAddress::LocalHost, 0); }
     quint16 port() const { return server_.serverPort(); }
     QStringList workflowCommands() const { return workflowCommands_; }
+    QStringList workflowWorkpieceIds() const { return workflowWorkpieceIds_; }
     QStringList geometryProfileWorkpieceIds() const {
         return geometryProfileWorkpieceIds_;
     }
     QStringList validationPollJobIds() const { return validationPollJobIds_; }
+    QList<QPair<int, int>> geometrySaveBaseRevisions() const {
+        return geometrySaveBaseRevisions_;
+    }
+    int listWorkpieceCount() const { return listWorkpieceCount_; }
+    void setValidationWarnings(const QJsonArray &warnings) { validationWarnings_ = warnings; }
+    void setWorkpieces(const QJsonArray &workpieces) { workpieces_ = workpieces; }
+    void setProfileRevisions(int libraryRevision, int draftRevision,
+                             int activeRevision) {
+        profileLibraryRevision_ = libraryRevision;
+        profileDraftRevision_ = draftRevision;
+        profileActiveRevision_ = activeRevision;
+    }
+    void setProfileDraft(const QJsonObject &draft) { profileDraft_ = draft; }
+    void failNextPublish() { failNextPublish_ = true; }
     void holdGeometryProfiles(bool hold = true) { holdGeometryProfiles_ = hold; }
+    void holdGeometrySave(bool hold = true) { holdGeometrySave_ = hold; }
+    void holdGeometryValidation(bool hold = true) { holdGeometryValidation_ = hold; }
+    void holdGeometryMutations(bool hold = true) { holdGeometryMutations_ = hold; }
+    void holdWorkpieceRefresh(bool hold = true) { holdWorkpieceRefresh_ = hold; }
+    void setInitialValidationState(const QString &state) { initialValidationState_ = state; }
+    void setValidationPollState(const QString &state) { validationPollState_ = state; }
+    void disconnectClient() {
+        if (socket_ != nullptr) socket_->abort();
+    }
     bool replyNextGeometryProfile() {
         if (heldGeometryProfiles_.isEmpty()) return false;
         const QPair<QString, QString> pending = heldGeometryProfiles_.dequeue();
         sendSuccess(pending.first, QJsonObject{{QStringLiteral("profile"),
-            profile(1, 1, 0, pending.second)}});
+            configuredProfile(pending.second)}});
+        return true;
+    }
+    bool replyNextGeometryProfileFailure() {
+        if (heldGeometryProfiles_.isEmpty()) return false;
+        const QPair<QString, QString> pending = heldGeometryProfiles_.dequeue();
+        send(QJsonObject{{QStringLiteral("version"), 1},
+                         {QStringLiteral("request_id"), pending.first},
+                         {QStringLiteral("ok"), false},
+                         {QStringLiteral("error"), QJsonObject{
+                             {QStringLiteral("code"), QStringLiteral("PROFILE_LOAD_FAILED")},
+                             {QStringLiteral("message"), QStringLiteral("synthetic profile failure")}}}});
+        return true;
+    }
+    bool replyGeometrySaveSuccess() {
+        if (heldGeometrySaves_.isEmpty()) return false;
+        const QPair<QString, QString> pending = heldGeometrySaves_.dequeue();
+        sendSuccess(pending.first, QJsonObject{{QStringLiteral("profile"),
+            profile(1, 2, 0, pending.second)}});
+        return true;
+    }
+    bool replyGeometrySaveFailure() {
+        if (heldGeometrySaves_.isEmpty()) return false;
+        const QPair<QString, QString> pending = heldGeometrySaves_.dequeue();
+        send(QJsonObject{{QStringLiteral("version"), 1},
+                         {QStringLiteral("request_id"), pending.first},
+                         {QStringLiteral("ok"), false},
+                         {QStringLiteral("error"), QJsonObject{
+                             {QStringLiteral("code"), QStringLiteral("SAVE_FAILED")},
+                             {QStringLiteral("message"), QStringLiteral("synthetic save failure")}}}});
+        return true;
+    }
+    bool replyGeometryValidationSuccess() {
+        if (heldGeometryValidations_.isEmpty()) return false;
+        const QString requestId = heldGeometryValidations_.dequeue();
+        sendSuccess(requestId, QJsonObject{{QStringLiteral("job"), QJsonObject{
+            {QStringLiteral("job_id"), QStringLiteral("job-1")},
+            {QStringLiteral("state"), QStringLiteral("completed")},
+            {QStringLiteral("base_library_revision"), 1},
+            {QStringLiteral("base_draft_revision"), 2},
+            {QStringLiteral("progress"), QJsonObject{{QStringLiteral("completed"), 1},
+                                                        {QStringLiteral("total"), 1}}},
+            {QStringLiteral("blocking_issues"), QJsonArray()},
+            {QStringLiteral("warnings"), validationWarnings_}}}});
+        return true;
+    }
+    bool replyGeometryMutationSuccess() {
+        if (heldGeometryMutations_.isEmpty()) return false;
+        const QJsonObject pending = heldGeometryMutations_.dequeue();
+        sendSuccess(pending.value(QStringLiteral("request_id")).toString(),
+                    QJsonObject{{QStringLiteral("profile"),
+                        profile(2, 2, 1,
+                                pending.value(QStringLiteral("workpiece_id")).toString())}});
+        return true;
+    }
+    bool replyGeometryMutationFailure() {
+        if (heldGeometryMutations_.isEmpty()) return false;
+        const QJsonObject pending = heldGeometryMutations_.dequeue();
+        send(QJsonObject{{QStringLiteral("version"), 1},
+                         {QStringLiteral("request_id"),
+                          pending.value(QStringLiteral("request_id")).toString()},
+                         {QStringLiteral("ok"), false},
+                         {QStringLiteral("error"), QJsonObject{
+                             {QStringLiteral("code"), QStringLiteral("MUTATION_FAILED")},
+                             {QStringLiteral("message"),
+                              QStringLiteral("synthetic geometry mutation failure")}}}});
+        return true;
+    }
+    bool replyWorkpieceRefresh() {
+        if (heldWorkpieceRefreshes_.isEmpty()) return false;
+        sendSuccess(heldWorkpieceRefreshes_.dequeue(),
+                    QJsonObject{{QStringLiteral("workpieces"), workpieces_}});
         return true;
     }
 
@@ -482,15 +620,15 @@ private slots:
                                  {QStringLiteral("ok"), true}, {QStringLiteral("service"), QStringLiteral("workpiece-orientation")},
                                  {QStringLiteral("ready"), true}});
             } else if (command == QStringLiteral("list_workpieces")) {
-                const QJsonArray workpieces{
-                    QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
-                                {QStringLiteral("name"), QStringLiteral("M1")}},
-                    QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
-                                {QStringLiteral("name"), QStringLiteral("M2")}}};
-                send(QJsonObject{{QStringLiteral("version"), 1},
-                                 {QStringLiteral("request_id"), requestId},
-                                 {QStringLiteral("ok"), true},
-                                 {QStringLiteral("workpieces"), workpieces}});
+                ++listWorkpieceCount_;
+                if (holdWorkpieceRefresh_) {
+                    heldWorkpieceRefreshes_.enqueue(requestId);
+                } else {
+                    send(QJsonObject{{QStringLiteral("version"), 1},
+                                     {QStringLiteral("request_id"), requestId},
+                                     {QStringLiteral("ok"), true},
+                                     {QStringLiteral("workpieces"), workpieces_}});
+                }
             } else if (command == QStringLiteral("get_geometry_mask_profile")) {
                 const QString workpieceId = request.value(QStringLiteral("workpiece_id")).toString();
                 geometryProfileWorkpieceIds_.append(workpieceId);
@@ -498,32 +636,82 @@ private slots:
                     heldGeometryProfiles_.enqueue(qMakePair(requestId, workpieceId));
                 } else {
                     sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"),
-                        profile(1, 1, 0, workpieceId)}});
+                        configuredProfile(workpieceId)}});
                 }
             } else if (command == QStringLiteral("save_geometry_mask_draft")) {
                 workflowCommands_.append(command);
-                sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"), profile(1, 2, 0)}});
+                const QString workpieceId = request.value(QStringLiteral("workpiece_id")).toString();
+                workflowWorkpieceIds_.append(workpieceId);
+                geometrySaveBaseRevisions_.append(qMakePair(
+                    request.value(QStringLiteral("base_library_revision")).toInt(-1),
+                    request.value(QStringLiteral("base_draft_revision")).toInt(-1)));
+                if (holdGeometrySave_) {
+                    heldGeometrySaves_.enqueue(qMakePair(requestId, workpieceId));
+                } else {
+                    sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"),
+                        profile(1, 2, 0, workpieceId)}});
+                }
             } else if (command == QStringLiteral("validate_geometry_mask_draft")) {
                 workflowCommands_.append(command);
-                sendSuccess(requestId, QJsonObject{{QStringLiteral("job"), QJsonObject{
-                    {QStringLiteral("job_id"), QStringLiteral("job-1")},
-                    {QStringLiteral("state"), QStringLiteral("completed")},
-                    {QStringLiteral("base_library_revision"), 1},
-                    {QStringLiteral("base_draft_revision"), 2},
-                    {QStringLiteral("blocking_issues"), QJsonArray()},
-                    {QStringLiteral("warnings"), QJsonArray()}}}});
+                workflowWorkpieceIds_.append(
+                    request.value(QStringLiteral("workpiece_id")).toString());
+                if (holdGeometryValidation_) {
+                    heldGeometryValidations_.enqueue(requestId);
+                } else {
+                    sendSuccess(requestId, QJsonObject{{QStringLiteral("job"), QJsonObject{
+                        {QStringLiteral("job_id"), QStringLiteral("job-1")},
+                        {QStringLiteral("state"), initialValidationState_},
+                        {QStringLiteral("base_library_revision"), 1},
+                        {QStringLiteral("base_draft_revision"), 2},
+                        {QStringLiteral("progress"), QJsonObject{
+                            {QStringLiteral("completed"), initialValidationState_ == QStringLiteral("completed") ? 1 : 0},
+                            {QStringLiteral("total"), 1}}},
+                        {QStringLiteral("blocking_issues"), QJsonArray()},
+                        {QStringLiteral("warnings"), validationWarnings_}}}});
+                }
             } else if (command == QStringLiteral("get_geometry_mask_validation_job")) {
                 const QString jobId = request.value(QStringLiteral("job_id")).toString();
                 validationPollJobIds_.append(jobId);
                 sendSuccess(requestId, QJsonObject{{QStringLiteral("job"), QJsonObject{
                     {QStringLiteral("job_id"), jobId},
-                    {QStringLiteral("state"), QStringLiteral("running")},
+                    {QStringLiteral("state"), validationPollState_},
+                    {QStringLiteral("base_library_revision"), 1},
+                    {QStringLiteral("base_draft_revision"), 2},
+                    {QStringLiteral("blocking_issues"), QJsonArray()},
+                    {QStringLiteral("warnings"), validationWarnings_},
                     {QStringLiteral("progress"), QJsonObject{
-                        {QStringLiteral("completed"), 2},
-                        {QStringLiteral("total"), 5}}}}}});
+                        {QStringLiteral("completed"), validationPollState_ == QStringLiteral("completed") ? 1 : 0},
+                        {QStringLiteral("total"), 1}}}}}});
             } else if (command == QStringLiteral("publish_geometry_mask_profile")) {
                 workflowCommands_.append(command);
-                sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"), profile(1, 2, 1)}});
+                const QString workpieceId = request.value(QStringLiteral("workpiece_id")).toString();
+                workflowWorkpieceIds_.append(workpieceId);
+                if (failNextPublish_) {
+                    failNextPublish_ = false;
+                    send(QJsonObject{{QStringLiteral("version"), 1},
+                                     {QStringLiteral("request_id"), requestId},
+                                     {QStringLiteral("ok"), false},
+                                     {QStringLiteral("error"), QJsonObject{
+                                         {QStringLiteral("code"), QStringLiteral("PUBLISH_FAILED")},
+                                         {QStringLiteral("message"), QStringLiteral("synthetic publish failure")}}}});
+                } else {
+                    sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"),
+                        profile(1, 2, 1, workpieceId)}});
+                }
+            } else if (command == QStringLiteral("rollback_geometry_mask_profile")
+                       || command == QStringLiteral("resolve_geometry_mask_migration")) {
+                workflowCommands_.append(command);
+                const QString workpieceId = request.value(QStringLiteral("workpiece_id")).toString();
+                workflowWorkpieceIds_.append(workpieceId);
+                if (holdGeometryMutations_) {
+                    heldGeometryMutations_.enqueue(QJsonObject{
+                        {QStringLiteral("request_id"), requestId},
+                        {QStringLiteral("command"), command},
+                        {QStringLiteral("workpiece_id"), workpieceId}});
+                } else {
+                    sendSuccess(requestId, QJsonObject{{QStringLiteral("profile"),
+                        profile(2, 2, 1, workpieceId)}});
+                }
             }
         }
     }
@@ -571,6 +759,15 @@ public:
     }
 
 private:
+    QJsonObject configuredProfile(const QString &workpieceId) const {
+        QJsonObject result = profile(profileLibraryRevision_, profileDraftRevision_,
+                                     profileActiveRevision_, workpieceId);
+        if (!profileDraft_.isEmpty()) {
+            result.insert(QStringLiteral("draft"), profileDraft_);
+        }
+        return result;
+    }
+
     void sendSuccess(const QString &requestId, const QJsonObject &fields) {
         QJsonObject response = fields;
         response.insert(QStringLiteral("version"), 1);
@@ -588,10 +785,30 @@ private:
     QTcpSocket *socket_ = nullptr;
     QByteArray buffer_;
     QStringList workflowCommands_;
+    QStringList workflowWorkpieceIds_;
     QStringList geometryProfileWorkpieceIds_;
     QStringList validationPollJobIds_;
+    QList<QPair<int, int>> geometrySaveBaseRevisions_;
     QQueue<QPair<QString, QString>> heldGeometryProfiles_;
+    QQueue<QPair<QString, QString>> heldGeometrySaves_;
+    QQueue<QString> heldGeometryValidations_;
+    QQueue<QJsonObject> heldGeometryMutations_;
+    QQueue<QString> heldWorkpieceRefreshes_;
+    QJsonArray workpieces_;
+    QJsonArray validationWarnings_;
     bool holdGeometryProfiles_ = false;
+    bool holdGeometrySave_ = false;
+    bool holdGeometryValidation_ = false;
+    bool holdGeometryMutations_ = false;
+    bool holdWorkpieceRefresh_ = false;
+    int listWorkpieceCount_ = 0;
+    bool failNextPublish_ = false;
+    QString initialValidationState_ = QStringLiteral("completed");
+    QString validationPollState_ = QStringLiteral("running");
+    int profileLibraryRevision_ = 1;
+    int profileDraftRevision_ = 1;
+    int profileActiveRevision_ = 0;
+    QJsonObject profileDraft_;
 };
 
 class TestMainWindow : public QObject {
@@ -751,11 +968,546 @@ private slots:
         QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::Inspection));
         QVERIFY(!page->hasUnsavedChanges());
 
+    }
+
+    void dirtyGeometryPageCanCancelPageNavigation() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        QVERIFY(page != nullptr);
+        QVERIFY(stack != nullptr);
+        page->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
         QVERIFY(window.requestPage(AppPage::GeometryRules));
         page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
-        chooseDirtyNavigationOption(QStringLiteral("保留并离开"));
-        QVERIFY(window.requestPage(AppPage::Inspection));
         QVERIFY(page->hasUnsavedChanges());
+
+        chooseDirtyNavigationOption(QStringLiteral("取消"));
+        QVERIFY(!window.requestPage(AppPage::Inspection));
+
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(page->hasUnsavedChanges());
+    }
+
+    void dirtyGeometryPageCanCancelWorkpieceChange() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        emit client.responseReceived(QStringLiteral("list_workpieces"), QJsonObject{
+            {QStringLiteral("workpieces"), QJsonArray{
+                QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                            {QStringLiteral("name"), QStringLiteral("M1")}},
+                QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                            {QStringLiteral("name"), QStringLiteral("M2")}}}}});
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        page->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        QVERIFY(page->hasUnsavedChanges());
+
+        chooseDirtyNavigationOption(QStringLiteral("取消"));
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("m1"));
+        QVERIFY(page->hasUnsavedChanges());
+    }
+
+    void dirtyGeometryPageCanCancelWindowClose() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        page->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        QVERIFY(page->hasUnsavedChanges());
+        window.show();
+        QCoreApplication::processEvents();
+
+        chooseDirtyNavigationOption(QStringLiteral("取消"));
+        QVERIFY(!window.close());
+
+        QVERIFY(window.isVisible());
+        QVERIFY(page->hasUnsavedChanges());
+    }
+
+    void geometrySaveSuccessCompletesPendingNavigation() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        QVERIFY(page != nullptr);
+        QVERIFY(stack != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        QVERIFY(page->hasUnsavedChanges());
+
+        chooseDirtyNavigationOption(QStringLiteral("保存并继续"));
+        QVERIFY(!window.requestPage(AppPage::Inspection));
+
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(!page->isEnabled());
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands(),
+                                  QStringList({QStringLiteral("save_geometry_mask_draft")}), 1000);
+        QVERIFY(!window.requestPage(AppPage::WorkpieceLibrary));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(shape != nullptr);
+        bool switchedWhileLocked = false;
+        connect(stack, &QStackedWidget::currentChanged, this, [stack, shape, &switchedWhileLocked]() {
+            if (stack->currentIndex() == static_cast<int>(AppPage::Inspection)) {
+                switchedWhileLocked = !shape->isEnabled();
+            }
+        });
+        QVERIFY(server.replyGeometrySaveSuccess());
+        QTRY_COMPARE_WITH_TIMEOUT(stack->currentIndex(),
+                                  static_cast<int>(AppPage::Inspection), 1000);
+        QVERIFY(switchedWhileLocked);
+        QVERIFY(page->isEnabled());
+        QVERIFY(shape->isEnabled());
+        QVERIFY(!page->hasUnsavedChanges());
+        QCOMPARE(server.workflowCommands(),
+                 QStringList({QStringLiteral("save_geometry_mask_draft")}));
+    }
+
+    void geometrySaveFailureCancelsPendingNavigation() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        QVERIFY(page != nullptr);
+        QVERIFY(stack != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+
+        chooseDirtyNavigationOption(QStringLiteral("保存并继续"));
+        QVERIFY(!window.requestPage(AppPage::Inspection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(server.replyGeometrySaveFailure());
+
+        QTRY_VERIFY_WITH_TIMEOUT(page->isEnabled(), 1000);
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(page->hasUnsavedChanges());
+        QVERIFY(page->findChild<QLabel *>(QStringLiteral("geometryStatusLabel"))
+                    ->text().contains(QStringLiteral("synthetic save failure")));
+    }
+
+    void listRefreshSaveStagesFullResponseUntilSuccess() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(combo->currentData().toString(), QStringLiteral("m1"), 1000);
+        QCOMPARE(combo->count(), 2);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+
+        server.setWorkpieces(QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m2")},
+                        {QStringLiteral("name"), QStringLiteral("新 M2")}}});
+        chooseDirtyNavigationOption(QStringLiteral("保存并继续"));
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces", Qt::DirectConnection));
+
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("m1"));
+        QCOMPARE(combo->count(), 2);
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(server.replyGeometrySaveSuccess());
+
+        QTRY_COMPARE_WITH_TIMEOUT(combo->currentData().toString(), QStringLiteral("m2"), 1000);
+        QCOMPARE(combo->count(), 1);
+        QCOMPARE(combo->currentText(), QStringLiteral("新 M2"));
+        QVERIFY(!page->hasUnsavedChanges());
+    }
+
+    void publishWorkflowLocksDraftEditingUntilFailure() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        auto *primary = page->findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        auto *addRule = page->findChild<QPushButton *>(QStringLiteral("addRuleButton"));
+        auto *canvas = page->findChild<QWidget *>(QStringLiteral("geometryRuleCanvas"));
+        auto *direction = page->findChild<QComboBox *>(QStringLiteral("directionCombo"));
+        auto *templateCombo = page->findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
+        auto *issues = page->findChild<QTableWidget *>(QStringLiteral("validationTable"));
+        QVERIFY(primary != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(addRule != nullptr);
+        QVERIFY(canvas != nullptr);
+        QVERIFY(direction != nullptr);
+        QVERIFY(templateCombo != nullptr);
+        QVERIFY(issues != nullptr);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(!shape->isEnabled());
+        QVERIFY(!addRule->isEnabled());
+        QVERIFY(!canvas->isEnabled());
+        QVERIFY(direction->isEnabled());
+        QVERIFY(templateCombo->isEnabled());
+        QVERIFY(issues->isEnabled());
+
+        QVERIFY(server.replyGeometrySaveFailure());
+        QTRY_VERIFY_WITH_TIMEOUT(shape->isEnabled(), 1000);
+        QVERIFY(addRule->isEnabled());
+        QVERIFY(canvas->isEnabled());
+    }
+
+    void queuedRefreshCannotPreemptPublishChainValidation() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        page->findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"))->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces", Qt::DirectConnection));
+        QVERIFY(server.replyGeometrySaveSuccess());
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 2000);
+        QCOMPARE(server.workflowCommands(), QStringList({
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft"),
+            QStringLiteral("publish_geometry_mask_profile")}));
+    }
+
+    void queuedRefreshCannotPreemptPublishAfterValidation() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryValidation();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        page->findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"))->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces", Qt::DirectConnection));
+        QVERIFY(server.replyGeometryValidationSuccess());
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 2000);
+        QCOMPARE(server.workflowCommands().last(),
+                 QStringLiteral("publish_geometry_mask_profile"));
+    }
+
+    void switchingWorkpieceDuringWarningContinuationKeepsWorkflowTarget() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setValidationWarnings(QJsonArray{
+            QJsonObject{{QStringLiteral("code"), QStringLiteral("effective_area_low")}}});
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *primary = page->findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+        auto *reason = page->findChild<QLineEdit *>(QStringLiteral("overrideReasonEdit"));
+        auto *workpieces = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        QVERIFY(page != nullptr);
+        QVERIFY(primary != nullptr);
+        QVERIFY(reason != nullptr);
+        QVERIFY(workpieces != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        reason->setText(QStringLiteral("已人工复核告警"));
+        QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
+
+        const int m2Index = workpieces->findData(QStringLiteral("m2"));
+        QVERIFY(m2Index >= 0);
+        workpieces->setCurrentIndex(m2Index);
+        QCOMPARE(workpieces->currentData().toString(), QStringLiteral("m2"));
+        QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
+        primary->click();
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 1500);
+        QCOMPARE(server.workflowCommands().last(),
+                 QStringLiteral("publish_geometry_mask_profile"));
+        QCOMPARE(server.workflowWorkpieceIds().last(), QStringLiteral("m1"));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m2"), 1500);
+    }
+
+    void warningContinuationQueuesOnceWhileBackendBusy() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setValidationWarnings(QJsonArray{
+            QJsonObject{{QStringLiteral("code"), QStringLiteral("effective_area_low")}}});
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *primary = page->findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+        auto *reason = page->findChild<QLineEdit *>(QStringLiteral("overrideReasonEdit"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(page != nullptr);
+        QVERIFY(primary != nullptr);
+        QVERIFY(reason != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        reason->setText(QStringLiteral("已人工复核告警"));
+        QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
+        server.holdWorkpieceRefresh();
+        const int refreshCount = server.listWorkpieceCount();
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces", Qt::DirectConnection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), refreshCount + 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Busy, 1000);
+
+        primary->click();
+        QCOMPARE(server.workflowCommands().size(), 2);
+        QVERIFY(!shape->isEnabled());
+        QVERIFY(server.replyWorkpieceRefresh());
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 1500);
+        QCOMPARE(server.workflowCommands(), QStringList({
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft"),
+            QStringLiteral("publish_geometry_mask_profile")}));
+    }
+
+    void disconnectBeforeValidationJobResponseDoesNotPublishAnUnrelatedValidation() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryValidation();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        auto *primary = page->findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+        QVERIFY(primary != nullptr);
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QCOMPARE(server.workflowCommands().last(), QStringLiteral("validate_geometry_mask_draft"));
+
+        server.disconnectClient();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() != BackendClient::State::Ready
+                                     && client.state() != BackendClient::State::Busy,
+                                 1000);
+        server.holdGeometryValidation(false);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(page->findChild<QGroupBox *>(
+            QStringLiteral("advancedGeometryGroup")) != nullptr, 1000);
+        auto *advanced = page->findChild<QGroupBox *>(QStringLiteral("advancedGeometryGroup"));
+        advanced->setChecked(true);
+        auto *validate = page->findChild<QPushButton *>(QStringLiteral("validateButton"));
+        QVERIFY(validate != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(validate->isEnabled(), 1500);
+
+        validate->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 1500);
+        QCOMPARE(server.workflowCommands().last(), QStringLiteral("validate_geometry_mask_draft"));
+        QTest::qWait(50);
+        QCOMPARE(server.workflowCommands().size(), 3);
+    }
+
+    void reconnectKeepsPublishChainBoundToAnAcceptedValidationJob() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setInitialValidationState(QStringLiteral("running"));
+        server.setValidationPollState(QStringLiteral("running"));
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        auto *primary = page->findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(primary != nullptr);
+        QVERIFY(shape != nullptr);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(!shape->isEnabled(), 1000);
+        server.disconnectClient();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() != BackendClient::State::Ready
+                                     && client.state() != BackendClient::State::Busy,
+                                 1000);
+        QVERIFY(!shape->isEnabled());
+
+        server.setValidationPollState(QStringLiteral("completed"));
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1500);
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 2500);
+        QCOMPARE(server.workflowCommands().last(),
+                 QStringLiteral("publish_geometry_mask_profile"));
+        QTRY_VERIFY_WITH_TIMEOUT(shape->isEnabled(), 1000);
+    }
+
+    void geometrySaveSuccessCompletesPendingWindowClose() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        window.show();
+        QCoreApplication::processEvents();
+
+        chooseDirtyNavigationOption(QStringLiteral("保存并继续"));
+        QVERIFY(!window.close());
+
+        QVERIFY(window.isVisible());
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(server.replyGeometrySaveSuccess());
+        QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 1000);
+    }
+
+    void geometryTransportFailureCancelsPendingNavigation() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        QVERIFY(page != nullptr);
+        QVERIFY(stack != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        chooseDirtyNavigationOption(QStringLiteral("保存并继续"));
+        QVERIFY(!window.requestPage(AppPage::Inspection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onBackendUnavailable", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("save transport lost"))));
+
+        QVERIFY(page->isEnabled());
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(page->hasUnsavedChanges());
+    }
+
+    void ordinaryGeometrySaveDoesNotNavigateOrValidate() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *stack = window.findChild<QStackedWidget *>(
+            QStringLiteral("mainPageStack"));
+        QVERIFY(page != nullptr);
+        QVERIFY(stack != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+
+        auto *advanced = page->findChild<QGroupBox *>(QStringLiteral("advancedGeometryGroup"));
+        auto *save = page->findChild<QPushButton *>(QStringLiteral("saveButton"));
+        QVERIFY(advanced != nullptr);
+        QVERIFY(save != nullptr);
+        advanced->setChecked(true);
+        QVERIFY(save->isEnabled());
+        save->click();
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QTest::qWait(100);
+        QCOMPARE(server.workflowCommands(),
+                 QStringList({QStringLiteral("save_geometry_mask_draft")}));
+        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::GeometryRules));
+        QVERIFY(page->findChild<QComboBox *>(QStringLiteral("shapeCombo"))->isEnabled());
     }
 
     void dirtyGeometryPageGuardsDetectionTargetChoices() {
@@ -793,14 +1545,6 @@ private slots:
         QCOMPARE(combo->currentData().toString(), QStringLiteral("m2"));
         QVERIFY(!page->hasUnsavedChanges());
 
-        combo->setCurrentIndex(combo->findData(QStringLiteral("m1")));
-        page->setSnapshot(GeometryWorkflowServer::profile(1, 1, 0));
-        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
-        chooseDirtyNavigationOption(QStringLiteral("保留并离开"));
-        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
-        QCOMPARE(combo->currentData().toString(), QStringLiteral("m2"));
-        QCOMPARE(stack->currentIndex(), static_cast<int>(AppPage::Inspection));
-        QVERIFY(page->hasUnsavedChanges());
     }
 
     void browsingLibraryDoesNotRetargetInspection() {
@@ -2639,6 +3383,291 @@ private slots:
                  QStringLiteral("m2"));
     }
 
+    void geometryProfileLoadLocksMutationUntilCurrentResponse() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        server.holdGeometryProfiles();
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1000);
+        QVERIFY(!shape->isEnabled());
+        QVERIFY(server.replyNextGeometryProfile());
+
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m2"), 1000);
+        QVERIFY(shape->isEnabled());
+    }
+
+    void staleGeometryProfileResponseDoesNotUnlockNewTarget() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryProfiles();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 1, 1000);
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QVERIFY(!shape->isEnabled());
+
+        QVERIFY(server.replyNextGeometryProfile());
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1000);
+        QVERIFY(!shape->isEnabled());
+        QVERIFY(server.replyNextGeometryProfile());
+
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m2"), 1000);
+        QVERIFY(shape->isEnabled());
+    }
+
+    void geometryProfileFailureAndDisconnectUnlockWithoutReplacingSnapshot() {
+        GeometryWorkflowServer failureServer;
+        QVERIFY(failureServer.listen());
+        BackendClient failureClient;
+        MainWindow failureWindow(&failureClient, nullptr);
+        failureClient.connectToService(QHostAddress::LocalHost, failureServer.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(failureClient.state() == BackendClient::State::Ready, 1000);
+        auto *failureCombo = failureWindow.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"));
+        auto *failurePage = failureWindow.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *failureShape = failurePage->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(failureWindow.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(failurePage->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        const QJsonObject originalDraft = failurePage->draft();
+        failureServer.holdGeometryProfiles();
+        failureCombo->setCurrentIndex(failureCombo->findData(QStringLiteral("m2")));
+        QTRY_COMPARE_WITH_TIMEOUT(failureServer.geometryProfileWorkpieceIds().size(), 2, 1000);
+        QVERIFY(!failureShape->isEnabled());
+        QVERIFY(failureServer.replyNextGeometryProfileFailure());
+        QTRY_VERIFY_WITH_TIMEOUT(failureShape->isEnabled(), 1000);
+        QCOMPARE(failurePage->snapshot().value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m1"));
+        QCOMPARE(failurePage->draft(), originalDraft);
+
+        GeometryWorkflowServer disconnectServer;
+        QVERIFY(disconnectServer.listen());
+        BackendClient disconnectClient;
+        MainWindow disconnectWindow(&disconnectClient, nullptr);
+        disconnectClient.connectToService(QHostAddress::LocalHost, disconnectServer.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(disconnectClient.state() == BackendClient::State::Ready, 1000);
+        auto *disconnectCombo = disconnectWindow.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"));
+        auto *disconnectPage = disconnectWindow.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *disconnectShape = disconnectPage->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(disconnectWindow.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(disconnectPage->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        const QJsonObject disconnectDraft = disconnectPage->draft();
+        disconnectServer.holdGeometryProfiles();
+        disconnectCombo->setCurrentIndex(disconnectCombo->findData(QStringLiteral("m2")));
+        QTRY_COMPARE_WITH_TIMEOUT(disconnectServer.geometryProfileWorkpieceIds().size(), 2, 1000);
+        QVERIFY(!disconnectShape->isEnabled());
+        disconnectServer.disconnectClient();
+        QTRY_VERIFY_WITH_TIMEOUT(disconnectClient.state() != BackendClient::State::Ready
+                                     && disconnectClient.state() != BackendClient::State::Busy,
+                                 1000);
+        QVERIFY(disconnectShape->isEnabled());
+        QCOMPARE(disconnectPage->snapshot().value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m1"));
+        QCOMPARE(disconnectPage->draft(), disconnectDraft);
+    }
+
+    void failedProfileSwitchCannotSaveDisplayedDraftToRequestedWorkpiece() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *addRule = page->findChild<QPushButton *>(QStringLiteral("addRuleButton"));
+        auto *save = page->findChild<QPushButton *>(QStringLiteral("saveButton"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QVERIFY(addRule != nullptr);
+        QVERIFY(save != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        server.holdGeometryProfiles();
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1000);
+        QVERIFY(server.replyNextGeometryProfileFailure());
+        QTRY_VERIFY_WITH_TIMEOUT(addRule->isEnabled(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Ready, 1000);
+        QCOMPARE(page->snapshot().value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m1"));
+
+        addRule->click();
+        QVERIFY(page->hasUnsavedChanges());
+        page->requestSaveDraft();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QCOMPARE(server.workflowWorkpieceIds().last(), QStringLiteral("m1"));
+    }
+
+    void rollbackLocksEditingAndAppliesSnapshotBeforeUnlock() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryMutations();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(page != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        SnapshotBeforeEnableObserver observer(page, shape, 2);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "rollbackGeometryProfile", Qt::DirectConnection,
+            Q_ARG(int, 1)));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QCOMPARE(server.workflowCommands().last(),
+                 QStringLiteral("rollback_geometry_mask_profile"));
+        QVERIFY(!shape->isEnabled());
+
+        QVERIFY(server.replyGeometryMutationSuccess());
+        QTRY_VERIFY_WITH_TIMEOUT(shape->isEnabled(), 1000);
+        QCOMPARE(page->snapshot().value(QStringLiteral("library_revision")).toInt(), 2);
+        QVERIFY(observer.observedEnable());
+        QVERIFY(observer.snapshotWasCurrent());
+    }
+
+    void migrationResolutionLocksEditingAndAppliesSnapshotBeforeUnlock() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryMutations();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(page != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        SnapshotBeforeEnableObserver observer(page, shape, 2);
+        const QJsonObject resolution{{QStringLiteral("action"),
+                                      QStringLiteral("keep")}};
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "resolveGeometryMigration", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("conflict-1")),
+            Q_ARG(QJsonObject, resolution),
+            Q_ARG(int, 1), Q_ARG(int, 1)));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QCOMPARE(server.workflowCommands().last(),
+                 QStringLiteral("resolve_geometry_mask_migration"));
+        QVERIFY(!shape->isEnabled());
+
+        QVERIFY(server.replyGeometryMutationSuccess());
+        QTRY_VERIFY_WITH_TIMEOUT(shape->isEnabled(), 1000);
+        QCOMPARE(page->snapshot().value(QStringLiteral("library_revision")).toInt(), 2);
+        QVERIFY(observer.observedEnable());
+        QVERIFY(observer.snapshotWasCurrent());
+    }
+
+    void rollbackFailureUnlocksEditingWithoutReplacingSnapshot() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryMutations();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(page != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        const QJsonObject originalSnapshot = page->snapshot();
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "rollbackGeometryProfile", Qt::DirectConnection,
+            Q_ARG(int, 1)));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(!shape->isEnabled());
+        QVERIFY(server.replyGeometryMutationFailure());
+
+        QTRY_VERIFY_WITH_TIMEOUT(shape->isEnabled(), 1000);
+        QCOMPARE(page->snapshot(), originalSnapshot);
+    }
+
+    void migrationDisconnectUnlocksEditingWithoutReplacingSnapshot() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryMutations();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(page != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        const QJsonObject originalSnapshot = page->snapshot();
+        const QJsonObject resolution{{QStringLiteral("action"),
+                                      QStringLiteral("keep")}};
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "resolveGeometryMigration", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("conflict-1")),
+            Q_ARG(QJsonObject, resolution),
+            Q_ARG(int, 1), Q_ARG(int, 1)));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(!shape->isEnabled());
+        server.disconnectClient();
+
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() != BackendClient::State::Ready
+                                     && client.state() != BackendClient::State::Busy,
+                                 1000);
+        QVERIFY(shape->isEnabled());
+        QCOMPARE(page->snapshot(), originalSnapshot);
+    }
+
     void rapidGeometryTargetRoundTripRefetchesCurrentGeneration() {
         GeometryWorkflowServer server;
         QVERIFY(server.listen());
@@ -2694,6 +3723,286 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1500);
         QCOMPARE(server.geometryProfileWorkpieceIds(),
                  QStringList({QStringLiteral("m1"), QStringLiteral("m1")}));
+    }
+
+    void unknownGeometryMutationForcesProfileReloadAfterReconnectWithoutRetry() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *shape = page->findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(page != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        server.holdGeometryMutations();
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "rollbackGeometryProfile", Qt::DirectConnection,
+            Q_ARG(int, 1)));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QCOMPARE(server.workflowCommands().last(),
+                 QStringLiteral("rollback_geometry_mask_profile"));
+        QVERIFY(!shape->isEnabled());
+        server.disconnectClient();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() != BackendClient::State::Ready
+                                     && client.state() != BackendClient::State::Busy,
+                                 1000);
+
+        server.holdGeometryMutations(false);
+        server.setProfileRevisions(3, 3, 1);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready
+                                     || client.state() == BackendClient::State::Busy,
+                                 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1500);
+        QCOMPARE(server.geometryProfileWorkpieceIds(),
+                 QStringList({QStringLiteral("m1"), QStringLiteral("m1")}));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("library_revision")).toInt(), 3, 1000);
+        QCOMPARE(server.workflowCommands(),
+                 QStringList({QStringLiteral("rollback_geometry_mask_profile")}));
+    }
+
+    void unknownSaveStillReconcilesAfterReconnectWithoutOverwritingDirtyDraft() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *status = page->findChild<QLabel *>(QStringLiteral("geometryStatusLabel"));
+        QVERIFY(page != nullptr);
+        QVERIFY(status != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        const QJsonObject localDraft = page->draft();
+        QVERIFY(page->hasUnsavedChanges());
+        page->requestSaveDraft();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        server.disconnectClient();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() != BackendClient::State::Ready
+                                     && client.state() != BackendClient::State::Busy,
+                                 1000);
+
+        server.holdGeometrySave(false);
+        server.setProfileRevisions(5, 6, 1);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready
+                                     || client.state() == BackendClient::State::Busy,
+                                 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1500);
+        QCOMPARE(page->draft(), localDraft);
+        QVERIFY(page->hasUnsavedChanges());
+        QCOMPARE(page->snapshot().value(QStringLiteral("library_revision")).toInt(), 5);
+        QCOMPARE(page->snapshot().value(QStringLiteral("draft_revision")).toInt(), 6);
+        QVERIFY(status->text().contains(QStringLiteral("结果未知")));
+        page->requestSaveDraft();
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometrySaveBaseRevisions().size(), 2, 1000);
+        QCOMPARE(server.geometrySaveBaseRevisions().last(), qMakePair(5, 6));
+        QCOMPARE(server.workflowCommands().mid(0, 2),
+                 QStringList({QStringLiteral("save_geometry_mask_draft"),
+                              QStringLiteral("save_geometry_mask_draft")}));
+    }
+
+    void dirtyReconciliationDiscardRestoresTheRemoteDraft() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometrySave();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        const QJsonObject localDraft = page->draft();
+        page->requestSaveDraft();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        server.disconnectClient();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() != BackendClient::State::Ready
+                                     && client.state() != BackendClient::State::Busy,
+                                 1000);
+
+        QJsonObject remoteDraft = GeometryWorkflowServer::profile(5, 6, 1)
+                                      .value(QStringLiteral("draft")).toObject();
+        QJsonArray remoteRules = remoteDraft.value(QStringLiteral("rules")).toArray();
+        remoteRules.append(QJsonObject{
+            {QStringLiteral("rule_id"), QStringLiteral("remote-only")},
+            {QStringLiteral("name"), QStringLiteral("远端规则")},
+            {QStringLiteral("shape"), QStringLiteral("circle")},
+            {QStringLiteral("mode"), QStringLiteral("inside")},
+            {QStringLiteral("margin_ratio"), 0.0},
+            {QStringLiteral("enabled"), true}});
+        remoteDraft.insert(QStringLiteral("rules"), remoteRules);
+        QVERIFY(remoteDraft != localDraft);
+        server.holdGeometrySave(false);
+        server.setProfileRevisions(5, 6, 1);
+        server.setProfileDraft(remoteDraft);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready
+                                     || client.state() == BackendClient::State::Busy,
+                                 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1500);
+        QCOMPARE(page->draft(), localDraft);
+        QVERIFY(page->hasUnsavedChanges());
+
+        page->discardUnsavedChanges();
+        QCOMPARE(page->draft(), remoteDraft);
+        QVERIFY(!page->hasUnsavedChanges());
+    }
+
+    void unrelatedProfileFailureDoesNotStopAcceptedValidationPolling() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setProfileRevisions(1, 2, 0);
+        server.setInitialValidationState(QStringLiteral("running"));
+        server.setValidationPollState(QStringLiteral("running"));
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *status = page->findChild<QLabel *>(QStringLiteral("geometryStatusLabel"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QVERIFY(status != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "validateGeometryDraft", Qt::DirectConnection,
+            Q_ARG(int, 1), Q_ARG(int, 2)));
+        QTimer *pollTimer = geometryValidationTimer(window);
+        QVERIFY(pollTimer != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(pollTimer->isActive(), 1000);
+
+        server.holdGeometryProfiles();
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1000);
+        QVERIFY(server.replyNextGeometryProfileFailure());
+        QTRY_VERIFY_WITH_TIMEOUT(status->text().contains(
+            QStringLiteral("PROFILE_LOAD_FAILED")), 1000);
+        QVERIFY(pollTimer->isActive());
+
+        const int pollsBeforeTerminal = server.validationPollJobIds().size();
+        server.setValidationPollState(QStringLiteral("completed"));
+        QTRY_VERIFY_WITH_TIMEOUT(server.validationPollJobIds().size()
+                                     > pollsBeforeTerminal,
+                                 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(!pollTimer->isActive(), 1000);
+    }
+
+    void completedValidationForPreviousWorkpieceDoesNotPopulateCurrentPage() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setProfileRevisions(1, 2, 0);
+        server.setInitialValidationState(QStringLiteral("running"));
+        server.setValidationPollState(QStringLiteral("running"));
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *advanced = page->findChild<QGroupBox *>(QStringLiteral("advancedGeometryGroup"));
+        auto *publish = page->findChild<QPushButton *>(QStringLiteral("publishButton"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QVERIFY(advanced != nullptr);
+        QVERIFY(publish != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "validateGeometryDraft", Qt::DirectConnection,
+            Q_ARG(int, 1), Q_ARG(int, 2)));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QTimer *pollTimer = geometryValidationTimer(window);
+        QVERIFY(pollTimer != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(pollTimer->isActive(), 1000);
+        pollTimer->stop();
+
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m2"), 1000);
+        advanced->setChecked(true);
+        QVERIFY(!publish->isEnabled());
+
+        QSignalSpy responseSpy(&client, &BackendClient::responseReceived);
+        server.setValidationPollState(QStringLiteral("completed"));
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "pollGeometryValidation", Qt::DirectConnection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.validationPollJobIds().size(), 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(responseSpy.count() >= 1, 1000);
+
+        QCOMPARE(page->snapshot().value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m2"));
+        QVERIFY(!publish->isEnabled());
+    }
+
+    void publishForBoundValidationUsesItsOriginalWorkpieceAfterSelectionChanges() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setProfileRevisions(1, 2, 0);
+        server.setInitialValidationState(QStringLiteral("running"));
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        QVERIFY(combo != nullptr);
+        QVERIFY(page != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "validateGeometryDraft", Qt::DirectConnection,
+            Q_ARG(int, 1), Q_ARG(int, 2)));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QTimer *pollTimer = geometryValidationTimer(window);
+        QVERIFY(pollTimer != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(pollTimer->isActive(), 1000);
+        pollTimer->stop();
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m2"), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Ready, 1000);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "publishGeometryProfile", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("job-1")), Q_ARG(int, 1), Q_ARG(int, 2),
+            Q_ARG(QString, QString())));
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QCOMPARE(server.workflowCommands().last(),
+                 QStringLiteral("publish_geometry_mask_profile"));
+        QCOMPARE(server.workflowWorkpieceIds().last(), QStringLiteral("m1"));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Ready, 1000);
+        QCOMPARE(page->snapshot().value(QStringLiteral("workpiece_id")).toString(),
+                 QStringLiteral("m2"));
     }
 
     void listRefreshRemovingCurrentTargetHonorsGeometryDirtyChoice() {
@@ -2762,6 +4071,88 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 2000);
         QCOMPARE(server.workflowCommands(), QStringList({
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft"),
+            QStringLiteral("publish_geometry_mask_profile")}));
+    }
+
+    void warningContinuationUsesSamePrimaryWithoutRepeatingSaveOrValidate() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setValidationWarnings(QJsonArray{
+            QJsonObject{{QStringLiteral("code"), QStringLiteral("effective_area_low")}}});
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *primary = window.findChild<QPushButton *>(
+            QStringLiteral("publishWorkflowButton"));
+        auto *reason = window.findChild<QLineEdit *>(QStringLiteral("overrideReasonEdit"));
+        auto *shape = window.findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(page != nullptr);
+        QVERIFY(primary != nullptr);
+        QVERIFY(reason != nullptr);
+        QVERIFY(shape != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        QCOMPARE(server.workflowCommands(), QStringList({
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft")}));
+        QVERIFY(!shape->isEnabled());
+        QVERIFY(reason->isEnabled());
+
+        reason->setText(QStringLiteral("已人工复核告警"));
+        QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
+        primary->click();
+        QTRY_VERIFY_WITH_TIMEOUT(server.workflowCommands().size() >= 3, 1000);
+        QTest::qWait(100);
+        QCOMPARE(server.workflowCommands(), QStringList({
+            QStringLiteral("save_geometry_mask_draft"),
+            QStringLiteral("validate_geometry_mask_draft"),
+            QStringLiteral("publish_geometry_mask_profile")}));
+    }
+
+    void failedWarningPublishClearsTheContinuation() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.setValidationWarnings(QJsonArray{
+            QJsonObject{{QStringLiteral("code"), QStringLiteral("effective_area_low")}}});
+        server.failNextPublish();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *primary = window.findChild<QPushButton *>(
+            QStringLiteral("publishWorkflowButton"));
+        auto *reason = window.findChild<QLineEdit *>(QStringLiteral("overrideReasonEdit"));
+        QVERIFY(page != nullptr);
+        QVERIFY(primary != nullptr);
+        QVERIFY(reason != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 2, 1000);
+        reason->setText(QStringLiteral("已人工复核告警"));
+        QTRY_VERIFY_WITH_TIMEOUT(primary->isEnabled(), 1000);
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 3, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(page->findChild<QLabel *>(
+            QStringLiteral("geometryStatusLabel"))->text().contains(
+                QStringLiteral("synthetic publish failure")), 1000);
+
+        primary->click();
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 6, 1000);
+        QCOMPARE(server.workflowCommands().mid(3), QStringList({
             QStringLiteral("save_geometry_mask_draft"),
             QStringLiteral("validate_geometry_mask_draft"),
             QStringLiteral("publish_geometry_mask_profile")}));

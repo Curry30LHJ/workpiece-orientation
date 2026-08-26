@@ -3,7 +3,9 @@
 #include <QDialog>
 #include <QPushButton>
 #include <QComboBox>
+#include <QCheckBox>
 #include <QImage>
+#include <QGroupBox>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -19,6 +21,7 @@
 
 QJsonObject profileSnapshot(int libraryRevision, int draftRevision, int activeRevision);
 QJsonObject configuredProfileSnapshot(const QString &imagePath, int draftRevision = 0);
+QJsonObject configuredV2ProfileSnapshot(const QString &frontPath, const QString &backPath);
 
 class TestGeometryRulesPage : public QObject {
     Q_OBJECT
@@ -30,11 +33,25 @@ private slots:
     void editorFieldChangeMarksDirtyAndDiscardRestores();
     void emptySnapshotDiscardRestoresNormalizedDraft();
     void requestSaveDraftUsesExistingSavePath();
+    void normalStateExposesOnePrimaryWorkflowAction();
+    void disabledWorkflowShowsTheExactReasonNearby();
+    void backendUnavailableDisablesWorkflowWithoutClearingState();
+    void lockedDirectionChangeDoesNotRequestPreviewOrStickSelectors();
+    void advancedDiagnosticsAreCollapsedByDefault();
+    void migrationControlsAppearOnlyWhenConflictExists();
+    void issueRowStoresAndSelectsExactContext();
+    void templateLevelIssueDoesNotInventRuleSelection();
+    void validationStatesUseHumanReadableLabels_data();
+    void validationStatesUseHumanReadableLabels();
+    void directionIndexIssueResolvesTemplateWithoutGuessing();
+    void regressionIssueUsesExpectedDirectionToLocateTemplate();
     void publishDisabledUntilCompletedValidationMatchesDraft();
     void draftEditInvalidatesVisibleValidationResult();
     void lateValidationUpdateStaysHiddenAfterDraftEdit();
     void warningPublishRequiresOverrideReason();
     void warningPublishRequirementIsVisible();
+    void warningContinuationUsesPrimaryWithoutResaving();
+    void warningWithoutJobIdentityStartsANewWorkflow();
     void saveAndDeleteRulesUpdateDraft();
     void templatePreviewLoadsRepresentativeImage();
     void validationRowSelectsTemplateForReview();
@@ -42,8 +59,11 @@ private slots:
     void publishWorkflowButtonEmitsDraft();
     void signedMarginSpinBoxAcceptsNegativeZeroAndPositive();
     void newRuleUsesSignedMarkerAndZeroDefault();
-    void savedSnapshotShowsFittedBoundaryInsteadOfCoarseGuide();
+    void savedDraftHidesGuideAndShowsFittedBoundary();
     void validationTemplateShowsFittedBoundaryInsteadOfCoarseGuide();
+    void layerVisibilityChangesDoNotDirtyDraft();
+    void layerVisibilityPersistsAcrossTemplateRefresh();
+    void directionAndTemplateSelectorsStayWithCanvas();
     void failedValidationTemplateDoesNotFallBackToCoarseGuide();
     void selectingTemplateRequestsPreviewWhileSavedGuideStaysHidden();
     void ruleInventoryDoesNotChangeAcrossValidationDirections();
@@ -184,6 +204,343 @@ void TestGeometryRulesPage::requestSaveDraftUsesExistingSavePath() {
     QCOMPARE(arguments.at(0).toJsonObject(), page.draft());
     QCOMPARE(arguments.at(1).toInt(), 7);
     QCOMPARE(arguments.at(2).toInt(), 8);
+}
+
+void TestGeometryRulesPage::normalStateExposesOnePrimaryWorkflowAction() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredProfileSnapshot(QString()));
+    page.setBackendAvailable(true, QString());
+    page.show();
+    QCoreApplication::processEvents();
+
+    auto *primary = page.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+    QVERIFY(primary != nullptr);
+    QCOMPARE(primary->property("role").toString(), QStringLiteral("primary"));
+    int visiblePrimaryCount = 0;
+    for (QPushButton *button : page.findChildren<QPushButton *>()) {
+        if (button->isVisibleTo(&page)
+            && button->property("role").toString() == QStringLiteral("primary")) {
+            ++visiblePrimaryCount;
+        }
+    }
+    QCOMPARE(visiblePrimaryCount, 1);
+}
+
+void TestGeometryRulesPage::disabledWorkflowShowsTheExactReasonNearby() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredProfileSnapshot(QString()));
+    page.setBackendAvailable(false, QStringLiteral("后端断开"));
+
+    auto *primary = page.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+    auto *reason = page.findChild<QLabel *>(QStringLiteral("publishDisabledReasonLabel"));
+    QVERIFY(primary != nullptr);
+    QVERIFY(reason != nullptr);
+    QVERIFY(!primary->isEnabled());
+    QCOMPARE(reason->text(), QStringLiteral("后端断开"));
+}
+
+void TestGeometryRulesPage::backendUnavailableDisablesWorkflowWithoutClearingState() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredProfileSnapshot(QString()));
+    page.setValidationJob(QJsonObject{
+        {QStringLiteral("job_id"), QStringLiteral("job-preserved")},
+        {QStringLiteral("state"), QStringLiteral("completed")},
+        {QStringLiteral("base_library_revision"), 1},
+        {QStringLiteral("base_draft_revision"), 0},
+        {QStringLiteral("progress"), QJsonObject{{QStringLiteral("completed"), 1},
+                                                   {QStringLiteral("total"), 1}}},
+        {QStringLiteral("report"), QJsonObject{{QStringLiteral("front"), QJsonArray{
+            QJsonObject{{QStringLiteral("template_id"), QStringLiteral("front:front.png")},
+                        {QStringLiteral("status"), QStringLiteral("active")}}
+        }}}}
+    });
+    page.setBackendAvailable(true, QString());
+    const QJsonObject draftBefore = page.draft();
+    const QJsonObject snapshotBefore = page.snapshot();
+    auto *table = page.findChild<QTableWidget *>(QStringLiteral("validationTable"));
+    auto *canvas = page.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
+    QVERIFY(table != nullptr);
+    QVERIFY(canvas != nullptr);
+    const int rowsBefore = table->rowCount();
+    const QJsonObject guideBefore = canvas->coarseShape();
+    const QJsonObject fittedBefore = canvas->fittedShape();
+    const QJsonObject effectiveBefore = canvas->effectiveShape();
+
+    page.setBackendAvailable(false, QStringLiteral("后端断开"));
+
+    QCOMPARE(page.draft(), draftBefore);
+    QCOMPARE(page.snapshot(), snapshotBefore);
+    QCOMPARE(table->rowCount(), rowsBefore);
+    QCOMPARE(canvas->coarseShape(), guideBefore);
+    QCOMPARE(canvas->fittedShape(), fittedBefore);
+    QCOMPARE(canvas->effectiveShape(), effectiveBefore);
+    QVERIFY(!page.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"))->isEnabled());
+    QCOMPARE(page.findChild<QLabel *>(QStringLiteral("publishDisabledReasonLabel"))->text(),
+             QStringLiteral("后端断开"));
+}
+
+void TestGeometryRulesPage::lockedDirectionChangeDoesNotRequestPreviewOrStickSelectors() {
+    QTemporaryDir directory;
+    const QString frontPath = directory.filePath(QStringLiteral("front.png"));
+    const QString backPath = directory.filePath(QStringLiteral("back.png"));
+    QImage image(120, 120, QImage::Format_RGB32);
+    image.fill(Qt::black);
+    QVERIFY(image.save(frontPath));
+    QVERIFY(image.save(backPath));
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(frontPath, backPath));
+    auto *direction = page.findChild<QComboBox *>(QStringLiteral("directionCombo"));
+    auto *templates = page.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
+    QVERIFY(direction != nullptr);
+    QVERIFY(templates != nullptr);
+    QSignalSpy previewSpy(&page, &GeometryRulesPage::previewRequested);
+
+    page.setEditingLocked(true);
+    direction->setCurrentIndex(direction->findData(QStringLiteral("back")));
+
+    QCOMPARE(previewSpy.count(), 0);
+    QVERIFY(direction->isEnabled());
+    QVERIFY(templates->isEnabled());
+}
+
+void TestGeometryRulesPage::advancedDiagnosticsAreCollapsedByDefault() {
+    GeometryRulesPage page;
+    page.show();
+    QCoreApplication::processEvents();
+
+    auto *advanced = page.findChild<QGroupBox *>(QStringLiteral("advancedGeometryGroup"));
+    auto *content = page.findChild<QWidget *>(QStringLiteral("advancedGeometryContent"));
+    QVERIFY(advanced != nullptr);
+    QVERIFY(content != nullptr);
+    QVERIFY(advanced->isCheckable());
+    QVERIFY(!advanced->isChecked());
+    QVERIFY(!content->isVisibleTo(&page));
+
+    const QStringList advancedControlNames{
+        QStringLiteral("anchorCandidateCombo"),
+        QStringLiteral("ruleCandidateCombo"),
+        QStringLiteral("reviewStateCombo"),
+        QStringLiteral("reviewReasonEdit"),
+        QStringLiteral("setAnchorButton"),
+        QStringLiteral("manualAnchorButton"),
+        QStringLiteral("versionCombo"),
+        QStringLiteral("copyActiveToDraftButton"),
+        QStringLiteral("saveButton"),
+        QStringLiteral("validateButton"),
+        QStringLiteral("rollbackButton"),
+        QStringLiteral("migrationPanel"),
+    };
+    for (const QString &name : advancedControlNames) {
+        QWidget *control = page.findChild<QWidget *>(name);
+        QVERIFY2(control != nullptr, qPrintable(name));
+        QVERIFY2(content->isAncestorOf(control), qPrintable(name));
+    }
+    auto *primary = page.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+    QVERIFY(primary != nullptr);
+    QVERIFY(!content->isAncestorOf(primary));
+}
+
+void TestGeometryRulesPage::migrationControlsAppearOnlyWhenConflictExists() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredProfileSnapshot(QString()));
+    page.show();
+    QCoreApplication::processEvents();
+    auto *panel = page.findChild<QWidget *>(QStringLiteral("migrationPanel"));
+    QVERIFY(panel != nullptr);
+    QVERIFY(!panel->isVisibleTo(&page));
+
+    QJsonObject snapshot = configuredProfileSnapshot(QString());
+    QJsonObject draft = snapshot.value(QStringLiteral("draft")).toObject();
+    draft.insert(QStringLiteral("migration"), QJsonObject{
+        {QStringLiteral("conflicts"), QJsonArray{QJsonObject{
+            {QStringLiteral("conflict_id"), QStringLiteral("legacy-1")},
+            {QStringLiteral("type"), QStringLiteral("missing_direction")},
+            {QStringLiteral("sources"), QJsonArray()}}}}});
+    snapshot.insert(QStringLiteral("draft"), draft);
+    page.setSnapshot(snapshot);
+    QCoreApplication::processEvents();
+    QVERIFY(panel->isVisibleTo(&page));
+}
+
+void TestGeometryRulesPage::issueRowStoresAndSelectsExactContext() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(QString(), QString()));
+    page.setValidationJob(QJsonObject{
+        {QStringLiteral("job_id"), QStringLiteral("job-context")},
+        {QStringLiteral("state"), QStringLiteral("completed")},
+        {QStringLiteral("base_library_revision"), 4},
+        {QStringLiteral("base_draft_revision"), 2},
+        {QStringLiteral("progress"), QJsonObject{{QStringLiteral("completed"), 1},
+                                                   {QStringLiteral("total"), 1}}},
+        {QStringLiteral("report"), QJsonObject{{QStringLiteral("front"), QJsonArray{
+            QJsonObject{{QStringLiteral("template_id"), QStringLiteral("front:front.png")},
+                        {QStringLiteral("status"), QStringLiteral("low_confidence")},
+                        {QStringLiteral("rules"), QJsonArray{
+                            QJsonObject{{QStringLiteral("rule_id"), QStringLiteral("glare")},
+                                        {QStringLiteral("status"), QStringLiteral("active")}},
+                            QJsonObject{{QStringLiteral("rule_id"), QStringLiteral("intrusion")},
+                                        {QStringLiteral("status"), QStringLiteral("failed")},
+                                        {QStringLiteral("reason_code"), QStringLiteral("edge_support_low")}}
+                        }}}
+        }}}}
+    });
+
+    auto *table = page.findChild<QTableWidget *>(QStringLiteral("validationTable"));
+    auto *direction = page.findChild<QComboBox *>(QStringLiteral("directionCombo"));
+    auto *templates = page.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
+    auto *rules = page.findChild<QListWidget *>(QStringLiteral("ruleList"));
+    QVERIFY(table != nullptr);
+    QVERIFY(direction != nullptr);
+    QVERIFY(templates != nullptr);
+    QVERIFY(rules != nullptr);
+    QCOMPARE(table->rowCount(), 1);
+    QTableWidgetItem *identity = table->item(0, 0);
+    QVERIFY(identity != nullptr);
+    QCOMPARE(identity->data(GeometryRulesPage::DirectionRole).toString(), QStringLiteral("front"));
+    QCOMPARE(identity->data(GeometryRulesPage::TemplateIdRole).toString(), QStringLiteral("front:front.png"));
+    QCOMPARE(identity->data(GeometryRulesPage::RuleIdRole).toString(), QStringLiteral("intrusion"));
+    QCOMPARE(identity->data(GeometryRulesPage::ReasonCodeRole).toString(), QStringLiteral("edge_support_low"));
+
+    QVERIFY(QMetaObject::invokeMethod(&page, "selectValidationTemplate", Qt::DirectConnection,
+                                      Q_ARG(int, 0)));
+    QCOMPARE(direction->currentData().toString(), QStringLiteral("front"));
+    QCOMPARE(templates->currentData(Qt::UserRole + 1).toString(), QStringLiteral("front:front.png"));
+    QVERIFY(rules->currentItem() != nullptr);
+    QCOMPARE(rules->currentItem()->data(Qt::UserRole).toString(), QStringLiteral("intrusion"));
+}
+
+void TestGeometryRulesPage::templateLevelIssueDoesNotInventRuleSelection() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(QString(), QString()));
+    page.setValidationJob(QJsonObject{
+        {QStringLiteral("job_id"), QStringLiteral("job-template")},
+        {QStringLiteral("state"), QStringLiteral("completed")},
+        {QStringLiteral("base_library_revision"), 4},
+        {QStringLiteral("base_draft_revision"), 2},
+        {QStringLiteral("report"), QJsonObject{{QStringLiteral("back"), QJsonArray{
+            QJsonObject{{QStringLiteral("template_id"), QStringLiteral("back:back.png")},
+                        {QStringLiteral("status"), QStringLiteral("low_confidence")},
+                        {QStringLiteral("reason_code"), QStringLiteral("source_disagreement")}}
+        }}}}
+    });
+    auto *table = page.findChild<QTableWidget *>(QStringLiteral("validationTable"));
+    auto *rules = page.findChild<QListWidget *>(QStringLiteral("ruleList"));
+    QVERIFY(table != nullptr);
+    QVERIFY(rules != nullptr);
+    QCOMPARE(table->rowCount(), 1);
+    QCOMPARE(table->item(0, 0)->data(GeometryRulesPage::RuleIdRole).toString(), QString());
+
+    QVERIFY(QMetaObject::invokeMethod(&page, "selectValidationTemplate", Qt::DirectConnection,
+                                      Q_ARG(int, 0)));
+    QCOMPARE(rules->currentRow(), -1);
+}
+
+void TestGeometryRulesPage::validationStatesUseHumanReadableLabels_data() {
+    QTest::addColumn<QString>("state");
+    QTest::addColumn<QString>("reason");
+    QTest::addColumn<QString>("expected");
+    QTest::newRow("active") << QStringLiteral("active") << QString() << QStringLiteral("通过");
+    QTest::newRow("low confidence") << QStringLiteral("low_confidence") << QString() << QStringLiteral("低置信度");
+    QTest::newRow("not configured") << QStringLiteral("not_configured") << QString() << QStringLiteral("未配置");
+    QTest::newRow("needs reseed") << QStringLiteral("needs_reseed") << QString() << QStringLiteral("拟合失败");
+    QTest::newRow("failed") << QStringLiteral("failed") << QString() << QStringLiteral("拟合失败");
+    QTest::newRow("excluded") << QStringLiteral("excluded") << QStringLiteral("人工排除反光")
+                               << QStringLiteral("已排除");
+}
+
+void TestGeometryRulesPage::validationStatesUseHumanReadableLabels() {
+    QFETCH(QString, state);
+    QFETCH(QString, reason);
+    QFETCH(QString, expected);
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(QString(), QString()));
+    QJsonObject reportRow{{QStringLiteral("template_id"), QStringLiteral("front:front.png")},
+                          {QStringLiteral("status"), state}};
+    if (state == QStringLiteral("excluded")) {
+        reportRow.insert(QStringLiteral("review_reason"), reason);
+    } else {
+        reportRow.insert(QStringLiteral("reason_code"), reason);
+    }
+    page.setValidationJob(QJsonObject{
+        {QStringLiteral("job_id"), QStringLiteral("job-state")},
+        {QStringLiteral("state"), QStringLiteral("completed")},
+        {QStringLiteral("base_library_revision"), 4},
+        {QStringLiteral("base_draft_revision"), 2},
+        {QStringLiteral("report"), QJsonObject{{QStringLiteral("front"), QJsonArray{reportRow}}}}
+    });
+    auto *table = page.findChild<QTableWidget *>(QStringLiteral("validationTable"));
+    QVERIFY(table != nullptr);
+    QCOMPARE(table->rowCount(), 1);
+    QCOMPARE(table->item(0, 2)->text(), expected);
+    if (state == QStringLiteral("excluded")) {
+        QVERIFY(table->item(0, 3)->text().contains(reason));
+    }
+}
+
+void TestGeometryRulesPage::regressionIssueUsesExpectedDirectionToLocateTemplate() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(QString(), QString()));
+    page.setValidationJob(QJsonObject{
+        {QStringLiteral("job_id"), QStringLiteral("job-regression-direction")},
+        {QStringLiteral("state"), QStringLiteral("completed")},
+        {QStringLiteral("base_library_revision"), 4},
+        {QStringLiteral("base_draft_revision"), 2},
+        {QStringLiteral("blocking_issues"), QJsonArray{QJsonObject{
+            {QStringLiteral("code"), QStringLiteral("geometry_fusion_regression")},
+            {QStringLiteral("changed_predictions"), QJsonArray{QJsonObject{
+                {QStringLiteral("template_id"), QStringLiteral("back:back.png")},
+                {QStringLiteral("expected"), QStringLiteral("back")},
+                {QStringLiteral("baseline_predicted"), QStringLiteral("back")},
+                {QStringLiteral("candidate_predicted"), QStringLiteral("front")}
+            }}}
+        }}}
+    });
+
+    auto *table = page.findChild<QTableWidget *>(QStringLiteral("validationTable"));
+    auto *direction = page.findChild<QComboBox *>(QStringLiteral("directionCombo"));
+    auto *templates = page.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
+    QVERIFY(table != nullptr);
+    QVERIFY(direction != nullptr);
+    QVERIFY(templates != nullptr);
+    QCOMPARE(table->rowCount(), 1);
+    QCOMPARE(table->item(0, 0)->data(GeometryRulesPage::DirectionRole).toString(),
+             QStringLiteral("back"));
+
+    QVERIFY(QMetaObject::invokeMethod(&page, "selectValidationTemplate", Qt::DirectConnection,
+                                      Q_ARG(int, 0)));
+    QCOMPARE(direction->currentData().toString(), QStringLiteral("back"));
+    QCOMPARE(templates->currentData(Qt::UserRole + 1).toString(),
+             QStringLiteral("back:back.png"));
+}
+
+void TestGeometryRulesPage::directionIndexIssueResolvesTemplateWithoutGuessing() {
+    GeometryRulesPage page;
+    QJsonObject snapshot = configuredV2ProfileSnapshot(QString(), QString());
+    QJsonArray templates = snapshot.value(QStringLiteral("templates")).toArray();
+    templates.prepend(QJsonObject{{QStringLiteral("template_id"), QStringLiteral("front:first.png")},
+                                  {QStringLiteral("direction"), QStringLiteral("front")},
+                                  {QStringLiteral("path"), QString()}});
+    snapshot.insert(QStringLiteral("templates"), templates);
+    page.setSnapshot(snapshot);
+    page.setValidationJob(QJsonObject{
+        {QStringLiteral("job_id"), QStringLiteral("job-index")},
+        {QStringLiteral("state"), QStringLiteral("completed")},
+        {QStringLiteral("base_library_revision"), 4},
+        {QStringLiteral("base_draft_revision"), 2},
+        {QStringLiteral("warnings"), QJsonArray{
+            QJsonObject{{QStringLiteral("code"), QStringLiteral("effective_area_low")},
+                        {QStringLiteral("orientation"), QStringLiteral("front")},
+                        {QStringLiteral("index"), 1}}
+        }}
+    });
+    auto *table = page.findChild<QTableWidget *>(QStringLiteral("validationTable"));
+    QVERIFY(table != nullptr);
+    QCOMPARE(table->rowCount(), 1);
+    QCOMPARE(table->item(0, 0)->data(GeometryRulesPage::DirectionRole).toString(),
+             QStringLiteral("front"));
+    QCOMPARE(table->item(0, 0)->data(GeometryRulesPage::TemplateIdRole).toString(),
+             QStringLiteral("front:front.png"));
+    QCOMPARE(table->item(0, 0)->data(GeometryRulesPage::RuleIdRole).toString(), QString());
 }
 
 QJsonObject profileSnapshot(int libraryRevision, int draftRevision, int activeRevision) {
@@ -401,13 +758,74 @@ void TestGeometryRulesPage::warningPublishRequirementIsVisible() {
                                         {"progress", QJsonObject{{"completed", 2}, {"total", 2}}}});
     auto *label = dialog.findChild<QLabel *>(QStringLiteral("overrideReasonLabel"));
     auto *edit = dialog.findChild<QLineEdit *>(QStringLiteral("overrideReasonEdit"));
+    auto *primary = dialog.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+    auto *disabledReason = dialog.findChild<QLabel *>(QStringLiteral("publishDisabledReasonLabel"));
     QVERIFY(label != nullptr);
     QVERIFY(edit != nullptr);
+    QVERIFY(primary != nullptr);
+    QVERIFY(disabledReason != nullptr);
     QCOMPARE(label->text(), QStringLiteral("发布覆盖原因（有告警或回归时必填）"));
     QCOMPARE(edit->placeholderText(), QStringLiteral("请说明已检查告警/回归并确认发布"));
     QVERIFY(!dialog.findChild<QPushButton *>(QStringLiteral("publishButton"))->isEnabled());
+    QVERIFY(!primary->isEnabled());
+    QVERIFY(disabledReason->text().contains(QStringLiteral("发布覆盖原因")));
     edit->setText(QStringLiteral("已检查有效区域告警，确认继续发布"));
     QVERIFY(dialog.findChild<QPushButton *>(QStringLiteral("publishButton"))->isEnabled());
+    QVERIFY(primary->isEnabled());
+}
+
+void TestGeometryRulesPage::warningContinuationUsesPrimaryWithoutResaving() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(QString(), QString()));
+    page.setValidationJob(QJsonObject{
+        {QStringLiteral("job_id"), QStringLiteral("warning-job")},
+        {QStringLiteral("state"), QStringLiteral("completed")},
+        {QStringLiteral("base_library_revision"), 4},
+        {QStringLiteral("base_draft_revision"), 2},
+        {QStringLiteral("blocking_issues"), QJsonArray()},
+        {QStringLiteral("warnings"), QJsonArray{
+            QJsonObject{{QStringLiteral("code"), QStringLiteral("effective_area_low")}}}}
+    });
+    auto *primary = page.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+    auto *reason = page.findChild<QLineEdit *>(QStringLiteral("overrideReasonEdit"));
+    QVERIFY(primary != nullptr);
+    QVERIFY(reason != nullptr);
+    QSignalSpy workflowSpy(&page, &GeometryRulesPage::publishWorkflowRequested);
+    QSignalSpy publishSpy(&page, &GeometryRulesPage::publishRequested);
+
+    reason->setText(QStringLiteral("已人工复核"));
+    primary->click();
+
+    QCOMPARE(workflowSpy.count(), 0);
+    QCOMPARE(publishSpy.count(), 1);
+    const QList<QVariant> arguments = publishSpy.takeFirst();
+    QCOMPARE(arguments.at(0).toString(), QStringLiteral("warning-job"));
+    QCOMPARE(arguments.at(3).toString(), QStringLiteral("已人工复核"));
+}
+
+void TestGeometryRulesPage::warningWithoutJobIdentityStartsANewWorkflow() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredV2ProfileSnapshot(QString(), QString()));
+    page.setValidationJob(QJsonObject{
+        {QStringLiteral("state"), QStringLiteral("completed")},
+        {QStringLiteral("base_library_revision"), 4},
+        {QStringLiteral("base_draft_revision"), 2},
+        {QStringLiteral("blocking_issues"), QJsonArray()},
+        {QStringLiteral("warnings"), QJsonArray{
+            QJsonObject{{QStringLiteral("code"), QStringLiteral("effective_area_low")}}}}
+    });
+    auto *primary = page.findChild<QPushButton *>(QStringLiteral("publishWorkflowButton"));
+    auto *reason = page.findChild<QLineEdit *>(QStringLiteral("overrideReasonEdit"));
+    QVERIFY(primary != nullptr);
+    QVERIFY(reason != nullptr);
+    QSignalSpy workflowSpy(&page, &GeometryRulesPage::publishWorkflowRequested);
+    QSignalSpy publishSpy(&page, &GeometryRulesPage::publishRequested);
+
+    reason->setText(QStringLiteral("没有可恢复的验证任务"));
+    primary->click();
+
+    QCOMPARE(publishSpy.count(), 0);
+    QCOMPARE(workflowSpy.count(), 1);
 }
 
 void TestGeometryRulesPage::saveAndDeleteRulesUpdateDraft() {
@@ -681,7 +1099,7 @@ void TestGeometryRulesPage::newRuleUsesSignedMarkerAndZeroDefault() {
     QCOMPARE(rule.value("margin_semantics").toString(), QStringLiteral("signed_boundary_v2"));
 }
 
-void TestGeometryRulesPage::savedSnapshotShowsFittedBoundaryInsteadOfCoarseGuide() {
+void TestGeometryRulesPage::savedDraftHidesGuideAndShowsFittedBoundary() {
     QTemporaryDir directory;
     const QString imagePath = directory.filePath(QStringLiteral("front.png"));
     QImage image(120, 120, QImage::Format_RGB32);
@@ -728,7 +1146,9 @@ void TestGeometryRulesPage::savedSnapshotShowsFittedBoundaryInsteadOfCoarseGuide
     savedSnapshot.insert(QStringLiteral("draft"), dialog.draft());
     dialog.setSnapshot(savedSnapshot);
 
-    QVERIFY(canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->guideVisible());
+    QVERIFY(canvas->fittedBoundaryVisible());
     QCOMPARE(canvas->fitShape().value(QStringLiteral("r")).toDouble(), 31.0);
 }
 
@@ -762,8 +1182,80 @@ void TestGeometryRulesPage::validationTemplateShowsFittedBoundaryInsteadOfCoarse
                                       Q_ARG(int, 0)));
     auto *canvas = dialog.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
     QVERIFY(canvas != nullptr);
-    QVERIFY(canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->guideVisible());
+    QVERIFY(canvas->fittedBoundaryVisible());
     QCOMPARE(canvas->fitShape().value(QStringLiteral("rx")).toDouble(), 31.0);
+}
+
+void TestGeometryRulesPage::layerVisibilityChangesDoNotDirtyDraft() {
+    GeometryRulesPage page;
+    page.setSnapshot(configuredProfileSnapshot(QString()));
+    auto *canvas = page.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
+    auto *guide = page.findChild<QCheckBox *>(QStringLiteral("guideLayerToggle"));
+    auto *fitted = page.findChild<QCheckBox *>(QStringLiteral("fittedLayerToggle"));
+    auto *effective = page.findChild<QCheckBox *>(QStringLiteral("effectiveLayerToggle"));
+    auto *mask = page.findChild<QCheckBox *>(QStringLiteral("maskLayerToggle"));
+    QVERIFY(canvas != nullptr);
+    QVERIFY(guide != nullptr);
+    QVERIFY(fitted != nullptr);
+    QVERIFY(effective != nullptr);
+    QVERIFY(mask != nullptr);
+    QVERIFY(!page.hasUnsavedChanges());
+
+    guide->setChecked(true);
+    fitted->setChecked(false);
+    effective->setChecked(false);
+    mask->setChecked(false);
+
+    QVERIFY(canvas->guideVisible());
+    QVERIFY(!canvas->fittedBoundaryVisible());
+    QVERIFY(!canvas->effectiveBoundaryVisible());
+    QVERIFY(!canvas->maskOverlayVisible());
+    QVERIFY(!page.hasUnsavedChanges());
+}
+
+void TestGeometryRulesPage::layerVisibilityPersistsAcrossTemplateRefresh() {
+    QTemporaryDir directory;
+    const QString firstPath = directory.filePath(QStringLiteral("front.png"));
+    const QString secondPath = directory.filePath(QStringLiteral("front-01.png"));
+    QImage image(120, 120, QImage::Format_RGB32);
+    image.fill(Qt::black);
+    QVERIFY(image.save(firstPath));
+    QVERIFY(image.save(secondPath));
+    QJsonObject snapshot = configuredProfileSnapshot(firstPath);
+    QJsonArray templates = snapshot.value(QStringLiteral("templates")).toArray();
+    templates.append(QJsonObject{{QStringLiteral("template_id"), QStringLiteral("front:front-01.png")},
+                                 {QStringLiteral("direction"), QStringLiteral("front")},
+                                 {QStringLiteral("path"), secondPath}});
+    snapshot.insert(QStringLiteral("templates"), templates);
+    GeometryRulesPage page;
+    page.setSnapshot(snapshot);
+    auto *canvas = page.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
+    auto *combo = page.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
+    auto *effective = page.findChild<QCheckBox *>(QStringLiteral("effectiveLayerToggle"));
+    QVERIFY(canvas != nullptr);
+    QVERIFY(combo != nullptr);
+    QVERIFY(effective != nullptr);
+    effective->setChecked(false);
+
+    combo->setCurrentIndex(1);
+
+    QVERIFY(!effective->isChecked());
+    QVERIFY(!canvas->effectiveBoundaryVisible());
+    QVERIFY(!page.hasUnsavedChanges());
+}
+
+void TestGeometryRulesPage::directionAndTemplateSelectorsStayWithCanvas() {
+    GeometryRulesPage page;
+    auto *canvas = page.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
+    auto *direction = page.findChild<QComboBox *>(QStringLiteral("directionCombo"));
+    auto *templates = page.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
+    QVERIFY(canvas != nullptr);
+    QVERIFY(direction != nullptr);
+    QVERIFY(templates != nullptr);
+    QCOMPARE(direction->parentWidget(), canvas->parentWidget());
+    QCOMPARE(templates->parentWidget(), canvas->parentWidget());
 }
 
 void TestGeometryRulesPage::failedValidationTemplateDoesNotFallBackToCoarseGuide() {
@@ -795,7 +1287,8 @@ void TestGeometryRulesPage::failedValidationTemplateDoesNotFallBackToCoarseGuide
     auto *diagnostics = dialog.findChild<QTextEdit *>();
     QVERIFY(canvas != nullptr);
     QVERIFY(diagnostics != nullptr);
-    QVERIFY(canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->guideVisible());
     QVERIFY(canvas->fitShape().isEmpty());
     QVERIFY(diagnostics->toPlainText().contains(QStringLiteral("topology_constraint_failed")));
 }
@@ -821,7 +1314,8 @@ void TestGeometryRulesPage::selectingTemplateRequestsPreviewWhileSavedGuideStays
     auto *combo = dialog.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
     QVERIFY(canvas != nullptr);
     QVERIFY(combo != nullptr);
-    QVERIFY(canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->guideVisible());
     QSignalSpy previewSpy(&dialog, &GeometryRulesPage::previewRequested);
 
     combo->setCurrentIndex(1);
@@ -831,7 +1325,8 @@ void TestGeometryRulesPage::selectingTemplateRequestsPreviewWhileSavedGuideStays
     QCOMPARE(request.value(QStringLiteral("template_id")).toString(),
              QStringLiteral("front:front-01.png"));
     QVERIFY(!request.value(QStringLiteral("seed_shape")).toObject().isEmpty());
-    QVERIFY(canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->guideVisible());
 }
 
 void TestGeometryRulesPage::lowConfidenceBackPreviewExplainsHowToRetry() {
@@ -934,11 +1429,13 @@ void TestGeometryRulesPage::savedCalibrationShowsFittedBoundaryOnlyForReferenceT
     auto *templatesCombo = dialog.findChild<QComboBox *>(QStringLiteral("templatePreviewCombo"));
     QVERIFY(canvas != nullptr);
     QVERIFY(templatesCombo != nullptr);
-    QVERIFY(canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->guideVisible());
     QVERIFY(qAbs(canvas->fitShape().value(QStringLiteral("r")).toDouble() - 37.8) < 0.001);
 
     templatesCombo->setCurrentIndex(templatesCombo->findText(QStringLiteral("front:front-01.png")));
-    QVERIFY(canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->coarseShape().isEmpty());
+    QVERIFY(!canvas->guideVisible());
     QVERIFY(canvas->fitShape().isEmpty());
 }
 
