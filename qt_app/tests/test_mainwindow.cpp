@@ -1173,6 +1173,92 @@ private slots:
         QVERIFY(!page->hasUnsavedChanges());
     }
 
+    void busyListResponsePreservesTheFrozenWorkpieceNavigationTarget() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *workpieces = window.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"));
+        QVERIFY(page != nullptr);
+        QVERIFY(workpieces != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(workpieces->currentData().toString(),
+                                  QStringLiteral("m1"), 1000);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+        QVERIFY(page->hasUnsavedChanges());
+
+        server.holdWorkpieceRefresh();
+        server.holdGeometrySave();
+        const int refreshCount = server.listWorkpieceCount();
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), refreshCount + 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Busy, 1000);
+
+        chooseDirtyNavigationOption(QStringLiteral("保存并继续"));
+        workpieces->setCurrentIndex(workpieces->findData(QStringLiteral("m2")));
+        QCOMPARE(workpieces->currentData().toString(), QStringLiteral("m1"));
+        QVERIFY(server.replyWorkpieceRefresh());
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands(),
+                                  QStringList({QStringLiteral("save_geometry_mask_draft")}),
+                                  1000);
+        QCOMPARE(server.workflowWorkpieceIds().first(), QStringLiteral("m1"));
+        QVERIFY(server.replyGeometrySaveSuccess());
+
+        QTRY_COMPARE_WITH_TIMEOUT(workpieces->currentData().toString(),
+                                  QStringLiteral("m2"), 1000);
+    }
+
+    void busyListResponseFallsBackWhenFrozenWorkpieceTargetWasRemoved() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *page = window.findChild<GeometryRulesPage *>(
+            QStringLiteral("geometryRulesPage"));
+        auto *workpieces = window.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"));
+        QVERIFY(page != nullptr);
+        QVERIFY(workpieces != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(workpieces->currentData().toString(),
+                                  QStringLiteral("m1"), 1000);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(page->snapshot().value(
+            QStringLiteral("workpiece_id")).toString(), QStringLiteral("m1"), 1000);
+        page->findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+
+        server.setWorkpieces(QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("m1")},
+                        {QStringLiteral("name"), QStringLiteral("M1")}}});
+        server.holdWorkpieceRefresh();
+        server.holdGeometrySave();
+        const int refreshCount = server.listWorkpieceCount();
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(), refreshCount + 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Busy, 1000);
+
+        chooseDirtyNavigationOption(QStringLiteral("保存并继续"));
+        workpieces->setCurrentIndex(workpieces->findData(QStringLiteral("m2")));
+        QVERIFY(server.replyWorkpieceRefresh());
+        QTRY_COMPARE_WITH_TIMEOUT(server.workflowCommands().size(), 1, 1000);
+        QVERIFY(server.replyGeometrySaveSuccess());
+
+        QTRY_VERIFY_WITH_TIMEOUT(!page->hasUnsavedChanges(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(workpieces->currentData().toString(),
+                                  QStringLiteral("m1"), 1000);
+        QCOMPARE(workpieces->count(), 1);
+    }
+
     void listRefreshSaveStagesFullResponseUntilSuccess() {
         GeometryWorkflowServer server;
         QVERIFY(server.listen());

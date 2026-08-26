@@ -167,7 +167,8 @@ private:
     void completePendingGeometryNavigation();
     void applyWorkpieceListResponse(const QJsonObject &response,
                                     quint64 refreshTransactionId,
-                                    bool includedMandatoryRefresh);
+                                    bool includedMandatoryRefresh,
+                                    const QString &preferredTarget = QString());
     void setCurrentPageUnchecked(AppPage page);
     bool applyDetectionWorkpieceChange(const QString &workpieceId);
     void refreshDetectionWorkpieceConsumers();

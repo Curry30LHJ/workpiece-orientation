@@ -342,7 +342,8 @@ void MainWindow::completePendingGeometryNavigation() {
         if (page == AppPage::GeometryRules) ensureGeometryProfileForCurrentWorkpiece();
     } else if (kind == PendingNavigationKind::Workpiece) {
         if (!listResponse.isEmpty()) {
-            applyWorkpieceListResponse(listResponse, refreshTransactionId, includedMandatory);
+            applyWorkpieceListResponse(listResponse, refreshTransactionId,
+                                       includedMandatory, workpieceId);
         } else {
             applyDetectionWorkpieceChange(workpieceId);
         }
@@ -377,20 +378,25 @@ void MainWindow::refreshDetectionWorkpieceConsumers() {
 
 void MainWindow::applyWorkpieceListResponse(const QJsonObject &response,
                                             quint64 refreshTransactionId,
-                                            bool includedMandatoryRefresh) {
+                                            bool includedMandatoryRefresh,
+                                            const QString &preferredTarget) {
     const QString previousId = selectedWorkpieceId();
     const QJsonArray workpieces = response.value(QStringLiteral("workpieces")).toArray();
     QList<QPair<QString, QString>> items;
-    QString requestedId = previousId;
+    QString requestedId = preferredTarget.isEmpty() ? previousId : preferredTarget;
     bool previousStillExists = false;
+    bool requestedStillExists = false;
     for (const QJsonValue &value : workpieces) {
         const QJsonObject item = value.toObject();
         const QString id = item.value(QStringLiteral("id")).toString();
         const QString name = item.value(QStringLiteral("name")).toString();
         items.append(qMakePair(id, name));
         previousStillExists = previousStillExists || id == previousId;
+        requestedStillExists = requestedStillExists || id == requestedId;
     }
-    if (!previousStillExists) requestedId.clear();
+    if (!requestedStillExists) {
+        requestedId = previousStillExists ? previousId : QString();
+    }
     const QString proposedId = requestedId.isEmpty() && !items.isEmpty()
         ? items.constFirst().first : requestedId;
     if (geometryRulesPage_ != nullptr && geometryRulesPage_->hasUnsavedChanges()
