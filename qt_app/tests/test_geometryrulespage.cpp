@@ -18,6 +18,7 @@
 #include "../geometryrulecanvas.h"
 
 QJsonObject profileSnapshot(int libraryRevision, int draftRevision, int activeRevision);
+QJsonObject configuredProfileSnapshot(const QString &imagePath, int draftRevision = 0);
 
 class TestGeometryRulesPage : public QObject {
     Q_OBJECT
@@ -25,6 +26,9 @@ class TestGeometryRulesPage : public QObject {
 private slots:
     void pageIsAChildWidgetAndHasNoDialogCloseAction();
     void dirtyStateEmitsOnlyOnChangeAndDiscardRestoresSnapshot();
+    void editorFieldChangeMarksDirtyAndDiscardRestores_data();
+    void editorFieldChangeMarksDirtyAndDiscardRestores();
+    void emptySnapshotDiscardRestoresNormalizedDraft();
     void requestSaveDraftUsesExistingSavePath();
     void publishDisabledUntilCompletedValidationMatchesDraft();
     void draftEditInvalidatesVisibleValidationResult();
@@ -52,6 +56,9 @@ private slots:
     void fusionRegressionRemainsVisibleWhileInspectingTemplateFit();
     void publishWorkflowNavigatesToMissingDirectionCalibration();
     void migrationConflictKeepOnlyEmitsExplicitResolution();
+    void allSupportedShapesUseTheSavePath();
+    void emptyDraftHasNoDefaultDrawingTool();
+    void signedMarginKeepsItsSignForInsideAndOutside();
 };
 
 void TestGeometryRulesPage::pageIsAChildWidgetAndHasNoDialogCloseAction() {
@@ -93,6 +100,73 @@ void TestGeometryRulesPage::dirtyStateEmitsOnlyOnChangeAndDiscardRestoresSnapsho
     QCOMPARE(dirtySpy.count(), 2);
 }
 
+void TestGeometryRulesPage::editorFieldChangeMarksDirtyAndDiscardRestores_data() {
+    QTest::addColumn<QString>("field");
+    QTest::newRow("name") << QStringLiteral("name");
+    QTest::newRow("shape") << QStringLiteral("shape");
+    QTest::newRow("mode") << QStringLiteral("mode");
+    QTest::newRow("margin") << QStringLiteral("margin");
+}
+
+void TestGeometryRulesPage::editorFieldChangeMarksDirtyAndDiscardRestores() {
+    QFETCH(QString, field);
+    GeometryRulesPage page;
+    const QJsonObject saved = configuredProfileSnapshot(QString());
+    page.setSnapshot(saved);
+    const QJsonObject savedDraft = page.draft();
+    auto *shape = page.findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+    auto *margin = page.findChild<QSpinBox *>(QStringLiteral("marginSpinBox"));
+    QLineEdit *name = nullptr;
+    QComboBox *mode = nullptr;
+    for (QLineEdit *candidate : page.findChildren<QLineEdit *>()) {
+        if (candidate->text() == QStringLiteral("中心反光")) name = candidate;
+    }
+    for (QComboBox *candidate : page.findChildren<QComboBox *>()) {
+        if (candidate->findData(QStringLiteral("inside")) >= 0
+            && candidate->findData(QStringLiteral("outside")) >= 0) {
+            mode = candidate;
+        }
+    }
+    QVERIFY(name != nullptr);
+    QVERIFY(shape != nullptr);
+    QVERIFY(mode != nullptr);
+    QVERIFY(margin != nullptr);
+
+    if (field == QStringLiteral("name")) {
+        name->setText(QStringLiteral("中心高光"));
+    } else if (field == QStringLiteral("shape")) {
+        shape->setCurrentIndex(shape->findData(QStringLiteral("ellipse")));
+    } else if (field == QStringLiteral("mode")) {
+        mode->setCurrentIndex(mode->findData(QStringLiteral("outside")));
+    } else {
+        margin->setValue(3);
+    }
+
+    QVERIFY(page.hasUnsavedChanges());
+    page.discardUnsavedChanges();
+    QVERIFY(!page.hasUnsavedChanges());
+    QCOMPARE(page.draft(), savedDraft);
+}
+
+void TestGeometryRulesPage::emptySnapshotDiscardRestoresNormalizedDraft() {
+    GeometryRulesPage page;
+    page.setSnapshot(QJsonObject{{QStringLiteral("workpiece_id"), QStringLiteral("m-empty")},
+                                 {QStringLiteral("library_revision"), 1},
+                                 {QStringLiteral("draft_revision"), 0}});
+    const QJsonObject normalized = page.draft();
+    QVERIFY(!normalized.isEmpty());
+    const QJsonObject directions = normalized.value(QStringLiteral("directions")).toObject();
+    QVERIFY(directions.contains(QStringLiteral("front")));
+    QVERIFY(directions.contains(QStringLiteral("back")));
+    page.findChild<QPushButton *>(QStringLiteral("addRuleButton"))->click();
+    QVERIFY(page.hasUnsavedChanges());
+
+    page.discardUnsavedChanges();
+
+    QVERIFY(!page.hasUnsavedChanges());
+    QCOMPARE(page.draft(), normalized);
+}
+
 void TestGeometryRulesPage::requestSaveDraftUsesExistingSavePath() {
     GeometryRulesPage page;
     page.setSnapshot(profileSnapshot(7, 8, 1));
@@ -118,7 +192,7 @@ QJsonObject profileSnapshot(int libraryRevision, int draftRevision, int activeRe
     };
 }
 
-QJsonObject configuredProfileSnapshot(const QString &imagePath, int draftRevision = 0) {
+QJsonObject configuredProfileSnapshot(const QString &imagePath, int draftRevision) {
     QJsonObject snapshot = profileSnapshot(1, draftRevision, 0);
     snapshot.insert(QStringLiteral("templates"), QJsonArray{
         QJsonObject{{QStringLiteral("template_id"), QStringLiteral("front:front.png")},
@@ -1046,6 +1120,90 @@ void TestGeometryRulesPage::migrationConflictKeepOnlyEmitsExplicitResolution() {
     const QJsonObject resolution = arguments.at(1).toJsonObject();
     QCOMPARE(resolution.value(QStringLiteral("action")).toString(), QStringLiteral("keep_only"));
     QCOMPARE(resolution.value(QStringLiteral("survivor_rule_id")).toString(), QStringLiteral("back-glare-a"));
+}
+
+void TestGeometryRulesPage::allSupportedShapesUseTheSavePath() {
+    const QStringList shapes{QStringLiteral("circle"), QStringLiteral("ellipse"),
+                             QStringLiteral("rotated_rectangle")};
+    for (const QString &shapeName : shapes) {
+        GeometryRulesPage page;
+        page.setSnapshot(configuredProfileSnapshot(QString()));
+        auto *shape = page.findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+        QVERIFY(shape != nullptr);
+        const int index = shape->findData(shapeName);
+        QVERIFY(index >= 0);
+        shape->setCurrentIndex(index);
+        QSignalSpy saveSpy(&page, &GeometryRulesPage::saveDraftRequested);
+
+        page.requestSaveDraft();
+
+        QCOMPARE(saveSpy.count(), 1);
+        const QJsonObject savedDraft = saveSpy.takeFirst().at(0).toJsonObject();
+        const QJsonObject savedRule = savedDraft.value(QStringLiteral("directions")).toObject()
+            .value(QStringLiteral("front")).toObject().value(QStringLiteral("rules"))
+            .toArray().first().toObject();
+        QCOMPARE(savedRule.value(QStringLiteral("shape")).toString(), shapeName);
+    }
+}
+
+void TestGeometryRulesPage::emptyDraftHasNoDefaultDrawingTool() {
+    GeometryRulesPage page;
+    page.setSnapshot(profileSnapshot(1, 0, 0));
+    auto *shape = page.findChild<QComboBox *>(QStringLiteral("shapeCombo"));
+    auto *canvas = page.findChild<GeometryRuleCanvas *>(QStringLiteral("geometryRuleCanvas"));
+    QVERIFY(shape != nullptr);
+    QVERIFY(canvas != nullptr);
+    QVERIFY(shape->currentData().toString().isEmpty());
+    canvas->setImage(QImage(120, 120, QImage::Format_RGB32));
+    page.resize(800, 600);
+    page.show();
+    QCoreApplication::processEvents();
+    QSignalSpy shapeSpy(canvas, &GeometryRuleCanvas::shapeChanged);
+
+    QTest::mousePress(canvas, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+    QTest::mouseMove(canvas, QPoint(80, 80));
+    QTest::mouseRelease(canvas, Qt::LeftButton, Qt::NoModifier, QPoint(80, 80));
+
+    QCOMPARE(shapeSpy.count(), 0);
+}
+
+void TestGeometryRulesPage::signedMarginKeepsItsSignForInsideAndOutside() {
+    const QStringList modes{QStringLiteral("inside"), QStringLiteral("outside")};
+    const QList<int> margins{-2, 2};
+    for (const QString &modeName : modes) {
+        for (int marginPercent : margins) {
+            GeometryRulesPage page;
+            page.setSnapshot(configuredProfileSnapshot(QString()));
+            QComboBox *mode = nullptr;
+            for (QComboBox *candidate : page.findChildren<QComboBox *>()) {
+                if (candidate->findData(QStringLiteral("inside")) >= 0
+                    && candidate->findData(QStringLiteral("outside")) >= 0) {
+                    mode = candidate;
+                }
+            }
+            auto *margin = page.findChild<QSpinBox *>(QStringLiteral("marginSpinBox"));
+            QVERIFY(mode != nullptr);
+            QVERIFY(margin != nullptr);
+            QVERIFY(margin->toolTip().contains(QStringLiteral("负值向内收缩")));
+            QVERIFY(margin->toolTip().contains(QStringLiteral("正值向外扩张")));
+            mode->setCurrentIndex(mode->findData(modeName));
+            margin->setValue(marginPercent);
+            QSignalSpy saveSpy(&page, &GeometryRulesPage::saveDraftRequested);
+
+            page.requestSaveDraft();
+
+            QCOMPARE(saveSpy.count(), 1);
+            const QJsonObject rule = saveSpy.takeFirst().at(0).toJsonObject()
+                .value(QStringLiteral("directions")).toObject()
+                .value(QStringLiteral("front")).toObject()
+                .value(QStringLiteral("rules")).toArray().first().toObject();
+            QCOMPARE(rule.value(QStringLiteral("mode")).toString(), modeName);
+            QCOMPARE(rule.value(QStringLiteral("margin_ratio")).toDouble(),
+                     marginPercent / 100.0);
+            QCOMPARE(rule.value(QStringLiteral("margin_semantics")).toString(),
+                     QStringLiteral("signed_boundary_v2"));
+        }
+    }
 }
 
 QTEST_MAIN(TestGeometryRulesPage)

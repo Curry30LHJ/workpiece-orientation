@@ -2639,6 +2639,34 @@ private slots:
                  QStringLiteral("m2"));
     }
 
+    void rapidGeometryTargetRoundTripRefetchesCurrentGeneration() {
+        GeometryWorkflowServer server;
+        QVERIFY(server.listen());
+        server.holdGeometryProfiles();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        auto *combo = window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox"));
+        QVERIFY(combo != nullptr);
+        QTRY_COMPARE_WITH_TIMEOUT(combo->currentData().toString(), QStringLiteral("m1"), 1000);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 1, 1000);
+
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m2")));
+        combo->setCurrentIndex(combo->findData(QStringLiteral("m1")));
+        QCOMPARE(combo->currentData().toString(), QStringLiteral("m1"));
+
+        QVERIFY(server.replyNextGeometryProfile());
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 2, 1000);
+        QVERIFY(server.replyNextGeometryProfile());
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.geometryProfileWorkpieceIds().size(), 3, 1000);
+        QCOMPARE(server.geometryProfileWorkpieceIds(),
+                 QStringList({QStringLiteral("m1"), QStringLiteral("m2"),
+                              QStringLiteral("m1")}));
+    }
+
     void reconnectRetriesUnloadedGeometryProfileForCurrentTargetOnce() {
         GeometryWorkflowServer server;
         QVERIFY(server.listen());

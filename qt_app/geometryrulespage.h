@@ -92,6 +92,7 @@ private:
     void setCurrentCalibration(const QJsonObject &calibration);
     QString calibrationState(const QString &side, const QString &ruleId) const;
     void ensureDirectionObject(const QString &name);
+    void restoreSnapshotDraft();
     void setCurrentRuleFromEditor();
     void loadCurrentRuleIntoEditor();
     QJsonObject currentRule() const;

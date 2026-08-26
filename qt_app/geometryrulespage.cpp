@@ -296,9 +296,16 @@ GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
                 canvas_->setTool(shape == QStringLiteral("circle") ? GeometryRuleCanvas::Circle
                                    : shape == QStringLiteral("ellipse") ? GeometryRuleCanvas::Ellipse
                                                                           : shape == QStringLiteral("rotated_rectangle")
-                                                                                ? GeometryRuleCanvas::RotatedRectangle
-                                                                                : GeometryRuleCanvas::None);
+                                                                                 ? GeometryRuleCanvas::RotatedRectangle
+                                                                                 : GeometryRuleCanvas::None);
+                setCurrentRuleFromEditor();
             });
+    connect(ruleNameEdit_, &QLineEdit::textChanged, this,
+            [this](const QString &) { setCurrentRuleFromEditor(); });
+    connect(modeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int) { setCurrentRuleFromEditor(); });
+    connect(marginSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this](int) { setCurrentRuleFromEditor(); });
     connect(anchorCandidateCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int index) { Q_UNUSED(index); candidateChanged(anchorCandidateCombo_->currentIndex()); });
     connect(ruleCandidateCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -699,14 +706,7 @@ void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     manualEditContextKey_.clear();
     pendingPreviewContextKey_.clear();
     snapshot_ = snapshot;
-    draft_ = snapshot.value(QStringLiteral("draft")).toObject();
-    if (draft_.isEmpty()) {
-        draft_ = QJsonObject{{QStringLiteral("schema_version"), 1},
-                             {QStringLiteral("directions"), QJsonObject{{QStringLiteral("front"), emptyDirection()},
-                                                                           {QStringLiteral("back"), emptyDirection()}}}};
-    }
-    ensureDirectionObject(QStringLiteral("front"));
-    ensureDirectionObject(QStringLiteral("back"));
+    restoreSnapshotDraft();
     job_ = QJsonObject();
     editorDirection_.clear();
     setDirty(false);
@@ -735,6 +735,17 @@ void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     refreshTemplatePreview();
     dirtyLabel_->setText(QStringLiteral("草稿已保存"));
     updatePublishState();
+}
+
+void GeometryRulesPage::restoreSnapshotDraft() {
+    draft_ = snapshot_.value(QStringLiteral("draft")).toObject();
+    if (draft_.isEmpty()) {
+        draft_ = QJsonObject{{QStringLiteral("schema_version"), 1},
+                             {QStringLiteral("directions"), QJsonObject{{QStringLiteral("front"), emptyDirection()},
+                                                                            {QStringLiteral("back"), emptyDirection()}}}};
+    }
+    ensureDirectionObject(QStringLiteral("front"));
+    ensureDirectionObject(QStringLiteral("back"));
 }
 
 void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
@@ -1674,7 +1685,8 @@ void GeometryRulesPage::resetCurrentRule() {
 }
 
 void GeometryRulesPage::reloadDraft() {
-    draft_ = snapshot_.value(QStringLiteral("draft")).toObject();
+    restoreSnapshotDraft();
+    editorDirection_.clear();
     undoHistory_.clear();
     redoHistory_.clear();
     setDirty(false);

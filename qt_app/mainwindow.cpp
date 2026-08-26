@@ -727,8 +727,17 @@ void MainWindow::ensureGeometryProfileForCurrentWorkpiece() {
     }
     if (pendingCommand_ == QStringLiteral("get_geometry_mask_profile")
         && pendingFields_.value(QStringLiteral("workpiece_id")).toString()
-            == workpieceId) {
+            == workpieceId
+        && pendingGeometryTargetGeneration_ == geometryTargetGeneration_) {
         return;
+    }
+    for (const QueuedCommandIntent &intent : queuedMutationCommands_) {
+        if (intent.command == QStringLiteral("get_geometry_mask_profile")
+            && intent.fields.value(QStringLiteral("workpiece_id")).toString()
+                == workpieceId
+            && intent.geometryTargetGeneration == geometryTargetGeneration_) {
+            return;
+        }
     }
     requestGeometryProfile(workpieceId);
 }
@@ -1402,6 +1411,7 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
             && profileWorkpieceId == issuedWorkpieceId;
         if (!currentResponse) {
             if (geometryRulesPage_ != nullptr) geometryRulesPage_->setBusy(false);
+            ensureGeometryProfileForCurrentWorkpiece();
             return;
         }
         if (geometryRulesPage_ != nullptr) {
