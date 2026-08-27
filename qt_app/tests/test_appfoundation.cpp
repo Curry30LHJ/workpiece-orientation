@@ -70,6 +70,27 @@ private slots:
         QVERIFY(!restartButton->isVisible());
     }
 
+    void backendLifecycleLabelsDistinguishStartupLoadingAndRecovery() {
+        AppHeader header;
+        auto *label = header.findChild<QLabel *>(QStringLiteral("backendStatusLabel"));
+        QVERIFY(label != nullptr);
+
+        header.setBackendState(BackendUiState::Starting,
+                               QStringLiteral("正在启动服务"));
+        QVERIFY(label->text().contains(QStringLiteral("正在启动")));
+        QVERIFY(!label->text().contains(QStringLiteral("模型加载中")));
+
+        header.setBackendState(BackendUiState::Loading,
+                               QStringLiteral("正在加载权重"));
+        QVERIFY(label->text().contains(QStringLiteral("模型加载中")));
+
+        header.setBackendState(BackendUiState::Recovering,
+                               QStringLiteral("连接暂时中断"));
+        QVERIFY(label->text().contains(QStringLiteral("正在重连")));
+        QCOMPARE(label->property("messageKind").toString(),
+                 QStringLiteral("warning"));
+    }
+
     void themeContainsApprovedTokens() {
         const QString qss = AppTheme::styleSheet();
         QVERIFY(qss.contains(QStringLiteral("#F4F6F8"), Qt::CaseInsensitive));

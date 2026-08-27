@@ -14,7 +14,15 @@ class QPushButton;
 enum class AppPage { Inspection = 0, WorkpieceLibrary = 1, GeometryRules = 2 };
 Q_DECLARE_METATYPE(AppPage)
 
-enum class BackendUiState { Disconnected, Loading, Ready, Busy, Error };
+enum class BackendUiState {
+    Disconnected,
+    Starting,
+    Loading,
+    Ready,
+    Busy,
+    Recovering,
+    Error
+};
 
 struct BackendStatusDetails {
     BackendUiState state = BackendUiState::Disconnected;

@@ -17,12 +17,16 @@ namespace {
 
 QString backendStateText(BackendUiState state) {
     switch (state) {
+    case BackendUiState::Starting:
+        return QStringLiteral("后端：正在启动");
     case BackendUiState::Loading:
         return QStringLiteral("后端：模型加载中");
     case BackendUiState::Ready:
         return QStringLiteral("后端：已连接");
     case BackendUiState::Busy:
         return QStringLiteral("后端：处理中");
+    case BackendUiState::Recovering:
+        return QStringLiteral("后端：正在重连");
     case BackendUiState::Error:
         return QStringLiteral("后端：不可用");
     case BackendUiState::Disconnected:
@@ -176,7 +180,8 @@ void AppHeader::setBackendState(BackendUiState state, const QString &detail) {
         backendStatusLabel_->fontMetrics().elidedText(fullText, Qt::ElideMiddle, 290));
     QString messageKind = QStringLiteral("neutral");
     if (state == BackendUiState::Ready) messageKind = QStringLiteral("success");
-    if (state == BackendUiState::Loading || state == BackendUiState::Busy) {
+    if (state == BackendUiState::Starting || state == BackendUiState::Loading
+        || state == BackendUiState::Busy || state == BackendUiState::Recovering) {
         messageKind = QStringLiteral("warning");
     }
     if (state == BackendUiState::Error || state == BackendUiState::Disconnected) {
@@ -205,6 +210,9 @@ void AppHeader::setBackendDetails(const BackendStatusDetails &details) {
         summaryDetail = details.recentError;
     } else if (details.state == BackendUiState::Loading) {
         summaryDetail = details.modelDetail;
+    } else if (details.state == BackendUiState::Recovering) {
+        summaryDetail = details.recentError.isEmpty()
+            ? details.connectionDetail : details.recentError;
     } else {
         summaryDetail = details.connectionDetail;
     }
