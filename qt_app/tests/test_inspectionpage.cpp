@@ -2,6 +2,7 @@
 
 #include <QApplication>
 #include <QDateTime>
+#include <QDir>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFileInfo>
@@ -183,6 +184,43 @@ private slots:
         QVERIFY(target != nullptr);
         QVERIFY(target->toolTip().contains(QFileInfo(path).fileName()));
         QVERIFY(target->text().size() < target->toolTip().size());
+    }
+
+    void captureNarrowBatchEvidenceWhenRequested() {
+        const QString captureDirectory =
+            QString::fromLocal8Bit(qgetenv("QT_UI_CAPTURE_DIR"));
+        if (captureDirectory.isEmpty()) return;
+        QVERIFY(QDir().mkpath(captureDirectory));
+
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QStringList paths;
+        for (int index = 0; index < 12; ++index) {
+            paths.append(writeImage(
+                directory,
+                QStringLiteral("M1_批量检测_%1_长文件名.png").arg(index)));
+        }
+        QVERIFY(!paths.contains(QString()));
+
+        InspectionPage page;
+        page.resize(1037, 652);
+        page.setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("M1"));
+        page.setBackendAvailable(true, false, QString());
+        page.beginBatch(paths, QStringLiteral("m1"));
+        for (int index = 0; index < paths.size(); ++index) {
+            page.handleBackendResponse(
+                QStringLiteral("predict"),
+                predictionResponse(index % 2 == 0
+                                       ? QStringLiteral("front")
+                                       : QStringLiteral("back"),
+                                   index % 3 == 0));
+        }
+        page.show();
+        QCoreApplication::processEvents();
+
+        const QString screenshotPath = QDir(captureDirectory).filePath(
+            QStringLiteral("qt-ui-inspection-batch-1037x652.png"));
+        QVERIFY2(page.grab().save(screenshotPath), qPrintable(screenshotPath));
     }
 
     void batchIdsAreNonEmptyAndUnique() {
