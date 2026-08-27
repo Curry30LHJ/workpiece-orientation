@@ -28,6 +28,7 @@ FAST_ROTATION_DEGREES = tuple(range(30, 360, 30))
 FAST_AUGMENT_BELOW_PER_SIDE = 20
 FAST_BUILD_IMAGE_BATCH = 32
 _CACHE_ERROR = "FAST_CACHE_REVISION_MISMATCH"
+_FEATURE_ERROR = "FAST_FEATURE_INVALID"
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,10 @@ def _cache_error(message: str) -> ValueError:
     return ValueError(f"{_CACHE_ERROR}: {message}")
 
 
+def _feature_error(message: str) -> ValueError:
+    return ValueError(f"{_FEATURE_ERROR}: {message}")
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
@@ -81,6 +86,27 @@ def _image_digest(image: np.ndarray) -> str:
     return hasher.hexdigest()
 
 
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _validate_template_signature(signature: Any, counts: Mapping[str, int]) -> None:
+    if not isinstance(signature, dict) or set(signature) != {"front", "back", "combined_sha256"}:
+        raise _cache_error("template signature is invalid")
+    for label in ("front", "back"):
+        entries = signature[label]
+        if not isinstance(entries, list) or len(entries) != counts[label]:
+            raise _cache_error("template signature count is invalid")
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+                raise _cache_error("template signature entry is invalid")
+            if not isinstance(entry["path"], str) or not entry["path"] or not _is_sha256(entry["sha256"]):
+                raise _cache_error("template signature digest is invalid")
+    combined = _digest({"front": signature["front"], "back": signature["back"]})
+    if signature["combined_sha256"] != combined:
+        raise _cache_error("template signature digest is invalid")
+
+
 def _validate_image(image: Any, path: Path) -> np.ndarray:
     if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3 or image.size == 0:
         raise ValueError(f"template image is unreadable or invalid: {path}")
@@ -97,23 +123,52 @@ def _compiled_signature(compiled: CompiledFastGeometry) -> dict[str, Any]:
     }
 
 
-def _rotation_center(variants: FastGeometryVariants, image: np.ndarray) -> tuple[float, float]:
-    """Use a fitted rule/anchor center when published, otherwise image center."""
-    for direction in variants.directions.values():
-        if not isinstance(direction, Mapping):
-            continue
-        candidates = list(direction.get("rules", ()))
-        candidates.append(direction.get("fitted_shape"))
-        candidates.append(direction.get("anchor"))
-        for candidate in candidates:
-            if not isinstance(candidate, Mapping):
+def _cache_revision_payload(
+    library_revision: int,
+    model_fingerprint: str,
+    template_signature: Mapping[str, Any],
+    compiled_geometry: CompiledFastGeometry,
+) -> dict[str, Any]:
+    return {
+        "runtime_format_version": FAST_RUNTIME_FORMAT_VERSION,
+        "library_revision": library_revision,
+        "model_fingerprint": model_fingerprint,
+        "template_signature": template_signature,
+        "compiled_geometry": _compiled_signature(compiled_geometry),
+        "feature_layout": FAST_FEATURE_LAYOUT,
+    }
+
+
+def _geometry_context_shape(image: np.ndarray, geometry: FastGeometryProcessor) -> tuple[int, int]:
+    height, width = image.shape[:2]
+    max_side = getattr(geometry, "max_side", max(height, width))
+    if not isinstance(max_side, (int, float)) or not np.isfinite(max_side) or max_side <= 0:
+        return height, width
+    scale = min(1.0, float(max_side) / max(height, width))
+    return max(1, round(height * scale)), max(1, round(width * scale))
+
+
+def _rotation_center(
+    label: str,
+    variants: FastGeometryVariants,
+    image: np.ndarray,
+    context_shape: tuple[int, int],
+) -> tuple[float, float]:
+    """Use this label's fitted rule center, mapped from context to source pixels."""
+    direction = variants.directions.get(label)
+    rules = direction.get("rules", ()) if isinstance(direction, Mapping) else ()
+    if isinstance(rules, Sequence) and not isinstance(rules, (str, bytes, bytearray)):
+        for rule in rules:
+            if not isinstance(rule, Mapping) or rule.get("status") != "active":
                 continue
-            shape = candidate.get("fitted_shape", candidate)
+            shape = rule.get("fitted_shape")
             if not isinstance(shape, Mapping):
                 continue
             x, y = shape.get("cx"), shape.get("cy")
             if isinstance(x, (int, float)) and isinstance(y, (int, float)) and np.isfinite((x, y)).all():
-                return float(x), float(y)
+                source_height, source_width = image.shape[:2]
+                context_height, context_width = context_shape
+                return float(x) * source_width / context_width, float(y) * source_height / context_height
     height, width = image.shape[:2]
     return width / 2.0, height / 2.0
 
@@ -125,6 +180,33 @@ def _rotate_slots(images: tuple[np.ndarray, np.ndarray, np.ndarray], center: tup
         cv2.warpAffine(image, matrix, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
         for image in images
     )  # type: ignore[return-value]
+
+
+def _pack_three_embeddings(
+    embeddings: Sequence[np.ndarray],
+    *,
+    expected_slot_dim: int | None = None,
+) -> tuple[np.ndarray, int]:
+    if not isinstance(embeddings, Sequence) or isinstance(embeddings, (str, bytes, bytearray)) or len(embeddings) != 3:
+        raise _feature_error("exactly three embeddings are required")
+    vectors: list[np.ndarray] = []
+    for embedding in embeddings:
+        try:
+            vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError) as exc:
+            raise _feature_error("embedding is not numeric") from exc
+        if vector.size == 0 or not np.isfinite(vector).all():
+            raise _feature_error("embedding must be finite and non-empty")
+        vectors.append(vector)
+    slot_dim = vectors[0].size
+    if any(vector.size != slot_dim for vector in vectors[1:]):
+        raise _feature_error("embedding slot dimensions must match")
+    if expected_slot_dim is not None and slot_dim != expected_slot_dim:
+        raise _feature_error("embedding slot dimension does not match cache")
+    try:
+        return pack_embeddings(vectors), slot_dim
+    except ValueError as exc:
+        raise _feature_error("embedding packing failed") from exc
 
 
 class FastOrientationEngine:
@@ -180,6 +262,13 @@ class FastOrientationEngine:
         total_originals = sum(len(items) for items in originals.values())
         samples: dict[str, list[_TrainingSample]] = {"front": [], "back": []}
         geometry_review_counts = {"front": 0, "back": 0}
+        augmentation_totals = {
+            label: len(originals[label]) * len(FAST_ROTATION_DEGREES)
+            if len(originals[label]) < FAST_AUGMENT_BELOW_PER_SIDE else 0
+            for label in ("front", "back")
+        }
+        total_augmented = sum(augmentation_totals.values())
+        augmented_done = 0
         completed = 0
         for label in ("front", "back"):
             for source_id, image, _ in originals[label]:
@@ -191,23 +280,18 @@ class FastOrientationEngine:
                 self._progress(progress_callback, "fast_originals", completed, total_originals, "templates")
 
                 if len(originals[label]) < FAST_AUGMENT_BELOW_PER_SIDE:
-                    center = _rotation_center(variants, image)
+                    center = _rotation_center(label, variants, image, _geometry_context_shape(image, self.geometry))
                     for degree in FAST_ROTATION_DEGREES:
                         samples[label].append(_TrainingSample(label, source_id, False, _rotate_slots(variants.images, center, degree)))
+                        augmented_done += 1
+                        self._progress(progress_callback, "fast_augmentation", augmented_done, total_augmented, "augmented_samples")
 
         augmented_counts = {
             label: len(samples[label]) - len(originals[label])
             for label in ("front", "back")
         }
-        total_augmented = sum(augmented_counts.values())
-        augmented_done = 0
         if total_augmented == 0:
             self._progress(progress_callback, "fast_augmentation", 0, 0, "augmented_samples")
-        else:
-            for label in ("front", "back"):
-                for _ in range(augmented_counts[label]):
-                    augmented_done += 1
-                    self._progress(progress_callback, "fast_augmentation", augmented_done, total_augmented, "augmented_samples")
 
         features = self._embed_samples(samples)
         self._progress(progress_callback, "fast_ridge", 0, 1, "ridge_head")
@@ -232,17 +316,9 @@ class FastOrientationEngine:
             "ridge": head.training_summary,
             "build_ms": (perf_counter() - started) * 1000.0,
         }
-        revision_payload = {
-            "runtime_format_version": FAST_RUNTIME_FORMAT_VERSION,
-            "library_revision": library_revision,
-            "model_fingerprint": model_fingerprint,
-            "template_signature": signature,
-            "compiled_geometry": _compiled_signature(compiled),
-            "feature_layout": FAST_FEATURE_LAYOUT,
-        }
         return FastRuntimeCache(
             FAST_RUNTIME_FORMAT_VERSION,
-            _digest(revision_payload),
+            _digest(_cache_revision_payload(library_revision, model_fingerprint, signature, compiled)),
             library_revision,
             compiled.profile_revision,
             model_fingerprint,
@@ -261,9 +337,10 @@ class FastOrientationEngine:
         batch_started = perf_counter()
         embeddings = self.embed_batch(variants.images)
         global_batch_ms = (perf_counter() - batch_started) * 1000.0
-        if not isinstance(embeddings, Sequence) or len(embeddings) != len(FAST_FEATURE_LAYOUT):
-            raise ValueError("embed_batch must return one embedding for each fast feature slot")
-        feature = pack_embeddings(embeddings)
+        feature, _ = _pack_three_embeddings(
+            embeddings,
+            expected_slot_dim=cache.ridge_head.feature_dim // len(FAST_FEATURE_LAYOUT),
+        )
         head_started = perf_counter()
         decision = predict_ridge(cache.ridge_head, feature)
         linear_head_ms = (perf_counter() - head_started) * 1000.0
@@ -309,9 +386,17 @@ class FastOrientationEngine:
             chunk = images[start:start + FAST_BUILD_IMAGE_BATCH]
             returned = self.embed_batch(chunk)
             if not isinstance(returned, Sequence) or len(returned) != len(chunk):
-                raise ValueError("embed_batch returned an unexpected batch size")
+                raise _feature_error("embedder returned an unexpected batch size")
             embeddings.extend(returned)
-        packed = [pack_embeddings(embeddings[index:index + 3]) for index in range(0, len(embeddings), 3)]
+        packed: list[np.ndarray] = []
+        expected_slot_dim: int | None = None
+        for index in range(0, len(embeddings), len(FAST_FEATURE_LAYOUT)):
+            feature, slot_dim = _pack_three_embeddings(
+                embeddings[index:index + len(FAST_FEATURE_LAYOUT)],
+                expected_slot_dim=expected_slot_dim,
+            )
+            expected_slot_dim = slot_dim
+            packed.append(feature)
         front_count = len(samples["front"])
         return {"front": packed[:front_count], "back": packed[front_count:]}
 
@@ -321,20 +406,25 @@ class FastOrientationEngine:
             raise _cache_error("cache type is invalid")
         if cache.format_version != FAST_RUNTIME_FORMAT_VERSION:
             raise _cache_error("runtime format is invalid")
-        if not isinstance(cache.cache_revision, str) or not cache.cache_revision:
+        if not isinstance(cache.cache_revision, str) or len(cache.cache_revision) != 64 or not _is_sha256(cache.cache_revision):
             raise _cache_error("cache revision is invalid")
         if type(cache.library_revision) is not int or cache.library_revision < 0:
             raise _cache_error("library revision is invalid")
         if not isinstance(cache.model_fingerprint, str) or not cache.model_fingerprint.strip():
             raise _cache_error("model fingerprint is invalid")
-        if cache.feature_layout != FAST_FEATURE_LAYOUT or not isinstance(cache.template_signature, dict):
+        if cache.feature_layout != FAST_FEATURE_LAYOUT:
             raise _cache_error("feature layout or template signature is invalid")
         if not isinstance(cache.compiled_geometry, CompiledFastGeometry):
             raise _cache_error("compiled geometry is invalid")
         if cache.geometry_profile_revision != cache.compiled_geometry.profile_revision:
             raise _cache_error("geometry profile revision is invalid")
+        if not isinstance(cache.template_counts, dict) or set(cache.template_counts) != {"front", "back"}:
+            raise _cache_error("template counts are invalid")
+        if any(type(cache.template_counts[label]) is not int or cache.template_counts[label] <= 0 for label in ("front", "back")):
+            raise _cache_error("template counts are invalid")
+        _validate_template_signature(cache.template_signature, cache.template_counts)
         head = cache.ridge_head
-        if not isinstance(head, RidgeHead) or head.feature_dim <= 0:
+        if not isinstance(head, RidgeHead) or head.feature_dim <= 0 or head.feature_dim % len(FAST_FEATURE_LAYOUT) != 0:
             raise _cache_error("ridge head is invalid")
         values = np.asarray(head.weights, dtype=np.float64)
         if values.ndim != 1 or values.size != head.feature_dim or not np.isfinite(values).all():
@@ -345,3 +435,11 @@ class FastOrientationEngine:
             raise _cache_error("ridge values are invalid")
         if cache.compiled_geometry.format_version != FAST_GEOMETRY_FORMAT_VERSION:
             raise _cache_error("geometry format is invalid")
+        expected_revision = _digest(_cache_revision_payload(
+            cache.library_revision,
+            cache.model_fingerprint,
+            cache.template_signature,
+            cache.compiled_geometry,
+        ))
+        if cache.cache_revision != expected_revision:
+            raise _cache_error("cache revision does not match cache content")

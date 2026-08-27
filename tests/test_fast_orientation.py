@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -7,7 +8,8 @@ import cv2
 import numpy as np
 import pytest
 
-from src.fast_geometry import FastGeometryProcessor, compile_fast_geometry
+import src.fast_orientation as fast_orientation
+from src.fast_geometry import FastGeometryProcessor, FastGeometryVariants, compile_fast_geometry
 from src.fast_orientation import FAST_ROTATION_DEGREES, FastOrientationEngine
 
 
@@ -68,6 +70,67 @@ def fake_engine(*, fail_geometry: bool = False, record_batches: bool = False):
     embedder = FakeEmbedder(record_batches=record_batches)
     geometry = FastGeometryProcessor(FakeCalibrator(fail=fail_geometry))
     return FastOrientationEngine(embedder, geometry, image_reader=read_marker), embedder
+
+
+class RuleCenterGeometry:
+    """Geometry boundary that reports rule centers in its resized context."""
+
+    max_side = 256
+
+    def __init__(self, centers: dict[str, tuple[float, float]], *, active_labels: set[str] | None = None) -> None:
+        self.centers = centers
+        self.active_labels = set(centers) if active_labels is None else active_labels
+
+    def build_variants(self, image: np.ndarray, compiled: object) -> FastGeometryVariants:
+        directions = {}
+        for label, center in self.centers.items():
+            rule_status = "active" if label in self.active_labels else "low_confidence"
+            directions[label] = {
+                "status": rule_status,
+                "anchor": {"cx": center[0] + 3.0, "cy": center[1] + 3.0},
+                "rules": [{
+                    "status": rule_status,
+                    "fitted_shape": {"cx": center[0], "cy": center[1]},
+                }],
+            }
+        return FastGeometryVariants(
+            (image.copy(), image.copy(), image.copy()),
+            "active",
+            False,
+            (),
+            directions,
+            {"geometry_context": 0.0, "geometry_fit": 0.0, "mask_build": 0.0},
+        )
+
+
+class RepeatingEmbedder:
+    def __init__(self, slots: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
+        self.slots = slots
+        self.position = 0
+        self.batch_sizes: list[int] = []
+
+    def __call__(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        self.batch_sizes.append(len(images))
+        result = []
+        for _ in images:
+            result.append(self.slots[self.position % 3].copy())
+            self.position += 1
+        return result
+
+
+def map_reader(images: dict[str, np.ndarray]):
+    return lambda path: images[str(path)].copy()
+
+
+def bright_marker_image(marker: int, *, size: tuple[int, int], center: tuple[int, int]) -> np.ndarray:
+    height, width = size
+    image = np.full((height, width, 3), marker, dtype=np.uint8)
+    cv2.circle(image, center, 8, (255, 255, 255), -1)
+    return image
+
+
+def recorded_images(embedder: FakeEmbedder) -> list[np.ndarray]:
+    return [image for batch in embedder.batches for image in batch]
 
 
 def configured_profile() -> dict:
@@ -177,3 +240,134 @@ def test_predict_rejects_stale_cache_before_embedder_is_called(tmp_path):
         engine.predict(marker_image(10), replace(cache, format_version=999))
 
     assert embedder.batch_sizes == []
+
+
+def test_augmentation_scales_rule_center_from_geometry_context_to_source_pixels():
+    front = bright_marker_image(10, size=(512, 1024), center=(800, 400))
+    back = bright_marker_image(200, size=(512, 1024), center=(800, 400))
+    embedder = FakeEmbedder(record_batches=True)
+    engine = FastOrientationEngine(
+        embedder,
+        RuleCenterGeometry({"front": (200.0, 100.0), "back": (200.0, 100.0)}),
+        image_reader=map_reader({"front.png": front, "back.png": back}),
+    )
+
+    engine.build_cache([Path("front.png")], [Path("back.png")], geometry_profile=None, library_revision=1, model_fingerprint="m")
+
+    first_rotated_raw_slot = recorded_images(embedder)[3]
+    assert first_rotated_raw_slot[400, 800].tolist() == [255, 255, 255]
+
+
+def test_augmentation_uses_the_active_rule_center_for_its_own_label():
+    front = bright_marker_image(10, size=(64, 64), center=(12, 20))
+    back = bright_marker_image(200, size=(64, 64), center=(44, 36))
+    embedder = FakeEmbedder(record_batches=True)
+    engine = FastOrientationEngine(
+        embedder,
+        RuleCenterGeometry({"front": (12.0, 20.0), "back": (44.0, 36.0)}),
+        image_reader=map_reader({"front.png": front, "back.png": back}),
+    )
+
+    engine.build_cache([Path("front.png")], [Path("back.png")], geometry_profile=None, library_revision=1, model_fingerprint="m")
+
+    images = recorded_images(embedder)
+    assert images[3][20, 12].tolist() == [255, 255, 255]
+    assert images[39][36, 44].tolist() == [255, 255, 255]
+
+
+def test_augmentation_without_an_active_rule_center_uses_decoded_image_center():
+    front = bright_marker_image(10, size=(64, 64), center=(32, 32))
+    back = bright_marker_image(200, size=(64, 64), center=(32, 32))
+    embedder = FakeEmbedder(record_batches=True)
+    engine = FastOrientationEngine(
+        embedder,
+        RuleCenterGeometry({"front": (10.0, 10.0), "back": (54.0, 54.0)}, active_labels=set()),
+        image_reader=map_reader({"front.png": front, "back.png": back}),
+    )
+
+    engine.build_cache([Path("front.png")], [Path("back.png")], geometry_profile=None, library_revision=1, model_fingerprint="m")
+
+    assert recorded_images(embedder)[3][32, 32].tolist() == [255, 255, 255]
+
+
+@pytest.mark.parametrize("slots", [
+    (np.ones(2, np.float32), np.ones(3, np.float32), np.ones(2, np.float32)),
+    (np.ones(2, np.float32), np.empty(0, np.float32), np.ones(2, np.float32)),
+    (np.ones(2, np.float32), np.array([np.nan, 1.0], np.float32), np.ones(2, np.float32)),
+])
+def test_build_rejects_invalid_embedding_slots_before_ridge(monkeypatch, tmp_path, slots):
+    front = write_marker(tmp_path / "front.png", 10)
+    back = write_marker(tmp_path / "back.png", 200)
+    engine = FastOrientationEngine(
+        RepeatingEmbedder(slots),
+        FastGeometryProcessor(FakeCalibrator()),
+        image_reader=read_marker,
+    )
+    monkeypatch.setattr(fast_orientation, "fit_ridge_head", lambda *args, **kwargs: pytest.fail("Ridge must not run"))
+
+    with pytest.raises(ValueError, match="FAST_FEATURE_INVALID"):
+        engine.build_cache([front], [back], geometry_profile=None, library_revision=1, model_fingerprint="m")
+
+
+@pytest.mark.parametrize("slots", [
+    (np.ones(2, np.float32), np.ones(3, np.float32), np.ones(2, np.float32)),
+    (np.ones(2, np.float32), np.empty(0, np.float32), np.ones(2, np.float32)),
+    (np.ones(2, np.float32), np.array([np.inf, 1.0], np.float32), np.ones(2, np.float32)),
+])
+def test_predict_rejects_invalid_embedding_slots_before_ridge(monkeypatch, tmp_path, slots):
+    engine, _ = fake_engine()
+    front = write_markers(tmp_path, "front", 2, base=10)
+    back = write_markers(tmp_path, "back", 2, base=200)
+    cache = engine.build_cache(front, back, geometry_profile=None, library_revision=1, model_fingerprint="m")
+    invalid = RepeatingEmbedder(slots)
+    engine.embed_batch = invalid
+    monkeypatch.setattr(fast_orientation, "predict_ridge", lambda *args, **kwargs: pytest.fail("Ridge must not run"))
+
+    with pytest.raises(ValueError, match="FAST_FEATURE_INVALID"):
+        engine.predict(marker_image(10), cache)
+
+    assert invalid.batch_sizes == [3]
+
+
+def test_predict_rejects_mutated_cache_invariants_and_accepts_valid_cache(tmp_path):
+    engine, embedder = fake_engine()
+    front = write_markers(tmp_path, "front", 2, base=10)
+    back = write_markers(tmp_path, "back", 2, base=200)
+    cache = engine.build_cache(front, back, geometry_profile=None, library_revision=1, model_fingerprint="m")
+
+    assert engine.predict(marker_image(10), cache)["label"] in {"front", "back"}
+    embedder.batch_sizes.clear()
+    invalid_digest = deepcopy(cache.template_signature)
+    invalid_digest["front"][0]["sha256"] = "not-a-sha256"
+    invalid_combined = deepcopy(cache.template_signature)
+    invalid_combined["combined_sha256"] = "0" * 64
+    invalid_head = replace(cache.ridge_head, weights=np.ones(5, np.float32), feature_dim=5)
+    invalid_caches = [
+        replace(cache, cache_revision="0" * 64),
+        replace(cache, template_counts={"front": 0, "back": 2}),
+        replace(cache, template_signature=invalid_digest),
+        replace(cache, template_signature=invalid_combined),
+        replace(cache, ridge_head=invalid_head),
+    ]
+
+    for invalid_cache in invalid_caches:
+        with pytest.raises(ValueError, match="FAST_CACHE_REVISION_MISMATCH"):
+            engine.predict(marker_image(10), invalid_cache)
+
+    assert embedder.batch_sizes == []
+
+
+def test_augmentation_progress_is_emitted_as_samples_are_generated(tmp_path):
+    events: list[dict] = []
+    front = write_markers(tmp_path, "front", 2, base=10)
+    back = write_markers(tmp_path, "back", 20, base=100)
+    engine, _ = fake_engine()
+
+    engine.build_cache(front, back, geometry_profile=None, library_revision=1, model_fingerprint="m", progress_callback=events.append)
+
+    first_augmentation = next(index for index, event in enumerate(events) if event["phase"] == "fast_augmentation")
+    second_original = next(index for index, event in enumerate(events) if event["phase"] == "fast_originals" and event["completed"] == 2)
+    augmentation = [event for event in events if event["phase"] == "fast_augmentation"]
+    assert first_augmentation < second_original
+    assert [event["completed"] for event in augmentation] == list(range(1, 23))
+    assert all(event["total"] == 22 and event["unit"] == "augmented_samples" for event in augmentation)
