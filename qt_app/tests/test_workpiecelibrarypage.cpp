@@ -524,6 +524,131 @@ private slots:
         QVERIFY(result.contains(QStringLiteral("fast-revision-9")));
     }
 
+    void sha256FastCacheRevisionStaysContainedAtMinimumWindowSize() {
+        const QString revision = QStringLiteral(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        const QString compactRevision = QStringLiteral("01234567…89abcdef");
+        WorkpieceLibraryPage page;
+        page.resize(1024, 640);
+        auto *tabs = page.findChild<QTabWidget *>(QStringLiteral("libraryTabWidget"));
+        QVERIFY(tabs != nullptr);
+        tabs->setCurrentIndex(1);
+
+        page.setRegistrationResult(QJsonObject{
+            {QStringLiteral("template_counts"), QJsonObject{
+                {QStringLiteral("front"), 5}, {QStringLiteral("back"), 12}}},
+            {QStringLiteral("elapsed_ms"), 88.0},
+            {QStringLiteral("fast_cache_state"), QStringLiteral("ready")},
+            {QStringLiteral("fast_cache_revision"), revision},
+        });
+        page.show();
+        QCoreApplication::processEvents();
+
+        QCOMPARE(page.size(), QSize(1024, 640));
+        for (QLabel *label : {
+                 page.findChild<QLabel *>(QStringLiteral("latestRegistrationResultLabel")),
+                 page.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))}) {
+            QVERIFY(label != nullptr);
+            QVERIFY(label->isVisibleTo(&page));
+            QVERIFY(label->text().contains(compactRevision));
+            QVERIFY(!label->text().contains(revision));
+            QCOMPARE(label->toolTip(), revision);
+            const QRect labelRect(label->mapTo(&page, QPoint(0, 0)), label->size());
+            QVERIFY(page.rect().contains(labelRect));
+        }
+    }
+
+    void loadingDetailsResetReadyCacheAndErrorMessageKinds() {
+        WorkpieceLibraryPage page;
+        page.setWorkpieces(QJsonArray{
+            summary(QStringLiteral("m-ready"), QStringLiteral("Ready"), 4, 5),
+            summary(QStringLiteral("m-next"), QStringLiteral("Next"), 4, 5),
+        }, QString());
+        auto *list = page.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *detail = page.findChild<QLabel *>(
+            QStringLiteral("workpieceDetailsSummaryLabel"));
+        auto *message = page.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"));
+        QVERIFY(list != nullptr);
+        QVERIFY(detail != nullptr);
+        QVERIFY(message != nullptr);
+        list->setCurrentRow(0);
+        QJsonObject ready = summary(
+            QStringLiteral("m-ready"), QStringLiteral("Ready"), 4, 5);
+        ready.insert(QStringLiteral("fast_cache"), QJsonObject{
+            {QStringLiteral("state"), QStringLiteral("ready")},
+            {QStringLiteral("completed"), 9},
+            {QStringLiteral("total"), 9},
+            {QStringLiteral("elapsed_ms"), 12.0},
+        });
+        page.setWorkpieceDetails(ready);
+        page.setOperationError(QStringLiteral("OLD_ERROR"), QStringLiteral("旧错误"));
+        QCOMPARE(detail->property("messageKind").toString(), QStringLiteral("success"));
+        QCOMPARE(message->property("messageKind").toString(), QStringLiteral("error"));
+
+        list->setCurrentRow(1);
+
+        QVERIFY(detail->text().contains(QStringLiteral("正在加载工件详情")));
+        QCOMPARE(detail->property("messageKind").toString(), QStringLiteral("neutral"));
+        QVERIFY(message->text().contains(QStringLiteral("正在加载工件详情")));
+        QCOMPARE(message->property("messageKind").toString(), QStringLiteral("neutral"));
+    }
+
+    void emptyListResetsFailedCacheAndErrorMessageKinds() {
+        WorkpieceLibraryPage page;
+        page.setWorkpieces(QJsonArray{
+            summary(QStringLiteral("m-failed"), QStringLiteral("Failed"), 4, 5),
+        }, QString());
+        auto *list = page.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *detail = page.findChild<QLabel *>(
+            QStringLiteral("workpieceDetailsSummaryLabel"));
+        auto *message = page.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"));
+        QVERIFY(list != nullptr);
+        QVERIFY(detail != nullptr);
+        QVERIFY(message != nullptr);
+        list->setCurrentRow(0);
+        QJsonObject failed = summary(
+            QStringLiteral("m-failed"), QStringLiteral("Failed"), 4, 5);
+        failed.insert(QStringLiteral("fast_cache"), QJsonObject{
+            {QStringLiteral("state"), QStringLiteral("failed")},
+            {QStringLiteral("completed"), 3},
+            {QStringLiteral("total"), 9},
+            {QStringLiteral("elapsed_ms"), 12.0},
+            {QStringLiteral("error"), QStringLiteral("构建失败")},
+        });
+        page.setWorkpieceDetails(failed);
+        page.setOperationError(QStringLiteral("OLD_ERROR"), QStringLiteral("旧错误"));
+        QCOMPARE(detail->property("messageKind").toString(), QStringLiteral("error"));
+        QCOMPARE(message->property("messageKind").toString(), QStringLiteral("error"));
+
+        page.setWorkpieces(QJsonArray(), QString());
+
+        QCOMPARE(detail->text(), QStringLiteral("请选择工件查看详情"));
+        QCOMPARE(detail->property("messageKind").toString(), QStringLiteral("neutral"));
+        QVERIFY(message->text().isEmpty());
+        QCOMPARE(message->property("messageKind").toString(), QStringLiteral("neutral"));
+    }
+
+    void detailFailureReplacesReadyCacheWithErrorPlaceholder() {
+        WorkpieceLibraryPage page;
+        QJsonObject ready = summary(
+            QStringLiteral("m-ready"), QStringLiteral("Ready"), 4, 5);
+        ready.insert(QStringLiteral("fast_cache"), QJsonObject{
+            {QStringLiteral("state"), QStringLiteral("ready")},
+        });
+        page.setWorkpieceDetails(ready);
+
+        page.handleBackendFailure(QStringLiteral("get_workpiece_details"),
+                                  QStringLiteral("DETAILS_FAILED"),
+                                  QStringLiteral("详情读取失败"));
+
+        auto *detail = page.findChild<QLabel *>(
+            QStringLiteral("workpieceDetailsSummaryLabel"));
+        QVERIFY(detail != nullptr);
+        QVERIFY(detail->text().contains(QStringLiteral("工件详情加载失败")));
+        QVERIFY(detail->text().contains(QStringLiteral("详情读取失败")));
+        QCOMPARE(detail->property("messageKind").toString(), QStringLiteral("error"));
+    }
+
     void registrationTaskStatusKeepsLastProgressOnOrdinaryFailure() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());

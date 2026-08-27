@@ -9,6 +9,7 @@
 #include <QImage>
 #include <QImageReader>
 #include <QJsonArray>
+#include <QLabel>
 #include <QListWidgetItem>
 #include <QMessageBox>
 #include <QSet>
@@ -101,6 +102,18 @@ QString fastCacheMessageKind(const QJsonObject &cache) {
     return cache.isEmpty() ? QStringLiteral("neutral") : QStringLiteral("warning");
 }
 
+QString compactRevision(const QString &revision) {
+    if (revision.size() <= 20) return revision;
+    return revision.left(8) + QChar(0x2026) + revision.right(8);
+}
+
+void presentLabel(QLabel *label, const QString &text, const QString &messageKind) {
+    label->setProperty("messageKind", messageKind);
+    label->style()->unpolish(label);
+    label->style()->polish(label);
+    label->setText(text);
+}
+
 QDateTime jobSubmittedAt(const QJsonObject &job) {
     const QJsonValue timestamp = job.value(QStringLiteral("last_submitted_at"));
     if (timestamp.isDouble()) {
@@ -142,6 +155,8 @@ WorkpieceLibraryPage::WorkpieceLibraryPage(QWidget *parent)
     ui->templateDetailsTable->horizontalHeader()->setStretchLastSection(true);
     ui->evolutionJobsTable->horizontalHeader()->setStretchLastSection(true);
     ui->workpieceDetailsSummaryLabel->setWordWrap(true);
+    ui->latestRegistrationResultLabel->setWordWrap(true);
+    ui->libraryMessageLabel->setWordWrap(true);
     ui->registrationProgressBar->setRange(0, 1);
     ui->registrationProgressBar->setValue(0);
     registrationElapsedTimer_.setInterval(100);
@@ -219,7 +234,10 @@ void WorkpieceLibraryPage::setWorkpieces(
         browsedWorkpieceId_.clear();
         workpieceDetails_ = QJsonObject();
         ui->templateDetailsTable->setRowCount(0);
-        ui->workpieceDetailsSummaryLabel->setText(QStringLiteral("请选择工件查看详情"));
+        presentLabel(ui->workpieceDetailsSummaryLabel,
+                     QStringLiteral("请选择工件查看详情"),
+                     QStringLiteral("neutral"));
+        showMessage(QString());
     }
     rebuildWorkpieceList();
     updateControlStates();
@@ -242,11 +260,9 @@ void WorkpieceLibraryPage::setWorkpieceDetails(const QJsonObject &details) {
     const QJsonObject fastCache = details.value(QStringLiteral("fast_cache")).toObject();
     const QString fastCacheText = fastCacheDescription(fastCache);
     if (!fastCacheText.isEmpty()) summary.append(QLatin1Char('\n') + fastCacheText);
-    ui->workpieceDetailsSummaryLabel->setProperty(
-        "messageKind", fastCacheMessageKind(fastCache));
-    ui->workpieceDetailsSummaryLabel->style()->unpolish(ui->workpieceDetailsSummaryLabel);
-    ui->workpieceDetailsSummaryLabel->style()->polish(ui->workpieceDetailsSummaryLabel);
-    ui->workpieceDetailsSummaryLabel->setText(summary);
+    presentLabel(ui->workpieceDetailsSummaryLabel, summary,
+                 fastCacheMessageKind(fastCache));
+    showMessage(QString());
     const QJsonArray templates = details.value(QStringLiteral("templates")).toArray();
     ui->templateDetailsTable->setRowCount(templates.size());
     for (int row = 0; row < templates.size(); ++row) {
@@ -382,16 +398,14 @@ void WorkpieceLibraryPage::setRegistrationResult(const QJsonObject &response) {
     const QString fastCacheRevision = response.value(
         QStringLiteral("fast_cache_revision")).toString();
     if (!fastCacheRevision.isEmpty()) {
-        result.append(QStringLiteral(" · 版本 %1").arg(fastCacheRevision));
+        result.append(QStringLiteral(" · 版本 %1").arg(
+            compactRevision(fastCacheRevision)));
     }
-    ui->latestRegistrationResultLabel->setProperty(
-        "messageKind", fastCacheMessageKind(fastCache));
-    ui->latestRegistrationResultLabel->style()->unpolish(
-        ui->latestRegistrationResultLabel);
-    ui->latestRegistrationResultLabel->style()->polish(
-        ui->latestRegistrationResultLabel);
-    ui->latestRegistrationResultLabel->setText(result);
+    presentLabel(ui->latestRegistrationResultLabel, result,
+                 fastCacheMessageKind(fastCache));
+    ui->latestRegistrationResultLabel->setToolTip(fastCacheRevision);
     showMessage(result);
+    ui->libraryMessageLabel->setToolTip(fastCacheRevision);
     if (draftMatchesSavedRegistration()) setDirty(false);
     publishRegistrationTaskStatus(QStringLiteral("active"), frontCount + backCount,
                                   frontCount + backCount, elapsedMs);
@@ -445,6 +459,11 @@ void WorkpieceLibraryPage::handleBackendFailure(const QString &command,
         registrationInFlight_ = false;
         stopRegistrationProgress();
         updateControlStates();
+    }
+    if (command == QStringLiteral("get_workpiece_details")) {
+        presentLabel(ui->workpieceDetailsSummaryLabel,
+                     QStringLiteral("工件详情加载失败：%1").arg(message),
+                     QStringLiteral("error"));
     }
     setOperationError(code, message);
 }
@@ -567,7 +586,10 @@ void WorkpieceLibraryPage::browseSelectedWorkpiece() {
     browsedWorkpieceId_ = id;
     workpieceDetails_ = QJsonObject();
     ui->templateDetailsTable->setRowCount(0);
-    ui->workpieceDetailsSummaryLabel->setText(QStringLiteral("正在加载工件详情…"));
+    presentLabel(ui->workpieceDetailsSummaryLabel,
+                 QStringLiteral("正在加载工件详情…"),
+                 QStringLiteral("neutral"));
+    showMessage(QStringLiteral("正在加载工件详情…"));
     ui->recycleNameConfirmationEdit->clear();
     updateControlStates();
     emit commandRequested(QStringLiteral("get_workpiece_details"), {
@@ -725,11 +747,9 @@ void WorkpieceLibraryPage::setDirty(bool dirty) {
 }
 
 void WorkpieceLibraryPage::showMessage(const QString &message, bool error) {
-    ui->libraryMessageLabel->setProperty(
-        "messageKind", error ? QStringLiteral("error") : QStringLiteral("neutral"));
-    ui->libraryMessageLabel->style()->unpolish(ui->libraryMessageLabel);
-    ui->libraryMessageLabel->style()->polish(ui->libraryMessageLabel);
-    ui->libraryMessageLabel->setText(message);
+    presentLabel(ui->libraryMessageLabel, message,
+                 error ? QStringLiteral("error") : QStringLiteral("neutral"));
+    ui->libraryMessageLabel->setToolTip(QString());
 }
 
 void WorkpieceLibraryPage::rebuildWorkpieceList() {

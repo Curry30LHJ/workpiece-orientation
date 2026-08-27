@@ -657,6 +657,37 @@ private slots:
         QVERIFY(!evidence.contains(QStringLiteral("局部匹配")));
     }
 
+    void legacyNonActiveGeometryKeepsRawStatusWording_data() {
+        QTest::addColumn<QString>("status");
+        QTest::addColumn<QString>("expectedLine");
+        QTest::newRow("low-confidence")
+            << QStringLiteral("low_confidence")
+            << QStringLiteral("几何规则：未应用（low_confidence）");
+        QTest::newRow("not-configured")
+            << QStringLiteral("not_configured")
+            << QStringLiteral("几何规则：未应用（not_configured）");
+    }
+
+    void legacyNonActiveGeometryKeepsRawStatusWording() {
+        QFETCH(QString, status);
+        QFETCH(QString, expectedLine);
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(directory, QStringLiteral("legacy-geometry.png"));
+        QVERIFY(!path.isEmpty());
+        InspectionPage page;
+        InspectionRecord record = resultRecord(QStringLiteral("legacy-geometry"), path);
+        record.response.insert(QStringLiteral("geometry_mask"), QJsonObject{
+            {QStringLiteral("status"), status},
+        });
+
+        page.showSingleResult(record);
+
+        const QStringList lines = page.findChild<QTextEdit *>(
+            QStringLiteral("evidenceTextEdit"))->toPlainText().split(QLatin1Char('\n'));
+        QCOMPARE(lines.value(2), expectedLine);
+    }
+
     void backendFailurePreservesVisibleImageAndEvidence() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());

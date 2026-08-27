@@ -22,7 +22,15 @@
 #include "inspectionimageview.h"
 
 namespace {
-QString geometryDescription(const QJsonObject &response) {
+QString legacyGeometryDescription(const QJsonObject &response) {
+    const QString status = response.value(QStringLiteral("geometry_mask"))
+                               .toObject().value(QStringLiteral("status")).toString();
+    if (status == QStringLiteral("active")) return QStringLiteral("已应用");
+    if (status.isEmpty()) return QStringLiteral("未提供");
+    return QStringLiteral("未应用（%1）").arg(status);
+}
+
+QString fastGeometryDescription(const QJsonObject &response) {
     QString status = response.value(QStringLiteral("geometry_status")).toString();
     if (status.isEmpty()) {
         status = response.value(QStringLiteral("geometry_mask"))
@@ -1145,7 +1153,7 @@ QString InspectionPage::evidenceSummary(const InspectionRecord &record) const {
             QStringLiteral("快速判别：%1（采用此结果）")
                 .arg(orientationText(record.label)),
             QStringLiteral("判别器：Ridge"),
-            QStringLiteral("几何规则：%1").arg(geometryDescription(response)),
+            QStringLiteral("几何规则：%1").arg(fastGeometryDescription(response)),
         };
         if (response.contains(QStringLiteral("decision_margin"))) {
             lines.append(QStringLiteral("判别间隔：%1")
@@ -1178,7 +1186,8 @@ QString InspectionPage::evidenceSummary(const InspectionRecord &record) const {
         localLine.append(QStringLiteral("（采用此结果）"));
     }
     QStringList lines{globalLine, localLine,
-                      QStringLiteral("几何规则：%1").arg(geometryDescription(response))};
+                      QStringLiteral("几何规则：%1").arg(
+                          legacyGeometryDescription(response))};
     if (record.needsReview) {
         const QString reason = response.value(QStringLiteral("review_reason"))
                                    .toString(QStringLiteral("证据需人工复核"));
