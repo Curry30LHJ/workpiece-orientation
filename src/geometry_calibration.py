@@ -304,6 +304,11 @@ def _coarse_shape(anchor: Mapping[str, Any], image_shape: tuple[int, int]) -> di
     return result
 
 
+def public_coarse_shape(anchor: Mapping[str, Any], image_shape: tuple[int, int]) -> dict[str, Any]:
+    """Expose the established coarse-anchor projection for fast consumers."""
+    return _coarse_shape(anchor, image_shape)
+
+
 def _rule_expected(rule: Mapping[str, Any], anchor: Mapping[str, Any]) -> dict[str, Any]:
     shape = rule.get("shape")
     if shape not in SUPPORTED_SHAPES:
@@ -336,6 +341,11 @@ def _rule_expected(rule: Mapping[str, Any], anchor: Mapping[str, Any]) -> dict[s
     return result
 
 
+def public_rule_expected(rule: Mapping[str, Any], anchor: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose the established object-relative rule projection for fast consumers."""
+    return _rule_expected(rule, anchor)
+
+
 def _offset_shape(shape: Mapping[str, Any], margin_ratio: float) -> dict[str, Any]:
     margin = _finite(margin_ratio, "margin_ratio")
     if margin < -0.94 or margin > 0.94:
@@ -349,6 +359,11 @@ def _offset_shape(shape: Mapping[str, Any], margin_ratio: float) -> dict[str, An
         result["rx"] = max(1.0, float(shape["rx"]) * factor)
         result["ry"] = max(1.0, float(shape["ry"]) * factor)
     return result
+
+
+def public_offset_shape(shape: Mapping[str, Any], margin_ratio: float) -> dict[str, Any]:
+    """Expose the established signed margin projection for fast consumers."""
+    return _offset_shape(shape, margin_ratio)
 
 
 def _shape_mask(shape: Mapping[str, Any], image_shape: tuple[int, int], mode: str, margin_ratio: float) -> np.ndarray:
@@ -372,6 +387,13 @@ def _shape_mask(shape: Mapping[str, Any], image_shape: tuple[int, int], mode: st
     if mode == "outside":
         mask = cv2.bitwise_not(mask)
     return mask
+
+
+def public_shape_mask(
+    shape: Mapping[str, Any], image_shape: tuple[int, int], mode: str, margin_ratio: float,
+) -> np.ndarray:
+    """Expose the established shape-mask semantics for fast consumers."""
+    return _shape_mask(shape, image_shape, mode, margin_ratio)
 
 
 def _select_aligned(value: Any, keep: np.ndarray, axis: int) -> Any:

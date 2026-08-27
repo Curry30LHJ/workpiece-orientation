@@ -8,6 +8,13 @@ from src import geometry_calibration
 from src.geometry_calibration import (
     GeometryCalibrator,
     _filter_rule_candidates,
+    _coarse_shape,
+    _offset_shape,
+    _rule_expected,
+    public_coarse_shape,
+    public_offset_shape,
+    public_rule_expected,
+    public_shape_mask,
     _shape_error,
     _shape_extents,
     _shape_mask,
@@ -571,6 +578,36 @@ def test_signed_inside_and_outside_masks_use_one_boundary_formula():
 
     assert np.count_nonzero(inside[0]) < np.count_nonzero(inside[1]) < np.count_nonzero(inside[2])
     assert np.count_nonzero(outside[0]) > np.count_nonzero(outside[1]) > np.count_nonzero(outside[2])
+
+
+@pytest.mark.parametrize("shape", [
+    {"shape": "circle", "cx": 80.0, "cy": 60.0, "rx": 32.0, "ry": 32.0, "angle_deg": 0.0},
+    {"shape": "ellipse", "cx": 80.0, "cy": 60.0, "rx": 40.0, "ry": 30.0, "angle_deg": 17.0},
+    {"shape": "rotated_rectangle", "cx": 80.0, "cy": 60.0, "half_width": 40.0, "half_height": 30.0, "angle_deg": 17.0},
+])
+@pytest.mark.parametrize("mode", ["inside", "outside"])
+@pytest.mark.parametrize("margin", [-0.04, 0.0, 0.02])
+def test_public_shape_margin_wrappers_match_private_mask_semantics(shape, mode, margin):
+    assert public_offset_shape(shape, margin) == _offset_shape(shape, margin)
+    assert np.array_equal(
+        public_shape_mask(shape, (140, 180), mode, margin),
+        _shape_mask(shape, (140, 180), mode, margin),
+    )
+
+
+def test_public_shape_projection_wrappers_match_private_semantics():
+    anchor_profile = {
+        "shape": "ellipse",
+        "coarse": {"cx": 0.5, "cy": 0.5, "rx": 0.4, "ry": 0.3, "angle_deg": 21.0},
+    }
+    rule = {
+        "shape": "ellipse",
+        "geometry": {"cx": 0.1, "cy": -0.2, "rx": 0.5, "ry": 0.4, "angle_deg": 7.0},
+    }
+    private_anchor = _coarse_shape(anchor_profile, (140, 180))
+
+    assert public_coarse_shape(anchor_profile, (140, 180)) == private_anchor
+    assert public_rule_expected(rule, private_anchor) == _rule_expected(rule, private_anchor)
 
 
 def test_fit_keeps_raw_shape_and_scales_only_effective_dimensions():
