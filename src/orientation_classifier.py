@@ -89,6 +89,7 @@ class TemplateCache:
     geometry_template_indices: dict[str, list[int]] | None = None
     geometry_unsafe: bool = False
     fast_runtime: FastRuntimeCache | None = None
+    fast_template_signature: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -309,13 +310,18 @@ class OrientationClassifier:
         front_paths: Sequence[Path],
         back_paths: Sequence[Path],
         progress_callback: Callable[[str, int, int], None] | None = None,
+        *,
+        library_revision: int = 1,
     ) -> TemplateCache:
+        if type(library_revision) is not int or library_revision < 0:
+            raise ValueError("library_revision must be a non-negative integer")
         return self._build_template_cache(
             front_paths,
             back_paths,
             progress_callback,
             include_local=self.inference_mode != "fast_geometry",
             attach_fast=self.inference_mode in {"fast_geometry", "compare"},
+            library_revision=library_revision,
         )
 
     def _build_template_cache(
@@ -326,6 +332,7 @@ class OrientationClassifier:
         *,
         include_local: bool,
         attach_fast: bool,
+        library_revision: int,
     ) -> TemplateCache:
         if not front_paths or not back_paths:
             raise ValueError("Each orientation requires at least one template")
@@ -356,13 +363,14 @@ class OrientationClassifier:
             raw_global_vectors={label: vectors.copy() for label, vectors in global_vectors.items()},
             raw_local_features=local_features,
             ignored_regions={},
+            fast_template_signature=self._fast_template_signature(front_paths, back_paths),
         )
         if attach_fast and self.fast_engine is not None:
-            fast_runtime = self.fast_engine.build_cache(
+            fast_runtime = self._fast_build_engine().build_cache(
                 front_paths,
                 back_paths,
                 geometry_profile=None,
-                library_revision=1,
+                library_revision=library_revision,
                 model_fingerprint=self.model_fingerprint,
                 progress_callback=self._adapt_fast_progress(progress_callback),
             )
@@ -385,6 +393,22 @@ class OrientationClassifier:
                 return
 
         return report
+
+    def _fast_build_engine(self) -> FastOrientationEngine:
+        if self.fast_engine is None:
+            raise OrientationClassifierError("FAST_CACHE_NOT_READY: fast engine is unavailable")
+        engine = self.fast_engine
+        if not isinstance(engine, FastOrientationEngine):
+            return engine
+
+        def background_embed(images: Sequence[np.ndarray]) -> list[np.ndarray]:
+            return self.model_gate.run_background_step(lambda: engine.embed_batch(images))
+
+        return FastOrientationEngine(
+            background_embed,
+            engine.geometry,
+            image_reader=engine.image_reader,
+        )
 
     @staticmethod
     def _image_fingerprint(path: Path) -> str:
@@ -421,6 +445,64 @@ class OrientationClassifier:
         }
 
     @staticmethod
+    def _fast_image_fingerprint(path: Path) -> str:
+        image = _read_image(Path(path))
+        normalized = np.ascontiguousarray(image)
+        digest = hashlib.sha256()
+        digest.update(str(normalized.shape).encode("ascii"))
+        digest.update(normalized.dtype.str.encode("ascii"))
+        digest.update(normalized.tobytes())
+        return digest.hexdigest()
+
+    @classmethod
+    def _fast_template_signature(
+        cls,
+        front_paths: Sequence[Path],
+        back_paths: Sequence[Path],
+    ) -> dict[str, Any]:
+        signature: dict[str, Any] = {}
+        for label, paths in (("front", front_paths), ("back", back_paths)):
+            signature[label] = [
+                {
+                    "path": str(Path(path)),
+                    "sha256": cls._fast_image_fingerprint(Path(path)),
+                }
+                for path in paths
+            ]
+        encoded = json.dumps(
+            {"front": signature["front"], "back": signature["back"]},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        signature["combined_sha256"] = hashlib.sha256(encoded).hexdigest()
+        return signature
+
+    @staticmethod
+    def _fast_template_signatures_match(
+        cached: Any,
+        actual: Any,
+    ) -> bool:
+        if not isinstance(cached, Mapping) or not isinstance(actual, Mapping):
+            return False
+        for label in ("front", "back"):
+            cached_entries = cached.get(label)
+            actual_entries = actual.get(label)
+            if not isinstance(cached_entries, list) or not isinstance(actual_entries, list):
+                return False
+            if len(cached_entries) != len(actual_entries):
+                return False
+            for cached_entry, actual_entry in zip(cached_entries, actual_entries):
+                if not isinstance(cached_entry, Mapping) or not isinstance(actual_entry, Mapping):
+                    return False
+                if cached_entry.get("sha256") != actual_entry.get("sha256"):
+                    return False
+                if Path(str(cached_entry.get("path", ""))).name != Path(
+                    str(actual_entry.get("path", ""))
+                ).name:
+                    return False
+        return True
+
+    @staticmethod
     def _cache_for_persistence(cache: TemplateCache) -> TemplateCache:
         """Persist the unfiltered base cache; active masks are restored separately."""
         raw = getattr(cache, "raw_local_features", None) or cache.local_features
@@ -432,6 +514,7 @@ class OrientationClassifier:
             raw_local_features=raw,
             ignored_regions={},
             fast_runtime=None,
+            fast_template_signature=getattr(cache, "fast_template_signature", None),
         )
 
     @staticmethod
@@ -450,6 +533,7 @@ class OrientationClassifier:
             geometry_template_indices=getattr(cache, "geometry_template_indices", None),
             geometry_unsafe=bool(getattr(cache, "geometry_unsafe", False)),
             fast_runtime=getattr(cache, "fast_runtime", None),
+            fast_template_signature=getattr(cache, "fast_template_signature", None),
         )
 
     @staticmethod
@@ -538,10 +622,7 @@ class OrientationClassifier:
         if cache.model_fingerprint != self.model_fingerprint:
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: model fingerprint differs")
         geometry_revision = self._record_geometry_revision(record)
-        if (
-            geometry_revision is not None
-            and cache.geometry_profile_revision != geometry_revision
-        ):
+        if cache.geometry_profile_revision != geometry_revision:
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: geometry revision differs")
         expected_counts = {
             "front": len(record.front_images),
@@ -549,6 +630,20 @@ class OrientationClassifier:
         }
         if cache.template_counts != expected_counts:
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: template counts differ")
+        try:
+            actual_signature = self._fast_template_signature(
+                record.front_images,
+                record.back_images,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "FAST_CACHE_REVISION_MISMATCH: template content is unavailable"
+            ) from exc
+        if not self._fast_template_signatures_match(
+            cache.template_signature,
+            actual_signature,
+        ):
+            raise ValueError("FAST_CACHE_REVISION_MISMATCH: template content differs")
 
     def save_template_cache(self, record: Any, cache: TemplateCache) -> None:
         """Atomically persist a base template cache for one workpiece."""
@@ -578,20 +673,22 @@ class OrientationClassifier:
         root = Path(record.root)
         target = root / FAST_RUNTIME_CACHE_FILE_NAME
         temporary_root = root / f".fast-runtime-{uuid.uuid4().hex}"
-        temporary_root.mkdir()
-        temporary = temporary_root / FAST_RUNTIME_CACHE_FILE_NAME
-        payload = {
-            "signature": self._fast_persistence_signature(record, cache),
-            "cache": cache,
-        }
+        temporary_root_created = False
         try:
+            temporary_root.mkdir()
+            temporary_root_created = True
+            temporary = temporary_root / FAST_RUNTIME_CACHE_FILE_NAME
+            payload = {
+                "signature": self._fast_persistence_signature(record, cache),
+                "cache": cache,
+            }
             with temporary.open("wb") as stream:
                 pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, target)
         finally:
-            if temporary_root.exists():
+            if temporary_root_created and temporary_root.exists():
                 shutil.rmtree(temporary_root)
 
     def load_fast_runtime_cache(self, record: Any) -> FastRuntimeCache | None:
@@ -620,7 +717,7 @@ class OrientationClassifier:
     ) -> FastRuntimeCache:
         if self.fast_engine is None:
             raise OrientationClassifierError("FAST_CACHE_NOT_READY: fast engine is unavailable")
-        return self.fast_engine.build_cache(
+        return self._fast_build_engine().build_cache(
             record.front_images,
             record.back_images,
             geometry_profile=geometry_profile,
@@ -658,7 +755,15 @@ class OrientationClassifier:
                     None,
                     include_local=True,
                     attach_fast=False,
+                    library_revision=int(getattr(record, "revision", 1)),
                 )
+            cache = replace(
+                cache,
+                fast_template_signature=self._fast_template_signature(
+                    record.front_images,
+                    record.back_images,
+                ),
+            )
             fast_runtime = self.load_fast_runtime_cache(record)
             if fast_runtime is not None:
                 cache = replace(cache, fast_runtime=fast_runtime)
@@ -852,6 +957,10 @@ class OrientationClassifier:
             geometry_template_indices=geometry_indices,
             ignored_regions={},
             geometry_unsafe=geometry_unsafe,
+            fast_template_signature=self._fast_template_signature(
+                record.front_images,
+                record.back_images,
+            ),
         )
         if self.inference_mode in {"fast_geometry", "compare"} and self.fast_engine is not None:
             fast_runtime = self.build_fast_runtime_cache(
@@ -1730,12 +1839,16 @@ class OrientationClassifier:
                     "FAST_CACHE_REVISION_MISMATCH: library revision differs"
                 )
             geometry_revision = getattr(cache, "geometry_profile_revision", None)
-            if (
-                geometry_revision is not None
-                and runtime.geometry_profile_revision != geometry_revision
-            ):
+            if runtime.geometry_profile_revision != geometry_revision:
                 raise OrientationClassifierError(
                     "FAST_CACHE_REVISION_MISMATCH: geometry revision differs"
+                )
+            if not self._fast_template_signatures_match(
+                runtime.template_signature,
+                getattr(cache, "fast_template_signature", None),
+            ):
+                raise OrientationClassifierError(
+                    "FAST_CACHE_REVISION_MISMATCH: template content differs"
                 )
             try:
                 FastOrientationEngine._validate_cache(runtime)

@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 import pickle
 import sys
+import threading
 import time
 import types
 
@@ -102,7 +103,18 @@ def build_fast_runtime(
     model_fingerprint,
     geometry_profile=None,
 ):
-    def embed_batch(images):
+    engine = make_fast_engine()
+    return engine.build_cache(
+        front,
+        back,
+        geometry_profile=geometry_profile,
+        library_revision=library_revision,
+        model_fingerprint=model_fingerprint,
+    )
+
+
+def make_fast_engine(embed_batch=None):
+    def default_embed_batch(images):
         return [
             np.asarray(
                 [float(np.mean(image)) / 255.0, 1.0 - float(np.mean(image)) / 255.0],
@@ -111,17 +123,10 @@ def build_fast_runtime(
             for image in images
         ]
 
-    engine = FastOrientationEngine(
-        embed_batch,
+    return FastOrientationEngine(
+        embed_batch or default_embed_batch,
         FastGeometryProcessor(FakeGeometryCalibrator()),
         image_reader=lambda path: cv2.imread(str(path), cv2.IMREAD_COLOR),
-    )
-    return engine.build_cache(
-        front,
-        back,
-        geometry_profile=geometry_profile,
-        library_revision=library_revision,
-        model_fingerprint=model_fingerprint,
     )
 
 
@@ -481,6 +486,7 @@ def test_fast_path_timing_includes_decode_and_full_classifier_call(classifier, t
         library_revision=4,
         model_fingerprint="model-a",
     )
+    base = classifier.build_template_cache(front, back)
 
     class DelayedFastEngine(ReturningFastEngine):
         def predict(self, image, cache):
@@ -499,14 +505,7 @@ def test_fast_path_timing_includes_decode_and_full_classifier_call(classifier, t
     classifier.inference_mode = "fast_geometry"
     classifier.model_fingerprint = "model-a"
     classifier.fast_engine = DelayedFastEngine()
-    cache = TemplateCache(
-        global_vectors={
-            "front": np.asarray([[1.0, 0.0]], dtype=np.float32),
-            "back": np.asarray([[0.0, 1.0]], dtype=np.float32),
-        },
-        local_features={"front": [{}], "back": [{}]},
-        fast_runtime=runtime,
-    )
+    cache = replace(base, fast_runtime=runtime)
 
     result = classifier.predict_with_cache(
         cache,
@@ -528,17 +527,11 @@ def test_fast_array_input_reports_zero_decode_time(classifier, tmp_path):
         library_revision=4,
         model_fingerprint="model-a",
     )
+    base = classifier.build_template_cache(front, back)
     classifier.inference_mode = "fast_geometry"
     classifier.model_fingerprint = "model-a"
     classifier.fast_engine = ReturningFastEngine()
-    cache = TemplateCache(
-        global_vectors={
-            "front": np.asarray([[1.0, 0.0]], dtype=np.float32),
-            "back": np.asarray([[0.0, 1.0]], dtype=np.float32),
-        },
-        local_features={"front": [{}], "back": [{}]},
-        fast_runtime=runtime,
-    )
+    cache = replace(base, fast_runtime=runtime)
 
     result = classifier.predict_with_cache(
         cache,
@@ -547,6 +540,332 @@ def test_fast_array_input_reports_zero_decode_time(classifier, tmp_path):
     )
 
     assert result["timings_ms"]["decode"] == 0.0
+
+
+def test_profiled_fast_cache_is_rejected_against_no_profile_record(classifier, tmp_path):
+    front = [write_marker(tmp_path / "profiled-front.png", 1)]
+    back = [write_marker(tmp_path / "profiled-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        geometry_profile=geometry_profile(),
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    root = tmp_path / "record"
+    root.mkdir()
+    profiled_record = SimpleNamespace(
+        root=root,
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=3,
+    )
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(profiled_record, runtime)
+    no_profile_record = SimpleNamespace(
+        root=root,
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+
+    assert classifier.load_fast_runtime_cache(no_profile_record) is None
+
+    base = classifier.build_template_cache(front, back)
+    classifier.inference_mode = "fast_geometry"
+    classifier.fast_engine = ReturningFastEngine()
+    with pytest.raises(OrientationClassifierError, match="FAST_CACHE_REVISION_MISMATCH"):
+        classifier.predict_with_cache(
+            replace(base, fast_runtime=runtime, geometry_profile_revision=None),
+            np.full((8, 8, 3), 3, dtype=np.uint8),
+            library_revision=7,
+        )
+    assert classifier.fast_engine.calls == 0
+
+
+def test_no_profile_fast_cache_is_accepted_only_for_no_profile(classifier, tmp_path):
+    front = [write_marker(tmp_path / "no-profile-front.png", 1)]
+    back = [write_marker(tmp_path / "no-profile-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=5,
+        model_fingerprint="model-a",
+    )
+    root = tmp_path / "record"
+    root.mkdir()
+    no_profile_record = SimpleNamespace(
+        root=root,
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=5,
+        geometry_profile_revision=None,
+    )
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(no_profile_record, runtime)
+
+    assert classifier.load_fast_runtime_cache(no_profile_record) is not None
+
+    profiled_record = SimpleNamespace(
+        root=root,
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=5,
+        geometry_profile_revision=3,
+    )
+    assert classifier.load_fast_runtime_cache(profiled_record) is None
+
+    base = classifier.build_template_cache(front, back)
+    classifier.inference_mode = "fast_geometry"
+    classifier.fast_engine = ReturningFastEngine()
+    accepted = classifier.predict_with_cache(
+        replace(base, fast_runtime=runtime, geometry_profile_revision=None),
+        np.full((8, 8, 3), 3, dtype=np.uint8),
+        library_revision=5,
+    )
+    assert accepted["label"] == "front"
+    with pytest.raises(OrientationClassifierError, match="FAST_CACHE_REVISION_MISMATCH"):
+        classifier.predict_with_cache(
+            replace(base, fast_runtime=runtime, geometry_profile_revision=3),
+            np.full((8, 8, 3), 3, dtype=np.uint8),
+            library_revision=5,
+        )
+
+
+def test_fast_cache_save_rejects_same_count_different_template_content(classifier, tmp_path):
+    source_front = [write_marker(tmp_path / "source-front.png", 1)]
+    source_back = [write_marker(tmp_path / "source-back.png", 2)]
+    other_front = [write_marker(tmp_path / "other-front.png", 3)]
+    other_back = [write_marker(tmp_path / "other-back.png", 4)]
+    runtime = build_fast_runtime(
+        source_front,
+        source_back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    record = SimpleNamespace(
+        root=tmp_path / "record",
+        front_images=tuple(other_front),
+        back_images=tuple(other_back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+
+    with pytest.raises(ValueError, match="FAST_CACHE_REVISION_MISMATCH"):
+        classifier.save_fast_runtime_cache(record, runtime)
+
+    assert not (record.root / ".fast_runtime_cache.pkl").exists()
+
+
+def test_fast_cache_load_rejects_same_count_different_template_content(classifier, tmp_path):
+    source_front = [write_marker(tmp_path / "load-source-front.png", 1)]
+    source_back = [write_marker(tmp_path / "load-source-back.png", 2)]
+    other_front = [write_marker(tmp_path / "load-other-front.png", 3)]
+    other_back = [write_marker(tmp_path / "load-other-back.png", 4)]
+    runtime = build_fast_runtime(
+        source_front,
+        source_back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    record = SimpleNamespace(
+        root=tmp_path / "record",
+        front_images=tuple(other_front),
+        back_images=tuple(other_back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    persistence_signature = {
+        "format_version": runtime.format_version,
+        "library_revision": 7,
+        "geometry_profile_revision": None,
+        "model_fingerprint": "model-a",
+        "template_content": classifier._template_cache_signature(other_front, other_back),
+        "template_counts": {"front": 1, "back": 1},
+        "feature_layout": ("raw", "front_masked", "back_masked"),
+        "feature_dim": runtime.ridge_head.feature_dim,
+    }
+    with (record.root / ".fast_runtime_cache.pkl").open("wb") as stream:
+        pickle.dump(
+            {"signature": persistence_signature, "cache": runtime},
+            stream,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    assert classifier.load_fast_runtime_cache(record) is None
+    assert (record.root / ".fast_runtime_cache.pkl").is_file()
+
+
+def test_fast_prediction_rejects_runtime_from_same_count_different_templates(classifier, tmp_path):
+    source_front = [write_marker(tmp_path / "predict-source-front.png", 1)]
+    source_back = [write_marker(tmp_path / "predict-source-back.png", 2)]
+    other_front = [write_marker(tmp_path / "predict-other-front.png", 3)]
+    other_back = [write_marker(tmp_path / "predict-other-back.png", 4)]
+    runtime = build_fast_runtime(
+        source_front,
+        source_back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    base = classifier.build_template_cache(other_front, other_back)
+    classifier.inference_mode = "fast_geometry"
+    classifier.model_fingerprint = "model-a"
+    classifier.fast_engine = ReturningFastEngine()
+
+    with pytest.raises(OrientationClassifierError, match="FAST_CACHE_REVISION_MISMATCH"):
+        classifier.predict_with_cache(
+            replace(base, fast_runtime=runtime),
+            np.full((8, 8, 3), 3, dtype=np.uint8),
+            library_revision=7,
+        )
+
+    assert classifier.fast_engine.calls == 0
+
+
+def test_fast_template_build_binds_explicit_library_revision(classifier, tmp_path):
+    front = [write_marker(tmp_path / "revision-front.png", 1)]
+    back = [write_marker(tmp_path / "revision-back.png", 2)]
+    classifier.inference_mode = "fast_geometry"
+    classifier.model_fingerprint = "model-a"
+    classifier.fast_engine = make_fast_engine()
+
+    cache = classifier.build_template_cache(front, back, library_revision=4)
+    result = classifier.predict_with_cache(
+        cache,
+        np.full((8, 8, 3), 1, dtype=np.uint8),
+        library_revision=4,
+    )
+
+    assert cache.fast_runtime is not None
+    assert cache.fast_runtime.library_revision == 4
+    assert result["library_revision"] == 4
+    with pytest.raises(OrientationClassifierError, match="FAST_CACHE_REVISION_MISMATCH"):
+        classifier.predict_with_cache(
+            cache,
+            np.full((8, 8, 3), 1, dtype=np.uint8),
+            library_revision=1,
+        )
+
+
+def test_fast_cache_build_batches_yield_to_waiting_online_prediction(classifier, tmp_path):
+    front = [write_marker(tmp_path / "gate-front.png", 1)]
+    back = [write_marker(tmp_path / "gate-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=2,
+        model_fingerprint="model-a",
+    )
+    base = classifier.build_template_cache(front, back)
+    first_build_entered = threading.Event()
+    release_first_build = threading.Event()
+    online_submitted = threading.Event()
+    online_entered = threading.Event()
+    entries = []
+    build_batches = 0
+
+    def ordered_embed(images):
+        nonlocal build_batches
+        if len(images) == 3:
+            entries.append("online")
+            online_entered.set()
+        else:
+            build_batches += 1
+            entries.append(f"build-{build_batches}")
+            if build_batches == 1:
+                first_build_entered.set()
+                assert release_first_build.wait(2)
+        return [
+            np.asarray([float(np.mean(image)), 255.0 - float(np.mean(image))], np.float32)
+            for image in images
+        ]
+
+    classifier.inference_mode = "fast_geometry"
+    classifier.model_fingerprint = "model-a"
+    classifier.fast_engine = make_fast_engine(ordered_embed)
+    record = SimpleNamespace(
+        root=tmp_path,
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=2,
+        geometry_profile_revision=None,
+    )
+    errors = []
+
+    def build():
+        try:
+            classifier.build_fast_runtime_cache(record, None)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def predict():
+        online_submitted.set()
+        try:
+            classifier.predict_fast_with_cache(
+                replace(base, fast_runtime=runtime),
+                np.full((8, 8, 3), 1, dtype=np.uint8),
+                library_revision=2,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    builder = threading.Thread(target=build)
+    builder.start()
+    assert first_build_entered.wait(2)
+    online = threading.Thread(target=predict)
+    online.start()
+    assert online_submitted.wait(1)
+    time.sleep(0.03)
+    online_overlapped_build = online_entered.is_set()
+    release_first_build.set()
+    for thread in (builder, online):
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert online_overlapped_build is False
+    assert entries[:3] == ["build-1", "online", "build-2"]
+
+
+def test_fast_cache_prewrite_failure_cleans_temp_and_preserves_sidecar(
+    classifier, tmp_path, monkeypatch
+):
+    front = [write_marker(tmp_path / "cleanup-front.png", 1)]
+    back = [write_marker(tmp_path / "cleanup-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    record = SimpleNamespace(
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, runtime)
+    sidecar = record.root / ".fast_runtime_cache.pkl"
+    previous = sidecar.read_bytes()
+
+    def fail_signature(*_args, **_kwargs):
+        raise RuntimeError("signature failed")
+
+    monkeypatch.setattr(classifier, "_fast_persistence_signature", fail_signature)
+    with pytest.raises(RuntimeError, match="signature failed"):
+        classifier.save_fast_runtime_cache(record, runtime)
+
+    assert sidecar.read_bytes() == previous
+    assert not any(path.name.startswith(".fast-runtime-") for path in record.root.iterdir())
 
 
 def test_predict_with_cache_uses_supplied_snapshot_not_mutable_map(classifier, tmp_path):
