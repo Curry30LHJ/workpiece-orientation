@@ -170,6 +170,7 @@ private slots:
         FakeProcessLauncher launcher;
         AppConfig config = configFor(port, 1000);
         config.localSearchMode = QStringLiteral("exhaustive");
+        config.inferenceMode = QStringLiteral("fast_geometry");
         BackendProcessManager manager(config, &client, &launcher);
         QSignalSpy readySpy(&manager, &BackendProcessManager::backendReady);
         QObject::connect(&launcher, &FakeProcessLauncher::startRequested, &server, [&]() {
@@ -187,6 +188,14 @@ private slots:
         QCOMPARE(
             launcher.lastArguments.value(modeIndex + 1),
             QStringLiteral("exhaustive")
+        );
+        const int inferenceModeIndex = launcher.lastArguments.indexOf(
+            QStringLiteral("--inference-mode")
+        );
+        QVERIFY(inferenceModeIndex >= 0);
+        QCOMPARE(
+            launcher.lastArguments.value(inferenceModeIndex + 1),
+            QStringLiteral("fast_geometry")
         );
         QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1500);
         QVERIFY(manager.ownedByThisSession());

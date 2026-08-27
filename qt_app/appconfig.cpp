@@ -80,6 +80,25 @@ std::optional<AppConfig> AppConfig::load(const QString &path, QString *error) {
         }
         config.localSearchMode = mode;
     }
+    const QJsonValue inferenceModeValue = object.value(QStringLiteral("inference_mode"));
+    if (!inferenceModeValue.isUndefined()) {
+        if (!inferenceModeValue.isString()) {
+            setError(error, QStringLiteral(
+                "inference_mode must be legacy, fast_geometry, or compare"
+            ));
+            return std::nullopt;
+        }
+        const QString mode = inferenceModeValue.toString().trimmed().toLower();
+        if (mode != QStringLiteral("legacy")
+            && mode != QStringLiteral("fast_geometry")
+            && mode != QStringLiteral("compare")) {
+            setError(error, QStringLiteral(
+                "inference_mode must be legacy, fast_geometry, or compare"
+            ));
+            return std::nullopt;
+        }
+        config.inferenceMode = mode;
+    }
     const QString hostText = object.value(QStringLiteral("host")).toString();
     if (hostText != QStringLiteral("127.0.0.1")) {
         setError(error, QStringLiteral("host must be 127.0.0.1"));

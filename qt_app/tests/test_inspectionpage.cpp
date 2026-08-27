@@ -577,6 +577,86 @@ private slots:
         QVERIFY(rawEvidence.contains(QStringLiteral("7.3")));
     }
 
+    void fastPredictionShowsRidgeAndGeometryWithoutLocalEvidence() {
+        InspectionPage page;
+
+        page.handleBackendResponse(QStringLiteral("predict"), QJsonObject{
+            {QStringLiteral("label"), QStringLiteral("front")},
+            {QStringLiteral("inference_engine"), QStringLiteral("fast_geometry")},
+            {QStringLiteral("decision_source"), QStringLiteral("fast_ridge")},
+            {QStringLiteral("decision_margin"), 0.183},
+            {QStringLiteral("geometry_status"), QStringLiteral("active")},
+            {QStringLiteral("needs_review"), false},
+            {QStringLiteral("fast_cache_revision"), QStringLiteral("fast-revision-9")},
+            {QStringLiteral("local_prediction"), QStringLiteral("back")},
+            {QStringLiteral("local_scores"), QJsonObject{
+                {QStringLiteral("ALIKED-LightGlue-ORB-matching-points"), 99.0}}},
+            {QStringLiteral("timings_ms"), QJsonObject{
+                {QStringLiteral("decode"), 0.4},
+                {QStringLiteral("geometry_context"), 1.1},
+                {QStringLiteral("geometry_fit"), 3.1},
+                {QStringLiteral("mask_build"), 2.0},
+                {QStringLiteral("global_batch"), 7.2},
+                {QStringLiteral("linear_head"), 1.0},
+                {QStringLiteral("total"), 14.8}}},
+        });
+
+        const QString evidence = page.findChild<QTextEdit *>(
+            QStringLiteral("evidenceTextEdit"))->toPlainText();
+        const QString rawEvidence = page.findChild<QTextEdit *>(
+            QStringLiteral("rawEvidenceTextEdit"))->toPlainText();
+        const QString combined = evidence + QLatin1Char('\n') + rawEvidence;
+        QVERIFY(evidence.contains(QStringLiteral("快速判别")));
+        QVERIFY(evidence.contains(QStringLiteral("正面")));
+        QVERIFY(evidence.contains(QStringLiteral("采用此结果")));
+        QVERIFY(evidence.contains(QStringLiteral("几何规则：已应用")));
+        QVERIFY(rawEvidence.contains(QStringLiteral("fast_geometry")));
+        QVERIFY(rawEvidence.contains(QStringLiteral("fast_ridge")));
+        QVERIFY(rawEvidence.contains(QStringLiteral("0.183")));
+        QVERIFY(rawEvidence.contains(QStringLiteral("fast-revision-9")));
+        for (const QString &timing : {
+                 QStringLiteral("decode"), QStringLiteral("geometry_context"),
+                 QStringLiteral("geometry_fit"), QStringLiteral("mask_build"),
+                 QStringLiteral("global_batch"), QStringLiteral("linear_head"),
+                 QStringLiteral("total")}) {
+            QVERIFY2(rawEvidence.contains(timing), qPrintable(timing));
+        }
+        for (const QString &forbidden : {
+                 QStringLiteral("局部匹配"), QStringLiteral("局部候选"),
+                 QStringLiteral("ALIKED"), QStringLiteral("LightGlue"),
+                 QStringLiteral("ORB"), QStringLiteral("matching-points"),
+                 QStringLiteral("匹配点")}) {
+            QVERIFY2(!combined.contains(forbidden), qPrintable(forbidden));
+        }
+    }
+
+    void fastReviewKeepsDirectionAndShowsBackendReason() {
+        InspectionPage page;
+
+        page.handleBackendResponse(QStringLiteral("predict"), QJsonObject{
+            {QStringLiteral("label"), QStringLiteral("back")},
+            {QStringLiteral("inference_engine"), QStringLiteral("fast_geometry")},
+            {QStringLiteral("decision_source"), QStringLiteral("fast_ridge")},
+            {QStringLiteral("decision_margin"), 0.004},
+            {QStringLiteral("geometry_status"), QStringLiteral("low_confidence")},
+            {QStringLiteral("needs_review"), true},
+            {QStringLiteral("review_reason"),
+             QStringLiteral("几何拟合置信度不足；分类边界裕量不足")},
+            {QStringLiteral("timings_ms"), QJsonObject{{QStringLiteral("total"), 9.6}}},
+        });
+
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("resultLabel"))->text()
+                    .contains(QStringLiteral("反面")));
+        const QString evidence = page.findChild<QTextEdit *>(
+            QStringLiteral("evidenceTextEdit"))->toPlainText();
+        QVERIFY(evidence.contains(QStringLiteral("快速判别")));
+        QVERIFY(evidence.contains(QStringLiteral("反面")));
+        QVERIFY(evidence.contains(QStringLiteral("几何规则：置信度不足")));
+        QVERIFY(evidence.contains(
+            QStringLiteral("几何拟合置信度不足；分类边界裕量不足")));
+        QVERIFY(!evidence.contains(QStringLiteral("局部匹配")));
+    }
+
     void backendFailurePreservesVisibleImageAndEvidence() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());

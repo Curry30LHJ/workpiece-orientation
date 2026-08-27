@@ -253,6 +253,66 @@ private slots:
                  QStringLiteral("front:36.png"));
     }
 
+    void fastCacheStatesUseTextCountsElapsedAndRecoveryHints_data() {
+        QTest::addColumn<QString>("state");
+        QTest::addColumn<QString>("error");
+        QTest::addColumn<QString>("expectedStateText");
+        QTest::addColumn<QString>("expectedKind");
+        QTest::newRow("ready")
+            << QStringLiteral("ready") << QString()
+            << QStringLiteral("快速缓存：已就绪") << QStringLiteral("success");
+        QTest::newRow("queued")
+            << QStringLiteral("queued") << QString()
+            << QStringLiteral("快速缓存：排队中") << QStringLiteral("warning");
+        QTest::newRow("running")
+            << QStringLiteral("running") << QString()
+            << QStringLiteral("快速缓存：构建中") << QStringLiteral("warning");
+        QTest::newRow("failed")
+            << QStringLiteral("failed") << QStringLiteral("显存不足；请重新建立工件库")
+            << QStringLiteral("快速缓存：构建失败") << QStringLiteral("error");
+        QTest::newRow("not-ready")
+            << QStringLiteral("not_ready") << QString()
+            << QStringLiteral("快速缓存：未就绪") << QStringLiteral("warning");
+        QTest::newRow("capability-unavailable")
+            << QStringLiteral("not_ready")
+            << QStringLiteral("FAST_CACHE_CAPABILITY_UNAVAILABLE: 当前环境不支持快速缓存")
+            << QStringLiteral("快速缓存：能力不可用") << QStringLiteral("error");
+    }
+
+    void fastCacheStatesUseTextCountsElapsedAndRecoveryHints() {
+        QFETCH(QString, state);
+        QFETCH(QString, error);
+        QFETCH(QString, expectedStateText);
+        QFETCH(QString, expectedKind);
+        WorkpieceLibraryPage page;
+
+        page.setWorkpieceDetails(QJsonObject{
+            {QStringLiteral("id"), QStringLiteral("m-fast")},
+            {QStringLiteral("name"), QStringLiteral("M-fast")},
+            {QStringLiteral("template_counts"), QJsonObject{
+                {QStringLiteral("front"), 4}, {QStringLiteral("back"), 5}}},
+            {QStringLiteral("detectable"), true},
+            {QStringLiteral("fast_cache"), QJsonObject{
+                {QStringLiteral("state"), state},
+                {QStringLiteral("completed"), 3},
+                {QStringLiteral("total"), 9},
+                {QStringLiteral("elapsed_ms"), 125.5},
+                {QStringLiteral("error"), error}}},
+        });
+
+        auto *summaryLabel = page.findChild<QLabel *>(
+            QStringLiteral("workpieceDetailsSummaryLabel"));
+        QVERIFY(summaryLabel != nullptr);
+        const QString text = summaryLabel->text();
+        QVERIFY(text.contains(expectedStateText));
+        QVERIFY(text.contains(QStringLiteral("3/9")));
+        QVERIFY(text.contains(QStringLiteral("125.5 ms")));
+        if (!error.isEmpty()) {
+            QVERIFY(text.contains(error));
+        }
+        QCOMPARE(summaryLabel->property("messageKind").toString(), expectedKind);
+    }
+
     void evolutionRowsUseJobIdAndPreserveFailures() {
         WorkpieceLibraryPage page;
         QSignalSpy taskSpy(&page, &WorkpieceLibraryPage::taskStatusChanged);
@@ -417,6 +477,51 @@ private slots:
         QCOMPARE(page.findChild<QLabel *>(QStringLiteral("backTemplatesLabel"))->text(),
                  QStringLiteral("反面已选择 3 张"));
         QVERIFY(registerButton->isEnabled());
+    }
+
+    void fastBuildPhasesUseChineseProgressText_data() {
+        QTest::addColumn<QString>("phase");
+        QTest::addColumn<QString>("expected");
+        QTest::newRow("originals")
+            << QStringLiteral("fast_originals") << QStringLiteral("提取快速特征");
+        QTest::newRow("augmentation")
+            << QStringLiteral("fast_augmentation") << QStringLiteral("生成旋转增强");
+        QTest::newRow("ridge")
+            << QStringLiteral("fast_ridge") << QStringLiteral("构建快速判别器");
+    }
+
+    void fastBuildPhasesUseChineseProgressText() {
+        QFETCH(QString, phase);
+        QFETCH(QString, expected);
+        WorkpieceLibraryPage page;
+
+        page.setRegistrationProgress(QJsonObject{
+            {QStringLiteral("phase"), phase},
+            {QStringLiteral("completed"), 1},
+            {QStringLiteral("total"), 3},
+        }, 27);
+
+        const QString progress = page.findChild<QLabel *>(
+            QStringLiteral("registrationProgressLabel"))->text();
+        QVERIFY(progress.contains(expected));
+        QVERIFY(progress.contains(QStringLiteral("1/3")));
+    }
+
+    void registrationResultShowsFastCacheStateAndRevision() {
+        WorkpieceLibraryPage page;
+
+        page.setRegistrationResult(QJsonObject{
+            {QStringLiteral("template_counts"), QJsonObject{
+                {QStringLiteral("front"), 5}, {QStringLiteral("back"), 12}}},
+            {QStringLiteral("elapsed_ms"), 88.0},
+            {QStringLiteral("fast_cache_state"), QStringLiteral("ready")},
+            {QStringLiteral("fast_cache_revision"), QStringLiteral("fast-revision-9")},
+        });
+
+        const QString result = page.findChild<QLabel *>(
+            QStringLiteral("latestRegistrationResultLabel"))->text();
+        QVERIFY(result.contains(QStringLiteral("快速缓存：已就绪")));
+        QVERIFY(result.contains(QStringLiteral("fast-revision-9")));
     }
 
     void registrationTaskStatusKeepsLastProgressOnOrdinaryFailure() {

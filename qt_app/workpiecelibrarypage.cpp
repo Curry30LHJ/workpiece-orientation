@@ -45,9 +45,60 @@ QString phaseText(const QString &phase) {
     if (phase == QStringLiteral("validating")) return QStringLiteral("校验图片");
     if (phase == QStringLiteral("copying")) return QStringLiteral("写入模板");
     if (phase == QStringLiteral("features")) return QStringLiteral("提取特征");
+    if (phase == QStringLiteral("fast_originals")) return QStringLiteral("提取快速特征");
+    if (phase == QStringLiteral("fast_augmentation")) return QStringLiteral("生成旋转增强");
+    if (phase == QStringLiteral("fast_ridge")) return QStringLiteral("构建快速判别器");
     if (phase == QStringLiteral("committing")) return QStringLiteral("提交更新");
     if (phase == QStringLiteral("active")) return QStringLiteral("已生效");
     return phase;
+}
+
+bool fastCacheCapabilityUnavailable(const QJsonObject &cache) {
+    return cache.value(QStringLiteral("error")).toString().contains(
+        QStringLiteral("FAST_CACHE_CAPABILITY_UNAVAILABLE"));
+}
+
+QString fastCacheStateText(const QJsonObject &cache) {
+    const QString state = cache.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("ready")) return QStringLiteral("已就绪");
+    if (state == QStringLiteral("queued")) return QStringLiteral("排队中");
+    if (state == QStringLiteral("running") || state == QStringLiteral("building")) {
+        return QStringLiteral("构建中");
+    }
+    if (state == QStringLiteral("failed")) return QStringLiteral("构建失败");
+    if (state == QStringLiteral("not_ready")) {
+        return fastCacheCapabilityUnavailable(cache)
+            ? QStringLiteral("能力不可用") : QStringLiteral("未就绪");
+    }
+    return state.isEmpty() ? QStringLiteral("未提供") : state;
+}
+
+QString fastCacheDescription(const QJsonObject &cache) {
+    if (cache.isEmpty()) return QString();
+    QStringList parts{QStringLiteral("快速缓存：%1").arg(fastCacheStateText(cache))};
+    if (cache.value(QStringLiteral("completed")).isDouble()
+        && cache.value(QStringLiteral("total")).isDouble()) {
+        parts.append(QStringLiteral("进度 %1/%2")
+                         .arg(cache.value(QStringLiteral("completed")).toInt())
+                         .arg(cache.value(QStringLiteral("total")).toInt()));
+    }
+    if (cache.value(QStringLiteral("elapsed_ms")).isDouble()) {
+        parts.append(QStringLiteral("耗时 %1 ms")
+                         .arg(QString::number(
+                             cache.value(QStringLiteral("elapsed_ms")).toDouble(), 'g', 10)));
+    }
+    const QString error = cache.value(QStringLiteral("error")).toString();
+    if (!error.isEmpty()) parts.append(QStringLiteral("提示：%1").arg(error));
+    return parts.join(QStringLiteral(" · "));
+}
+
+QString fastCacheMessageKind(const QJsonObject &cache) {
+    const QString state = cache.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("ready")) return QStringLiteral("success");
+    if (state == QStringLiteral("failed") || fastCacheCapabilityUnavailable(cache)) {
+        return QStringLiteral("error");
+    }
+    return cache.isEmpty() ? QStringLiteral("neutral") : QStringLiteral("warning");
 }
 
 QDateTime jobSubmittedAt(const QJsonObject &job) {
@@ -90,6 +141,7 @@ WorkpieceLibraryPage::WorkpieceLibraryPage(QWidget *parent)
     ui->libraryWorkpieceList->setTextElideMode(Qt::ElideRight);
     ui->templateDetailsTable->horizontalHeader()->setStretchLastSection(true);
     ui->evolutionJobsTable->horizontalHeader()->setStretchLastSection(true);
+    ui->workpieceDetailsSummaryLabel->setWordWrap(true);
     ui->registrationProgressBar->setRange(0, 1);
     ui->registrationProgressBar->setValue(0);
     registrationElapsedTimer_.setInterval(100);
@@ -179,14 +231,22 @@ void WorkpieceLibraryPage::setWorkpieceDetails(const QJsonObject &details) {
     if (!browsedWorkpieceId_.isEmpty() && id != browsedWorkpieceId_) return;
     workpieceDetails_ = details;
     const QJsonObject counts = details.value(QStringLiteral("template_counts")).toObject();
-    ui->workpieceDetailsSummaryLabel->setText(
+    QString summary =
         QStringLiteral("%1 · 正面 %2 张 · 反面 %3 张 · 几何规则 %4 条 · %5")
             .arg(details.value(QStringLiteral("name")).toString())
             .arg(counts.value(QStringLiteral("front")).toInt())
             .arg(counts.value(QStringLiteral("back")).toInt())
             .arg(details.value(QStringLiteral("geometry_rule_count")).toInt())
             .arg(details.value(QStringLiteral("detectable")).toBool()
-                     ? QStringLiteral("可检测") : QStringLiteral("不可检测")));
+                     ? QStringLiteral("可检测") : QStringLiteral("不可检测"));
+    const QJsonObject fastCache = details.value(QStringLiteral("fast_cache")).toObject();
+    const QString fastCacheText = fastCacheDescription(fastCache);
+    if (!fastCacheText.isEmpty()) summary.append(QLatin1Char('\n') + fastCacheText);
+    ui->workpieceDetailsSummaryLabel->setProperty(
+        "messageKind", fastCacheMessageKind(fastCache));
+    ui->workpieceDetailsSummaryLabel->style()->unpolish(ui->workpieceDetailsSummaryLabel);
+    ui->workpieceDetailsSummaryLabel->style()->polish(ui->workpieceDetailsSummaryLabel);
+    ui->workpieceDetailsSummaryLabel->setText(summary);
     const QJsonArray templates = details.value(QStringLiteral("templates")).toArray();
     ui->templateDetailsTable->setRowCount(templates.size());
     for (int row = 0; row < templates.size(); ++row) {
@@ -310,8 +370,26 @@ void WorkpieceLibraryPage::setRegistrationResult(const QJsonObject &response) {
         savedRegistrationFields_.value(QStringLiteral("back_images")).toArray().size());
     const qint64 elapsedMs = static_cast<qint64>(response.value(QStringLiteral("elapsed_ms")).toDouble(
         registrationElapsedClock_.isValid() ? registrationElapsedClock_.elapsed() : 0));
-    const QString result = QStringLiteral("工件库建立成功：正面 %1 张，反面 %2 张，耗时 %3 ms")
-                               .arg(frontCount).arg(backCount).arg(elapsedMs);
+    QString result = QStringLiteral("工件库建立成功：正面 %1 张，反面 %2 张，耗时 %3 ms")
+                         .arg(frontCount).arg(backCount).arg(elapsedMs);
+    const QString fastCacheState = response.value(
+        QStringLiteral("fast_cache_state")).toString();
+    QJsonObject fastCache;
+    if (!fastCacheState.isEmpty()) {
+        fastCache.insert(QStringLiteral("state"), fastCacheState);
+        result.append(QStringLiteral(" · %1").arg(fastCacheDescription(fastCache)));
+    }
+    const QString fastCacheRevision = response.value(
+        QStringLiteral("fast_cache_revision")).toString();
+    if (!fastCacheRevision.isEmpty()) {
+        result.append(QStringLiteral(" · 版本 %1").arg(fastCacheRevision));
+    }
+    ui->latestRegistrationResultLabel->setProperty(
+        "messageKind", fastCacheMessageKind(fastCache));
+    ui->latestRegistrationResultLabel->style()->unpolish(
+        ui->latestRegistrationResultLabel);
+    ui->latestRegistrationResultLabel->style()->polish(
+        ui->latestRegistrationResultLabel);
     ui->latestRegistrationResultLabel->setText(result);
     showMessage(result);
     if (draftMatchesSavedRegistration()) setDirty(false);

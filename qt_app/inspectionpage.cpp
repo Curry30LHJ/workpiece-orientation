@@ -23,9 +23,14 @@
 
 namespace {
 QString geometryDescription(const QJsonObject &response) {
-    const QString status = response.value(QStringLiteral("geometry_mask"))
-                               .toObject().value(QStringLiteral("status")).toString();
+    QString status = response.value(QStringLiteral("geometry_status")).toString();
+    if (status.isEmpty()) {
+        status = response.value(QStringLiteral("geometry_mask"))
+                     .toObject().value(QStringLiteral("status")).toString();
+    }
     if (status == QStringLiteral("active")) return QStringLiteral("已应用");
+    if (status == QStringLiteral("low_confidence")) return QStringLiteral("置信度不足");
+    if (status == QStringLiteral("not_configured")) return QStringLiteral("未配置");
     if (status.isEmpty()) return QStringLiteral("未提供");
     return QStringLiteral("未应用（%1）").arg(status);
 }
@@ -1134,6 +1139,27 @@ QString InspectionPage::dispositionText(const InspectionRecord &record) const {
 
 QString InspectionPage::evidenceSummary(const InspectionRecord &record) const {
     const QJsonObject response = record.response;
+    if (response.value(QStringLiteral("inference_engine")).toString()
+        == QStringLiteral("fast_geometry")) {
+        QStringList lines{
+            QStringLiteral("快速判别：%1（采用此结果）")
+                .arg(orientationText(record.label)),
+            QStringLiteral("判别器：Ridge"),
+            QStringLiteral("几何规则：%1").arg(geometryDescription(response)),
+        };
+        if (response.contains(QStringLiteral("decision_margin"))) {
+            lines.append(QStringLiteral("判别间隔：%1")
+                             .arg(QString::number(
+                                 response.value(QStringLiteral("decision_margin")).toDouble(),
+                                 'g', 8)));
+        }
+        if (record.needsReview) {
+            const QString reason = response.value(QStringLiteral("review_reason"))
+                                       .toString(QStringLiteral("证据需人工复核"));
+            lines.append(QStringLiteral("复检原因：%1").arg(reason));
+        }
+        return lines.join(QLatin1Char('\n'));
+    }
     const QString globalPrediction = response.value(
         QStringLiteral("global_prediction")).toString(record.label);
     const QString localPrediction = response.value(
@@ -1164,6 +1190,32 @@ QString InspectionPage::evidenceSummary(const InspectionRecord &record) const {
 QString InspectionPage::rawEvidence(const InspectionRecord &record) const {
     QStringList lines;
     const QJsonObject response = record.response;
+    if (response.value(QStringLiteral("inference_engine")).toString()
+        == QStringLiteral("fast_geometry")) {
+        lines.append(QStringLiteral("推理引擎：%1")
+                         .arg(response.value(QStringLiteral("inference_engine")).toString()));
+        if (response.contains(QStringLiteral("decision_source"))) {
+            lines.append(QStringLiteral("判别来源：%1")
+                             .arg(response.value(QStringLiteral("decision_source")).toString()));
+        }
+        if (response.contains(QStringLiteral("decision_margin"))) {
+            lines.append(QStringLiteral("判别间隔：%1")
+                             .arg(QString::number(
+                                 response.value(QStringLiteral("decision_margin")).toDouble(),
+                                 'g', 8)));
+        }
+        const QString cacheRevision = response.value(
+            QStringLiteral("fast_cache_revision")).toString();
+        if (!cacheRevision.isEmpty()) {
+            lines.append(QStringLiteral("快速缓存版本：%1").arg(cacheRevision));
+        }
+        const QJsonObject timings = response.value(QStringLiteral("timings_ms")).toObject();
+        for (auto it = timings.constBegin(); it != timings.constEnd(); ++it) {
+            lines.append(QStringLiteral("阶段耗时 %1（毫秒）：%2")
+                             .arg(it.key(), QString::number(it.value().toDouble(), 'g', 10)));
+        }
+        return lines.join(QLatin1Char('\n'));
+    }
     if (response.contains(QStringLiteral("global_scores"))) {
         lines.append(QStringLiteral("全局原始得分：%1")
                          .arg(QString::fromUtf8(QJsonDocument(

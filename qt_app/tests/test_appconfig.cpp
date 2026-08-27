@@ -72,6 +72,44 @@ private slots:
         QCOMPARE(config->requestTimeoutMs, 120000);
         QCOMPARE(config->libraryDir, temporary.filePath(QStringLiteral("运行库")));
         QCOMPARE(config->localSearchMode, QStringLiteral("adaptive"));
+        QCOMPARE(config->inferenceMode, QStringLiteral("legacy"));
+    }
+
+    void acceptsInferenceModes_data() {
+        QTest::addColumn<QString>("mode");
+        QTest::newRow("legacy") << QStringLiteral("legacy");
+        QTest::newRow("fast") << QStringLiteral("fast_geometry");
+        QTest::newRow("compare") << QStringLiteral("compare");
+    }
+
+    void acceptsInferenceModes() {
+        QFETCH(QString, mode);
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        QJsonObject object = validConfig(temporary);
+        object[QStringLiteral("inference_mode")] = mode;
+        QString error;
+
+        const auto config = AppConfig::load(writeConfig(temporary, object), &error);
+
+        QVERIFY2(config.has_value(), qPrintable(error));
+        QCOMPARE(config->inferenceMode, mode);
+    }
+
+    void rejectsUnknownInferenceMode() {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        QJsonObject object = validConfig(temporary);
+        object[QStringLiteral("inference_mode")] = QStringLiteral("automatic");
+        QString error;
+
+        const auto config = AppConfig::load(writeConfig(temporary, object), &error);
+
+        QVERIFY(!config.has_value());
+        QVERIFY(error.contains(QStringLiteral("inference_mode")));
+        QVERIFY(error.contains(QStringLiteral("legacy")));
+        QVERIFY(error.contains(QStringLiteral("fast_geometry")));
+        QVERIFY(error.contains(QStringLiteral("compare")));
     }
 
     void acceptsLocalSearchModes_data() {

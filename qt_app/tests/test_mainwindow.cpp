@@ -2213,13 +2213,33 @@ private slots:
             QStringLiteral("mainPageStack"));
         QVERIFY(stack != nullptr);
         QCOMPARE(stack->currentIndex(), 0);
+        auto *backendStatus = window.findChild<QLabel *>(
+            QStringLiteral("backendStatusLabel"));
+        auto *workpieceSelector = window.findChild<QComboBox *>(
+            QStringLiteral("workpieceComboBox"));
+        auto *taskDetail = window.findChild<QLabel *>(
+            QStringLiteral("globalTaskDetailLabel"));
+        auto *taskProgress = window.findChild<QProgressBar *>(
+            QStringLiteral("globalTaskProgressBar"));
+        QVERIFY(backendStatus != nullptr);
+        QVERIFY(workpieceSelector != nullptr);
+        QVERIFY(taskDetail != nullptr);
+        QVERIFY(taskProgress != nullptr);
         QVERIFY(QMetaObject::invokeMethod(&window, "showWorkpieceLibrary",
                                           Qt::DirectConnection));
         QCOMPARE(stack->currentIndex(), 1);
-        QVERIFY(window.findChild<QLabel *>(
-                    QStringLiteral("backendStatusLabel")) != nullptr);
-        QVERIFY(window.findChild<QComboBox *>(
-                    QStringLiteral("workpieceComboBox")) != nullptr);
+        QVERIFY(window.requestPage(AppPage::GeometryRules));
+        QCOMPARE(stack->currentIndex(), 2);
+        QVERIFY(window.requestPage(AppPage::Inspection));
+        QCOMPARE(stack->currentIndex(), 0);
+        QCOMPARE(window.findChild<QLabel *>(QStringLiteral("backendStatusLabel")),
+                 backendStatus);
+        QCOMPARE(window.findChild<QComboBox *>(QStringLiteral("workpieceComboBox")),
+                 workpieceSelector);
+        QCOMPARE(window.findChild<QLabel *>(QStringLiteral("globalTaskDetailLabel")),
+                 taskDetail);
+        QCOMPARE(window.findChild<QProgressBar *>(
+                     QStringLiteral("globalTaskProgressBar")), taskProgress);
     }
 
     void acceptsUnequalTemplateCountsAndShowsLowCountWarning() {

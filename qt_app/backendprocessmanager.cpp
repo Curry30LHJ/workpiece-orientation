@@ -242,6 +242,7 @@ QStringList BackendProcessManager::backendArguments() const {
         QStringLiteral("--model-dir"), config_.modelDir,
         QStringLiteral("--library-dir"), config_.libraryDir,
         QStringLiteral("--local-search-mode"), config_.localSearchMode,
+        QStringLiteral("--inference-mode"), config_.inferenceMode,
     };
 }
 

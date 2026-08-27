@@ -12,6 +12,7 @@ struct AppConfig {
     QString modelDir;
     QString libraryDir;
     QString localSearchMode = QStringLiteral("adaptive");
+    QString inferenceMode = QStringLiteral("legacy");
     QHostAddress host;
     quint16 port = 37651;
     int startupTimeoutMs = 600000;
