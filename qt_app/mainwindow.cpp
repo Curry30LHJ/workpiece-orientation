@@ -110,10 +110,14 @@ void MainWindow::initializeUi() {
     appHeader_->setCurrentPage(AppPage::Inspection);
 
     BackendStatusDetails initialBackendDetails;
-    initialBackendDetails.connectionDetail = QStringLiteral("未连接");
-    initialBackendDetails.modelDetail = QStringLiteral("未加载");
+    initialBackendDetails.state = manager_ == nullptr
+        ? BackendUiState::Disconnected : BackendUiState::Starting;
+    initialBackendDetails.connectionDetail = manager_ == nullptr
+        ? QStringLiteral("未连接") : QStringLiteral("正在启动后端");
+    initialBackendDetails.modelDetail = manager_ == nullptr
+        ? QStringLiteral("未加载") : QStringLiteral("等待模型就绪");
     initialBackendDetails.canRestart = manager_ != nullptr;
-    appHeader_->setBackendDetails(initialBackendDetails);
+    presentBackendState(initialBackendDetails);
 
     predictButton_->setEnabled(false);
     chooseImageButton_->setEnabled(false);
@@ -612,6 +616,23 @@ void MainWindow::connectBackendSignals() {
     }
 }
 
+void MainWindow::presentBackendState(const BackendStatusDetails &details) {
+    backendPresentationState_ = details.state;
+    appHeader_->setBackendDetails(details);
+
+    QString pageDetail = details.connectionDetail;
+    if (details.state == BackendUiState::Loading) {
+        pageDetail = details.modelDetail;
+    } else if (details.state == BackendUiState::Busy) {
+        pageDetail = details.currentTask;
+    } else if (details.state == BackendUiState::Error
+               || details.state == BackendUiState::Recovering) {
+        pageDetail = details.recentError.isEmpty()
+            ? details.connectionDetail : details.recentError;
+    }
+    workpieceLibraryPage_->setBackendState(details.state, pageDetail);
+}
+
 void MainWindow::sendPageCommand(CommandOwner owner, const QString &command,
                                  const QJsonObject &fields,
                                  quint64 refreshTransactionId) {
@@ -870,8 +891,8 @@ void MainWindow::setBackendError(const QString &message) {
     details.modelDetail = QStringLiteral("未加载");
     details.recentError = message;
     details.canRestart = false;
-    appHeader_->setBackendDetails(details);
-    workpieceLibraryPage_->setBackendState(BackendUiState::Error, message);
+    backendEverReady_ = false;
+    presentBackendState(details);
     showLibraryMessage(message, true);
     updateButtonStates();
 }
@@ -1446,14 +1467,25 @@ void MainWindow::submitTemplateConfirmation(const QString &workpieceId, const QS
 
 void MainWindow::restartBackend() {
     if (manager_ != nullptr) {
+        BackendStatusDetails details;
+        details.state = backendEverReady_
+            ? BackendUiState::Recovering : BackendUiState::Starting;
+        details.connectionDetail = backendEverReady_
+            ? QStringLiteral("正在重新启动后端") : QStringLiteral("正在启动后端");
+        details.modelDetail = QStringLiteral("等待模型就绪");
+        details.recentError = backendRecoveryDetail_;
+        details.canRestart = true;
+        presentBackendState(details);
         manager_->restart();
     }
 }
 
 void MainWindow::onBackendReady() {
+    backendRecoveryDetail_.clear();
     const bool firstReadySignal = !backendReadyHandled_;
     backendReadyHandled_ = true;
     backendReady_ = true;
+    backendEverReady_ = true;
     clientBusy_ = false;
     if (geometryRulesPage_ != nullptr) {
         geometryRulesPage_->setBackendAvailable(true, QString());
@@ -1464,8 +1496,7 @@ void MainWindow::onBackendReady() {
     details.connectionDetail = QStringLiteral("已连接");
     details.modelDetail = QStringLiteral("已加载");
     details.canRestart = true;
-    appHeader_->setBackendDetails(details);
-    workpieceLibraryPage_->setBackendState(BackendUiState::Ready, QString());
+    presentBackendState(details);
     updateButtonStates();
     if (evolutionPollTimer_ != nullptr) {
         evolutionPollTimer_->start();
@@ -1497,8 +1528,7 @@ void MainWindow::onBackendLoading(const QString &message) {
     details.connectionDetail = QStringLiteral("已连接");
     details.modelDetail = message.isEmpty() ? QStringLiteral("模型加载中") : message;
     details.canRestart = manager_ != nullptr;
-    appHeader_->setBackendDetails(details);
-    workpieceLibraryPage_->setBackendState(BackendUiState::Loading, details.modelDetail);
+    presentBackendState(details);
     showLibraryMessage(message.isEmpty() ? QStringLiteral("正在加载模型，请稍候…") : message);
     updateButtonStates();
 }
@@ -1608,8 +1638,7 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
     details.currentTask = interruptedTask;
     details.recentError = reason;
     details.canRestart = true;
-    appHeader_->setBackendDetails(details);
-    workpieceLibraryPage_->setBackendState(BackendUiState::Error, reason);
+    presentBackendState(details);
     showLibraryMessage(hasPreservedWork
                            ? QStringLiteral("后端连接中断，未完成操作结果未知；请重连后刷新：%1").arg(reason)
                            : reason,
@@ -1637,31 +1666,71 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
     if (state != BackendClient::State::Ready && state != BackendClient::State::Busy) {
         backendReadyHandled_ = false;
     }
-    BackendStatusDetails details;
-    details.connectionDetail = detail;
-    details.canRestart = manager_ != nullptr || state == BackendClient::State::Error;
+
     if (state == BackendClient::State::Ready) {
         backendReady_ = true;
+        backendEverReady_ = true;
+        BackendStatusDetails details;
         details.state = BackendUiState::Ready;
+        details.connectionDetail = QStringLiteral("已连接");
         details.modelDetail = QStringLiteral("已加载");
+        details.canRestart = manager_ != nullptr;
+        presentBackendState(details);
     } else if (state == BackendClient::State::Busy) {
+        BackendStatusDetails details;
         details.state = BackendUiState::Busy;
+        details.connectionDetail = QStringLiteral("已连接");
         details.modelDetail = QStringLiteral("已加载");
         details.currentTask = detail;
-    } else if (state == BackendClient::State::Connecting
-               || state == BackendClient::State::Handshaking) {
-        details.state = BackendUiState::Loading;
-        details.modelDetail = detail;
-    } else if (state == BackendClient::State::Error) {
-        details.state = BackendUiState::Error;
-        details.modelDetail = QStringLiteral("状态未知");
-        details.recentError = detail;
+        details.canRestart = manager_ != nullptr;
+        presentBackendState(details);
     } else {
-        details.state = BackendUiState::Disconnected;
-        details.modelDetail = QStringLiteral("未加载");
+        backendReady_ = false;
+        if (manager_ != nullptr) {
+            if (backendPresentationState_ != BackendUiState::Error) {
+                if (!backendEverReady_) {
+                    BackendStatusDetails details;
+                    details.state = backendPresentationState_ == BackendUiState::Loading
+                        ? BackendUiState::Loading : BackendUiState::Starting;
+                    details.connectionDetail = QStringLiteral("正在启动后端");
+                    details.modelDetail = details.state == BackendUiState::Loading
+                        ? QStringLiteral("模型加载中") : QStringLiteral("等待模型就绪");
+                    details.recentError = state == BackendClient::State::Error
+                        ? detail : QString();
+                    details.canRestart = true;
+                    presentBackendState(details);
+                } else if (backendPresentationState_ != BackendUiState::Loading
+                           && (state == BackendClient::State::Connecting
+                               || state == BackendClient::State::Handshaking)) {
+                    BackendStatusDetails details;
+                    details.state = BackendUiState::Recovering;
+                    details.connectionDetail = QStringLiteral("正在重新连接");
+                    details.modelDetail = QStringLiteral("等待后端恢复");
+                    details.recentError = backendRecoveryDetail_;
+                    details.canRestart = true;
+                    presentBackendState(details);
+                }
+            }
+        } else {
+            BackendStatusDetails details;
+            details.connectionDetail = detail;
+            details.canRestart = state == BackendClient::State::Error;
+            if (state == BackendClient::State::Connecting
+                || state == BackendClient::State::Handshaking) {
+                details.state = BackendUiState::Starting;
+                details.modelDetail = QStringLiteral("等待后端就绪");
+            } else if (state == BackendClient::State::Error) {
+                details.state = BackendUiState::Error;
+                details.modelDetail = QStringLiteral("状态未知");
+                details.recentError = detail;
+            } else {
+                details.state = BackendUiState::Disconnected;
+                details.modelDetail = QStringLiteral("未加载");
+            }
+            presentBackendState(details);
+        }
     }
-    appHeader_->setBackendDetails(details);
-    workpieceLibraryPage_->setBackendState(details.state, detail);
+
     updateButtonStates();
     if (state == BackendClient::State::Ready
         && dispatchStagedGeometryDraftSave()) {
@@ -2109,8 +2178,39 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
 }
 
 void MainWindow::onClientTransportFailed(const QString &code, const QString &message) {
-    Q_UNUSED(code)
+    if (manager_ != nullptr && code == QStringLiteral("MODEL_LOADING")) {
+        backendRecoveryDetail_ = message;
+        return;
+    }
+
+    const bool recoverableTransport = code == QStringLiteral("CONNECTION_ERROR")
+        || code == QStringLiteral("CONNECTION_LOST")
+        || code == QStringLiteral("TIMEOUT");
+    if (manager_ != nullptr && !backendEverReady_ && recoverableTransport) {
+        backendRecoveryDetail_ = message;
+        return;
+    }
+    if (manager_ != nullptr && backendPresentationState_ == BackendUiState::Error) {
+        backendRecoveryDetail_ = message;
+        return;
+    }
+    if (manager_ != nullptr && backendPresentationState_ == BackendUiState::Recovering
+        && recoverableTransport) {
+        backendRecoveryDetail_ = message;
+        return;
+    }
+
     onBackendUnavailable(message);
+    if (manager_ != nullptr && backendEverReady_ && recoverableTransport) {
+        backendRecoveryDetail_ = message;
+        BackendStatusDetails details;
+        details.state = BackendUiState::Recovering;
+        details.connectionDetail = QStringLiteral("正在重新连接");
+        details.modelDetail = QStringLiteral("等待后端恢复");
+        details.recentError = message;
+        details.canRestart = true;
+        presentBackendState(details);
+    }
 }
 
 void MainWindow::updateButtonStates() {

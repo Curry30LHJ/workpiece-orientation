@@ -2683,6 +2683,141 @@ private slots:
                      QStringLiteral("predictButton"))->isEnabled());
     }
 
+    void managedStartupDoesNotExposeRetryChurn() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37651), &client, &launcher);
+        MainWindow window(&client, &manager);
+        auto *status = window.findChild<QLabel *>(
+            QStringLiteral("backendStatusLabel"));
+        QVERIFY(status != nullptr);
+        QVERIFY(status->text().contains(QStringLiteral("正在启动")));
+
+        auto setClientState = [&window](BackendClient::State state,
+                                        const QString &detail) {
+            return QMetaObject::invokeMethod(
+                &window, "onClientStateChanged", Qt::DirectConnection,
+                Q_ARG(BackendClient::State, state), Q_ARG(QString, detail));
+        };
+        QVERIFY(setClientState(BackendClient::State::Connecting,
+                               QStringLiteral("正在连接后端")));
+        QVERIFY(setClientState(BackendClient::State::Error,
+                               QStringLiteral("Connection refused")));
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientTransportFailed", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("CONNECTION_ERROR")),
+            Q_ARG(QString, QStringLiteral("Connection refused"))));
+        QVERIFY(setClientState(BackendClient::State::Disconnected,
+                               QStringLiteral("后端连接已断开")));
+
+        QVERIFY(status->text().contains(QStringLiteral("正在启动")));
+        QVERIFY(!status->text().contains(QStringLiteral("未连接")));
+        QVERIFY(!status->text().contains(QStringLiteral("不可用")));
+    }
+
+    void managedLoadingAndTerminalFailureHaveStablePrecedence() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37652), &client, &launcher);
+        MainWindow window(&client, &manager);
+        auto *status = window.findChild<QLabel *>(
+            QStringLiteral("backendStatusLabel"));
+        QVERIFY(status != nullptr);
+
+        emit manager.backendLoading(QStringLiteral("正在加载权重"));
+        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientStateChanged", Qt::DirectConnection,
+            Q_ARG(BackendClient::State, BackendClient::State::Disconnected),
+            Q_ARG(QString, QStringLiteral("后端连接已断开"))));
+        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+
+        emit manager.backendUnavailable(QStringLiteral("后端启动超时"));
+        QVERIFY(status->text().contains(QStringLiteral("不可用")));
+        QVERIFY(status->toolTip().contains(QStringLiteral("后端启动超时")));
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientStateChanged", Qt::DirectConnection,
+            Q_ARG(BackendClient::State, BackendClient::State::Disconnected),
+            Q_ARG(QString, QStringLiteral("后端连接已断开"))));
+        QVERIFY(status->text().contains(QStringLiteral("不可用")));
+    }
+
+    void managedRuntimeModelLoadingRemainsDistinctFromReconnectFailure() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37654), &client, &launcher);
+        MainWindow window(&client, &manager);
+        auto *status = window.findChild<QLabel *>(
+            QStringLiteral("backendStatusLabel"));
+        QVERIFY(status != nullptr);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onBackendReady", Qt::DirectConnection));
+        emit manager.backendLoading(QStringLiteral("模型正在重新加载"));
+        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientTransportFailed", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("MODEL_LOADING")),
+            Q_ARG(QString, QStringLiteral("模型正在重新加载"))));
+        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+        QVERIFY(!status->text().contains(QStringLiteral("不可用")));
+        QVERIFY(!status->text().contains(QStringLiteral("正在重连")));
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientStateChanged", Qt::DirectConnection,
+            Q_ARG(BackendClient::State, BackendClient::State::Connecting),
+            Q_ARG(QString, QStringLiteral("再次探测后端"))));
+        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+    }
+
+    void managedConnectionLossShowsOneRecoveryStateUntilReady() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37653), &client, &launcher);
+        MainWindow window(&client, &manager);
+        auto *status = window.findChild<QLabel *>(
+            QStringLiteral("backendStatusLabel"));
+        QVERIFY(status != nullptr);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onBackendReady", Qt::DirectConnection));
+        QVERIFY(status->text().contains(QStringLiteral("已连接")));
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientTransportFailed", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("CONNECTION_LOST")),
+            Q_ARG(QString, QStringLiteral("连接已断开"))));
+        QVERIFY(status->text().contains(QStringLiteral("正在重连")));
+
+        for (BackendClient::State state : {BackendClient::State::Error,
+                                           BackendClient::State::Disconnected,
+                                           BackendClient::State::Connecting}) {
+            QVERIFY(QMetaObject::invokeMethod(
+                &window, "onClientStateChanged", Qt::DirectConnection,
+                Q_ARG(BackendClient::State, state),
+                Q_ARG(QString, QStringLiteral("自动重连"))));
+            QVERIFY(status->text().contains(QStringLiteral("正在重连")));
+        }
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onBackendReady", Qt::DirectConnection));
+        QVERIFY(status->text().contains(QStringLiteral("已连接")));
+    }
+
+    void unmanagedClientErrorRemainsDirectlyVisible() {
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        auto *status = window.findChild<QLabel *>(
+            QStringLiteral("backendStatusLabel"));
+        QVERIFY(status != nullptr);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientStateChanged", Qt::DirectConnection,
+            Q_ARG(BackendClient::State, BackendClient::State::Error),
+            Q_ARG(QString, QStringLiteral("外部后端连接失败"))));
+        QVERIFY(status->text().contains(QStringLiteral("不可用")));
+        QVERIFY(status->toolTip().contains(QStringLiteral("外部后端连接失败")));
+    }
+
     void transportFailurePreservesPreviousPredictionAndMarksOutcomeUnknown() {
         QTemporaryDir dir;
         const QString imagePath = writeImages(dir, QStringLiteral("preserved"), 1).constFirst();

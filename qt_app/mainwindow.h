@@ -107,6 +107,7 @@ private:
 
     void initializeUi();
     void connectBackendSignals();
+    void presentBackendState(const BackendStatusDetails &details);
     void sendPageCommand(CommandOwner owner, const QString &command,
                          const QJsonObject &fields = QJsonObject(),
                          quint64 refreshTransactionId = 0);
@@ -201,6 +202,9 @@ private:
     bool batchInFlight_ = false;
     bool backendReady_ = false;
     bool backendReadyHandled_ = false;
+    BackendUiState backendPresentationState_ = BackendUiState::Disconnected;
+    bool backendEverReady_ = false;
+    QString backendRecoveryDetail_;
     bool clientBusy_ = false;
     QTimer *evolutionPollTimer_ = nullptr;
     QTimer *geometryPollTimer_ = nullptr;
