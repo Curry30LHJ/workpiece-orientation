@@ -48,6 +48,7 @@ TEMPLATE_CACHE_FILE_NAME = ".template_cache.pkl"
 FAST_RUNTIME_CACHE_FILE_NAME = ".fast_runtime_cache.pkl"
 INFERENCE_MODES = ("legacy", "fast_geometry", "compare")
 DEFAULT_INFERENCE_MODE = "legacy"
+_GEOMETRY_REVISION_FROM_RECORD = object()
 
 
 LOGGER = logging.getLogger(__name__)
@@ -90,6 +91,21 @@ class TemplateCache:
     geometry_unsafe: bool = False
     fast_runtime: FastRuntimeCache | None = None
     fast_template_signature: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class StagedFastRuntimeCache:
+    record_root: Path
+    temporary_root: Path
+    temporary_path: Path
+    cache: FastRuntimeCache
+
+
+@dataclass(frozen=True)
+class CommittedFastRuntimeCache:
+    target_path: Path
+    backup_path: Path | None
+    temporary_root: Path
 
 
 @dataclass(frozen=True)
@@ -615,13 +631,19 @@ class OrientationClassifier:
         self,
         record: Any,
         cache: FastRuntimeCache,
+        *,
+        geometry_profile_revision: int | None | object = _GEOMETRY_REVISION_FROM_RECORD,
     ) -> None:
         FastOrientationEngine._validate_cache(cache)
         if cache.library_revision != int(record.revision):
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: library revision differs")
         if cache.model_fingerprint != self.model_fingerprint:
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: model fingerprint differs")
-        geometry_revision = self._record_geometry_revision(record)
+        geometry_revision = (
+            self._record_geometry_revision(record)
+            if geometry_profile_revision is _GEOMETRY_REVISION_FROM_RECORD
+            else geometry_profile_revision
+        )
         if cache.geometry_profile_revision != geometry_revision:
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: geometry revision differs")
         expected_counts = {
@@ -669,11 +691,33 @@ class OrientationClassifier:
 
     def save_fast_runtime_cache(self, record: Any, cache: FastRuntimeCache) -> None:
         """Validate and atomically replace one workpiece's fast payload."""
-        self._validate_fast_runtime_for_record(record, cache)
+        staged = self.stage_fast_runtime_cache(record, cache)
+        try:
+            committed = self.commit_staged_fast_runtime_cache(record, staged)
+        except Exception:
+            self.discard_staged_fast_runtime_cache(staged)
+            raise
+        self.finalize_staged_fast_runtime_cache(committed)
+
+    def stage_fast_runtime_cache(
+        self,
+        record: Any,
+        cache: FastRuntimeCache,
+        *,
+        geometry_profile_revision: int | None | object = _GEOMETRY_REVISION_FROM_RECORD,
+    ) -> StagedFastRuntimeCache:
+        """Validate and serialize a fast payload without changing the live sidecar."""
+        self._validate_fast_runtime_for_record(
+            record,
+            cache,
+            geometry_profile_revision=geometry_profile_revision,
+        )
         root = Path(record.root)
-        target = root / FAST_RUNTIME_CACHE_FILE_NAME
-        temporary_root = root / f".fast-runtime-{uuid.uuid4().hex}"
+        if not root.is_dir():
+            raise FileNotFoundError(f"workpiece root is unavailable: {root}")
+        temporary_root = root.parent / f".fast-runtime-stage-{root.name}-{uuid.uuid4().hex}"
         temporary_root_created = False
+        staged = False
         try:
             temporary_root.mkdir()
             temporary_root_created = True
@@ -686,10 +730,52 @@ class OrientationClassifier:
                 pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, target)
+            staged = True
+            return StagedFastRuntimeCache(root, temporary_root, temporary, cache)
         finally:
-            if temporary_root_created and temporary_root.exists():
+            if temporary_root_created and not staged and temporary_root.exists():
                 shutil.rmtree(temporary_root)
+
+    @staticmethod
+    def commit_staged_fast_runtime_cache(
+        record: Any,
+        staged: StagedFastRuntimeCache,
+    ) -> CommittedFastRuntimeCache:
+        root = Path(record.root)
+        if root != staged.record_root or not root.is_dir():
+            raise ValueError("FAST_CACHE_REVISION_MISMATCH: workpiece root changed")
+        target = root / FAST_RUNTIME_CACHE_FILE_NAME
+        backup = staged.temporary_root / ".previous-fast-runtime-cache.pkl"
+        backup_path = None
+        if target.is_file():
+            os.replace(target, backup)
+            backup_path = backup
+        try:
+            os.replace(staged.temporary_path, target)
+        except Exception:
+            if backup_path is not None and backup_path.is_file():
+                os.replace(backup_path, target)
+            raise
+        return CommittedFastRuntimeCache(target, backup_path, staged.temporary_root)
+
+    @staticmethod
+    def finalize_staged_fast_runtime_cache(committed: CommittedFastRuntimeCache) -> None:
+        if committed.temporary_root.exists():
+            shutil.rmtree(committed.temporary_root)
+
+    @staticmethod
+    def rollback_committed_fast_runtime_cache(committed: CommittedFastRuntimeCache) -> None:
+        if committed.target_path.exists():
+            committed.target_path.unlink()
+        if committed.backup_path is not None and committed.backup_path.is_file():
+            os.replace(committed.backup_path, committed.target_path)
+        if committed.temporary_root.exists():
+            shutil.rmtree(committed.temporary_root)
+
+    @staticmethod
+    def discard_staged_fast_runtime_cache(staged: StagedFastRuntimeCache) -> None:
+        if staged.temporary_root.exists():
+            shutil.rmtree(staged.temporary_root)
 
     def load_fast_runtime_cache(self, record: Any) -> FastRuntimeCache | None:
         cache_path = Path(record.root) / FAST_RUNTIME_CACHE_FILE_NAME

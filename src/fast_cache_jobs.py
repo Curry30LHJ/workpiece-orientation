@@ -25,8 +25,8 @@ class FastCacheJobSnapshot:
 @dataclass
 class _FastCacheJob:
     snapshot: FastCacheJobSnapshot
-    build: Callable[[Callable[[dict[str, Any]], None]], Any]
-    publish: Callable[[Any], bool]
+    build: Callable[[Callable[[dict[str, Any]], None]], Any] | None
+    publish: Callable[[Any], bool] | None
     started_at: float | None = None
 
 
@@ -73,7 +73,12 @@ class FastCacheJobManager:
                 publish=publish,
             )
             self._jobs[key] = job
+            previous_key = self._latest.get(workpiece_id)
             self._latest[workpiece_id] = key
+            if previous_key is not None and previous_key != key:
+                previous = self._jobs.get(previous_key)
+                if previous is not None and previous.snapshot.state in {"ready", "failed", "stale"}:
+                    self._jobs.pop(previous_key, None)
             self._queue.append(key)
             if self._worker is None or self._worker.done():
                 self._worker = self._executor.submit(self._drain)
@@ -88,6 +93,11 @@ class FastCacheJobManager:
     def shutdown(self) -> None:
         with self._condition:
             self._stopping = True
+            for key in self._queue:
+                job = self._jobs[key]
+                job.build = None
+                job.publish = None
+            self._condition.notify_all()
             worker = self._worker
         if worker is not None:
             worker.result()
@@ -113,6 +123,8 @@ class FastCacheJobManager:
                 job.started_at = time.perf_counter()
                 job.snapshot = replace(job.snapshot, state="running")
             try:
+                if job.build is None or job.publish is None:
+                    return
                 cache = job.build(lambda event: self._progress(key, event))
                 published = bool(job.publish(cache))
             except Exception as exc:
@@ -129,6 +141,10 @@ class FastCacheJobManager:
                     elapsed_ms=elapsed_ms,
                     error=error,
                 )
+                job.build = None
+                job.publish = None
+                if self._latest.get(job.snapshot.workpiece_id) != key:
+                    self._jobs.pop(key, None)
 
     def _progress(self, key: tuple[str, int, int | None], event: dict[str, Any]) -> None:
         if not isinstance(event, dict):

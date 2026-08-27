@@ -1,12 +1,16 @@
 from dataclasses import replace
+import gc
+import json
 from pathlib import Path
 import threading
+import weakref
 
 import cv2
 import numpy as np
 import pytest
 
 from src.fast_cache_jobs import FastCacheJobManager
+from src.geometry_mask_profiles import GeometryMaskProfiles
 from src.orientation_classifier import TemplateCache
 from src.workpiece_catalog import WorkpieceCatalog
 from src.workpiece_library import WorkpieceLibrary
@@ -158,6 +162,7 @@ def test_shutdown_waits_for_current_step_without_starting_more_jobs():
     first_started = threading.Event()
     first_release = threading.Event()
     second_started = threading.Event()
+    stopping_observed = threading.Event()
     shutdown_done = threading.Event()
 
     def first(_progress):
@@ -175,16 +180,120 @@ def test_shutdown_waits_for_current_step_without_starting_more_jobs():
         publish=lambda _cache: True,
     )
     assert first_started.wait(1.0)
+
+    def observe_stopping():
+        with manager._condition:
+            manager._condition.wait_for(lambda: manager._stopping)
+            stopping_observed.set()
+
+    observer = threading.Thread(target=observe_stopping)
+    observer.start()
     stopper = threading.Thread(target=lambda: (manager.shutdown(), shutdown_done.set()))
     stopper.start()
-    assert not shutdown_done.wait(0.05)
-    first_release.set()
-    assert shutdown_done.wait(1.0)
-    stopper.join(timeout=1.0)
+    try:
+        assert stopping_observed.wait(1.0)
+        assert not shutdown_done.is_set()
+    finally:
+        first_release.set()
+        with manager._condition:
+            manager._condition.notify_all()
+        stopper.join(timeout=2.0)
+        observer.join(timeout=2.0)
 
+    assert shutdown_done.is_set()
     assert not second_started.is_set()
     assert manager.snapshot("first").state == "ready"
     assert manager.snapshot("second").state == "queued"
+
+
+def test_superseded_terminal_jobs_release_callback_captures():
+    manager = FastCacheJobManager()
+    releases = [threading.Event() for _ in range(3)]
+    starts = [threading.Event() for _ in range(3)]
+    references = []
+
+    class Capture:
+        pass
+
+    def make_build(index):
+        capture = Capture()
+        references.append(weakref.ref(capture))
+
+        def build(_progress, retained=capture):
+            assert retained is not None
+            starts[index].set()
+            assert releases[index].wait(2.0)
+            return index
+
+        return build
+
+    builds = [make_build(index) for index in range(3)]
+    for revision, build in enumerate(builds, start=1):
+        manager.schedule(
+            workpiece_id="m7",
+            library_revision=revision,
+            geometry_profile_revision=None,
+            build=build,
+            publish=lambda _cache: True,
+        )
+    del builds
+    del build
+
+    try:
+        assert starts[0].wait(1.0)
+        releases[0].set()
+        assert starts[1].wait(1.0)
+        gc.collect()
+        assert references[0]() is None
+        releases[1].set()
+        assert starts[2].wait(1.0)
+        gc.collect()
+        assert references[1]() is None
+    finally:
+        for release in releases:
+            release.set()
+        manager.shutdown()
+    gc.collect()
+    assert references[2]() is None
+
+
+def test_terminal_job_retention_is_bounded_across_repeated_revisions():
+    manager = FastCacheJobManager()
+    published = []
+    all_published = threading.Event()
+
+    def publish(value):
+        published.append(value)
+        if value == 25:
+            all_published.set()
+        return True
+
+    for revision in range(1, 26):
+        manager.schedule(
+            workpiece_id="m7",
+            library_revision=revision,
+            geometry_profile_revision=None,
+            build=lambda _progress, value=revision: value,
+            publish=publish,
+        )
+
+    assert all_published.wait(2.0)
+    manager.shutdown()
+
+    assert published == list(range(1, 26))
+    assert len(manager._jobs) == 1
+    latest = manager.snapshot("m7")
+    assert latest is not None
+    assert latest.library_revision == 25
+    assert latest.state == "ready"
+    duplicate = manager.schedule(
+        workpiece_id="m7",
+        library_revision=25,
+        geometry_profile_revision=None,
+        build=lambda _progress: pytest.fail("latest terminal revision rebuilt"),
+        publish=lambda _cache: pytest.fail("latest terminal revision republished"),
+    )
+    assert duplicate == latest
 
 
 class BlockingFastClassifier:
@@ -210,6 +319,27 @@ class BlockingFastClassifier:
         (record.root / ".fast_runtime_cache.pkl").write_bytes(b"ready")
         self.saved.append((record.id, runtime))
 
+    @staticmethod
+    def stage_fast_runtime_cache(record, runtime, *, geometry_profile_revision=None):
+        return record, runtime, geometry_profile_revision
+
+    def commit_staged_fast_runtime_cache(self, record, staged):
+        _captured_record, runtime, _geometry_revision = staged
+        self.save_fast_runtime_cache(record, runtime)
+        return staged
+
+    @staticmethod
+    def finalize_staged_fast_runtime_cache(_committed):
+        return None
+
+    @staticmethod
+    def discard_staged_fast_runtime_cache(_staged):
+        return None
+
+    @staticmethod
+    def rollback_committed_fast_runtime_cache(_committed):
+        return None
+
     def set_template_cache(self, workpiece_id, cache):
         self.caches[workpiece_id] = cache
 
@@ -222,6 +352,41 @@ class BlockingFastClassifier:
         return {"label": "front", "library_revision": library_revision}
 
 
+class BlockingRestoreClassifier(BlockingFastClassifier):
+    def __init__(self):
+        super().__init__()
+        self.base_build_started = threading.Event()
+        self.base_build_release = threading.Event()
+
+    def build_template_cache(self, front, back, progress_callback=None, *, library_revision=1):
+        self.base_build_started.set()
+        assert self.base_build_release.wait(2.0)
+        return builder(front, back, progress_callback)
+
+
+class BlockingPersistenceClassifier(BlockingFastClassifier):
+    def __init__(self):
+        super().__init__()
+        self.persistence_started = threading.Event()
+        self.persistence_release = threading.Event()
+
+    def _block_persistence(self):
+        self.persistence_started.set()
+        assert self.persistence_release.wait(2.0)
+
+    def save_fast_runtime_cache(self, record, runtime):
+        self._block_persistence()
+        super().save_fast_runtime_cache(record, runtime)
+
+    def stage_fast_runtime_cache(self, record, runtime, *, geometry_profile_revision=None):
+        self._block_persistence()
+        return record, runtime, geometry_profile_revision
+
+    def commit_staged_fast_runtime_cache(self, record, staged):
+        _captured_record, runtime, _geometry_revision = staged
+        super().save_fast_runtime_cache(record, runtime)
+        return staged
+
 def _persist_base_library(tmp_path: Path):
     library = WorkpieceLibrary(tmp_path / "library")
     record, cache = library.register(
@@ -233,6 +398,192 @@ def _persist_base_library(tmp_path: Path):
     )
 
     return record, cache
+
+
+def test_restore_uses_valid_base_without_waiting_for_base_or_fast_builder(tmp_path):
+    classifier = BlockingRestoreClassifier()
+    classifier.inference_mode = "legacy"
+    classifier.base_build_release.set()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, base_cache = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False,
+    )
+    classifier.base_build_started.clear()
+    classifier.base_build_release.clear()
+    classifier.inference_mode = "fast_geometry"
+    catalog.recycle(record.id, operation_id="restore-async-recycle")
+    classifier.load_template_cache = lambda _record: base_cache
+    restored = []
+    restore_done = threading.Event()
+
+    def run_restore():
+        restored.append(catalog.restore(record.id, operation_id="restore-async"))
+        restore_done.set()
+
+    worker = threading.Thread(target=run_restore)
+    worker.start()
+    try:
+        assert restore_done.wait(1.0)
+        assert not classifier.base_build_started.is_set()
+        assert classifier.started.wait(1.0)
+        snapshot = catalog.capture_snapshot(record.id)
+        assert snapshot.record == restored[0]
+        assert snapshot.cache.global_vectors is base_cache.global_vectors
+        assert snapshot.cache.local_features is base_cache.local_features
+        assert snapshot.cache.fast_runtime is None
+    finally:
+        classifier.base_build_release.set()
+        classifier.release.set()
+        worker.join(timeout=2.0)
+        catalog.shutdown()
+
+
+@pytest.mark.parametrize("inference_mode", ["fast_geometry", "compare"])
+def test_restore_materializes_published_profile_without_sync_geometry_rebuild(
+    tmp_path,
+    inference_mode,
+):
+    classifier = BlockingFastClassifier()
+    classifier.inference_mode = "legacy"
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, base_cache = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False,
+    )
+    catalog.recycle(record.id, operation_id=f"profile-recycle-{inference_mode}")
+    classifier.inference_mode = inference_mode
+    classifier.load_template_cache = lambda _record: base_cache
+
+    class PublishedProfiles:
+        def __init__(self):
+            self.rebuild_started = threading.Event()
+            self.rebuild_release = threading.Event()
+
+        def sync_library_revision(self, _record):
+            return None
+
+        def snapshot(self, _workpiece_id):
+            return {
+                "active_revision": 8,
+                "active": {"profile_revision": 8, "rules": []},
+            }
+
+        def rebuild_active_cache(self, *_args, **_kwargs):
+            self.rebuild_started.set()
+            assert self.rebuild_release.wait(2.0)
+            return None
+
+    profiles = PublishedProfiles()
+    catalog.set_geometry_profiles(profiles)
+    restored = []
+    restore_done = threading.Event()
+    worker = threading.Thread(
+        target=lambda: (restored.append(catalog.restore(
+            record.id,
+            operation_id=f"profile-restore-{inference_mode}",
+        )), restore_done.set())
+    )
+    worker.start()
+    try:
+        assert restore_done.wait(1.0)
+        assert not profiles.rebuild_started.is_set()
+        assert classifier.started.wait(1.0)
+        snapshot = catalog.capture_snapshot(record.id)
+        assert snapshot.record == restored[0]
+        assert snapshot.cache.geometry_profile_revision == 8
+        assert snapshot.cache.fast_runtime is None
+    finally:
+        profiles.rebuild_release.set()
+        classifier.release.set()
+        worker.join(timeout=2.0)
+        catalog.shutdown()
+
+
+def test_blocked_fast_persistence_does_not_hold_catalog_lock(tmp_path):
+    record, base_cache = _persist_base_library(tmp_path)
+    classifier = BlockingPersistenceClassifier()
+    classifier.load_template_cache = lambda _record: base_cache
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    catalog.recover()
+    assert classifier.started.wait(1.0)
+    classifier.release.set()
+    assert classifier.persistence_started.wait(1.0)
+    captured = []
+    prediction_errors = []
+    reader_done = threading.Event()
+
+    def read_while_persistence_is_blocked():
+        captured.append(catalog.capture_snapshot(record.id))
+        try:
+            catalog.predict(record.id, tmp_path / "query.png")
+        except Exception as exc:
+            prediction_errors.append(exc)
+        reader_done.set()
+
+    reader = threading.Thread(target=read_while_persistence_is_blocked)
+    reader.start()
+    try:
+        assert reader_done.wait(1.0)
+        assert captured[0].cache.fast_runtime is None
+        assert len(prediction_errors) == 1
+        assert str(prediction_errors[0]) == "FAST_CACHE_NOT_READY: fast runtime cache is unavailable"
+    finally:
+        classifier.persistence_release.set()
+        reader.join(timeout=2.0)
+        catalog.shutdown()
+
+    assert catalog.capture_snapshot(record.id).cache.fast_runtime is not None
+
+
+def test_append_publishes_new_revision_before_blocked_fast_worker_finishes(tmp_path):
+    classifier = BlockingFastClassifier()
+    classifier.inference_mode = "legacy"
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False,
+    )
+    classifier.inference_mode = "fast_geometry"
+
+    appended, candidate = catalog.append_templates(
+        record.id,
+        [image(tmp_path / "front-extra.png", 11)],
+        [],
+        operation_id="append-fast-background",
+    )
+
+    try:
+        assert classifier.started.wait(1.0)
+        snapshot = catalog.capture_snapshot(record.id)
+        assert snapshot.record == appended
+        assert snapshot.cache is candidate
+        assert snapshot.cache.fast_runtime is None
+    finally:
+        classifier.release.set()
+        catalog.shutdown()
+
+    assert catalog.capture_snapshot(record.id).cache.fast_runtime == {
+        "library_revision": appended.revision,
+        "geometry": None,
+    }
+
+
+def test_recycle_keeps_blocked_fast_worker_from_recreating_sidecar(tmp_path):
+    classifier = BlockingFastClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False,
+    )
+    assert classifier.started.wait(1.0)
+
+    catalog.recycle(record.id, operation_id="recycle-with-fast-worker")
+    recycled = catalog.library.get_recycled(record.id)
+    assert catalog.fast_cache_status(record.id)["state"] == "running"
+
+    classifier.release.set()
+    catalog.shutdown()
+
+    assert catalog.fast_cache_status(record.id)["state"] == "stale"
+    assert classifier.saved == []
+    assert not (recycled.root / ".fast_runtime_cache.pkl").exists()
 
 
 def test_recovery_activates_base_and_rebuilds_fast_cache_in_background(tmp_path):
@@ -301,7 +652,7 @@ def test_recovery_of_published_geometry_queues_matching_fast_profile(tmp_path):
     }
 
 
-def test_compare_recovery_builds_legacy_geometry_without_waiting_for_fast_runtime(tmp_path):
+def test_compare_recovery_materializes_profile_without_sync_geometry_rebuild(tmp_path):
     record, base_cache = _persist_base_library(tmp_path)
     classifier = BlockingFastClassifier()
     classifier.inference_mode = "compare"
@@ -309,27 +660,27 @@ def test_compare_recovery_builds_legacy_geometry_without_waiting_for_fast_runtim
 
     class PublishedProfiles:
         def __init__(self):
-            self.fast_runtime_flags = []
+            self.rebuild_started = threading.Event()
 
         def sync_library_revision(self, _record):
             return None
 
-        def rebuild_active_cache(self, workpiece_id, _record, *, build_fast_runtime=True):
-            self.fast_runtime_flags.append(build_fast_runtime)
-            base = classifier.caches[workpiece_id]
-            return replace(
-                base,
-                geometry_profile={"profile_revision": 6, "rules": []},
-                geometry_profile_revision=6,
-                fast_runtime=None,
-            )
+        def snapshot(self, _workpiece_id):
+            return {
+                "active_revision": 6,
+                "active": {"profile_revision": 6, "rules": []},
+            }
+
+        def rebuild_active_cache(self, *_args, **_kwargs):
+            self.rebuild_started.set()
+            pytest.fail("compare recovery synchronously rebuilt geometry")
 
     profiles = PublishedProfiles()
     catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier, profiles)
 
     catalog.recover()
 
-    assert profiles.fast_runtime_flags == [False]
+    assert not profiles.rebuild_started.is_set()
     assert classifier.started.wait(1.0)
     assert catalog.capture_snapshot(record.id).cache.geometry_profile_revision == 6
     classifier.release.set()
@@ -360,9 +711,13 @@ class GeometryFastClassifier(BlockingFastClassifier):
 
     def __init__(self):
         super().__init__()
+        self.block_build = False
         self.fail_build = False
 
     def build_fast_runtime_cache(self, record, geometry_profile, progress_callback=None):
+        if self.block_build:
+            self.started.set()
+            assert self.release.wait(2.0)
         if self.fail_build:
             raise RuntimeError("geometry fast build failed")
         return {
@@ -373,6 +728,16 @@ class GeometryFastClassifier(BlockingFastClassifier):
     def save_template_cache(self, record, cache):
         if cache.fast_runtime is not None:
             self.save_fast_runtime_cache(record, cache.fast_runtime)
+
+    def prepare_template_masks(self, workpiece_id, ignored_regions, *, base_cache=None):
+        base = base_cache or self.caches[workpiece_id]
+        return replace(
+            base,
+            ignored_regions=ignored_regions,
+            geometry_profile=None,
+            geometry_profile_revision=None,
+            fast_runtime=None,
+        ), {}
 
 
 def test_geometry_publication_builds_target_revision_before_pointer_swap(tmp_path):
@@ -401,7 +766,7 @@ def test_geometry_publication_builds_target_revision_before_pointer_swap(tmp_pat
     catalog.shutdown()
 
 
-def test_geometry_publication_build_failure_leaves_pointer_and_cache_unchanged(tmp_path):
+def test_failed_geometry_replacement_keeps_pointer_while_fast_build_is_blocked(tmp_path):
     classifier = GeometryFastClassifier()
     catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
     record, base = catalog.register(
@@ -409,6 +774,7 @@ def test_geometry_publication_build_failure_leaves_pointer_and_cache_unchanged(t
     )
     before = catalog.capture_snapshot(record.id)
     classifier.inference_mode = "fast_geometry"
+    classifier.block_build = True
     classifier.fail_build = True
     candidate = replace(
         base,
@@ -416,16 +782,150 @@ def test_geometry_publication_build_failure_leaves_pointer_and_cache_unchanged(t
         geometry_profile_revision=4,
     )
 
-    with pytest.raises(RuntimeError, match="geometry fast build failed"):
-        catalog.publish_geometry_profile(
-            record.id,
-            candidate,
-            profile_revision=4,
-            previous_profile_revision=None,
-            expected_revision=record.revision,
-            operation_id="publish-fast-failure",
-        )
+    errors = []
+    done = threading.Event()
 
+    def publish():
+        try:
+            catalog.publish_geometry_profile(
+                record.id,
+                candidate,
+                profile_revision=4,
+                previous_profile_revision=None,
+                expected_revision=record.revision,
+                operation_id="publish-fast-failure",
+            )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=publish)
+    worker.start()
+    try:
+        assert classifier.started.wait(1.0)
+        assert catalog.capture_snapshot(record.id) is before
+        assert catalog.get(record.id).revision == record.revision
+        assert not done.is_set()
+    finally:
+        classifier.release.set()
+        worker.join(timeout=2.0)
+        catalog.shutdown()
+
+    assert done.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert str(errors[0]) == "geometry fast build failed"
     assert catalog.capture_snapshot(record.id) is before
     assert catalog.get(record.id).revision == record.revision
-    catalog.shutdown()
+
+
+def test_geometry_rollback_keeps_active_cache_while_fast_worker_is_blocked(tmp_path):
+    classifier = GeometryFastClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False,
+    )
+    group = {
+        "group_id": "legacy",
+        "name": "legacy",
+        "enabled": True,
+        "propagation": {"state": "active"},
+        "annotations": [{
+            "orientation": "front",
+            "index": 0,
+            "status": "active",
+            "regions": [{"x": 0, "y": 0, "width": 2, "height": 2}],
+        }],
+    }
+    catalog.commit_annotation_document(
+        record.id,
+        [group],
+        expected_revision=record.revision,
+        operation_id="legacy-before-geometry",
+        active_groups=[group],
+    )
+    record = catalog.get(record.id)
+    profiles = GeometryMaskProfiles(
+        catalog,
+        start_worker=False,
+        storage_dir=tmp_path / "geometry-jobs",
+    )
+    catalog.set_geometry_profiles(profiles)
+    profile = profiles.snapshot(record.id)["draft"]
+    profile_root = record.root / "geometry_masks"
+    (profile_root / "revisions").mkdir(parents=True, exist_ok=True)
+    profile_document = {
+        "schema_version": profile["schema_version"],
+        "library_revision": record.revision + 1,
+        "draft_revision": 0,
+        "active_revision": 1,
+        "previous_active_revision": None,
+        "draft": profile,
+        "active": profile,
+    }
+    profile_path = profile_root / "profile.json"
+    profile_path.write_text(json.dumps(profile_document), encoding="utf-8")
+    (profile_root / "revisions" / "1.json").write_text(
+        json.dumps({
+            "profile": profile,
+            "previous_active_revision": None,
+            "previous_source": "legacy",
+        }),
+        encoding="utf-8",
+    )
+    classifier.inference_mode = "fast_geometry"
+    current = catalog.capture_snapshot(record.id)
+    published = catalog.publish_geometry_profile(
+        record.id,
+        replace(
+            current.cache,
+            geometry_profile={**profile, "profile_revision": 1},
+            geometry_profile_revision=1,
+            fast_runtime=None,
+        ),
+        profile_revision=1,
+        previous_profile_revision=None,
+        expected_revision=record.revision,
+        operation_id="publish-before-rollback",
+    )
+    before = catalog.capture_snapshot(record.id)
+    classifier.block_build = True
+    classifier.started.clear()
+    classifier.release.clear()
+    rolled = []
+    errors = []
+    done = threading.Event()
+
+    def rollback():
+        try:
+            rolled.append(profiles.rollback(
+                record.id,
+                expected_library_revision=published.revision,
+                operation_id="rollback-to-legacy",
+            ))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=rollback)
+    worker.start()
+    try:
+        assert classifier.started.wait(1.0)
+        assert catalog.capture_snapshot(record.id) is before
+        assert json.loads(profile_path.read_text(encoding="utf-8"))["active_revision"] == 1
+        assert not done.is_set()
+    finally:
+        classifier.release.set()
+        worker.join(timeout=2.0)
+        catalog.shutdown()
+        profiles.shutdown()
+
+    assert done.is_set()
+    assert errors == []
+    assert rolled[0]["active_revision"] is None
+    ready = catalog.capture_snapshot(record.id)
+    assert ready.record.revision == published.revision + 1
+    assert ready.cache.geometry_profile_revision is None
+    assert ready.cache.fast_runtime["geometry_profile_revision"] is None

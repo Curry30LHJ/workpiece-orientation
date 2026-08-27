@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import json
 import threading
@@ -797,7 +798,7 @@ def test_restore_cache_miss_builds_fast_cache_for_recycled_library_revision(tmp_
 
 
 @pytest.mark.parametrize("inference_mode", ["fast_geometry", "compare"])
-def test_restore_rebuilds_stale_fast_sidecar_while_preserving_valid_base_cache(
+def test_restore_queues_stale_fast_sidecar_rebuild_while_preserving_valid_base_cache(
     tmp_path,
     inference_mode,
 ):
@@ -822,6 +823,7 @@ def test_restore_rebuilds_stale_fast_sidecar_while_preserving_valid_base_cache(
     assert loaded_base.fast_runtime is None
 
     restored = catalog.restore(record.id, operation_id=f"restore-{inference_mode}")
+    catalog.shutdown()
     snapshot = catalog.capture_snapshot(record.id)
     persisted = classifier.load_template_cache(restored)
 
@@ -1250,3 +1252,103 @@ def test_first_geometry_publish_can_rollback_to_legacy_cache(tmp_path):
     )
     assert rolled["active_revision"] is None
     assert classifier.get_template_cache(record.id).ignored_regions
+
+
+def test_legacy_rollback_persists_none_geometry_sidecar_with_production_validator(tmp_path):
+    classifier = persisted_fast_classifier("fast_geometry")
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7",
+        [image(tmp_path / "front.png", 10)],
+        [image(tmp_path / "back.png", 20)],
+        False,
+    )
+    catalog.shutdown()
+    group = _active_legacy_group()
+    catalog.commit_annotation_document(
+        record.id,
+        [group],
+        expected_revision=record.revision,
+        operation_id="production-legacy-active",
+        active_groups=[group],
+    )
+    record = catalog.get(record.id)
+    profiles = GeometryMaskProfiles(
+        catalog,
+        start_worker=False,
+        storage_dir=tmp_path / "production-geometry-jobs",
+    )
+    catalog.set_geometry_profiles(profiles)
+    profile = profiles.snapshot(record.id)["draft"]
+    profile_root = record.root / "geometry_masks"
+    (profile_root / "revisions").mkdir(parents=True, exist_ok=True)
+    profile_path = profile_root / "profile.json"
+    profile_document = {
+        "schema_version": profile["schema_version"],
+        "library_revision": record.revision + 1,
+        "draft_revision": 0,
+        "active_revision": 1,
+        "previous_active_revision": None,
+        "draft": profile,
+        "active": profile,
+    }
+    profile_path.write_text(json.dumps(profile_document), encoding="utf-8")
+    (profile_root / "revisions" / "1.json").write_text(
+        json.dumps({
+            "profile": profile,
+            "previous_active_revision": None,
+            "previous_source": "legacy",
+        }),
+        encoding="utf-8",
+    )
+    current = catalog.capture_snapshot(record.id)
+    published = catalog.publish_geometry_profile(
+        record.id,
+        replace(
+            current.cache,
+            geometry_profile={**profile, "profile_revision": 1},
+            geometry_profile_revision=1,
+            fast_runtime=None,
+        ),
+        profile_revision=1,
+        previous_profile_revision=None,
+        expected_revision=record.revision,
+        operation_id="production-publish-geometry",
+    )
+    assert classifier.load_fast_runtime_cache(published) is not None
+
+    before = catalog.capture_snapshot(record.id)
+    original_stage = classifier.stage_fast_runtime_cache
+
+    def fail_stage(*_args, **_kwargs):
+        raise RuntimeError("staged legacy persistence failed")
+
+    classifier.stage_fast_runtime_cache = fail_stage
+    with pytest.raises(RuntimeError, match="staged legacy persistence failed"):
+        catalog.restore_legacy_annotation_cache(
+            record.id,
+            expected_revision=published.revision,
+            operation_id="production-rollback-stage-failure",
+        )
+    assert catalog.capture_snapshot(record.id) is before
+    assert catalog.get(record.id).revision == published.revision
+    classifier.stage_fast_runtime_cache = original_stage
+
+    restored = catalog.restore_legacy_annotation_cache(
+        record.id,
+        expected_revision=published.revision,
+        operation_id="production-rollback-legacy",
+    )
+    profile_document.update({
+        "library_revision": restored.revision,
+        "active_revision": None,
+        "previous_active_revision": None,
+        "active": None,
+    })
+    profile_path.write_text(json.dumps(profile_document), encoding="utf-8")
+
+    runtime = classifier.load_fast_runtime_cache(restored)
+    assert runtime is not None
+    assert runtime.library_revision == restored.revision
+    assert runtime.geometry_profile_revision is None
+    profiles.shutdown()

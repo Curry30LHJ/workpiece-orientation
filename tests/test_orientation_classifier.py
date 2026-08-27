@@ -269,6 +269,80 @@ def test_fast_cache_round_trip_binds_library_geometry_and_model_revisions(classi
     assert loaded.fast_runtime.ridge_head.feature_dim == runtime.ridge_head.feature_dim
 
 
+def test_staged_fast_cache_commit_and_rollback_preserve_previous_sidecar(classifier, tmp_path):
+    front = [write_marker(tmp_path / "staged-front.png", 1)]
+    back = [write_marker(tmp_path / "staged-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    old_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "old"})
+    new_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "new"})
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, old_runtime)
+
+    staged = classifier.stage_fast_runtime_cache(
+        record,
+        new_runtime,
+        geometry_profile_revision=None,
+    )
+
+    assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "old"
+    committed = classifier.commit_staged_fast_runtime_cache(record, staged)
+    assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "new"
+    classifier.rollback_committed_fast_runtime_cache(committed)
+    assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "old"
+
+
+def test_staged_fast_cache_partial_serialization_failure_removes_sibling_stage(
+    classifier,
+    tmp_path,
+    monkeypatch,
+):
+    front = [write_marker(tmp_path / "partial-front.png", 1)]
+    back = [write_marker(tmp_path / "partial-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, runtime)
+    previous = (record.root / ".fast_runtime_cache.pkl").read_bytes()
+
+    def fail_after_partial_write(_payload, stream, **_kwargs):
+        stream.write(b"partial")
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr("src.orientation_classifier.pickle.dump", fail_after_partial_write)
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        classifier.stage_fast_runtime_cache(record, runtime)
+
+    assert (record.root / ".fast_runtime_cache.pkl").read_bytes() == previous
+    assert list(tmp_path.glob(".fast-runtime-stage-record-*")) == []
+
+
 def test_fast_cache_revision_mismatch_is_ignored_without_deleting_base_cache(classifier, tmp_path):
     front = [write_marker(tmp_path / "stale-front.png", 1)]
     back = [write_marker(tmp_path / "stale-back.png", 2)]
