@@ -25,6 +25,9 @@ from src.workpiece_library import (
 
 LOGGER = logging.getLogger(__name__)
 SUMMARY_READ_ATTEMPTS = 3
+FAST_CACHE_CAPABILITY_ERROR = (
+    "FAST_CACHE_CAPABILITY_UNAVAILABLE: staged fast-cache persistence is unavailable"
+)
 
 
 class WorkpieceCatalogError(RuntimeError):
@@ -58,15 +61,49 @@ class WorkpieceCatalog:
         self.fast_jobs = fast_jobs or FastCacheJobManager()
 
     def _activate(self, record: WorkpieceRecord, cache: TemplateCache) -> None:
+        previous = self._snapshots.get(record.id)
+        try:
+            self.classifier.set_template_cache(record.id, cache)
+        except Exception:
+            self._restore_active_snapshot(record.id, previous)
+            raise
         self._snapshots[record.id] = ActiveWorkpieceSnapshot(record, cache)
-        self.classifier.set_template_cache(record.id, cache)
+
+    def _restore_active_snapshot(
+        self,
+        workpiece_id: str,
+        snapshot: ActiveWorkpieceSnapshot | None,
+    ) -> None:
+        if snapshot is None:
+            remover = getattr(self.classifier, "remove_template_cache", None)
+            if callable(remover):
+                remover(workpiece_id)
+            self._snapshots.pop(workpiece_id, None)
+            return
+        self.classifier.set_template_cache(workpiece_id, snapshot.cache)
+        self._snapshots[workpiece_id] = snapshot
+
+    def _fast_mode_requested(self) -> bool:
+        return getattr(self.classifier, "inference_mode", None) in {"fast_geometry", "compare"}
+
+    def _fast_cache_capability_error(self) -> str | None:
+        if not self._fast_mode_requested():
+            return None
+        methods = (
+            "build_fast_runtime_cache",
+            "save_fast_runtime_cache",
+            "stage_fast_runtime_cache",
+            "commit_staged_fast_runtime_cache",
+            "finalize_staged_fast_runtime_cache",
+            "discard_staged_fast_runtime_cache",
+            "rollback_committed_fast_runtime_cache",
+        )
+        if all(callable(getattr(self.classifier, name, None)) for name in methods):
+            return None
+        return FAST_CACHE_CAPABILITY_ERROR
 
     def _fast_cache_enabled(self) -> bool:
-        return (
-            getattr(self.classifier, "inference_mode", None) in {"fast_geometry", "compare"}
-            and callable(getattr(self.classifier, "build_fast_runtime_cache", None))
-            and callable(getattr(self.classifier, "save_fast_runtime_cache", None))
-        )
+        return self._fast_mode_requested() and self._fast_cache_capability_error() is None
 
     def _schedule_fast_cache(self, record: WorkpieceRecord, cache: TemplateCache) -> None:
         if not self._fast_cache_enabled() or getattr(cache, "fast_runtime", None) is not None:
@@ -231,7 +268,7 @@ class WorkpieceCatalog:
             "completed": 0,
             "total": 0,
             "elapsed_ms": 0.0,
-            "error": None,
+            "error": None if ready else self._fast_cache_capability_error(),
         }
 
     def shutdown(self) -> None:
@@ -272,6 +309,13 @@ class WorkpieceCatalog:
             return result
 
     def _load_template_cache(self, record: WorkpieceRecord):
+        recover_staging = getattr(
+            self.classifier,
+            "recover_fast_runtime_cache_staging",
+            None,
+        )
+        if callable(recover_staging):
+            recover_staging(record)
         loader = getattr(self.classifier, "load_template_cache", None)
         return loader(record) if callable(loader) else None
 
@@ -568,18 +612,24 @@ class WorkpieceCatalog:
                         )
                     if runtime is not None:
                         committed = self.classifier.commit_staged_fast_runtime_cache(target, staged)
+                    activated = False
                     try:
+                        self._activate(target, candidate)
+                        activated = True
                         updated = self.library.replace_geometry_profile_pointers(
                             workpiece_id,
                             expected_revision=expected_revision,
                             active_revision=None,
                             previous_active_revision=None,
                         )
-                        self._activate(updated, candidate)
                     except Exception:
-                        if committed is not None:
-                            self.classifier.rollback_committed_fast_runtime_cache(committed)
-                            committed = None
+                        try:
+                            if activated:
+                                self._restore_active_snapshot(workpiece_id, current)
+                        finally:
+                            if committed is not None:
+                                self.classifier.rollback_committed_fast_runtime_cache(committed)
+                                committed = None
                         raise
                 persisted = replace(candidate, fast_runtime=None) if runtime is not None else candidate
                 self._save_template_cache(updated, persisted)
@@ -932,21 +982,27 @@ class WorkpieceCatalog:
                         )
                     if runtime is not None:
                         committed = self.classifier.commit_staged_fast_runtime_cache(target, staged)
+                    activated = False
                     try:
+                        # Activation is an in-memory swap.  Publish it before the
+                        # durable pointer so a failed classifier swap cannot advance
+                        # the manifest revision.
+                        self._activate(target, prepared_cache)
+                        activated = True
                         record = self.library.replace_geometry_profile_pointers(
                             workpiece_id,
                             expected_revision=expected_revision,
                             active_revision=profile_revision,
                             previous_active_revision=previous_profile_revision,
                         )
-                        # set_template_cache is an in-memory reference swap; it does not
-                        # run model inference.  The durable cache writer stores only the
-                        # unmasked base cache so recovery can rebuild any active profile.
-                        self._activate(record, prepared_cache)
                     except Exception:
-                        if committed is not None:
-                            self.classifier.rollback_committed_fast_runtime_cache(committed)
-                            committed = None
+                        try:
+                            if activated:
+                                self._restore_active_snapshot(workpiece_id, current_snapshot)
+                        finally:
+                            if committed is not None:
+                                self.classifier.rollback_committed_fast_runtime_cache(committed)
+                                committed = None
                         raise
                 persisted = replace(prepared_cache, fast_runtime=None) if runtime is not None else prepared_cache
                 self._save_template_cache(record, persisted)
@@ -1001,7 +1057,7 @@ class WorkpieceCatalog:
                 self._activate(record, cache)
             effective = cache
             geometry_profiles = self.geometry_profiles
-            if self._fast_cache_enabled():
+            if self._fast_mode_requested():
                 try:
                     effective = self._materialize_fast_profile(record, cache)
                 except Exception as exc:

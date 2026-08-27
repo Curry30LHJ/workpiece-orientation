@@ -740,6 +740,312 @@ class GeometryFastClassifier(BlockingFastClassifier):
         ), {}
 
 
+class FailureAtomicGeometryClassifier(GeometryFastClassifier):
+    def __init__(self):
+        super().__init__()
+        self.fail_next_activation = False
+        self.sidecar_committed = threading.Event()
+
+    def set_template_cache(self, workpiece_id, cache):
+        super().set_template_cache(workpiece_id, cache)
+        if self.fail_next_activation:
+            self.fail_next_activation = False
+            raise RuntimeError("activation failed after sidecar commit")
+
+    @staticmethod
+    def stage_fast_runtime_cache(record, runtime, *, geometry_profile_revision=None):
+        target = record.root / ".fast_runtime_cache.pkl"
+        return {
+            "target": target,
+            "payload": json.dumps(runtime, sort_keys=True).encode("utf-8"),
+            "previous": target.read_bytes() if target.is_file() else None,
+            "runtime": runtime,
+        }
+
+    def commit_staged_fast_runtime_cache(self, record, staged):
+        staged["target"].write_bytes(staged["payload"])
+        self.saved.append((record.id, staged["runtime"]))
+        self.sidecar_committed.set()
+        return staged
+
+    @staticmethod
+    def rollback_committed_fast_runtime_cache(committed):
+        if committed["previous"] is None:
+            if committed["target"].is_file():
+                committed["target"].unlink()
+        else:
+            committed["target"].write_bytes(committed["previous"])
+
+
+class BuildSaveOnlyFastClassifier(GeometryFastClassifier):
+    stage_fast_runtime_cache = None
+    commit_staged_fast_runtime_cache = None
+    finalize_staged_fast_runtime_cache = None
+    discard_staged_fast_runtime_cache = None
+    rollback_committed_fast_runtime_cache = None
+
+    def __init__(self):
+        super().__init__()
+        self.fast_build_calls = 0
+
+    def build_fast_runtime_cache(self, record, geometry_profile, progress_callback=None):
+        self.fast_build_calls += 1
+        return {
+            "library_revision": record.revision,
+            "geometry_profile_revision": (
+                None if geometry_profile is None else geometry_profile["profile_revision"]
+            ),
+        }
+
+
+class RecordingFastJobs:
+    def __init__(self):
+        self.scheduled = []
+
+    def schedule(self, **kwargs):
+        self.scheduled.append(kwargs)
+
+    @staticmethod
+    def snapshot(_workpiece_id):
+        return None
+
+    @staticmethod
+    def shutdown():
+        return None
+
+
+@pytest.mark.parametrize("inference_mode", ["fast_geometry", "compare"])
+def test_build_save_only_classifier_is_not_scheduled_and_reports_capability_error(
+    tmp_path,
+    inference_mode,
+):
+    record, base_cache = _persist_base_library(tmp_path)
+    classifier = BuildSaveOnlyFastClassifier()
+    classifier.inference_mode = inference_mode
+    classifier.load_template_cache = lambda _record: base_cache
+    jobs = RecordingFastJobs()
+
+    class PublishedProfiles:
+        def __init__(self):
+            self.rebuild_calls = 0
+
+        @staticmethod
+        def sync_library_revision(_record):
+            return None
+
+        @staticmethod
+        def snapshot(_workpiece_id):
+            return {
+                "active_revision": 6,
+                "active": {"profile_revision": 6, "rules": []},
+            }
+
+        def rebuild_active_cache(self, *_args, **_kwargs):
+            self.rebuild_calls += 1
+            pytest.fail("unsupported fast classifier triggered synchronous geometry rebuild")
+
+    profiles = PublishedProfiles()
+    catalog = WorkpieceCatalog(
+        WorkpieceLibrary(tmp_path / "library"),
+        classifier,
+        profiles,
+        fast_jobs=jobs,
+    )
+
+    catalog.recover()
+
+    snapshot = catalog.capture_snapshot(record.id)
+    assert snapshot.cache.geometry_profile_revision == 6
+    assert snapshot.cache.fast_runtime is None
+    assert profiles.rebuild_calls == 0
+    assert classifier.fast_build_calls == 0
+    assert jobs.scheduled == []
+    assert catalog.fast_cache_status(record.id) == {
+        "state": "not_ready",
+        "completed": 0,
+        "total": 0,
+        "elapsed_ms": 0.0,
+        "error": "FAST_CACHE_CAPABILITY_UNAVAILABLE: staged fast-cache persistence is unavailable",
+    }
+
+
+@pytest.mark.parametrize("inference_mode", ["fast_geometry", "compare"])
+def test_geometry_publish_with_build_save_only_classifier_skips_unpublishable_build(
+    tmp_path,
+    inference_mode,
+):
+    classifier = BuildSaveOnlyFastClassifier()
+    classifier.inference_mode = inference_mode
+    jobs = RecordingFastJobs()
+    catalog = WorkpieceCatalog(
+        WorkpieceLibrary(tmp_path / "library"),
+        classifier,
+        fast_jobs=jobs,
+    )
+    record, base = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False,
+    )
+    candidate = replace(
+        base,
+        geometry_profile={"profile_revision": 3},
+        geometry_profile_revision=3,
+    )
+
+    published = catalog.publish_geometry_profile(
+        record.id,
+        candidate,
+        profile_revision=3,
+        previous_profile_revision=None,
+        expected_revision=record.revision,
+        operation_id=f"build-save-only-{inference_mode}",
+    )
+
+    assert published.revision == record.revision + 1
+    assert catalog.capture_snapshot(record.id).cache is candidate
+    assert classifier.fast_build_calls == 0
+    assert jobs.scheduled == []
+    assert catalog.fast_cache_status(record.id)["error"] == (
+        "FAST_CACHE_CAPABILITY_UNAVAILABLE: staged fast-cache persistence is unavailable"
+    )
+
+
+def test_background_activation_failure_restores_snapshot_classifier_and_sidecar(tmp_path):
+    record, base_cache = _persist_base_library(tmp_path)
+    classifier = FailureAtomicGeometryClassifier()
+    classifier.inference_mode = "fast_geometry"
+    classifier.block_build = True
+    classifier.load_template_cache = lambda _record: base_cache
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+
+    catalog.recover()
+    assert classifier.started.wait(1.0)
+    before = catalog.capture_snapshot(record.id)
+    manifest_path = record.root / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    sidecar = record.root / ".fast_runtime_cache.pkl"
+    sidecar.write_bytes(b"old-sidecar")
+    sidecar_before = sidecar.read_bytes()
+    classifier.fail_next_activation = True
+    classifier.release.set()
+    catalog.shutdown()
+
+    assert classifier.sidecar_committed.is_set()
+    status = catalog.fast_cache_status(record.id)
+    assert status["state"] == "failed"
+    assert status["error"] == "activation failed after sidecar commit"
+    assert catalog.capture_snapshot(record.id) is before
+    assert classifier.caches[record.id] is before.cache
+    assert catalog.get(record.id) is before.record
+    assert manifest_path.read_bytes() == manifest_before
+    assert sidecar.read_bytes() == sidecar_before
+
+
+def test_geometry_activation_failure_restores_snapshot_pointer_and_sidecar(tmp_path):
+    classifier = FailureAtomicGeometryClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, base = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False,
+    )
+    before = catalog.capture_snapshot(record.id)
+    manifest_path = record.root / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    sidecar = record.root / ".fast_runtime_cache.pkl"
+    sidecar.write_bytes(b"old-sidecar")
+    sidecar_before = sidecar.read_bytes()
+    classifier.inference_mode = "fast_geometry"
+    classifier.fail_next_activation = True
+    candidate = replace(
+        base,
+        geometry_profile={"profile_revision": 3},
+        geometry_profile_revision=3,
+    )
+
+    with pytest.raises(RuntimeError, match="activation failed after sidecar commit"):
+        catalog.publish_geometry_profile(
+            record.id,
+            candidate,
+            profile_revision=3,
+            previous_profile_revision=None,
+            expected_revision=record.revision,
+            operation_id="geometry-activation-failure",
+        )
+
+    assert classifier.sidecar_committed.is_set()
+    assert catalog.capture_snapshot(record.id) is before
+    assert classifier.caches[record.id] is before.cache
+    assert catalog.get(record.id) is before.record
+    assert manifest_path.read_bytes() == manifest_before
+    assert sidecar.read_bytes() == sidecar_before
+    catalog.shutdown()
+
+
+def test_legacy_rollback_activation_failure_restores_snapshot_pointer_and_sidecar(tmp_path):
+    classifier = FailureAtomicGeometryClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7", [image(tmp_path / "front.png", 10)], [image(tmp_path / "back.png", 20)], False,
+    )
+    group = {
+        "group_id": "legacy",
+        "name": "legacy",
+        "enabled": True,
+        "propagation": {"state": "active"},
+        "annotations": [{
+            "orientation": "front",
+            "index": 0,
+            "status": "active",
+            "regions": [{"x": 0, "y": 0, "width": 2, "height": 2}],
+        }],
+    }
+    catalog.commit_annotation_document(
+        record.id,
+        [group],
+        expected_revision=record.revision,
+        operation_id="legacy-before-failure",
+        active_groups=[group],
+    )
+    record = catalog.get(record.id)
+    classifier.inference_mode = "fast_geometry"
+    current = catalog.capture_snapshot(record.id)
+    published = catalog.publish_geometry_profile(
+        record.id,
+        replace(
+            current.cache,
+            geometry_profile={"profile_revision": 1},
+            geometry_profile_revision=1,
+            fast_runtime=None,
+        ),
+        profile_revision=1,
+        previous_profile_revision=None,
+        expected_revision=record.revision,
+        operation_id="geometry-before-legacy-failure",
+    )
+    before = catalog.capture_snapshot(record.id)
+    library_before = catalog.get(record.id)
+    manifest_path = published.root / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    sidecar = published.root / ".fast_runtime_cache.pkl"
+    sidecar_before = sidecar.read_bytes()
+    classifier.sidecar_committed.clear()
+    classifier.fail_next_activation = True
+
+    with pytest.raises(RuntimeError, match="activation failed after sidecar commit"):
+        catalog.restore_legacy_annotation_cache(
+            record.id,
+            expected_revision=published.revision,
+            operation_id="legacy-activation-failure",
+        )
+
+    assert classifier.sidecar_committed.is_set()
+    assert catalog.capture_snapshot(record.id) is before
+    assert classifier.caches[record.id] is before.cache
+    assert catalog.get(record.id) is library_before
+    assert catalog.get(record.id) == before.record
+    assert manifest_path.read_bytes() == manifest_before
+    assert sidecar.read_bytes() == sidecar_before
+    catalog.shutdown()
+
+
 def test_geometry_publication_builds_target_revision_before_pointer_swap(tmp_path):
     classifier = GeometryFastClassifier()
     catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)

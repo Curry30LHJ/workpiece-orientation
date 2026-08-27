@@ -993,6 +993,36 @@ def test_catalog_recover_uses_classifier_cache_before_rebuilding(tmp_path):
     assert manifest_path.stat().st_mtime_ns == before_mtime
 
 
+def test_catalog_recover_resolves_fast_cache_staging_before_loading_cache(tmp_path):
+    initial_library = WorkpieceLibrary(tmp_path / "library")
+    record, expected_cache = initial_library.register(
+        "M7",
+        [image(tmp_path / "recovery-order-front.png", 10)],
+        [image(tmp_path / "recovery-order-back.png", 20)],
+        False,
+        builder,
+    )
+
+    class RecoveryAwareClassifier(CachingFakeClassifier):
+        def __init__(self):
+            super().__init__(preloaded=expected_cache)
+            self.recovery_order = []
+
+        def recover_fast_runtime_cache_staging(self, candidate_record):
+            self.recovery_order.append(("recover", candidate_record.id))
+
+        def load_template_cache(self, candidate_record):
+            self.recovery_order.append(("load", candidate_record.id))
+            return super().load_template_cache(candidate_record)
+
+    classifier = RecoveryAwareClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+
+    catalog.recover()
+
+    assert classifier.recovery_order == [("recover", record.id), ("load", record.id)]
+
+
 def test_recover_does_not_hold_catalog_lock_during_geometry_rebuild(tmp_path):
     initial = WorkpieceLibrary(tmp_path / "library")
     record, _ = initial.register(

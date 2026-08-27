@@ -2,6 +2,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from contextlib import contextmanager
 from dataclasses import replace
+import json
+import os
 import pickle
 import sys
 import threading
@@ -291,6 +293,8 @@ def test_staged_fast_cache_commit_and_rollback_preserve_previous_sidecar(classif
     record.root.mkdir()
     classifier.model_fingerprint = "model-a"
     classifier.save_fast_runtime_cache(record, old_runtime)
+    target = record.root / ".fast_runtime_cache.pkl"
+    previous = target.read_bytes()
 
     staged = classifier.stage_fast_runtime_cache(
         record,
@@ -300,9 +304,306 @@ def test_staged_fast_cache_commit_and_rollback_preserve_previous_sidecar(classif
 
     assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "old"
     committed = classifier.commit_staged_fast_runtime_cache(record, staged)
+    committed_again = classifier.commit_staged_fast_runtime_cache(record, staged)
+    assert committed_again == committed
     assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "new"
     classifier.rollback_committed_fast_runtime_cache(committed)
+    classifier.rollback_committed_fast_runtime_cache(committed_again)
+    classifier.discard_staged_fast_runtime_cache(staged)
+    classifier.discard_staged_fast_runtime_cache(staged)
+    assert target.read_bytes() == previous
     assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "old"
+
+
+def test_staged_fast_cache_replacement_keeps_live_sidecar_readable(
+    classifier,
+    tmp_path,
+    monkeypatch,
+):
+    front = [write_marker(tmp_path / "atomic-front.png", 1)]
+    back = [write_marker(tmp_path / "atomic-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    old_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "old"})
+    new_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "new"})
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, old_runtime)
+    staged = classifier.stage_fast_runtime_cache(
+        record,
+        new_runtime,
+        geometry_profile_revision=None,
+    )
+    target = record.root / ".fast_runtime_cache.pkl"
+    previous = target.read_bytes()
+    replacing = threading.Event()
+    release = threading.Event()
+    errors = []
+    committed = []
+    real_replace = os.replace
+
+    def block_atomic_replace(source, destination):
+        if Path(source) == staged.temporary_path and Path(destination) == target:
+            replacing.set()
+            assert release.wait(2.0)
+        return real_replace(source, destination)
+
+    def commit():
+        try:
+            committed.append(classifier.commit_staged_fast_runtime_cache(record, staged))
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr("src.orientation_classifier.os.replace", block_atomic_replace)
+    worker = threading.Thread(target=commit)
+    worker.start()
+    try:
+        assert replacing.wait(1.0)
+        assert target.is_file()
+        assert target.read_bytes() == previous
+        assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "old"
+    finally:
+        release.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(committed) == 1
+    assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "new"
+
+
+def test_discard_after_interrupted_commit_restores_previous_sidecar(
+    classifier,
+    tmp_path,
+    monkeypatch,
+):
+    front = [write_marker(tmp_path / "discard-front.png", 1)]
+    back = [write_marker(tmp_path / "discard-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    old_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "old"})
+    new_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "new"})
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, old_runtime)
+    target = record.root / ".fast_runtime_cache.pkl"
+    previous = target.read_bytes()
+    staged = classifier.stage_fast_runtime_cache(record, new_runtime)
+    real_replace = os.replace
+
+    def replace_then_raise(source, destination):
+        real_replace(source, destination)
+        if Path(source) == staged.temporary_path and Path(destination) == target:
+            raise OSError("interrupted after atomic replacement")
+
+    monkeypatch.setattr("src.orientation_classifier.os.replace", replace_then_raise)
+    with pytest.raises(OSError, match="interrupted after atomic replacement"):
+        classifier.commit_staged_fast_runtime_cache(record, staged)
+
+    classifier.discard_staged_fast_runtime_cache(staged)
+    classifier.discard_staged_fast_runtime_cache(staged)
+
+    assert target.read_bytes() == previous
+    assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "old"
+
+
+def test_fast_cache_stage_recovery_discards_uncommitted_orphan_without_touching_live_sidecar(
+    classifier,
+    tmp_path,
+):
+    front = [write_marker(tmp_path / "orphan-front.png", 1)]
+    back = [write_marker(tmp_path / "orphan-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    old_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "old"})
+    new_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "new"})
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, old_runtime)
+    target = record.root / ".fast_runtime_cache.pkl"
+    previous = target.read_bytes()
+    staged = classifier.stage_fast_runtime_cache(record, new_runtime)
+
+    classifier.recover_fast_runtime_cache_staging(record)
+
+    assert target.read_bytes() == previous
+    assert not staged.temporary_root.exists()
+    assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "old"
+
+
+def test_fast_cache_stage_recovery_restores_old_sidecar_after_interrupted_revision_commit(
+    classifier,
+    tmp_path,
+):
+    front = [write_marker(tmp_path / "restart-front.png", 1)]
+    back = [write_marker(tmp_path / "restart-back.png", 2)]
+    old_runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    new_runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=8,
+        model_fingerprint="model-a",
+    )
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    target_record = SimpleNamespace(**{**record.__dict__, "revision": 8})
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, old_runtime)
+    target = record.root / ".fast_runtime_cache.pkl"
+    previous = target.read_bytes()
+    staged = classifier.stage_fast_runtime_cache(target_record, new_runtime)
+    os.replace(staged.temporary_path, target)
+
+    classifier.recover_fast_runtime_cache_staging(record)
+
+    assert target.read_bytes() == previous
+    assert not staged.temporary_root.exists()
+    assert classifier.load_fast_runtime_cache(record).library_revision == 7
+
+
+def test_fast_cache_stage_recovery_keeps_valid_live_sidecar_when_cleaning_orphan(
+    classifier,
+    tmp_path,
+):
+    front = [write_marker(tmp_path / "valid-orphan-front.png", 1)]
+    back = [write_marker(tmp_path / "valid-orphan-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    new_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "new"})
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    staged = classifier.stage_fast_runtime_cache(record, new_runtime)
+    target = record.root / ".fast_runtime_cache.pkl"
+    os.replace(staged.temporary_path, target)
+    published = target.read_bytes()
+
+    classifier.recover_fast_runtime_cache_staging(record)
+
+    assert target.read_bytes() == published
+    assert not staged.temporary_root.exists()
+    assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == "new"
+
+
+def test_fast_cache_stage_recovery_uses_committed_manifest_pointer_during_legacy_rollback(
+    classifier,
+    tmp_path,
+):
+    front = [write_marker(tmp_path / "manifest-front.png", 1)]
+    back = [write_marker(tmp_path / "manifest-back.png", 2)]
+    old_runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        geometry_profile={"profile_revision": 4},
+        model_fingerprint="model-a",
+    )
+    new_runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=8,
+        model_fingerprint="model-a",
+    )
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+    )
+    target_record = SimpleNamespace(**{**record.__dict__, "revision": 8})
+    record.root.mkdir()
+    profile_root = record.root / "geometry_masks"
+    profile_root.mkdir()
+    (profile_root / "profile.json").write_text(
+        json.dumps({"active_revision": 4}),
+        encoding="utf-8",
+    )
+    manifest_path = record.root / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"revision": 7, "geometry_mask_active_revision": 4}),
+        encoding="utf-8",
+    )
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, old_runtime)
+    staged = classifier.stage_fast_runtime_cache(
+        target_record,
+        new_runtime,
+        geometry_profile_revision=None,
+    )
+    target = record.root / ".fast_runtime_cache.pkl"
+    os.replace(staged.temporary_path, target)
+    published = target.read_bytes()
+    manifest_path.write_text(
+        json.dumps({"revision": 8, "geometry_mask_active_revision": None}),
+        encoding="utf-8",
+    )
+
+    classifier.recover_fast_runtime_cache_staging(target_record)
+
+    assert target.read_bytes() == published
+    assert not staged.temporary_root.exists()
+    assert classifier.load_fast_runtime_cache(target_record).library_revision == 8
+    assert classifier.load_fast_runtime_cache(target_record).geometry_profile_revision is None
 
 
 def test_staged_fast_cache_partial_serialization_failure_removes_sibling_stage(

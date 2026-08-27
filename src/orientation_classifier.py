@@ -99,6 +99,8 @@ class StagedFastRuntimeCache:
     temporary_root: Path
     temporary_path: Path
     cache: FastRuntimeCache
+    staged_digest: str
+    previous_digest: str | None
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,8 @@ class CommittedFastRuntimeCache:
     target_path: Path
     backup_path: Path | None
     temporary_root: Path
+    committed_digest: str
+    previous_digest: str | None
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,14 @@ class LocalSearchResult:
     diagnostics: dict[str, object]
     matching_ms: float
     trace: dict[str, object]
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _move_tensors(value: Any, device: Any) -> Any:
@@ -598,6 +610,15 @@ class OrientationClassifier:
         profile = getattr(record, "geometry_profile", None)
         if isinstance(profile, Mapping) and isinstance(profile.get("profile_revision"), int):
             return int(profile["profile_revision"])
+        manifest_path = Path(record.root) / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if "geometry_mask_active_revision" in manifest:
+                    active_revision = manifest["geometry_mask_active_revision"]
+                    return None if active_revision is None else int(active_revision)
+            except (OSError, ValueError, TypeError):
+                return None
         profile_path = Path(record.root) / "geometry_masks" / "profile.json"
         if profile_path.is_file():
             try:
@@ -730,8 +751,25 @@ class OrientationClassifier:
                 pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
                 stream.flush()
                 os.fsync(stream.fileno())
+            staged_digest = _file_sha256(temporary)
+            target = root / FAST_RUNTIME_CACHE_FILE_NAME
+            previous_digest = None
+            if target.is_file():
+                backup = temporary_root / ".previous-fast-runtime-cache.pkl"
+                with target.open("rb") as source, backup.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                previous_digest = _file_sha256(backup)
             staged = True
-            return StagedFastRuntimeCache(root, temporary_root, temporary, cache)
+            return StagedFastRuntimeCache(
+                root,
+                temporary_root,
+                temporary,
+                cache,
+                staged_digest,
+                previous_digest,
+            )
         finally:
             if temporary_root_created and not staged and temporary_root.exists():
                 shutil.rmtree(temporary_root)
@@ -746,17 +784,29 @@ class OrientationClassifier:
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: workpiece root changed")
         target = root / FAST_RUNTIME_CACHE_FILE_NAME
         backup = staged.temporary_root / ".previous-fast-runtime-cache.pkl"
-        backup_path = None
-        if target.is_file():
-            os.replace(target, backup)
-            backup_path = backup
-        try:
+        backup_path = backup if staged.previous_digest is not None else None
+        target_digest = _file_sha256(target) if target.is_file() else None
+        if not staged.temporary_path.is_file():
+            if target_digest != staged.staged_digest:
+                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: staged payload is unavailable")
+        else:
+            if _file_sha256(staged.temporary_path) != staged.staged_digest:
+                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: staged payload changed")
+            if target_digest != staged.previous_digest:
+                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: live sidecar changed")
+            if backup_path is not None and (
+                not backup_path.is_file()
+                or _file_sha256(backup_path) != staged.previous_digest
+            ):
+                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: rollback payload changed")
             os.replace(staged.temporary_path, target)
-        except Exception:
-            if backup_path is not None and backup_path.is_file():
-                os.replace(backup_path, target)
-            raise
-        return CommittedFastRuntimeCache(target, backup_path, staged.temporary_root)
+        return CommittedFastRuntimeCache(
+            target,
+            backup_path,
+            staged.temporary_root,
+            staged.staged_digest,
+            staged.previous_digest,
+        )
 
     @staticmethod
     def finalize_staged_fast_runtime_cache(committed: CommittedFastRuntimeCache) -> None:
@@ -765,32 +815,98 @@ class OrientationClassifier:
 
     @staticmethod
     def rollback_committed_fast_runtime_cache(committed: CommittedFastRuntimeCache) -> None:
-        if committed.target_path.exists():
+        target_digest = (
+            _file_sha256(committed.target_path) if committed.target_path.is_file() else None
+        )
+        if committed.previous_digest is not None:
+            if target_digest != committed.previous_digest:
+                if target_digest != committed.committed_digest:
+                    raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: live sidecar changed")
+                if committed.backup_path is None or not committed.backup_path.is_file():
+                    raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: rollback payload is unavailable")
+                if _file_sha256(committed.backup_path) != committed.previous_digest:
+                    raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: rollback payload changed")
+                os.replace(committed.backup_path, committed.target_path)
+        elif target_digest is not None:
+            if target_digest != committed.committed_digest:
+                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: live sidecar changed")
             committed.target_path.unlink()
-        if committed.backup_path is not None and committed.backup_path.is_file():
-            os.replace(committed.backup_path, committed.target_path)
         if committed.temporary_root.exists():
             shutil.rmtree(committed.temporary_root)
 
     @staticmethod
     def discard_staged_fast_runtime_cache(staged: StagedFastRuntimeCache) -> None:
-        if staged.temporary_root.exists():
+        if not staged.temporary_root.exists():
+            return
+        if staged.temporary_path.is_file():
             shutil.rmtree(staged.temporary_root)
+            return
+        target = staged.record_root / FAST_RUNTIME_CACHE_FILE_NAME
+        target_digest = _file_sha256(target) if target.is_file() else None
+        if target_digest == staged.staged_digest:
+            backup = staged.temporary_root / ".previous-fast-runtime-cache.pkl"
+            OrientationClassifier.rollback_committed_fast_runtime_cache(
+                CommittedFastRuntimeCache(
+                    target,
+                    backup if staged.previous_digest is not None else None,
+                    staged.temporary_root,
+                    staged.staged_digest,
+                    staged.previous_digest,
+                )
+            )
+            return
+        if target_digest == staged.previous_digest:
+            shutil.rmtree(staged.temporary_root)
+            return
+        raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: live sidecar changed")
+
+    def _read_fast_runtime_cache(self, record: Any, cache_path: Path) -> FastRuntimeCache:
+        with cache_path.open("rb") as stream:
+            payload = pickle.load(stream)
+        if not isinstance(payload, dict) or set(payload) != {"signature", "cache"}:
+            raise ValueError("FAST_CACHE_REVISION_MISMATCH: payload is incomplete")
+        cache = payload["cache"]
+        self._validate_fast_runtime_for_record(record, cache)
+        if payload["signature"] != self._fast_persistence_signature(record, cache):
+            raise ValueError("FAST_CACHE_REVISION_MISMATCH: persistence signature differs")
+        return cache
+
+    def recover_fast_runtime_cache_staging(self, record: Any) -> None:
+        """Resolve interrupted sidecar replacements for the recovered manifest revision."""
+        root = Path(record.root)
+        target = root / FAST_RUNTIME_CACHE_FILE_NAME
+        pattern = f".fast-runtime-stage-{root.name}-*"
+        for temporary_root in sorted(root.parent.glob(pattern)):
+            if not temporary_root.is_dir():
+                continue
+            temporary = temporary_root / FAST_RUNTIME_CACHE_FILE_NAME
+            if temporary.is_file():
+                shutil.rmtree(temporary_root)
+                continue
+            try:
+                self._read_fast_runtime_cache(record, target)
+                target_is_valid = True
+            except Exception:
+                target_is_valid = False
+            if not target_is_valid:
+                backup = temporary_root / ".previous-fast-runtime-cache.pkl"
+                try:
+                    self._read_fast_runtime_cache(record, backup)
+                    backup_is_valid = True
+                except Exception:
+                    backup_is_valid = False
+                if backup_is_valid:
+                    os.replace(backup, target)
+                elif target.exists():
+                    target.unlink()
+            shutil.rmtree(temporary_root)
 
     def load_fast_runtime_cache(self, record: Any) -> FastRuntimeCache | None:
         cache_path = Path(record.root) / FAST_RUNTIME_CACHE_FILE_NAME
         if not cache_path.is_file():
             return None
         try:
-            with cache_path.open("rb") as stream:
-                payload = pickle.load(stream)
-            if not isinstance(payload, dict) or set(payload) != {"signature", "cache"}:
-                raise ValueError("FAST_CACHE_REVISION_MISMATCH: payload is incomplete")
-            cache = payload["cache"]
-            self._validate_fast_runtime_for_record(record, cache)
-            if payload["signature"] != self._fast_persistence_signature(record, cache):
-                raise ValueError("FAST_CACHE_REVISION_MISMATCH: persistence signature differs")
-            return cache
+            return self._read_fast_runtime_cache(record, cache_path)
         except Exception as exc:
             LOGGER.warning("Ignoring fast runtime cache %s: %s", cache_path, exc)
             return None
