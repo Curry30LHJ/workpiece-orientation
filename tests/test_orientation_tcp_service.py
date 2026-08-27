@@ -836,6 +836,68 @@ def test_shutdown_stops_fast_cache_jobs_once_before_listener_close():
     assert events == ["fast_jobs", "listener"]
 
 
+def test_serve_waits_for_fast_shutdown_before_closing_listener():
+    events = []
+    fast_started = threading.Event()
+    release_fast = threading.Event()
+    accept_started = threading.Event()
+    release_accept = threading.Event()
+    listener_closed = threading.Event()
+
+    class BlockingCatalog:
+        geometry_profiles = None
+
+        def shutdown(self):
+            events.append("fast_start")
+            fast_started.set()
+            assert release_fast.wait(timeout=2)
+            events.append("fast_end")
+
+    class ControlledListener:
+        close_calls = 0
+
+        def settimeout(self, timeout):
+            assert timeout == 0.2
+
+        def accept(self):
+            accept_started.set()
+            assert release_accept.wait(timeout=2)
+            raise socket.timeout
+
+        def close(self):
+            self.close_calls += 1
+            events.append("listener")
+            listener_closed.set()
+
+    runtime = ServiceRuntime()
+    runtime._snapshot = replace(runtime.snapshot(), status="ready", catalog=BlockingCatalog())
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    server._listener.close()
+    listener = ControlledListener()
+    server._listener = listener
+    serve_thread = threading.Thread(target=server.serve_forever)
+    shutdown_thread = threading.Thread(target=server.request_shutdown)
+    serve_thread.start()
+    assert accept_started.wait(timeout=2)
+    shutdown_thread.start()
+    assert fast_started.wait(timeout=2)
+
+    try:
+        release_accept.set()
+        assert listener_closed.wait(timeout=0.5) is False
+        assert listener.close_calls == 0
+        assert serve_thread.is_alive()
+    finally:
+        release_fast.set()
+        shutdown_thread.join(timeout=2)
+        serve_thread.join(timeout=2)
+
+    assert not shutdown_thread.is_alive()
+    assert not serve_thread.is_alive()
+    assert events == ["fast_start", "fast_end", "listener"]
+    assert listener.close_calls == 1
+
+
 def test_message_over_one_mib_returns_message_too_large_and_closes(client):
     client.send_raw(b'{"x":"' + b"x" * (1024 * 1024) + b'"}\n')
 
@@ -1330,6 +1392,169 @@ def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication
         "profiles-started",
         "evolution-started",
     ]
+
+
+def test_shutdown_during_loading_reclaims_late_catalog_without_starting_workers(
+    monkeypatch,
+    tmp_path,
+):
+    runtime = ServiceRuntime()
+    recovery_started = threading.Event()
+    release_recovery = threading.Event()
+    holder = {}
+    starts = []
+
+    class LoadedClassifier:
+        geometry_calibrator = None
+
+        @classmethod
+        def load(cls, project_root, model_dir, *, local_search_mode, inference_mode):
+            return cls()
+
+    class LoadedLibrary:
+        def __init__(self, library_dir):
+            self.library_dir = Path(library_dir)
+
+    class LoadedCatalog:
+        def __init__(self, library, classifier):
+            self.geometry_profiles = None
+            self.shutdown_calls = 0
+            holder["catalog"] = self
+
+        def set_geometry_profiles(self, profiles):
+            self.geometry_profiles = profiles
+
+        def recover(self):
+            recovery_started.set()
+            assert release_recovery.wait(timeout=2)
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    class LoadedProfiles:
+        def __init__(self, catalog, calibrator, *, storage_dir, start_worker=True):
+            assert start_worker is False
+            self.shutdown_calls = 0
+            holder["profiles"] = self
+
+        def start(self):
+            starts.append("profiles")
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    class LoadedEvolution:
+        def __init__(self, catalog, storage_dir, *, geometry_profiles, start_worker=True):
+            assert start_worker is False
+            holder["evolution"] = self
+
+        def start(self):
+            starts.append("evolution")
+
+        def shutdown(self):
+            starts.append("evolution_shutdown")
+
+    monkeypatch.setattr(service_module, "OrientationClassifier", LoadedClassifier)
+    monkeypatch.setattr(service_module, "WorkpieceLibrary", LoadedLibrary)
+    monkeypatch.setattr(service_module, "WorkpieceCatalog", LoadedCatalog)
+    monkeypatch.setattr(service_module, "GeometryMaskProfiles", LoadedProfiles)
+    monkeypatch.setattr(service_module, "TemplateEvolution", LoadedEvolution)
+
+    loader = threading.Thread(
+        target=service_module._load_runtime,
+        args=(runtime, tmp_path, tmp_path / "models", tmp_path / "library"),
+    )
+    loader.start()
+    assert recovery_started.wait(timeout=2)
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+
+    try:
+        server.request_shutdown()
+        server.request_shutdown()
+        release_recovery.set()
+        loader.join(timeout=2)
+        server.request_shutdown()
+    finally:
+        release_recovery.set()
+        loader.join(timeout=2)
+
+    assert not loader.is_alive()
+    assert holder["catalog"].shutdown_calls == 1
+    assert holder["profiles"].shutdown_calls == 1
+    assert starts == []
+    snapshot = runtime.snapshot()
+    assert snapshot.status == "loading"
+    assert snapshot.catalog is None
+    hello = OrientationCommandDispatcher(runtime).dispatch({
+        "version": 1,
+        "request_id": "after-late-load",
+        "command": "hello",
+    })
+    assert hello["ready"] is False
+
+
+def test_main_waits_for_loader_cleanup_after_listener_returns(monkeypatch, tmp_path):
+    loader_started = threading.Event()
+    release_loader = threading.Event()
+    loader_finished = threading.Event()
+    serve_returned = threading.Event()
+    main_returned = threading.Event()
+    holder = {}
+
+    class ParsedArguments:
+        host = "127.0.0.1"
+        port = 0
+        project_root = tmp_path
+        model_dir = tmp_path / "models"
+        library_dir = tmp_path / "library"
+        local_search_mode = "adaptive"
+        inference_mode = "legacy"
+
+    class Parser:
+        @staticmethod
+        def parse_args():
+            return ParsedArguments()
+
+    class ReturningServer:
+        def __init__(self, dispatcher, *, host, port):
+            self.shutdown_calls = 0
+            holder["server"] = self
+
+        def serve_forever(self):
+            assert loader_started.wait(timeout=2)
+            serve_returned.set()
+
+        def request_shutdown(self):
+            self.shutdown_calls += 1
+
+    def blocked_loader(*args):
+        loader_started.set()
+        assert release_loader.wait(timeout=2)
+        loader_finished.set()
+
+    monkeypatch.setattr(service_module, "_build_argument_parser", lambda: Parser())
+    monkeypatch.setattr(service_module, "configure_diagnostic_logging", lambda library_dir: None)
+    monkeypatch.setattr(service_module, "_prepare_windows_torch_dll_path", lambda: None)
+    monkeypatch.setattr(service_module, "OrientationTcpServer", ReturningServer)
+    monkeypatch.setattr(service_module, "_load_runtime", blocked_loader)
+
+    def run_main():
+        service_module.main()
+        main_returned.set()
+
+    main_thread = threading.Thread(target=run_main)
+    main_thread.start()
+    assert serve_returned.wait(timeout=2)
+
+    try:
+        assert main_returned.wait(timeout=0.5) is False
+    finally:
+        release_loader.set()
+        main_thread.join(timeout=2)
+
+    assert not main_thread.is_alive()
+    assert loader_finished.is_set()
+    assert holder["server"].shutdown_calls == 1
 
 
 def test_loading_runtime_accepts_shutdown_before_model_ready():

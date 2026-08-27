@@ -164,18 +164,43 @@ class RuntimeSnapshot:
     geometry_profiles: Any | None = None
 
 
+def _shutdown_runtime_components(
+    catalog: Any | None,
+    evolution: Any | None,
+    geometry_profiles: Any | None,
+) -> None:
+    for name, component in (
+        ("fast cache jobs", catalog),
+        ("template evolution", evolution),
+        ("geometry profiles", geometry_profiles),
+    ):
+        shutdown = getattr(component, "shutdown", None)
+        if not callable(shutdown):
+            continue
+        try:
+            shutdown()
+        except Exception:
+            LOGGER.exception("Unable to shut down %s", name)
+
+
 class ServiceRuntime:
     """Thread-safe model lifecycle state shared by the TCP dispatcher and loader."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._snapshot = RuntimeSnapshot(status="loading")
+        self._shutdown_requested = False
 
     def snapshot(self) -> RuntimeSnapshot:
         with self._lock:
             return self._snapshot
 
-    def set_ready(self, classifier: Any, library: Any, catalog: Any | None = None) -> None:
+    def request_shutdown(self) -> RuntimeSnapshot:
+        with self._lock:
+            self._shutdown_requested = True
+            return self._snapshot
+
+    def set_ready(self, classifier: Any, library: Any, catalog: Any | None = None) -> bool:
         resolved_catalog = catalog or WorkpieceCatalog(library, classifier)
         evolution = None
         library_dir = getattr(library, "library_dir", None)
@@ -190,6 +215,11 @@ class ServiceRuntime:
             setter = getattr(resolved_catalog, "set_geometry_profiles", None)
             if callable(setter):
                 setter(geometry_profiles)
+        with self._lock:
+            shutdown_requested = self._shutdown_requested
+        if shutdown_requested:
+            _shutdown_runtime_components(resolved_catalog, None, geometry_profiles)
+            return False
         if library_dir is not None:
             evolution = TemplateEvolution(
                 resolved_catalog,
@@ -198,14 +228,22 @@ class ServiceRuntime:
                 start_worker=False,
             )
         with self._lock:
-            self._snapshot = RuntimeSnapshot(
-                status="ready", classifier=classifier, library=library,
-                catalog=resolved_catalog, evolution=evolution, geometry_profiles=geometry_profiles,
-            )
-        for worker in (geometry_profiles, evolution):
-            start = getattr(worker, "start", None)
-            if callable(start):
-                start()
+            if self._shutdown_requested:
+                shutdown_requested = True
+            else:
+                shutdown_requested = False
+                self._snapshot = RuntimeSnapshot(
+                    status="ready", classifier=classifier, library=library,
+                    catalog=resolved_catalog, evolution=evolution, geometry_profiles=geometry_profiles,
+                )
+                for worker in (geometry_profiles, evolution):
+                    start = getattr(worker, "start", None)
+                    if callable(start):
+                        start()
+        if shutdown_requested:
+            _shutdown_runtime_components(resolved_catalog, evolution, geometry_profiles)
+            return False
+        return True
 
     def set_failed(self, code: str, message: str) -> None:
         with self._lock:
@@ -833,8 +871,11 @@ class OrientationTcpServer:
         self.dispatcher = dispatcher
         self.handshake_timeout_seconds = float(handshake_timeout_seconds)
         self._stop_event = threading.Event()
+        self._shutdown_started = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
+        self._listener_close_lock = threading.Lock()
+        self._listener_closed = False
         self._client_state_lock = threading.Lock()
         self._handshake_in_progress = False
         self._active_client = False
@@ -846,6 +887,16 @@ class OrientationTcpServer:
             self._listener.close()
             raise ServiceStartupError("PORT_IN_USE", f"cannot bind {host}:{port}: {exc}") from exc
         self.address = self._listener.getsockname()
+
+    def _close_listener_once(self) -> None:
+        with self._listener_close_lock:
+            if self._listener_closed:
+                return
+            self._listener_closed = True
+        try:
+            self._listener.close()
+        except OSError:
+            pass
 
     def _claim_handshake(self) -> bool:
         with self._client_state_lock:
@@ -973,36 +1024,40 @@ class OrientationTcpServer:
 
     def serve_forever(self) -> None:
         self._listener.settimeout(0.2)
-        while not self._stop_event.is_set():
-            try:
-                client, _ = self._listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                if self._stop_event.is_set():
+        try:
+            while not self._stop_event.is_set():
+                if self._shutdown_started.is_set():
+                    self._stop_event.wait()
                     break
-                raise
-            threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
-        self._listener.close()
+                try:
+                    client, _ = self._listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop_event.is_set():
+                        break
+                    raise
+                if self._shutdown_started.is_set():
+                    client.close()
+                    self._stop_event.wait()
+                    break
+                threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
+        finally:
+            self._close_listener_once()
 
     def request_shutdown(self) -> None:
         with self._shutdown_lock:
             if self._shutdown_requested:
                 return
             self._shutdown_requested = True
-            self._stop_event.set()
-        runtime = self.dispatcher.runtime.snapshot()
-        if runtime.catalog is not None and hasattr(runtime.catalog, "shutdown"):
-            runtime.catalog.shutdown()
-        if runtime.evolution is not None and hasattr(runtime.evolution, "shutdown"):
-            runtime.evolution.shutdown()
-        profiles = getattr(runtime.catalog, "geometry_profiles", None)
-        if profiles is not None and hasattr(profiles, "shutdown"):
-            profiles.shutdown()
+            self._shutdown_started.set()
+        runtime = self.dispatcher.runtime.request_shutdown()
+        profiles = runtime.geometry_profiles or getattr(runtime.catalog, "geometry_profiles", None)
         try:
-            self._listener.close()
-        except OSError:
-            pass
+            _shutdown_runtime_components(runtime.catalog, runtime.evolution, profiles)
+        finally:
+            self._stop_event.set()
+            self._close_listener_once()
 
 
 def _load_runtime(
@@ -1081,7 +1136,11 @@ def main() -> None:
         daemon=True,
     )
     loader.start()
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.request_shutdown()
+        loader.join()
 
 
 if __name__ == "__main__":
