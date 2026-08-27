@@ -107,6 +107,11 @@ def _shape_extents(shape: Mapping[str, Any]) -> tuple[float, float]:
     )
 
 
+def public_shape_extents(shape: Mapping[str, Any]) -> tuple[float, float]:
+    """Expose the established rotated shape extents for fast consumers."""
+    return _shape_extents(shape)
+
+
 def _shape_has_meaningful_angle(shape: Mapping[str, Any]) -> bool:
     if shape["shape"] == "rotated_rectangle":
         return True

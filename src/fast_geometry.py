@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence as SequenceABC
 from copy import deepcopy
 from dataclasses import dataclass
 from time import perf_counter
@@ -14,6 +15,7 @@ from src.geometry_calibration import (
     GeometryFitContext,
     public_coarse_shape,
     public_rule_expected,
+    public_shape_extents,
 )
 from src.geometry_profile_schema import materialize_runtime_profile
 
@@ -21,6 +23,16 @@ from src.geometry_profile_schema import materialize_runtime_profile
 FAST_GEOMETRY_FORMAT_VERSION = 1
 FAST_GEOMETRY_MAX_SIDE = 256
 _LOW_CONFIDENCE = "FAST_GEOMETRY_LOW_CONFIDENCE"
+_CACHE_INVALID = "FAST_CACHE_REVISION_MISMATCH"
+
+
+class FastGeometryCacheError(ValueError):
+    """Raised when a compiled fast-geometry cache cannot be used safely."""
+
+    code = _CACHE_INVALID
+
+    def __init__(self, message: str = "compiled geometry type or format is invalid") -> None:
+        super().__init__(f"{self.code}: {message}")
 
 
 @dataclass(frozen=True)
@@ -63,8 +75,13 @@ class FastGeometryProcessor:
     def build_variants(self, image: np.ndarray, compiled: CompiledFastGeometry) -> FastGeometryVariants:
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("image must be a BGR HxWx3 array")
+        self._validate_compiled(compiled)
         raw = image.copy()
-        configured = {label: direction for label, direction in compiled.directions.items() if direction is not None}
+        configured = {
+            label: compiled.directions[label]
+            for label in ("front", "back")
+            if compiled.directions[label] is not None
+        }
         timings = {"geometry_context": 0.0, "geometry_fit": 0.0, "mask_build": 0.0}
         diagnostics: dict[str, dict[str, Any]] = {
             label: {"status": "not_configured"} for label in ("front", "back")
@@ -83,22 +100,41 @@ class FastGeometryProcessor:
             if direction is None:
                 continue
             fit_started = perf_counter()
+            mask_started: float | None = None
             try:
                 fit = self.calibrator.fit(resized, direction, context=self._filtered_context(context, direction))
-            except Exception as exc:
-                fit = {"status": "low_confidence", "reason_code": str(exc), "rules": []}
-            timings["geometry_fit"] += (perf_counter() - fit_started) * 1000.0
-            mask_started = perf_counter()
-            mask = self._fit_mask(fit, resized.shape[:2])
-            ignored_ratio = float(fit.get("ignored_ratio", np.count_nonzero(mask) / max(mask.size, 1))) if mask is not None else 1.0
-            if fit.get("status") != "active" or mask is None or ignored_ratio >= 0.55:
-                diagnostics[label] = self._diagnostic(fit, ignored_ratio=ignored_ratio, status="low_confidence")
+                timings["geometry_fit"] += (perf_counter() - fit_started) * 1000.0
+                mask_started = perf_counter()
+                mask = self._fit_mask(fit, resized.shape[:2])
+                source_mask = (
+                    cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+                    if mask is not None else None
+                )
+                ignored_ratio = (
+                    float(np.count_nonzero(source_mask) / max(source_mask.size, 1))
+                    if source_mask is not None else 1.0
+                )
+                if fit.get("status") != "active" or source_mask is None or ignored_ratio >= 0.55:
+                    diagnostics[label] = self._diagnostic(
+                        fit, ignored_ratio=ignored_ratio, status="low_confidence",
+                    )
+                    failed = True
+                else:
+                    outputs[label] = self._fast_fill(
+                        image, source_mask, direction.get("fill_bgr", [0, 0, 0]),
+                    )
+                    diagnostics[label] = self._diagnostic(fit, ignored_ratio=ignored_ratio)
+                timings["mask_build"] += (perf_counter() - mask_started) * 1000.0
+            except Exception:
+                if mask_started is None:
+                    timings["geometry_fit"] += (perf_counter() - fit_started) * 1000.0
+                else:
+                    timings["mask_build"] += (perf_counter() - mask_started) * 1000.0
+                diagnostics[label] = {
+                    "status": "low_confidence",
+                    "reason_code": "FAST_GEOMETRY_PROCESSING_FAILED",
+                }
                 failed = True
-            else:
-                source_mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
-                outputs[label] = self._fast_fill(image, source_mask, direction.get("fill_bgr", [0, 0, 0]))
-                diagnostics[label] = self._diagnostic(fit, ignored_ratio=ignored_ratio)
-            timings["mask_build"] += (perf_counter() - mask_started) * 1000.0
         return FastGeometryVariants(
             (raw, outputs["front"], outputs["back"]),
             "low_confidence" if failed else "active",
@@ -116,6 +152,23 @@ class FastGeometryProcessor:
         return cv2.resize(image, (max(1, round(width * scale)), max(1, round(height * scale))), interpolation=cv2.INTER_AREA)
 
     @staticmethod
+    def _validate_compiled(compiled: CompiledFastGeometry) -> None:
+        if not isinstance(compiled, CompiledFastGeometry):
+            raise FastGeometryCacheError()
+        if compiled.format_version != FAST_GEOMETRY_FORMAT_VERSION:
+            raise FastGeometryCacheError()
+        if compiled.profile_revision is not None and type(compiled.profile_revision) is not int:
+            raise FastGeometryCacheError()
+        if not isinstance(compiled.directions, dict):
+            raise FastGeometryCacheError()
+        for label in ("front", "back"):
+            if label not in compiled.directions:
+                raise FastGeometryCacheError()
+            direction = compiled.directions[label]
+            if direction is not None and not isinstance(direction, Mapping):
+                raise FastGeometryCacheError()
+
+    @staticmethod
     def _filtered_context(context: GeometryFitContext, direction: Mapping[str, Any]) -> GeometryFitContext:
         """Keep contours within the direction's coarse center/scale windows."""
         anchor = direction.get("anchor")
@@ -125,9 +178,11 @@ class FastGeometryProcessor:
         expected: list[tuple[float, float, float, float]] = []
 
         def add_window(shape: Mapping[str, Any]) -> None:
-            rx = float(shape.get("rx", shape.get("half_width", 4.0)))
-            ry = float(shape.get("ry", shape.get("half_height", 4.0)))
-            expected.append((float(shape["cx"]), float(shape["cy"]), max(rx, 4.0), max(ry, 4.0)))
+            extent_x, extent_y = public_shape_extents(shape)
+            expected.append((
+                float(shape["cx"]), float(shape["cy"]),
+                max(float(extent_x), 4.0), max(float(extent_y), 4.0),
+            ))
 
         coarse = public_coarse_shape(anchor, (height, width))
         add_window(coarse)
@@ -151,13 +206,18 @@ class FastGeometryProcessor:
     @staticmethod
     def _fit_mask(fit: Mapping[str, Any], image_shape: tuple[int, int]) -> np.ndarray | None:
         masks = []
-        for rule in fit.get("rules", []):
-            mask = rule.get("ignore_mask") if isinstance(rule, Mapping) else None
-            if isinstance(mask, np.ndarray) and mask.shape == image_shape:
-                masks.append(mask)
-        top_level = fit.get("ignore_mask")
-        if isinstance(top_level, np.ndarray) and top_level.shape == image_shape:
-            masks.append(top_level)
+        rules = fit.get("rules")
+        if isinstance(rules, SequenceABC) and not isinstance(rules, (str, bytes, bytearray)):
+            for rule in rules:
+                mask = rule.get("ignore_mask") if isinstance(rule, Mapping) and rule.get("status") == "active" else None
+                if isinstance(mask, np.ndarray) and mask.shape == image_shape:
+                    masks.append(mask)
+        elif rules is None and fit.get("status") == "active":
+            # Older adapters may expose only an active aggregate; once rule
+            # results exist, their active masks are the authoritative source.
+            top_level = fit.get("ignore_mask")
+            if isinstance(top_level, np.ndarray) and top_level.shape == image_shape:
+                masks.append(top_level)
         if not masks:
             return None
         result = np.zeros(image_shape, dtype=np.uint8)
@@ -179,10 +239,16 @@ class FastGeometryProcessor:
         def clean(value: Any) -> Any:
             if isinstance(value, np.ndarray):
                 return None
+            if isinstance(value, np.generic):
+                return value.item()
             if isinstance(value, Mapping):
-                return {key: clean(item) for key, item in value.items() if not isinstance(item, np.ndarray)}
-            if isinstance(value, list):
-                return [clean(item) for item in value]
+                return {
+                    str(key): clean(item)
+                    for key, item in value.items()
+                    if not isinstance(item, np.ndarray)
+                }
+            if isinstance(value, SequenceABC) and not isinstance(value, (str, bytes, bytearray)):
+                return [clean(item) for item in value if not isinstance(item, np.ndarray)]
             return value
 
         result = clean(fit)

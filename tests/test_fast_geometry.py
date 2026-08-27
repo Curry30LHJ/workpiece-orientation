@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
+import json
 
 import cv2
 import numpy as np
 import pytest
 
-from src.fast_geometry import FastGeometryProcessor, compile_fast_geometry
+from src.fast_geometry import FastGeometryCacheError, FastGeometryProcessor, compile_fast_geometry
 from src.geometry_calibration import GeometryCalibrator, GeometryFitContext
 
 
@@ -190,3 +192,142 @@ def test_candidate_filter_keeps_distinct_inner_and_outer_boundaries():
     outer = variants.directions["back"]["rules"][0]["fitted_shape"]["rx"]
     assert inner == pytest.approx(52.0, rel=0.05)
     assert outer == pytest.approx(90.0, rel=0.05)
+
+
+def test_candidate_filter_keeps_slender_rotated_ellipse_boundaries():
+    profile = configured_profile()
+    profile["directions"]["front"] = {
+        "side": "front",
+        "anchor": {
+            "shape": "ellipse",
+            "coarse": {"cx": 0.5, "cy": 0.5, "rx": 180 / 512, "ry": 32 / 512, "angle_deg": 45.0},
+        },
+        "rules": [{
+            "rule_id": "inner", "name": "inner", "shape": "ellipse",
+            "geometry": {"cx": 0.0, "cy": 0.0, "rx": 0.5, "ry": 0.5, "angle_deg": 0.0},
+            "mode": "inside", "margin_ratio": 0.0, "enabled": True,
+        }],
+        "fill_bgr": [7, 7, 7],
+    }
+    profile["directions"]["back"] = {"side": "back", "anchor": None, "rules": []}
+    angles = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False, dtype=np.float32)
+    local = np.column_stack((90.0 * np.cos(angles), 8.0 * np.sin(angles)))
+    rotation = np.array([[np.sqrt(0.5), -np.sqrt(0.5)], [np.sqrt(0.5), np.sqrt(0.5)]], dtype=np.float32)
+    contour = (local @ rotation.T + np.array([128.0, 128.0], dtype=np.float32)).astype(np.float32)
+    context = GeometryFitContext((256, 256), (contour,))
+
+    filtered = FastGeometryProcessor._filtered_context(
+        context, compile_fast_geometry(profile).directions["front"],
+    )
+
+    assert len(filtered.contours) == 1
+    assert np.array_equal(filtered.contours[0], contour)
+    assert GeometryCalibrator._rank_candidates(
+        filtered.contours,
+        {"shape": "ellipse", "cx": 128.0, "cy": 128.0, "rx": 90.0, "ry": 8.0, "angle_deg": 45.0},
+        context.image_shape,
+        0.08,
+        prefer_larger=False,
+    )
+
+
+class StaleRatioCalibrator(FakeCalibrator):
+    def fit(self, image: np.ndarray, direction_profile: dict, *, context: GeometryFitContext):
+        mask = np.full(image.shape[:2], 255, dtype=np.uint8)
+        return {
+            "status": "active",
+            "rules": [{"status": "active", "ignore_mask": mask}],
+            "ignore_mask": mask,
+            "ignored_ratio": 0.01,
+        }
+
+
+def test_final_resized_union_ratio_rejects_stale_fit_ratio():
+    image = marker_image(17, size=512)
+    variants = FastGeometryProcessor(StaleRatioCalibrator()).build_variants(
+        image, compile_fast_geometry(configured_profile()),
+    )
+
+    assert variants.status == "low_confidence"
+    assert variants.needs_review is True
+    assert np.array_equal(variants.images[1], image)
+
+
+@pytest.mark.parametrize("compiled", [
+    object(),
+    replace(compile_fast_geometry(configured_profile()), format_version=999),
+])
+def test_malformed_compiled_geometry_raises_stable_cache_error(compiled):
+    processor, _ = processor_with_fake_calibrator()
+
+    with pytest.raises(FastGeometryCacheError, match="FAST_CACHE_REVISION_MISMATCH"):
+        processor.build_variants(marker_image(17), compiled)
+
+
+def test_post_fit_processing_failure_isolated_to_one_direction():
+    processor, _ = processor_with_fake_calibrator(mask_center=True)
+    profile = configured_profile()
+    profile["directions"]["back"]["fill_bgr"] = [7, 7]
+    image = marker_image(17)
+
+    variants = processor.build_variants(image, compile_fast_geometry(profile))
+
+    assert variants.images[1][32, 32].tolist() == [7, 7, 7]
+    assert np.array_equal(variants.images[2], image)
+    assert variants.needs_review is True
+
+
+class MixedRuleMaskCalibrator(FakeCalibrator):
+    def fit(self, image: np.ndarray, direction_profile: dict, *, context: GeometryFitContext):
+        active = np.zeros(image.shape[:2], dtype=np.uint8)
+        failed = np.zeros(image.shape[:2], dtype=np.uint8)
+        active[8:16, 8:16] = 255
+        failed[40:48, 40:48] = 255
+        return {
+            "status": "active",
+            "rules": [
+                {"status": "active", "ignore_mask": active},
+                {"status": "low_confidence", "ignore_mask": failed},
+            ],
+            "ignore_mask": np.full(image.shape[:2], 255, dtype=np.uint8),
+            "ignored_ratio": 0.01,
+        }
+
+
+def test_failed_rule_masks_and_stale_aggregate_do_not_contribute():
+    image = marker_image(17)
+    variants = FastGeometryProcessor(MixedRuleMaskCalibrator()).build_variants(
+        image, compile_fast_geometry(configured_profile()),
+    )
+
+    masked = variants.images[1]
+    assert variants.status == "active"
+    assert masked[10, 10].tolist() == [7, 7, 7]
+    assert masked[42, 42].tolist() == [17, 17, 17]
+    assert masked[24, 24].tolist() == [17, 17, 17]
+
+
+class NestedDiagnosticsCalibrator(FakeCalibrator):
+    def fit(self, image: np.ndarray, direction_profile: dict, *, context: GeometryFitContext):
+        mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        mask[8:16, 8:16] = 255
+        return {
+            "status": "active",
+            "rules": [{"status": "active", "ignore_mask": mask}],
+            "diagnostics": {
+                "nested": (
+                    np.int64(3),
+                    {"score": np.float32(1.25), "mask": np.ones((2, 2), dtype=np.uint8)},
+                ),
+            },
+        }
+
+
+def test_diagnostic_cleanup_serializes_nested_numpy_values():
+    variants = FastGeometryProcessor(NestedDiagnosticsCalibrator()).build_variants(
+        marker_image(17), compile_fast_geometry(configured_profile()),
+    )
+
+    serialized = json.dumps(variants.directions)
+    decoded = json.loads(serialized)
+    assert decoded["front"]["diagnostics"]["nested"] == [3, {"score": 1.25}]
