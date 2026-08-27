@@ -898,6 +898,235 @@ def test_serve_waits_for_fast_shutdown_before_closing_listener():
     assert listener.close_calls == 1
 
 
+def test_shutdown_between_accept_and_handler_start_closes_client_without_starting_handler(
+    monkeypatch,
+):
+    handler_constructed = threading.Event()
+    release_handler_constructor = threading.Event()
+    handler_starts = []
+
+    class AcceptedClient:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    class OneClientListener:
+        def __init__(self, client):
+            self.client = client
+            self.close_calls = 0
+            self.accept_calls = 0
+
+        def settimeout(self, timeout):
+            assert timeout == 0.2
+
+        def accept(self):
+            self.accept_calls += 1
+            assert self.accept_calls == 1
+            return self.client, ("127.0.0.1", 12345)
+
+        def close(self):
+            self.close_calls += 1
+
+    class DeferredHandler:
+        def start(self):
+            handler_starts.append("started")
+
+    class ShutdownCatalog:
+        geometry_profiles = None
+
+        def shutdown(self):
+            pass
+
+    runtime = ServiceRuntime()
+    runtime._snapshot = replace(runtime.snapshot(), status="ready", catalog=ShutdownCatalog())
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    server._listener.close()
+    client = AcceptedClient()
+    listener = OneClientListener(client)
+    server._listener = listener
+    real_thread = threading.Thread
+    serve_thread = real_thread(target=server.serve_forever)
+    shutdown_thread = real_thread(target=server.request_shutdown)
+
+    def blocked_handler_constructor(*, target, args, daemon):
+        assert target == server._handle_client
+        assert args == (client,)
+        assert daemon is True
+        handler_constructed.set()
+        assert release_handler_constructor.wait(timeout=2)
+        return DeferredHandler()
+
+    monkeypatch.setattr(service_module.threading, "Thread", blocked_handler_constructor)
+    serve_thread.start()
+    assert handler_constructed.wait(timeout=2)
+    shutdown_thread.start()
+
+    try:
+        shutdown_thread.join(timeout=2)
+        assert not shutdown_thread.is_alive()
+    finally:
+        release_handler_constructor.set()
+        shutdown_thread.join(timeout=2)
+        serve_thread.join(timeout=2)
+
+    assert not serve_thread.is_alive()
+    assert handler_starts == []
+    assert client.close_calls == 1
+    assert listener.close_calls == 1
+
+
+def test_accept_error_shuts_components_before_listener_once():
+    events = []
+
+    class ShutdownCatalog:
+        geometry_profiles = None
+
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+            events.extend(("fast_start", "fast_end"))
+
+    class FailingListener:
+        def __init__(self):
+            self.close_calls = 0
+
+        def settimeout(self, timeout):
+            assert timeout == 0.2
+
+        def accept(self):
+            events.append("accept")
+            raise OSError("accept failed")
+
+        def close(self):
+            self.close_calls += 1
+            events.append("listener")
+
+    catalog = ShutdownCatalog()
+    runtime = ServiceRuntime()
+    runtime._snapshot = replace(runtime.snapshot(), status="ready", catalog=catalog)
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    server._listener.close()
+    listener = FailingListener()
+    server._listener = listener
+
+    with pytest.raises(OSError, match="accept failed"):
+        server.serve_forever()
+    server.request_shutdown()
+    server.request_shutdown()
+
+    assert events == ["accept", "fast_start", "fast_end", "listener"]
+    assert catalog.shutdown_calls == 1
+    assert listener.close_calls == 1
+
+
+def test_shutdown_profile_resolution_error_still_closes_listener_and_releases_waiters():
+    class ExplodingSnapshot:
+        catalog = None
+        evolution = None
+
+        @property
+        def geometry_profiles(self):
+            raise RuntimeError("profile resolution failed")
+
+    class RecordingListener:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    runtime = ServiceRuntime()
+    original_request_shutdown = runtime.request_shutdown
+
+    def exploding_request_shutdown():
+        original_request_shutdown()
+        return ExplodingSnapshot()
+
+    runtime.request_shutdown = exploding_request_shutdown
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    server._listener.close()
+    listener = RecordingListener()
+    server._listener = listener
+    waiter = threading.Thread(target=server.request_shutdown, daemon=True)
+
+    try:
+        with pytest.raises(RuntimeError, match="profile resolution failed"):
+            server.request_shutdown()
+        waiter.start()
+        waiter.join(timeout=0.2)
+        assert not waiter.is_alive()
+    finally:
+        server._shutdown_complete.set()
+        if waiter.ident is not None:
+            waiter.join(timeout=2)
+
+    assert server._stop_event.is_set()
+    assert listener.close_calls == 1
+
+
+def test_handler_start_error_closes_client_and_shuts_components_before_listener(
+    monkeypatch,
+):
+    events = []
+
+    class AcceptedClient:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    class OneClientListener:
+        def __init__(self, client):
+            self.client = client
+            self.close_calls = 0
+
+        def settimeout(self, timeout):
+            assert timeout == 0.2
+
+        def accept(self):
+            return self.client, ("127.0.0.1", 12345)
+
+        def close(self):
+            self.close_calls += 1
+            events.append("listener")
+
+    class FailingHandler:
+        def start(self):
+            events.append("handler_start")
+            raise RuntimeError("handler start failed")
+
+    class ShutdownCatalog:
+        geometry_profiles = None
+
+        def shutdown(self):
+            events.extend(("fast_start", "fast_end"))
+
+    runtime = ServiceRuntime()
+    runtime._snapshot = replace(runtime.snapshot(), status="ready", catalog=ShutdownCatalog())
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    server._listener.close()
+    client = AcceptedClient()
+    listener = OneClientListener(client)
+    server._listener = listener
+    monkeypatch.setattr(
+        service_module.threading,
+        "Thread",
+        lambda *, target, args, daemon: FailingHandler(),
+    )
+
+    with pytest.raises(RuntimeError, match="handler start failed"):
+        server.serve_forever()
+
+    assert events == ["handler_start", "fast_start", "fast_end", "listener"]
+    assert client.close_calls == 1
+    assert listener.close_calls == 1
+
+
 def test_message_over_one_mib_returns_message_too_large_and_closes(client):
     client.send_raw(b'{"x":"' + b"x" * (1024 * 1024) + b'"}\n')
 
@@ -1392,6 +1621,211 @@ def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication
         "profiles-started",
         "evolution-started",
     ]
+
+
+def test_service_shutdown_claims_runtime_before_announcing_shutdown():
+    runtime = ServiceRuntime()
+    runtime_claim_entered = threading.Event()
+    release_runtime_claim = threading.Event()
+    publication_attempted = threading.Event()
+    starts = []
+    publication_results = []
+
+    class LateProfiles:
+        def start(self):
+            starts.append("profiles")
+
+    class LateCatalog:
+        def __init__(self):
+            self.geometry_profiles = LateProfiles()
+
+        def shutdown(self):
+            pass
+
+    original_request_shutdown = runtime.request_shutdown
+
+    def blocked_request_shutdown():
+        runtime_claim_entered.set()
+        assert release_runtime_claim.wait(timeout=2)
+        return original_request_shutdown()
+
+    runtime.request_shutdown = blocked_request_shutdown
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+
+    def publish_after_service_shutdown_begins():
+        assert server._shutdown_started.wait(timeout=2)
+        publication_attempted.set()
+        publication_results.append(
+            runtime.set_ready(FakeClassifier(), FakeLibrary(), LateCatalog())
+        )
+
+    shutdown_thread = threading.Thread(target=server.request_shutdown)
+    publisher_thread = threading.Thread(target=publish_after_service_shutdown_begins)
+    publisher_thread.start()
+    shutdown_thread.start()
+    assert runtime_claim_entered.wait(timeout=2)
+
+    try:
+        assert publication_attempted.wait(timeout=0.2) is False
+    finally:
+        release_runtime_claim.set()
+        shutdown_thread.join(timeout=2)
+        publisher_thread.join(timeout=2)
+        server.request_shutdown()
+
+    assert not shutdown_thread.is_alive()
+    assert not publisher_thread.is_alive()
+    assert publication_results == [False]
+    assert starts == []
+    assert runtime.snapshot().status == "loading"
+
+
+@pytest.mark.parametrize("failure_point", ["recover", "worker_start"])
+@pytest.mark.parametrize("concurrent_shutdown", [False, True])
+def test_runtime_loader_failure_reclaims_owned_resources_once(
+    monkeypatch,
+    tmp_path,
+    failure_point,
+    concurrent_shutdown,
+):
+    runtime = ServiceRuntime()
+    failure_reached = threading.Event()
+    release_failure = threading.Event()
+    failure_recorded = threading.Event()
+    runtime_claim_entered = threading.Event()
+    release_runtime_claim = threading.Event()
+    holder = {}
+    successful_starts = []
+    primary_error = "recover-primary" if failure_point == "recover" else "start-primary"
+
+    class LoadedClassifier:
+        geometry_calibrator = None
+
+        @classmethod
+        def load(cls, project_root, model_dir, *, local_search_mode, inference_mode):
+            return cls()
+
+    class LoadedLibrary:
+        def __init__(self, library_dir):
+            self.library_dir = Path(library_dir)
+
+    class LoadedCatalog:
+        def __init__(self, library, classifier):
+            self.geometry_profiles = None
+            self.shutdown_calls = 0
+            holder["catalog"] = self
+
+        def set_geometry_profiles(self, profiles):
+            self.geometry_profiles = profiles
+
+        def recover(self):
+            if failure_point == "recover":
+                failure_reached.set()
+                assert release_failure.wait(timeout=2)
+                raise RuntimeError(primary_error)
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+            raise RuntimeError("cleanup-secondary")
+
+    class LoadedProfiles:
+        def __init__(self, catalog, calibrator, *, storage_dir, start_worker=True):
+            assert start_worker is False
+            self.start_calls = 0
+            self.shutdown_calls = 0
+            holder["profiles"] = self
+
+        def start(self):
+            self.start_calls += 1
+            if failure_point == "worker_start":
+                failure_reached.set()
+                assert release_failure.wait(timeout=2)
+                raise RuntimeError(primary_error)
+            successful_starts.append("profiles")
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    class LoadedEvolution:
+        def __init__(self, catalog, storage_dir, *, geometry_profiles, start_worker=True):
+            assert start_worker is False
+            self.start_calls = 0
+            self.shutdown_calls = 0
+            holder["evolution"] = self
+
+        def start(self):
+            self.start_calls += 1
+            successful_starts.append("evolution")
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    monkeypatch.setattr(service_module, "OrientationClassifier", LoadedClassifier)
+    monkeypatch.setattr(service_module, "WorkpieceLibrary", LoadedLibrary)
+    monkeypatch.setattr(service_module, "WorkpieceCatalog", LoadedCatalog)
+    monkeypatch.setattr(service_module, "GeometryMaskProfiles", LoadedProfiles)
+    monkeypatch.setattr(service_module, "TemplateEvolution", LoadedEvolution)
+
+    original_set_failed = runtime.set_failed
+
+    def recording_set_failed(code, message):
+        original_set_failed(code, message)
+        failure_recorded.set()
+
+    runtime.set_failed = recording_set_failed
+    if concurrent_shutdown:
+        original_request_shutdown = runtime.request_shutdown
+
+        def blocked_request_shutdown():
+            runtime_claim_entered.set()
+            assert release_runtime_claim.wait(timeout=2)
+            return original_request_shutdown()
+
+        runtime.request_shutdown = blocked_request_shutdown
+
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    loader_thread = threading.Thread(
+        target=service_module._load_runtime,
+        args=(runtime, tmp_path, tmp_path / "models", tmp_path / "library"),
+    )
+    shutdown_thread = threading.Thread(target=server.request_shutdown)
+    loader_thread.start()
+    assert failure_reached.wait(timeout=2)
+    if concurrent_shutdown:
+        shutdown_thread.start()
+        assert runtime_claim_entered.wait(timeout=2)
+
+    try:
+        release_failure.set()
+        assert failure_recorded.wait(timeout=2)
+        release_runtime_claim.set()
+        loader_thread.join(timeout=2)
+        if concurrent_shutdown:
+            shutdown_thread.join(timeout=2)
+        else:
+            server.request_shutdown()
+        server.request_shutdown()
+    finally:
+        release_failure.set()
+        release_runtime_claim.set()
+        loader_thread.join(timeout=2)
+        if concurrent_shutdown:
+            shutdown_thread.join(timeout=2)
+        server.request_shutdown()
+
+    assert not loader_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert holder["catalog"].shutdown_calls == 1
+    assert holder["profiles"].shutdown_calls == 1
+    expected_evolution_shutdowns = 1 if failure_point == "worker_start" else 0
+    assert holder.get("evolution", SimpleNamespace(shutdown_calls=0)).shutdown_calls == expected_evolution_shutdowns
+    assert successful_starts == []
+    snapshot = runtime.snapshot()
+    assert snapshot.status == "failed"
+    assert snapshot.error_code == "MODEL_LOAD_FAILED"
+    assert snapshot.error_message == primary_error
+    assert snapshot.catalog is None
+    assert snapshot.classifier is None
 
 
 def test_shutdown_during_loading_reclaims_late_catalog_without_starting_workers(

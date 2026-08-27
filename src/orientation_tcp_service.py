@@ -201,49 +201,62 @@ class ServiceRuntime:
             return self._snapshot
 
     def set_ready(self, classifier: Any, library: Any, catalog: Any | None = None) -> bool:
-        resolved_catalog = catalog or WorkpieceCatalog(library, classifier)
+        owns_catalog = catalog is None
+        resolved_catalog = None
+        owns_geometry_profiles = False
         evolution = None
-        library_dir = getattr(library, "library_dir", None)
-        geometry_profiles = getattr(resolved_catalog, "geometry_profiles", None)
-        if geometry_profiles is None and library_dir is not None:
-            geometry_profiles = GeometryMaskProfiles(
-                resolved_catalog,
-                getattr(classifier, "geometry_calibrator", None),
-                storage_dir=Path(library_dir) / ".geometry-mask-jobs",
-                start_worker=False,
-            )
-            setter = getattr(resolved_catalog, "set_geometry_profiles", None)
-            if callable(setter):
-                setter(geometry_profiles)
-        with self._lock:
-            shutdown_requested = self._shutdown_requested
-        if shutdown_requested:
-            _shutdown_runtime_components(resolved_catalog, None, geometry_profiles)
-            return False
-        if library_dir is not None:
-            evolution = TemplateEvolution(
-                resolved_catalog,
-                Path(library_dir) / ".evolution",
-                geometry_profiles=geometry_profiles,
-                start_worker=False,
-            )
-        with self._lock:
-            if self._shutdown_requested:
-                shutdown_requested = True
-            else:
-                shutdown_requested = False
+        geometry_profiles = None
+        transferred = False
+        try:
+            resolved_catalog = catalog if catalog is not None else WorkpieceCatalog(library, classifier)
+            library_dir = getattr(library, "library_dir", None)
+            geometry_profiles = getattr(resolved_catalog, "geometry_profiles", None)
+            if geometry_profiles is None and library_dir is not None:
+                geometry_profiles = GeometryMaskProfiles(
+                    resolved_catalog,
+                    getattr(classifier, "geometry_calibrator", None),
+                    storage_dir=Path(library_dir) / ".geometry-mask-jobs",
+                    start_worker=False,
+                )
+                owns_geometry_profiles = True
+                setter = getattr(resolved_catalog, "set_geometry_profiles", None)
+                if callable(setter):
+                    setter(geometry_profiles)
+            with self._lock:
+                if self._shutdown_requested:
+                    return False
+            if library_dir is not None:
+                evolution = TemplateEvolution(
+                    resolved_catalog,
+                    Path(library_dir) / ".evolution",
+                    geometry_profiles=geometry_profiles,
+                    start_worker=False,
+                )
+            with self._lock:
+                if self._shutdown_requested:
+                    return False
+                previous_snapshot = self._snapshot
                 self._snapshot = RuntimeSnapshot(
                     status="ready", classifier=classifier, library=library,
                     catalog=resolved_catalog, evolution=evolution, geometry_profiles=geometry_profiles,
                 )
-                for worker in (geometry_profiles, evolution):
-                    start = getattr(worker, "start", None)
-                    if callable(start):
-                        start()
-        if shutdown_requested:
-            _shutdown_runtime_components(resolved_catalog, evolution, geometry_profiles)
-            return False
-        return True
+                try:
+                    for worker in (geometry_profiles, evolution):
+                        start = getattr(worker, "start", None)
+                        if callable(start):
+                            start()
+                except Exception:
+                    self._snapshot = previous_snapshot
+                    raise
+                transferred = True
+            return True
+        finally:
+            if not transferred:
+                _shutdown_runtime_components(
+                    resolved_catalog if owns_catalog else None,
+                    evolution,
+                    geometry_profiles if owns_geometry_profiles else None,
+                )
 
     def set_failed(self, code: str, message: str) -> None:
         with self._lock:
@@ -872,7 +885,8 @@ class OrientationTcpServer:
         self.handshake_timeout_seconds = float(handshake_timeout_seconds)
         self._stop_event = threading.Event()
         self._shutdown_started = threading.Event()
-        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self._shutdown_requested = False
         self._listener_close_lock = threading.Lock()
         self._listener_closed = False
@@ -913,6 +927,27 @@ class OrientationTcpServer:
     def _release_client(self) -> None:
         with self._client_state_lock:
             self._active_client = False
+
+    def _start_client_handler(self, client: socket.socket) -> bool:
+        try:
+            handler = threading.Thread(
+                target=self._handle_client,
+                args=(client,),
+                daemon=True,
+            )
+        except Exception:
+            client.close()
+            raise
+        try:
+            with self._lifecycle_lock:
+                if not self._shutdown_requested:
+                    handler.start()
+                    return True
+        except Exception:
+            client.close()
+            raise
+        client.close()
+        return False
 
     def _handle_client(self, sock: socket.socket) -> None:
         connection = JsonLineConnection(sock)
@@ -1023,41 +1058,47 @@ class OrientationTcpServer:
         }
 
     def serve_forever(self) -> None:
-        self._listener.settimeout(0.2)
         try:
+            self._listener.settimeout(0.2)
             while not self._stop_event.is_set():
                 if self._shutdown_started.is_set():
-                    self._stop_event.wait()
                     break
                 try:
                     client, _ = self._listener.accept()
                 except socket.timeout:
                     continue
                 except OSError:
-                    if self._stop_event.is_set():
+                    if self._shutdown_started.is_set():
                         break
                     raise
-                if self._shutdown_started.is_set():
-                    client.close()
-                    self._stop_event.wait()
+                if not self._start_client_handler(client):
                     break
-                threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
         finally:
-            self._close_listener_once()
+            self.request_shutdown()
 
     def request_shutdown(self) -> None:
-        with self._shutdown_lock:
+        with self._lifecycle_lock:
             if self._shutdown_requested:
-                return
-            self._shutdown_requested = True
-            self._shutdown_started.set()
-        runtime = self.dispatcher.runtime.request_shutdown()
-        profiles = runtime.geometry_profiles or getattr(runtime.catalog, "geometry_profiles", None)
+                owns_shutdown = False
+                runtime = None
+            else:
+                runtime = self.dispatcher.runtime.request_shutdown()
+                self._shutdown_requested = True
+                self._shutdown_started.set()
+                owns_shutdown = True
+        if not owns_shutdown:
+            self._shutdown_complete.wait()
+            return
+        assert runtime is not None
         try:
+            profiles = runtime.geometry_profiles or getattr(runtime.catalog, "geometry_profiles", None)
             _shutdown_runtime_components(runtime.catalog, runtime.evolution, profiles)
         finally:
             self._stop_event.set()
-            self._close_listener_once()
+            try:
+                self._close_listener_once()
+            finally:
+                self._shutdown_complete.set()
 
 
 def _load_runtime(
@@ -1068,6 +1109,9 @@ def _load_runtime(
     local_search_mode: str = DEFAULT_LOCAL_SEARCH_MODE,
     inference_mode: str = DEFAULT_INFERENCE_MODE,
 ) -> None:
+    catalog = None
+    profiles = None
+    transferred = False
     try:
         classifier = OrientationClassifier.load(
             project_root,
@@ -1085,10 +1129,13 @@ def _load_runtime(
         )
         catalog.set_geometry_profiles(profiles)
         catalog.recover()
-        runtime.set_ready(classifier, library, catalog)
+        transferred = runtime.set_ready(classifier, library, catalog)
     except Exception as exc:
         LOGGER.exception("Orientation service model loading failed")
         runtime.set_failed("MODEL_LOAD_FAILED", str(exc) or type(exc).__name__)
+    finally:
+        if not transferred:
+            _shutdown_runtime_components(catalog, None, profiles)
 
 
 def _build_argument_parser() -> argparse.ArgumentParser:
