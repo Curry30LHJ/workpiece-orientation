@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import pytest
 
+from src.fast_geometry import FastGeometryProcessor
+from src.fast_orientation import FastOrientationEngine
 from src.orientation_classifier import OrientationClassifier, TemplateCache
 from src.geometry_mask_profiles import GeometryMaskProfiles
 from src.workpiece_catalog import RestoreConflictError, WorkpieceCatalog
@@ -27,6 +29,36 @@ def builder(front, back, progress_callback=None):
         },
         local_features={"front": [{} for _ in front], "back": [{} for _ in back]},
     )
+
+
+class PersistedGlobalPredictor:
+    def predict(self, images):
+        embeddings = []
+        for item in images:
+            mean = float(np.mean(item)) / 255.0
+            embeddings.append(np.asarray([mean, 1.0 - mean], dtype=np.float32))
+        return embeddings
+
+
+def persisted_fast_classifier(inference_mode):
+    classifier = OrientationClassifier(
+        global_predictor=PersistedGlobalPredictor(),
+        extractor=object() if inference_mode == "compare" else None,
+        matcher=object() if inference_mode == "compare" else None,
+        device="cpu",
+        extract_features_fn=lambda item, *_args, **_kwargs: {
+            "marker": int(item[0, 0, 0])
+        },
+        score_feature_pair_fn=lambda *_args, **_kwargs: {"score": 1.0},
+        inference_mode=inference_mode,
+        model_fingerprint="catalog-model-a",
+    )
+    classifier.fast_engine = FastOrientationEngine(
+        classifier._global_embeddings,
+        FastGeometryProcessor(object()),
+        image_reader=lambda path: cv2.imread(str(path), cv2.IMREAD_COLOR),
+    )
+    return classifier
 
 
 class FakeClassifier:
@@ -755,6 +787,49 @@ def test_restore_cache_miss_builds_fast_cache_for_recycled_library_revision(tmp_
 
     assert restored.revision == updated.revision + 2 == 4
     assert classifier.caches[record.id].fast_runtime.library_revision == restored.revision
+
+
+@pytest.mark.parametrize("inference_mode", ["fast_geometry", "compare"])
+def test_restore_rebuilds_stale_fast_sidecar_while_preserving_valid_base_cache(
+    tmp_path,
+    inference_mode,
+):
+    classifier = persisted_fast_classifier(inference_mode)
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7",
+        [image(tmp_path / "front.png", 10)],
+        [image(tmp_path / "back.png", 20)],
+        False,
+    )
+    catalog.recycle(record.id, operation_id=f"recycle-{inference_mode}")
+    recycled = catalog.library.get_recycled(record.id)
+    base_path = recycled.root / ".template_cache.pkl"
+    fast_path = recycled.root / ".fast_runtime_cache.pkl"
+
+    loaded_base = classifier.load_template_cache(recycled)
+
+    assert base_path.is_file()
+    assert fast_path.is_file()
+    assert loaded_base is not None
+    assert loaded_base.fast_runtime is None
+
+    restored = catalog.restore(record.id, operation_id=f"restore-{inference_mode}")
+    snapshot = catalog.capture_snapshot(record.id)
+    persisted = classifier.load_template_cache(restored)
+
+    assert restored.revision == 3
+    assert snapshot.cache.fast_runtime is not None
+    assert snapshot.cache.fast_runtime.library_revision == restored.revision
+    assert persisted is not None
+    assert persisted.fast_runtime is not None
+    assert persisted.fast_runtime.library_revision == restored.revision
+    result = classifier.predict_fast_with_cache(
+        snapshot.cache,
+        np.full((8, 8, 3), 10, dtype=np.uint8),
+        library_revision=restored.revision,
+    )
+    assert result["inference_engine"] == "fast_geometry"
 
 
 def test_restore_rejects_case_insensitive_name_conflict_without_mutating_recycle(tmp_path):

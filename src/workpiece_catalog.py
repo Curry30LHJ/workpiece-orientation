@@ -708,7 +708,10 @@ class WorkpieceCatalog:
             with self._lock:
                 recycled = self.library.get_recycled(workpiece_id)
             cache = self._load_template_cache(recycled)
-            if cache is None:
+            if cache is None or (
+                getattr(self.classifier, "inference_mode", None) in {"fast_geometry", "compare"}
+                and getattr(cache, "fast_runtime", None) is None
+            ):
                 cache = _call_cache_builder(
                     self.classifier.build_template_cache,
                     recycled.front_images,
