@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -37,6 +38,21 @@ def fake_builder(front: list[Path], back: list[Path], progress_callback=None) ->
             "back": np.ones((len(back), 2), dtype=np.float32),
         },
         local_features={"front": [{} for _ in front], "back": [{} for _ in back]},
+    )
+
+
+def fast_revision_builder(
+    front: list[Path],
+    back: list[Path],
+    progress_callback=None,
+    *,
+    library_revision: int = 1,
+) -> TemplateCache:
+    cache = fake_builder(front, back, progress_callback)
+    return TemplateCache(
+        global_vectors=cache.global_vectors,
+        local_features=cache.local_features,
+        fast_runtime=SimpleNamespace(library_revision=library_revision),
     )
 
 
@@ -217,6 +233,23 @@ def test_prepare_append_preserves_inventory_and_adds_confirmed_templates(tmp_pat
         committed, retired = library.commit_prepared(prepared)
         assert library.get_template_inventory(committed.id) == staged_inventory
         library.remove_retired(retired)
+    finally:
+        library.abort_prepared(prepared)
+
+
+def test_prepare_append_builds_fast_cache_for_staged_library_revision(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "fast-front.png", 31)],
+        [],
+        fast_revision_builder,
+        operation_id="fast-revision-append",
+    )
+    try:
+        assert prepared.staged_record.revision == 2
+        assert prepared.candidate_cache.fast_runtime.library_revision == 2
     finally:
         library.abort_prepared(prepared)
 
@@ -555,6 +588,27 @@ def test_recover_rebuilds_and_saves_when_cache_loader_misses(tmp_path):
     assert len(recovered) == 1
     assert len(rebuilt) == 1
     assert saved == [(record.id, recovered[0][1])]
+
+
+def test_recover_rebuilds_fast_cache_for_manifest_library_revision(tmp_path):
+    library, record = _registered_library(tmp_path)
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "recovery-front.png", 31)],
+        [],
+        fake_builder,
+        operation_id="recovery-revision-append",
+    )
+    committed, retired = library.commit_prepared(prepared)
+    library.remove_retired(retired)
+
+    recovered = WorkpieceLibrary(library.library_dir).recover(
+        fast_revision_builder,
+        cache_loader=lambda candidate: None,
+    )
+
+    assert recovered[0][0].revision == committed.revision == 2
+    assert recovered[0][1].fast_runtime.library_revision == committed.revision
 
 
 def test_recover_restores_valid_backup_when_formal_directory_is_missing(tmp_path):

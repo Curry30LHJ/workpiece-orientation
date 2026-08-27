@@ -18,6 +18,7 @@ from src.workpiece_library import (
     StaleWorkpieceRevisionError,
     WorkpieceLibrary,
     WorkpieceRecord,
+    _call_cache_builder,
 )
 
 
@@ -708,10 +709,12 @@ class WorkpieceCatalog:
                 recycled = self.library.get_recycled(workpiece_id)
             cache = self._load_template_cache(recycled)
             if cache is None:
-                cache = self.classifier.build_template_cache(
+                cache = _call_cache_builder(
+                    self.classifier.build_template_cache,
                     recycled.front_images,
                     recycled.back_images,
                     None,
+                    library_revision=recycled.revision + 1,
                 )
             with self._lock:
                 try:

@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -82,6 +83,25 @@ class FakeClassifier:
 
     def predict_with_cache(self, cache, image_path, *, library_revision=None):
         return {"label": "front", "library_revision": library_revision}
+
+
+class RevisionAwareFastClassifier(FakeClassifier):
+    inference_mode = "fast_geometry"
+
+    def build_template_cache(
+        self,
+        front,
+        back,
+        progress_callback=None,
+        *,
+        library_revision=1,
+    ):
+        cache = builder(front, back, progress_callback)
+        return TemplateCache(
+            global_vectors=cache.global_vectors,
+            local_features=cache.local_features,
+            fast_runtime=SimpleNamespace(library_revision=library_revision),
+        )
 
 
 class BlockingPredictClassifier(FakeClassifier):
@@ -712,6 +732,29 @@ def test_recycle_removes_prediction_and_restore_republishes_same_workpiece(tmp_p
         "name": "M7",
     }
     assert record.id in classifier.caches
+
+
+def test_restore_cache_miss_builds_fast_cache_for_recycled_library_revision(tmp_path):
+    classifier = RevisionAwareFastClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7",
+        [image(tmp_path / "front.png", 10)],
+        [image(tmp_path / "back.png", 20)],
+        False,
+    )
+    updated, _ = catalog.append_templates(
+        record.id,
+        [image(tmp_path / "front-extra.png", 11)],
+        [],
+        operation_id="append-revision-2",
+    )
+    catalog.recycle(record.id, operation_id="recycle-revision-2")
+
+    restored = catalog.restore(record.id, operation_id="restore-revision-2")
+
+    assert restored.revision == updated.revision + 2 == 4
+    assert classifier.caches[record.id].fast_runtime.library_revision == restored.revision
 
 
 def test_restore_rejects_case_insensitive_name_conflict_without_mutating_recycle(tmp_path):

@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -77,6 +78,32 @@ CacheBuilder = Callable[[Sequence[Path], Sequence[Path], CacheProgressCallback |
 CacheLoader = Callable[[WorkpieceRecord], TemplateCache | None]
 CacheSaver = Callable[[WorkpieceRecord, TemplateCache], None]
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _call_cache_builder(
+    build_cache: CacheBuilder,
+    front_images: Sequence[Path],
+    back_images: Sequence[Path],
+    progress_callback: CacheProgressCallback | None,
+    *,
+    library_revision: int,
+) -> TemplateCache:
+    """Pass a known revision when supported without breaking legacy builders."""
+    try:
+        inspect.signature(build_cache).bind(
+            front_images,
+            back_images,
+            progress_callback,
+            library_revision=library_revision,
+        )
+    except (TypeError, ValueError):
+        return build_cache(front_images, back_images, progress_callback)
+    return build_cache(
+        front_images,
+        back_images,
+        progress_callback,
+        library_revision=library_revision,
+    )
 
 
 def _validate_name(name: str) -> str:
@@ -434,7 +461,13 @@ class WorkpieceLibrary:
                 offset = len(front) if label == "back" else 0
                 report({"phase": "features", "completed": offset + completed, "total": total})
 
-            cache = build_cache(staged_front, staged_back, cache_progress)
+            cache = _call_cache_builder(
+                build_cache,
+                staged_front,
+                staged_back,
+                cache_progress,
+                library_revision=1,
+            )
             report({"phase": "committing", "completed": total, "total": total})
             if existing is not None:
                 backup_root = self.library_dir / f".backup-{uuid.uuid4().hex}"
@@ -575,7 +608,13 @@ class WorkpieceLibrary:
                 offset = len(all_front) if label == "back" else 0
                 report({"phase": "features", "completed": offset + completed, "total": total})
 
-            cache = build_cache(staged_front, staged_back, cache_progress)
+            cache = _call_cache_builder(
+                build_cache,
+                staged_front,
+                staged_back,
+                cache_progress,
+                library_revision=base_record.revision + 1,
+            )
             staged_record = WorkpieceRecord(
                 base_record.id,
                 base_record.name,
@@ -733,7 +772,13 @@ class WorkpieceLibrary:
                     except Exception as exc:
                         LOGGER.warning("Ignoring invalid template cache for %s: %s", root, exc)
                 if cache is None:
-                    cache = build_cache(record.front_images, record.back_images, None)
+                    cache = _call_cache_builder(
+                        build_cache,
+                        record.front_images,
+                        record.back_images,
+                        None,
+                        library_revision=record.revision,
+                    )
                     if cache_saver is not None:
                         try:
                             cache_saver(record, cache)
