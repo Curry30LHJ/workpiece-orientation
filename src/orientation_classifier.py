@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import logging
@@ -93,6 +93,18 @@ class TemplateCache:
     fast_template_signature: dict[str, Any] | None = None
 
 
+@dataclass
+class _FastRuntimeTransaction:
+    lock: threading.Lock = field(repr=False, compare=False)
+    state: str = "staged"
+    released: bool = False
+
+    def release(self) -> None:
+        if not self.released:
+            self.released = True
+            self.lock.release()
+
+
 @dataclass(frozen=True)
 class StagedFastRuntimeCache:
     record_root: Path
@@ -101,6 +113,7 @@ class StagedFastRuntimeCache:
     cache: FastRuntimeCache
     staged_digest: str
     previous_digest: str | None
+    transaction: _FastRuntimeTransaction = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -110,6 +123,7 @@ class CommittedFastRuntimeCache:
     temporary_root: Path
     committed_digest: str
     previous_digest: str | None
+    transaction: _FastRuntimeTransaction = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -245,6 +259,18 @@ class OrientationClassifier:
         self.fast_engine = fast_engine
         self._inference_lock = threading.RLock()
         self._template_caches: dict[str, TemplateCache] = {}
+        self._fast_runtime_transaction_guard = threading.Lock()
+        self._fast_runtime_transaction_locks: dict[Path, threading.Lock] = {}
+
+    def _fast_runtime_transaction_lock(self, root: Path) -> threading.Lock:
+        guard = getattr(self, "_fast_runtime_transaction_guard", None)
+        if guard is None:
+            guard = threading.Lock()
+            self._fast_runtime_transaction_guard = guard
+            self._fast_runtime_transaction_locks = {}
+        key = Path(root).resolve()
+        with guard:
+            return self._fast_runtime_transaction_locks.setdefault(key, threading.Lock())
 
     @staticmethod
     def _model_directory_fingerprint(model_dir: Path) -> str:
@@ -736,6 +762,9 @@ class OrientationClassifier:
         root = Path(record.root)
         if not root.is_dir():
             raise FileNotFoundError(f"workpiece root is unavailable: {root}")
+        transaction_lock = self._fast_runtime_transaction_lock(root)
+        transaction_lock.acquire()
+        transaction = _FastRuntimeTransaction(transaction_lock)
         temporary_root = root.parent / f".fast-runtime-stage-{root.name}-{uuid.uuid4().hex}"
         temporary_root_created = False
         staged = False
@@ -769,10 +798,13 @@ class OrientationClassifier:
                 cache,
                 staged_digest,
                 previous_digest,
+                transaction,
             )
         finally:
             if temporary_root_created and not staged and temporary_root.exists():
                 shutil.rmtree(temporary_root)
+            if not staged:
+                transaction.release()
 
     @staticmethod
     def commit_staged_fast_runtime_cache(
@@ -780,85 +812,114 @@ class OrientationClassifier:
         staged: StagedFastRuntimeCache,
     ) -> CommittedFastRuntimeCache:
         root = Path(record.root)
-        if root != staged.record_root or not root.is_dir():
+        if root != staged.record_root:
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: workpiece root changed")
         target = root / FAST_RUNTIME_CACHE_FILE_NAME
         backup = staged.temporary_root / ".previous-fast-runtime-cache.pkl"
         backup_path = backup if staged.previous_digest is not None else None
-        target_digest = _file_sha256(target) if target.is_file() else None
-        if not staged.temporary_path.is_file():
-            if target_digest != staged.staged_digest:
-                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: staged payload is unavailable")
-        else:
-            if _file_sha256(staged.temporary_path) != staged.staged_digest:
-                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: staged payload changed")
-            if target_digest != staged.previous_digest:
-                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: live sidecar changed")
-            if backup_path is not None and (
-                not backup_path.is_file()
-                or _file_sha256(backup_path) != staged.previous_digest
-            ):
-                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: rollback payload changed")
-            os.replace(staged.temporary_path, target)
+        transaction = staged.transaction
+        if transaction.state == "staged":
+            transaction.state = "committing"
+            try:
+                os.replace(staged.temporary_path, target)
+            except Exception:
+                transaction.state = (
+                    "committed" if not staged.temporary_path.exists() else "staged"
+                )
+                raise
+            transaction.state = "committed"
+        elif transaction.state not in {"committed", "finalized"}:
+            raise ValueError(
+                f"FAST_CACHE_STAGE_STATE_CHANGED: transaction is {transaction.state}"
+            )
         return CommittedFastRuntimeCache(
             target,
             backup_path,
             staged.temporary_root,
             staged.staged_digest,
             staged.previous_digest,
+            transaction,
         )
 
     @staticmethod
     def finalize_staged_fast_runtime_cache(committed: CommittedFastRuntimeCache) -> None:
-        if committed.temporary_root.exists():
-            shutil.rmtree(committed.temporary_root)
+        transaction = committed.transaction
+        if transaction.state in {"finalized", "rolled_back", "discarded"}:
+            return
+        if transaction.state != "committed":
+            raise ValueError(
+                f"FAST_CACHE_STAGE_STATE_CHANGED: transaction is {transaction.state}"
+            )
+        try:
+            if committed.temporary_root.exists():
+                shutil.rmtree(committed.temporary_root)
+        finally:
+            transaction.state = "finalized"
+            transaction.release()
 
     @staticmethod
     def rollback_committed_fast_runtime_cache(committed: CommittedFastRuntimeCache) -> None:
-        target_digest = (
-            _file_sha256(committed.target_path) if committed.target_path.is_file() else None
-        )
-        if committed.previous_digest is not None:
-            if target_digest != committed.previous_digest:
-                if target_digest != committed.committed_digest:
-                    raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: live sidecar changed")
-                if committed.backup_path is None or not committed.backup_path.is_file():
-                    raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: rollback payload is unavailable")
-                if _file_sha256(committed.backup_path) != committed.previous_digest:
-                    raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: rollback payload changed")
+        transaction = committed.transaction
+        if transaction.state in {"rolled_back", "discarded"}:
+            return
+        if transaction.state != "committed":
+            raise ValueError(
+                f"FAST_CACHE_STAGE_STATE_CHANGED: transaction is {transaction.state}"
+            )
+        transaction.state = "rolling_back"
+        try:
+            if committed.previous_digest is not None:
+                if committed.backup_path is None:
+                    raise ValueError(
+                        "FAST_CACHE_STAGE_STATE_CHANGED: rollback payload is unavailable"
+                    )
                 os.replace(committed.backup_path, committed.target_path)
-        elif target_digest is not None:
-            if target_digest != committed.committed_digest:
-                raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: live sidecar changed")
-            committed.target_path.unlink()
-        if committed.temporary_root.exists():
-            shutil.rmtree(committed.temporary_root)
+            elif committed.target_path.exists():
+                committed.target_path.unlink()
+        except Exception:
+            transaction.state = (
+                "rolled_back"
+                if committed.previous_digest is not None
+                and committed.backup_path is not None
+                and not committed.backup_path.exists()
+                else "committed"
+            )
+            raise
+        try:
+            if committed.temporary_root.exists():
+                shutil.rmtree(committed.temporary_root)
+        finally:
+            transaction.state = "rolled_back"
+            transaction.release()
 
     @staticmethod
     def discard_staged_fast_runtime_cache(staged: StagedFastRuntimeCache) -> None:
-        if not staged.temporary_root.exists():
+        transaction = staged.transaction
+        if transaction.state in {"discarded", "rolled_back", "finalized"}:
             return
-        if staged.temporary_path.is_file():
-            shutil.rmtree(staged.temporary_root)
-            return
-        target = staged.record_root / FAST_RUNTIME_CACHE_FILE_NAME
-        target_digest = _file_sha256(target) if target.is_file() else None
-        if target_digest == staged.staged_digest:
+        if transaction.state == "committed":
             backup = staged.temporary_root / ".previous-fast-runtime-cache.pkl"
             OrientationClassifier.rollback_committed_fast_runtime_cache(
                 CommittedFastRuntimeCache(
-                    target,
+                    staged.record_root / FAST_RUNTIME_CACHE_FILE_NAME,
                     backup if staged.previous_digest is not None else None,
                     staged.temporary_root,
                     staged.staged_digest,
                     staged.previous_digest,
+                    transaction,
                 )
             )
             return
-        if target_digest == staged.previous_digest:
-            shutil.rmtree(staged.temporary_root)
-            return
-        raise ValueError("FAST_CACHE_STAGE_STATE_CHANGED: live sidecar changed")
+        if transaction.state != "staged":
+            raise ValueError(
+                f"FAST_CACHE_STAGE_STATE_CHANGED: transaction is {transaction.state}"
+            )
+        try:
+            if staged.temporary_root.exists():
+                shutil.rmtree(staged.temporary_root)
+        finally:
+            transaction.state = "discarded"
+            transaction.release()
 
     def _read_fast_runtime_cache(self, record: Any, cache_path: Path) -> FastRuntimeCache:
         with cache_path.open("rb") as stream:
@@ -871,14 +932,51 @@ class OrientationClassifier:
             raise ValueError("FAST_CACHE_REVISION_MISMATCH: persistence signature differs")
         return cache
 
-    def recover_fast_runtime_cache_staging(self, record: Any) -> None:
+    @staticmethod
+    def _fast_runtime_staging_directories(
+        record: Any,
+        staging_parent: Path | None,
+    ) -> list[Path]:
+        root = Path(record.root)
+        parent = root.parent if staging_parent is None else Path(staging_parent)
+        resolved_parent = parent.resolve()
+        allowed_parents = {root.parent.resolve()}
+        if root.parent.name == ".recycled":
+            allowed_parents.add(root.parent.parent.resolve())
+        if resolved_parent not in allowed_parents:
+            raise ValueError("FAST_CACHE_STAGE_PATH_INVALID: staging parent is unrelated")
+        if staging_parent is not None and str(record.id) != root.name:
+            raise ValueError("FAST_CACHE_STAGE_PATH_INVALID: record path does not match its id")
+
+        prefix = f".fast-runtime-stage-{root.name}-"
+        directories = []
+        candidates = sorted(parent.iterdir()) if parent.is_dir() else []
+        for candidate in candidates:
+            if not candidate.name.startswith(prefix):
+                continue
+            suffix = candidate.name[len(prefix):]
+            if (
+                candidate.parent.resolve() != resolved_parent
+                or candidate.resolve().parent != resolved_parent
+                or candidate.is_symlink()
+                or not candidate.is_dir()
+                or len(suffix) != 32
+                or any(character not in "0123456789abcdef" for character in suffix)
+            ):
+                continue
+            directories.append(candidate)
+        return directories
+
+    def recover_fast_runtime_cache_staging(
+        self,
+        record: Any,
+        *,
+        staging_parent: Path | None = None,
+    ) -> None:
         """Resolve interrupted sidecar replacements for the recovered manifest revision."""
         root = Path(record.root)
         target = root / FAST_RUNTIME_CACHE_FILE_NAME
-        pattern = f".fast-runtime-stage-{root.name}-*"
-        for temporary_root in sorted(root.parent.glob(pattern)):
-            if not temporary_root.is_dir():
-                continue
+        for temporary_root in self._fast_runtime_staging_directories(record, staging_parent):
             temporary = temporary_root / FAST_RUNTIME_CACHE_FILE_NAME
             if temporary.is_file():
                 shutil.rmtree(temporary_root)
@@ -900,6 +998,17 @@ class OrientationClassifier:
                 elif target.exists():
                     target.unlink()
             shutil.rmtree(temporary_root)
+
+    def recover_recycled_fast_runtime_cache_staging(
+        self,
+        record: Any,
+        library_root: Path,
+    ) -> None:
+        """Resolve this recycled record's exact sibling stages at the library root."""
+        self.recover_fast_runtime_cache_staging(
+            record,
+            staging_parent=library_root,
+        )
 
     def load_fast_runtime_cache(self, record: Any) -> FastRuntimeCache | None:
         cache_path = Path(record.root) / FAST_RUNTIME_CACHE_FILE_NAME

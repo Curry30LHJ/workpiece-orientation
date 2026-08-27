@@ -10,8 +10,10 @@ import numpy as np
 import pytest
 
 from src.fast_cache_jobs import FastCacheJobManager
+from src.fast_geometry import FastGeometryProcessor
+from src.fast_orientation import FastOrientationEngine
 from src.geometry_mask_profiles import GeometryMaskProfiles
-from src.orientation_classifier import TemplateCache
+from src.orientation_classifier import OrientationClassifier, TemplateCache, _file_sha256
 from src.workpiece_catalog import WorkpieceCatalog
 from src.workpiece_library import WorkpieceLibrary
 
@@ -387,6 +389,35 @@ class BlockingPersistenceClassifier(BlockingFastClassifier):
         super().save_fast_runtime_cache(record, runtime)
         return staged
 
+
+class ProductionFastPredictor:
+    @staticmethod
+    def predict(images):
+        return [
+            np.asarray(
+                [float(np.mean(item)) / 255.0, 1.0 - float(np.mean(item)) / 255.0],
+                dtype=np.float32,
+            )
+            for item in images
+        ]
+
+
+def production_fast_classifier():
+    classifier = OrientationClassifier(
+        global_predictor=ProductionFastPredictor(),
+        extractor=None,
+        matcher=None,
+        device="cpu",
+        inference_mode="fast_geometry",
+        model_fingerprint="catalog-model-a",
+    )
+    classifier.fast_engine = FastOrientationEngine(
+        classifier._global_embeddings,
+        FastGeometryProcessor(object()),
+        image_reader=lambda path: cv2.imread(str(path), cv2.IMREAD_COLOR),
+    )
+    return classifier
+
 def _persist_base_library(tmp_path: Path):
     library = WorkpieceLibrary(tmp_path / "library")
     record, cache = library.register(
@@ -398,6 +429,169 @@ def _persist_base_library(tmp_path: Path):
     )
 
     return record, cache
+
+
+def _write_geometry_recovery_state(
+    record,
+    *,
+    manifest_active_revision,
+    document_active_revision,
+    manifest_pointer_present=True,
+):
+    profile = {
+        "schema_version": 1,
+        "directions": {
+            "front": {"anchor": None, "rules": []},
+            "back": {"anchor": None, "rules": []},
+        },
+    }
+    profile_root = record.root / "geometry_masks"
+    revisions_root = profile_root / "revisions"
+    revisions_root.mkdir(parents=True, exist_ok=True)
+    for revision in {value for value in (manifest_active_revision, document_active_revision) if value}:
+        (revisions_root / f"{revision}.json").write_text(
+            json.dumps({
+                "profile": profile,
+                "previous_active_revision": None,
+            }),
+            encoding="utf-8",
+        )
+    (profile_root / "profile.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "library_revision": record.revision,
+            "draft_revision": max(manifest_active_revision or 0, document_active_revision or 0),
+            "active_revision": document_active_revision,
+            "previous_active_revision": None,
+            "draft": profile,
+            "active": profile if document_active_revision is not None else None,
+        }),
+        encoding="utf-8",
+    )
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest_pointer_present:
+        manifest["geometry_mask_active_revision"] = manifest_active_revision
+        manifest["geometry_mask_previous_active_revision"] = None
+    else:
+        manifest.pop("geometry_mask_active_revision", None)
+        manifest.pop("geometry_mask_previous_active_revision", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_recover_does_not_resurrect_profile_when_manifest_pointer_is_explicit_null(tmp_path):
+    record, base_cache = _persist_base_library(tmp_path)
+    _write_geometry_recovery_state(
+        record,
+        manifest_active_revision=None,
+        document_active_revision=1,
+    )
+    classifier = BlockingFastClassifier()
+    classifier.load_template_cache = lambda _record: base_cache
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    profiles = GeometryMaskProfiles(
+        catalog,
+        start_worker=False,
+        storage_dir=tmp_path / "geometry-recovery-jobs",
+    )
+    catalog.set_geometry_profiles(profiles)
+
+    catalog.recover()
+    try:
+        assert classifier.started.wait(1.0)
+        recovering = catalog.capture_snapshot(record.id)
+        assert recovering.cache.geometry_profile is None
+        assert recovering.cache.geometry_profile_revision is None
+        assert catalog.fast_cache_status(record.id)["state"] == "running"
+        summary = catalog.list_workpiece_summaries()[0]
+        assert summary["geometry_rule_count"] == 0
+        assert summary["fast_cache"]["state"] == "running"
+    finally:
+        classifier.release.set()
+        catalog.shutdown()
+        profiles.shutdown()
+
+    ready = catalog.capture_snapshot(record.id)
+    assert ready.cache.geometry_profile_revision is None
+    assert ready.cache.fast_runtime["geometry"] is None
+    assert classifier.saved[-1][1]["geometry"] is None
+    assert (record.root / ".fast_runtime_cache.pkl").read_bytes() == b"ready"
+    assert profiles.snapshot(record.id)["active_revision"] is None
+    assert catalog.list_workpiece_summaries()[0]["fast_cache"]["state"] == "ready"
+
+
+def test_recover_uses_manifest_immutable_revision_when_profile_document_is_ahead(tmp_path):
+    record, base_cache = _persist_base_library(tmp_path)
+    _write_geometry_recovery_state(
+        record,
+        manifest_active_revision=1,
+        document_active_revision=2,
+    )
+    classifier = BlockingFastClassifier()
+    classifier.load_template_cache = lambda _record: base_cache
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    profiles = GeometryMaskProfiles(
+        catalog,
+        start_worker=False,
+        storage_dir=tmp_path / "geometry-recovery-jobs",
+    )
+    catalog.set_geometry_profiles(profiles)
+
+    catalog.recover()
+    try:
+        assert classifier.started.wait(1.0)
+        recovering = catalog.capture_snapshot(record.id)
+        assert recovering.cache.geometry_profile_revision == 1
+        assert recovering.cache.geometry_profile["profile_revision"] == 1
+        job = catalog.fast_jobs.snapshot(record.id)
+        assert job is not None
+        assert job.geometry_profile_revision == 1
+        assert catalog.list_workpiece_summaries()[0]["fast_cache"]["state"] == "running"
+    finally:
+        classifier.release.set()
+        catalog.shutdown()
+        profiles.shutdown()
+
+    ready = catalog.capture_snapshot(record.id)
+    assert ready.cache.geometry_profile_revision == 1
+    assert ready.cache.fast_runtime["geometry"]["profile_revision"] == 1
+    assert classifier.saved[-1][1]["geometry"]["profile_revision"] == 1
+    assert (record.root / ".fast_runtime_cache.pkl").read_bytes() == b"ready"
+    assert profiles.snapshot(record.id)["active_revision"] == 1
+    assert catalog.list_workpiece_summaries()[0]["fast_cache"]["state"] == "ready"
+
+
+def test_recover_preserves_legacy_profile_identity_when_manifest_pointer_is_missing(tmp_path):
+    record, base_cache = _persist_base_library(tmp_path)
+    _write_geometry_recovery_state(
+        record,
+        manifest_active_revision=1,
+        document_active_revision=1,
+        manifest_pointer_present=False,
+    )
+    classifier = BlockingFastClassifier()
+    classifier.load_template_cache = lambda _record: base_cache
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    profiles = GeometryMaskProfiles(
+        catalog,
+        start_worker=False,
+        storage_dir=tmp_path / "legacy-geometry-recovery-jobs",
+    )
+    catalog.set_geometry_profiles(profiles)
+
+    catalog.recover()
+    try:
+        assert classifier.started.wait(1.0)
+        snapshot = catalog.capture_snapshot(record.id)
+        assert snapshot.cache.geometry_profile_revision == 1
+        assert catalog.fast_jobs.snapshot(record.id).geometry_profile_revision == 1
+    finally:
+        classifier.release.set()
+        catalog.shutdown()
+        profiles.shutdown()
+
+    assert catalog.capture_snapshot(record.id).cache.fast_runtime["geometry"]["profile_revision"] == 1
+    assert profiles.snapshot(record.id)["active_revision"] == 1
 
 
 def test_restore_uses_valid_base_without_waiting_for_base_or_fast_builder(tmp_path):
@@ -534,6 +728,51 @@ def test_blocked_fast_persistence_does_not_hold_catalog_lock(tmp_path):
     assert catalog.capture_snapshot(record.id).cache.fast_runtime is not None
 
 
+def test_fast_sidecar_hashing_never_blocks_catalog_snapshot_or_prediction(
+    tmp_path,
+    monkeypatch,
+):
+    record, base_cache = _persist_base_library(tmp_path)
+    classifier = production_fast_classifier()
+    classifier.load_template_cache = lambda _record: base_cache
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    hash_calls = []
+    hash_started = threading.Event()
+    read_snapshots = []
+    prediction_errors = []
+    real_hash = _file_sha256
+
+    def audited_hash(path):
+        hash_calls.append(Path(path))
+        hash_started.set()
+        reader_done = threading.Event()
+
+        def read_catalog():
+            read_snapshots.append(catalog.capture_snapshot(record.id))
+            try:
+                catalog.predict(record.id, tmp_path / "query.png")
+            except Exception as exc:
+                prediction_errors.append(str(exc))
+            reader_done.set()
+
+        reader = threading.Thread(target=read_catalog)
+        reader.start()
+        assert reader_done.wait(1.0), "file hash ran while catalog readers were blocked"
+        reader.join(timeout=1.0)
+        return real_hash(path)
+
+    monkeypatch.setattr("src.orientation_classifier._file_sha256", audited_hash)
+
+    catalog.recover()
+    assert hash_started.wait(1.0)
+    catalog.shutdown()
+
+    assert hash_calls
+    assert read_snapshots
+    assert set(prediction_errors) == {"FAST_CACHE_NOT_READY: fast runtime cache is unavailable"}
+    assert catalog.fast_cache_status(record.id)["state"] == "ready"
+
+
 def test_append_publishes_new_revision_before_blocked_fast_worker_finishes(tmp_path):
     classifier = BlockingFastClassifier()
     classifier.inference_mode = "legacy"
@@ -584,6 +823,144 @@ def test_recycle_keeps_blocked_fast_worker_from_recreating_sidecar(tmp_path):
     assert catalog.fast_cache_status(record.id)["state"] == "stale"
     assert classifier.saved == []
     assert not (recycled.root / ".fast_runtime_cache.pkl").exists()
+
+
+def test_restart_cleans_root_fast_stage_after_recycle_without_harming_live_sidecar(
+    tmp_path,
+):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, base_cache = library.register(
+        "M7",
+        [image(tmp_path / "front.png", 10)],
+        [image(tmp_path / "back.png", 20)],
+        False,
+        builder,
+    )
+    classifier = production_fast_classifier()
+    old_runtime = classifier.build_fast_runtime_cache(record, None)
+    classifier.save_fast_runtime_cache(record, old_runtime)
+    staged = classifier.stage_fast_runtime_cache(
+        record,
+        replace(
+            old_runtime,
+            training_summary={**old_runtime.training_summary, "marker": "uncommitted"},
+        ),
+    )
+    catalog = WorkpieceCatalog(library, classifier, fast_jobs=RecordingFastJobs())
+
+    catalog.recycle(record.id, operation_id="orphan-stage-recycle")
+    recycled = library.get_recycled(record.id)
+    live_runtime = classifier.build_fast_runtime_cache(recycled, None)
+    classifier.save_fast_runtime_cache(recycled, live_runtime)
+    live_sidecar = recycled.root / ".fast_runtime_cache.pkl"
+    live_bytes = live_sidecar.read_bytes()
+    assert staged.temporary_root.parent == library.library_dir
+    assert staged.temporary_root.is_dir()
+    assert (staged.temporary_root / ".previous-fast-runtime-cache.pkl").is_file()
+
+    restarted_classifier = production_fast_classifier()
+    restarted_classifier.load_template_cache = lambda _record: base_cache
+    restarted = WorkpieceCatalog(
+        WorkpieceLibrary(library.library_dir),
+        restarted_classifier,
+        fast_jobs=RecordingFastJobs(),
+    )
+    restarted.recover()
+
+    recovered_recycled = restarted.library.get_recycled(record.id)
+    recovered_sidecar = recovered_recycled.root / ".fast_runtime_cache.pkl"
+    assert not staged.temporary_root.exists()
+    assert recovered_sidecar.read_bytes() == live_bytes
+    assert restarted_classifier.load_fast_runtime_cache(recovered_recycled) is not None
+
+    restarted.purge(record.id, operation_id="orphan-stage-purge")
+
+    assert not recovered_recycled.root.exists()
+    assert list(library.library_dir.glob(f".fast-runtime-stage-{record.id}-*")) == []
+
+
+def test_purge_after_restart_removes_only_the_recycled_records_root_fast_stage(
+    tmp_path,
+):
+    library = WorkpieceLibrary(tmp_path / "library")
+    first, _ = library.register(
+        "M7",
+        [image(tmp_path / "first-front.png", 10)],
+        [image(tmp_path / "first-back.png", 20)],
+        False,
+        builder,
+    )
+    second, _ = library.register(
+        "M8",
+        [image(tmp_path / "second-front.png", 30)],
+        [image(tmp_path / "second-back.png", 40)],
+        False,
+        builder,
+    )
+    classifier = production_fast_classifier()
+    first_runtime = classifier.build_fast_runtime_cache(first, None)
+    second_runtime = classifier.build_fast_runtime_cache(second, None)
+    classifier.save_fast_runtime_cache(first, first_runtime)
+    classifier.save_fast_runtime_cache(second, second_runtime)
+    first_stage = classifier.stage_fast_runtime_cache(first, first_runtime)
+    second_stage = classifier.stage_fast_runtime_cache(second, second_runtime)
+    second_sidecar = second.root / ".fast_runtime_cache.pkl"
+    second_bytes = second_sidecar.read_bytes()
+    WorkpieceCatalog(library, classifier, fast_jobs=RecordingFastJobs()).recycle(
+        first.id,
+        operation_id="purge-orphan-recycle",
+    )
+
+    restarted_library = WorkpieceLibrary(library.library_dir)
+    restarted_library.recover(builder)
+    restarted = WorkpieceCatalog(
+        restarted_library,
+        production_fast_classifier(),
+        fast_jobs=RecordingFastJobs(),
+    )
+    assert first_stage.temporary_root.is_dir()
+    assert second_stage.temporary_root.is_dir()
+
+    restarted.purge(first.id, operation_id="purge-root-orphan")
+
+    assert not first_stage.temporary_root.exists()
+    assert second_stage.temporary_root.is_dir()
+    assert second_sidecar.read_bytes() == second_bytes
+    classifier.discard_staged_fast_runtime_cache(second_stage)
+
+
+def test_restore_cleans_recycled_records_root_fast_stage_before_moving_record(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, base_cache = library.register(
+        "M7",
+        [image(tmp_path / "restore-front.png", 10)],
+        [image(tmp_path / "restore-back.png", 20)],
+        False,
+        builder,
+    )
+    classifier = production_fast_classifier()
+    runtime = classifier.build_fast_runtime_cache(record, None)
+    classifier.save_fast_runtime_cache(record, runtime)
+    staged = classifier.stage_fast_runtime_cache(record, runtime)
+    catalog = WorkpieceCatalog(library, classifier, fast_jobs=RecordingFastJobs())
+    catalog.recycle(record.id, operation_id="restore-orphan-recycle")
+    recycled = library.get_recycled(record.id)
+    recycled_sidecar = recycled.root / ".fast_runtime_cache.pkl"
+    sidecar_bytes = recycled_sidecar.read_bytes()
+    restarted_library = WorkpieceLibrary(library.library_dir)
+    restarted_library.recover(builder)
+    restarted_classifier = production_fast_classifier()
+    restarted_classifier.load_template_cache = lambda _record: base_cache
+    restarted = WorkpieceCatalog(
+        restarted_library,
+        restarted_classifier,
+        fast_jobs=RecordingFastJobs(),
+    )
+
+    restored = restarted.restore(record.id, operation_id="restore-root-orphan")
+
+    assert not staged.temporary_root.exists()
+    assert (restored.root / ".fast_runtime_cache.pkl").read_bytes() == sidecar_bytes
 
 
 def test_recovery_activates_base_and_rebuilds_fast_cache_in_background(tmp_path):

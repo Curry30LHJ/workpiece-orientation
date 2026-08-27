@@ -215,8 +215,12 @@ class WorkpieceCatalog:
         geometry_profile = None
         geometry_profiles = self.geometry_profiles
         if geometry_profiles is not None:
-            geometry_profiles.sync_library_revision(record)
-            profile_snapshot = geometry_profiles.snapshot(record.id)
+            recover_profile = getattr(geometry_profiles, "recover_active_profile", None)
+            if callable(recover_profile):
+                profile_snapshot = recover_profile(record)
+            else:
+                geometry_profiles.sync_library_revision(record)
+                profile_snapshot = geometry_profiles.snapshot(record.id)
             active_revision = profile_snapshot.get("active_revision")
             active_profile = profile_snapshot.get("active")
             if type(active_revision) is int and isinstance(active_profile, dict):
@@ -318,6 +322,15 @@ class WorkpieceCatalog:
             recover_staging(record)
         loader = getattr(self.classifier, "load_template_cache", None)
         return loader(record) if callable(loader) else None
+
+    def _recover_recycled_fast_cache_staging(self, record: WorkpieceRecord) -> None:
+        recover_staging = getattr(
+            self.classifier,
+            "recover_recycled_fast_runtime_cache_staging",
+            None,
+        )
+        if callable(recover_staging):
+            recover_staging(record, self.library.library_dir)
 
     def _save_template_cache(self, record: WorkpieceRecord, cache) -> None:
         saver = getattr(self.classifier, "save_template_cache", None)
@@ -830,6 +843,10 @@ class WorkpieceCatalog:
             cache_loader=self._load_template_cache,
             cache_saver=self._save_template_cache,
         )
+        for summary in self.library.list_recycled():
+            self._recover_recycled_fast_cache_staging(
+                self.library.get_recycled(summary["id"])
+            )
         with self._lock:
             for record, cache in recovered:
                 self._activate(record, cache)
@@ -1037,6 +1054,7 @@ class WorkpieceCatalog:
         def action():
             with self._lock:
                 recycled = self.library.get_recycled(workpiece_id)
+            self._recover_recycled_fast_cache_staging(recycled)
             cache = self._load_template_cache(recycled)
             rebuilt_base = cache is None
             if rebuilt_base:
@@ -1089,6 +1107,9 @@ class WorkpieceCatalog:
 
     def purge(self, workpiece_id: str, *, operation_id: str):
         def action():
+            with self._lock:
+                recycled = self.library.get_recycled(workpiece_id)
+            self._recover_recycled_fast_cache_staging(recycled)
             with self._lock:
                 self.library.purge(workpiece_id)
                 self._snapshots.pop(workpiece_id, None)
