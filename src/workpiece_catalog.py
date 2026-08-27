@@ -860,7 +860,15 @@ class WorkpieceCatalog:
                     }:
                         candidate = self._materialize_fast_profile(record, base_cache)
                     else:
-                        geometry_profiles.sync_library_revision(record)
+                        recover_profile = getattr(
+                            geometry_profiles,
+                            "recover_active_profile",
+                            None,
+                        )
+                        if callable(recover_profile):
+                            recover_profile(record)
+                        else:
+                            geometry_profiles.sync_library_revision(record)
                         candidate = geometry_profiles.rebuild_active_cache(record.id, record)
                         if candidate is None:
                             candidate = self._prepare_legacy_annotation_cache(

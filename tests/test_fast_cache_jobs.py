@@ -594,6 +594,71 @@ def test_recover_preserves_legacy_profile_identity_when_manifest_pointer_is_miss
     assert profiles.snapshot(record.id)["active_revision"] == 1
 
 
+def test_legacy_recover_does_not_resurrect_explicitly_cleared_manifest_profile(tmp_path):
+    record, base_cache = _persist_base_library(tmp_path)
+    _write_geometry_recovery_state(
+        record,
+        manifest_active_revision=None,
+        document_active_revision=1,
+    )
+
+    class LegacyRecoveryClassifier(BlockingFastClassifier):
+        inference_mode = "legacy"
+
+        def __init__(self):
+            super().__init__()
+            self.geometry_prepares = []
+
+        def prepare_geometry_cache(
+            self,
+            workpiece_id,
+            _record,
+            profile,
+            _calibrator=None,
+            _progress_callback=None,
+        ):
+            self.geometry_prepares.append(profile)
+            current = self.caches[workpiece_id]
+            return replace(
+                current,
+                geometry_profile=profile,
+                geometry_profile_revision=profile.get("profile_revision"),
+                ignored_regions={"front": [[{"x": 0.1}]], "back": []},
+            ), {"front": [], "back": []}
+
+    classifier = LegacyRecoveryClassifier()
+    classifier.load_template_cache = lambda _record: base_cache
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    profiles = GeometryMaskProfiles(
+        catalog,
+        start_worker=False,
+        storage_dir=tmp_path / "legacy-null-recovery-jobs",
+    )
+    catalog.set_geometry_profiles(profiles)
+
+    catalog.recover()
+
+    snapshot = catalog.capture_snapshot(record.id)
+    manifest = json.loads((snapshot.record.root / "manifest.json").read_text(encoding="utf-8"))
+    profile_snapshot = profiles.snapshot(record.id)
+    summary = catalog.list_workpiece_summaries()[0]
+    assert classifier.geometry_prepares == []
+    assert snapshot.cache is base_cache
+    assert snapshot.cache.geometry_profile is None
+    assert snapshot.cache.geometry_profile_revision is None
+    assert snapshot.cache.ignored_regions is None
+    assert catalog.get(record.id) == snapshot.record
+    assert manifest["geometry_mask_active_revision"] is None
+    assert profile_snapshot["active_revision"] is None
+    assert profile_snapshot["active"] is None
+    assert profile_snapshot["library_revision"] == snapshot.record.revision
+    assert summary["revision"] == snapshot.record.revision
+    assert summary["geometry_status"] == profile_snapshot["profile_status"]
+    assert summary["geometry_rule_count"] == 0
+    profiles.shutdown()
+    catalog.shutdown()
+
+
 def test_restore_uses_valid_base_without_waiting_for_base_or_fast_builder(tmp_path):
     classifier = BlockingRestoreClassifier()
     classifier.inference_mode = "legacy"

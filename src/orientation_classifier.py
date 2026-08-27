@@ -801,10 +801,18 @@ class OrientationClassifier:
                 transaction,
             )
         finally:
-            if temporary_root_created and not staged and temporary_root.exists():
-                shutil.rmtree(temporary_root)
             if not staged:
-                transaction.release()
+                try:
+                    if temporary_root_created and temporary_root.exists():
+                        shutil.rmtree(temporary_root)
+                except Exception:
+                    LOGGER.warning(
+                        "Unable to clean failed fast cache staging %s",
+                        temporary_root,
+                        exc_info=True,
+                    )
+                finally:
+                    transaction.release()
 
     @staticmethod
     def commit_staged_fast_runtime_cache(
@@ -844,7 +852,9 @@ class OrientationClassifier:
     @staticmethod
     def finalize_staged_fast_runtime_cache(committed: CommittedFastRuntimeCache) -> None:
         transaction = committed.transaction
-        if transaction.state in {"finalized", "rolled_back", "discarded"}:
+        if transaction.state in {
+            "finalized", "rolled_back", "rollback_failed", "discarded"
+        }:
             return
         if transaction.state != "committed":
             raise ValueError(
@@ -860,7 +870,7 @@ class OrientationClassifier:
     @staticmethod
     def rollback_committed_fast_runtime_cache(committed: CommittedFastRuntimeCache) -> None:
         transaction = committed.transaction
-        if transaction.state in {"rolled_back", "discarded"}:
+        if transaction.state in {"rolled_back", "rollback_failed", "discarded"}:
             return
         if transaction.state != "committed":
             raise ValueError(
@@ -877,25 +887,33 @@ class OrientationClassifier:
             elif committed.target_path.exists():
                 committed.target_path.unlink()
         except Exception:
-            transaction.state = (
-                "rolled_back"
-                if committed.previous_digest is not None
+            rollback_completed = (
+                committed.previous_digest is not None
                 and committed.backup_path is not None
                 and not committed.backup_path.exists()
-                else "committed"
+            ) or (
+                committed.previous_digest is None
+                and not committed.target_path.exists()
+            )
+            transaction.state = (
+                "rolled_back" if rollback_completed else "rollback_failed"
             )
             raise
-        try:
-            if committed.temporary_root.exists():
-                shutil.rmtree(committed.temporary_root)
+        else:
+            try:
+                if committed.temporary_root.exists():
+                    shutil.rmtree(committed.temporary_root)
+            finally:
+                transaction.state = "rolled_back"
         finally:
-            transaction.state = "rolled_back"
             transaction.release()
 
     @staticmethod
     def discard_staged_fast_runtime_cache(staged: StagedFastRuntimeCache) -> None:
         transaction = staged.transaction
-        if transaction.state in {"discarded", "rolled_back", "finalized"}:
+        if transaction.state in {
+            "discarded", "rolled_back", "rollback_failed", "finalized"
+        }:
             return
         if transaction.state == "committed":
             backup = staged.temporary_root / ".previous-fast-runtime-cache.pkl"

@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import os
 import pickle
+import shutil
 import sys
 import threading
 import time
@@ -642,6 +643,269 @@ def test_staged_fast_cache_partial_serialization_failure_removes_sibling_stage(
 
     assert (record.root / ".fast_runtime_cache.pkl").read_bytes() == previous
     assert list(tmp_path.glob(".fast-runtime-stage-record-*")) == []
+
+
+def test_staging_cleanup_failure_preserves_primary_error_and_releases_record_lock(
+    classifier,
+    tmp_path,
+    monkeypatch,
+):
+    front = [write_marker(tmp_path / "cleanup-front.png", 1)]
+    back = [write_marker(tmp_path / "cleanup-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    classifier.save_fast_runtime_cache(record, runtime)
+    real_dump = pickle.dump
+    real_rmtree = shutil.rmtree
+
+    def fail_serialization(_payload, stream, **_kwargs):
+        stream.write(b"partial")
+        raise RuntimeError("primary serialization failure")
+
+    def fail_stage_cleanup(path, *args, **kwargs):
+        if Path(path).name.startswith(".fast-runtime-stage-record-"):
+            raise OSError("stage cleanup failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("src.orientation_classifier.pickle.dump", fail_serialization)
+    monkeypatch.setattr("src.orientation_classifier.shutil.rmtree", fail_stage_cleanup)
+    try:
+        classifier.stage_fast_runtime_cache(record, runtime)
+    except Exception as exc:
+        first_error = exc
+    else:
+        pytest.fail("fault-injected staging unexpectedly succeeded")
+    monkeypatch.setattr("src.orientation_classifier.pickle.dump", real_dump)
+    monkeypatch.setattr("src.orientation_classifier.shutil.rmtree", real_rmtree)
+
+    completed = threading.Event()
+    staged = []
+    errors = []
+
+    def stage_again():
+        try:
+            staged.append(classifier.stage_fast_runtime_cache(record, runtime))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=stage_again, daemon=True)
+    worker.start()
+    assert completed.wait(1.0), "failed staging cleanup permanently held the record lock"
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert type(first_error) is RuntimeError
+    assert str(first_error) == "primary serialization failure"
+    assert errors == []
+    assert len(staged) == 1
+    classifier.discard_staged_fast_runtime_cache(staged[0])
+    classifier.recover_fast_runtime_cache_staging(record)
+    classifier.recover_fast_runtime_cache_staging(record)
+    assert list(tmp_path.glob(".fast-runtime-stage-record-*")) == []
+
+
+@pytest.mark.parametrize("failure_point", ["replace", "unlink", "cleanup"])
+def test_failed_committed_rollback_releases_record_lock_and_remains_recoverable(
+    classifier,
+    tmp_path,
+    monkeypatch,
+    failure_point,
+):
+    front = [write_marker(tmp_path / "rollback-failure-front.png", 1)]
+    back = [write_marker(tmp_path / "rollback-failure-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    old_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "old"})
+    new_runtime = replace(runtime, training_summary={**runtime.training_summary, "marker": "new"})
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    if failure_point != "unlink":
+        classifier.save_fast_runtime_cache(record, old_runtime)
+    staged = classifier.stage_fast_runtime_cache(record, new_runtime)
+    committed = classifier.commit_staged_fast_runtime_cache(record, staged)
+    target = record.root / ".fast_runtime_cache.pkl"
+    published = target.read_bytes()
+    real_replace = os.replace
+    real_unlink = Path.unlink
+    real_rmtree = shutil.rmtree
+
+    def fail_rollback(source, destination):
+        if Path(source) == committed.backup_path and Path(destination) == target:
+            raise OSError("rollback replace failure")
+        return real_replace(source, destination)
+
+    def fail_unlink(path, *args, **kwargs):
+        if path == target:
+            raise OSError("rollback unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    def fail_cleanup(path, *args, **kwargs):
+        if Path(path) == committed.temporary_root:
+            raise OSError("rollback cleanup failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    if failure_point == "replace":
+        monkeypatch.setattr("src.orientation_classifier.os.replace", fail_rollback)
+    elif failure_point == "unlink":
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
+    else:
+        monkeypatch.setattr("src.orientation_classifier.shutil.rmtree", fail_cleanup)
+    with pytest.raises(OSError, match=f"rollback {failure_point} failure"):
+        classifier.rollback_committed_fast_runtime_cache(committed)
+    monkeypatch.setattr("src.orientation_classifier.os.replace", real_replace)
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    monkeypatch.setattr("src.orientation_classifier.shutil.rmtree", real_rmtree)
+    assert committed.temporary_root.is_dir()
+    if failure_point == "replace":
+        assert committed.backup_path is not None and committed.backup_path.is_file()
+    expected_marker = "old" if failure_point == "cleanup" else "new"
+    expected_sidecar = target.read_bytes()
+    if failure_point != "cleanup":
+        assert expected_sidecar == published
+
+    completed = threading.Event()
+    second_stage = []
+    errors = []
+
+    def stage_again():
+        try:
+            second_stage.append(classifier.stage_fast_runtime_cache(record, new_runtime))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=stage_again, daemon=True)
+    worker.start()
+    assert completed.wait(1.0), "failed rollback permanently held the record lock"
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(second_stage) == 1
+    classifier.discard_staged_fast_runtime_cache(second_stage[0])
+
+    classifier.rollback_committed_fast_runtime_cache(committed)
+    classifier.discard_staged_fast_runtime_cache(staged)
+    assert target.read_bytes() == expected_sidecar
+    classifier.recover_fast_runtime_cache_staging(record)
+    assert not committed.temporary_root.exists()
+    assert classifier.load_fast_runtime_cache(record).training_summary["marker"] == expected_marker
+
+
+def test_recycled_stage_recovery_rejects_an_unrelated_parent(classifier, tmp_path):
+    library_root = tmp_path / "library"
+    record_root = library_root / ".recycled" / "m7"
+    record_root.mkdir(parents=True)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    record = SimpleNamespace(id="m7", root=record_root)
+
+    with pytest.raises(ValueError, match="staging parent is unrelated"):
+        classifier.recover_recycled_fast_runtime_cache_staging(record, foreign)
+
+
+def test_stage_recovery_does_not_follow_a_symlink_candidate(
+    classifier,
+    tmp_path,
+    monkeypatch,
+):
+    record_root = tmp_path / "record"
+    record_root.mkdir()
+    record = SimpleNamespace(id="m7", root=record_root)
+    candidate = tmp_path / f".fast-runtime-stage-record-{'a' * 32}"
+    candidate.mkdir()
+    marker = candidate / "outside-marker"
+    marker.write_bytes(b"keep")
+    real_is_symlink = Path.is_symlink
+
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == candidate or real_is_symlink(path),
+    )
+
+    classifier.recover_fast_runtime_cache_staging(record)
+
+    assert candidate.is_dir()
+    assert marker.read_bytes() == b"keep"
+
+
+def test_same_record_fast_staging_is_serialized_until_first_transaction_finishes(
+    classifier,
+    tmp_path,
+):
+    front = [write_marker(tmp_path / "serialized-front.png", 1)]
+    back = [write_marker(tmp_path / "serialized-back.png", 2)]
+    runtime = build_fast_runtime(
+        front,
+        back,
+        library_revision=7,
+        model_fingerprint="model-a",
+    )
+    record = SimpleNamespace(
+        id="m7",
+        root=tmp_path / "record",
+        front_images=tuple(front),
+        back_images=tuple(back),
+        revision=7,
+        geometry_profile_revision=None,
+    )
+    record.root.mkdir()
+    classifier.model_fingerprint = "model-a"
+    first = classifier.stage_fast_runtime_cache(record, runtime)
+    attempted = threading.Event()
+    completed = threading.Event()
+    second = []
+    errors = []
+
+    def stage_second():
+        attempted.set()
+        try:
+            second.append(classifier.stage_fast_runtime_cache(record, runtime))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=stage_second)
+    worker.start()
+    assert attempted.wait(1.0)
+    assert not completed.wait(0.1)
+    classifier.discard_staged_fast_runtime_cache(first)
+    assert completed.wait(1.0)
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+
+    assert errors == []
+    assert len(second) == 1
+    classifier.discard_staged_fast_runtime_cache(second[0])
 
 
 def test_fast_cache_revision_mismatch_is_ignored_without_deleting_base_cache(classifier, tmp_path):
