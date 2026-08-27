@@ -2924,7 +2924,7 @@ private slots:
         QVERIFY(window.findChild<QTextEdit *>(QStringLiteral("rawEvidenceTextEdit"))
                     ->toPlainText().contains(QStringLiteral("0.75")));
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))
-                    ->text().contains(QStringLiteral("select-1.png")));
+                    ->toolTip().contains(QStringLiteral("select-1.png")));
     }
 
     void laterBatchResponsesDoNotReplaceManualSelection() {
@@ -3127,7 +3127,7 @@ private slots:
         waitForBatchCompletion(window, 3);
         QTRY_COMPARE(table->currentRow(), 1);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))
-                    ->text().contains(QStringLiteral("review-1.png")));
+                    ->toolTip().contains(QStringLiteral("review-1.png")));
     }
 
     void batchWithoutReviewSelectsFirstResult() {
@@ -3327,7 +3327,7 @@ private slots:
         QCOMPARE(table->rowCount(), 2);
         QVERIFY(!front->isEnabled());
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentResultTargetLabel"))
-                    ->text().contains(QStringLiteral("其他工件")));
+                    ->toolTip().contains(QStringLiteral("其他工件")));
         combo->setCurrentIndex(0);
         QTRY_VERIFY(front->isEnabled());
     }
@@ -4814,6 +4814,36 @@ private slots:
         MainWindow window;
         QVERIFY(window.minimumWidth() <= 1024);
         QVERIFY(window.minimumHeight() <= 640);
+    }
+
+    void scaled720pWindowKeepsBatchReviewActionsVisible() {
+        MainWindow window;
+        window.resize(1024, 640);
+        auto *page = window.findChild<InspectionPage *>();
+        QVERIFY(page != nullptr);
+        page->setMode(InspectionMode::Batch);
+        window.show();
+        QCoreApplication::processEvents();
+
+        auto *resultPane = page->findChild<QWidget *>(QStringLiteral("resultPane"));
+        auto *table = page->findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        QVERIFY(resultPane != nullptr);
+        QVERIFY(table != nullptr);
+        QCOMPARE(window.size(), QSize(1024, 640));
+        QVERIFY(resultPane->width() >= 440);
+        QVERIFY(table->height() >= 90);
+        QVERIFY(!table->horizontalScrollBar()->isVisible());
+
+        for (const QString &name : {QStringLiteral("confirmFrontButton"),
+                                    QStringLiteral("confirmBackButton"),
+                                    QStringLiteral("rejectConfirmationButton")}) {
+            auto *button = page->findChild<QPushButton *>(name);
+            QVERIFY(button != nullptr);
+            QVERIFY(button->isVisibleTo(&window));
+            const QRect rect(button->mapTo(&window, QPoint()), button->size());
+            QVERIFY2(window.rect().contains(rect), qPrintable(name));
+        }
     }
 
     void embeddedPagesRetainMainWindowAncestry() {

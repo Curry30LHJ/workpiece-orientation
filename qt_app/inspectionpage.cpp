@@ -4,6 +4,7 @@
 
 #include <QApplication>
 #include <QButtonGroup>
+#include <QEvent>
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QImageReader>
@@ -16,7 +17,6 @@
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QUuid>
-#include <QVBoxLayout>
 #include <QWheelEvent>
 
 #include "inspectionimageview.h"
@@ -34,13 +34,15 @@ QString geometryDescription(const QJsonObject &response) {
 InspectionPage::InspectionPage(QWidget *parent)
     : QWidget(parent), ui(new Ui::InspectionPage) {
     ui->setupUi(this);
+    ui->resultPane->installEventFilter(this);
     ui->inspectionPageLayout->setStretch(0, 0);
     ui->inspectionPageLayout->setStretch(1, 1);
     ui->inspectionSplitter->setSizes({650, 350});
     ui->inspectionSplitter->setStretchFactor(0, 65);
     ui->inspectionSplitter->setStretchFactor(1, 35);
     ui->inspectionSplitter->setChildrenCollapsible(false);
-    ui->batchReviewSplitter->setSizes({430, 230});
+    ui->batchReviewSplitter->setSizes({300, 240});
+    ui->batchReviewSplitter->setChildrenCollapsible(false);
     ui->recentInspectionList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     ui->recentInspectionList->setTextElideMode(Qt::ElideRight);
     ui->batchResultsTableWidget->setColumnCount(5);
@@ -51,8 +53,13 @@ InspectionPage::InspectionPage(QWidget *parent)
         0, QHeaderView::Stretch);
     for (int column = 1; column < 5; ++column) {
         ui->batchResultsTableWidget->horizontalHeader()->setSectionResizeMode(
-            column, QHeaderView::ResizeToContents);
+            column, QHeaderView::Fixed);
     }
+    ui->batchResultsTableWidget->setColumnWidth(1, 64);
+    ui->batchResultsTableWidget->setColumnWidth(2, 56);
+    ui->batchResultsTableWidget->setColumnWidth(3, 96);
+    ui->batchResultsTableWidget->setColumnWidth(4, 112);
+    ui->batchResultsTableWidget->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     ui->batchResultsTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
     ui->batchResultsTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
     ui->batchResultsTableWidget->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -140,10 +147,18 @@ InspectionPage::InspectionPage(QWidget *parent)
     QWidget::setTabOrder(ui->confirmFrontButton, ui->confirmBackButton);
     QWidget::setTabOrder(ui->confirmBackButton, ui->rejectConfirmationButton);
     renderActiveState();
+    updateResponsivePresentation();
 }
 
 InspectionPage::~InspectionPage() {
     delete ui;
+}
+
+bool InspectionPage::eventFilter(QObject *watched, QEvent *event) {
+    if (watched == ui->resultPane && event->type() == QEvent::Resize) {
+        updateResponsivePresentation();
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 InspectionPage::ModeState &InspectionPage::activeState() {
@@ -737,7 +752,7 @@ void InspectionPage::rebuildBatchTable() {
         for (int column = 0; column < values.size(); ++column) {
             auto *item = new QTableWidgetItem(values.at(column));
             item->setData(Qt::UserRole, record.id);
-            if (column == 0) item->setToolTip(record.imagePath);
+            item->setToolTip(column == 0 ? record.imagePath : values.at(column));
             ui->batchResultsTableWidget->setItem(row, column, item);
         }
     }
@@ -868,6 +883,41 @@ void InspectionPage::updateBatchSummary() {
     ui->batchProgressBar->setValue(completed);
 }
 
+void InspectionPage::updateResponsivePresentation() {
+    const bool compact = ui->resultPane->width() < 520;
+    if (compactResultLayout_ != compact
+        || !ui->resultLabel->property("responsiveInitialized").toBool()) {
+        compactResultLayout_ = compact;
+        ui->resultLabel->setProperty("compact", compact);
+        ui->resultLabel->setProperty("responsiveInitialized", true);
+        ui->resultLabel->style()->unpolish(ui->resultLabel);
+        ui->resultLabel->style()->polish(ui->resultLabel);
+        ui->batchResultsTableWidget->setColumnHidden(3, compact);
+    }
+
+    const QString fullText = ui->currentResultTargetLabel
+                                 ->property("fullText").toString();
+    if (!fullText.isEmpty()) {
+        ui->currentResultTargetLabel->setText(
+            ui->currentResultTargetLabel->fontMetrics().elidedText(
+                fullText, Qt::ElideMiddle,
+                qMax(80, ui->currentResultTargetLabel->width() - 4)));
+    }
+}
+
+void InspectionPage::setCurrentResultTargetText(const QString &text) {
+    ui->currentResultTargetLabel->setProperty("fullText", text);
+    ui->currentResultTargetLabel->setToolTip(text);
+    if (text.isEmpty()) {
+        ui->currentResultTargetLabel->clear();
+        return;
+    }
+    ui->currentResultTargetLabel->setText(
+        ui->currentResultTargetLabel->fontMetrics().elidedText(
+            text, Qt::ElideMiddle,
+            qMax(80, ui->currentResultTargetLabel->width() - 4)));
+}
+
 void InspectionPage::renderActiveState() {
     const bool batchMode = mode_ == InspectionMode::Batch;
     ui->singleModeButton->setChecked(!batchMode);
@@ -911,7 +961,7 @@ void InspectionPage::renderActiveState() {
         ui->reviewLabel->clear();
         ui->evidenceTextEdit->clear();
         ui->rawEvidenceTextEdit->clear();
-        ui->currentResultTargetLabel->clear();
+        setCurrentResultTargetText(QString());
     }
     const InspectionUiState visibleState = uiState();
     if (visibleState == InspectionUiState::Running) {
@@ -926,6 +976,7 @@ void InspectionPage::renderActiveState() {
         ui->resultMessageLabel->clear();
     }
     updateActionAvailability();
+    updateResponsivePresentation();
 }
 
 void InspectionPage::renderRecord(const InspectionRecord &record) {
@@ -947,14 +998,14 @@ void InspectionPage::renderRecord(const InspectionRecord &record) {
                    || record.disposition == BatchDisposition::SubmitFailed)) {
         detail = QStringLiteral("建议复检，%1").arg(detail);
     }
-    ui->currentResultTargetLabel->setText(
+    setCurrentResultTargetText(
         QStringLiteral("当前：%1（%2）")
             .arg(QFileInfo(record.imagePath).fileName(), detail));
     updateActionOrder(record.label);
 }
 
 void InspectionPage::updateActionOrder(const QString &predictedOrientation) {
-    QVBoxLayout *layout = ui->confirmationActionsLayout;
+    auto *layout = ui->confirmationActionsLayout;
     QPushButton *firstAction = ui->confirmFrontButton;
     QPushButton *secondAction = ui->confirmBackButton;
     layout->removeWidget(ui->confirmFrontButton);

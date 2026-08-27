@@ -6,18 +6,21 @@
 #include <QDropEvent>
 #include <QFileInfo>
 #include <QGraphicsScene>
+#include <QGridLayout>
 #include <QGroupBox>
+#include <QHBoxLayout>
 #include <QImage>
 #include <QLabel>
 #include <QListWidget>
 #include <QMimeData>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSignalSpy>
+#include <QSplitter>
 #include <QTableWidget>
 #include <QTemporaryDir>
 #include <QTextEdit>
 #include <QUrl>
-#include <QVBoxLayout>
 #include <QWheelEvent>
 
 #include "../inspectionimageview.h"
@@ -66,6 +69,122 @@ class TestInspectionPage : public QObject {
 
 private slots:
     void initTestCase() { AppTheme::apply(qApp); }
+
+    void narrowBatchLayoutKeepsTableAndReviewActionsUsable() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        QStringList paths;
+        for (int index = 0; index < 12; ++index) {
+            paths.append(writeImage(
+                directory,
+                QStringLiteral("很长的批量检测文件名_%1_用于验证窄屏布局.png")
+                    .arg(index)));
+        }
+        QVERIFY(!paths.contains(QString()));
+
+        InspectionPage page;
+        page.resize(1037, 620);
+        page.setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("M1"));
+        page.setBackendAvailable(true, false, QString());
+        page.beginBatch(paths, QStringLiteral("m1"));
+        for (int index = 0; index < paths.size(); ++index) {
+            page.handleBackendResponse(
+                QStringLiteral("predict"),
+                predictionResponse(index % 2 == 0
+                                       ? QStringLiteral("front")
+                                       : QStringLiteral("back"),
+                                   index % 3 == 0));
+        }
+        page.show();
+        QCoreApplication::processEvents();
+
+        auto *resultPane = page.findChild<QWidget *>(QStringLiteral("resultPane"));
+        auto *table = page.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        auto *detail = page.findChild<QWidget *>(QStringLiteral("resultDetailPane"));
+        auto *filters = page.findChild<QGridLayout *>(
+            QStringLiteral("batchFilterLayout"));
+        auto *front = page.findChild<QPushButton *>(
+            QStringLiteral("confirmFrontButton"));
+        auto *back = page.findChild<QPushButton *>(
+            QStringLiteral("confirmBackButton"));
+        auto *reject = page.findChild<QPushButton *>(
+            QStringLiteral("rejectConfirmationButton"));
+        QVERIFY(resultPane != nullptr);
+        QVERIFY(table != nullptr);
+        QVERIFY(detail != nullptr);
+        QVERIFY(filters != nullptr);
+        QVERIFY(front != nullptr);
+        QVERIFY(back != nullptr);
+        QVERIFY(reject != nullptr);
+
+        QVERIFY(resultPane->width() >= 440);
+        QVERIFY(table->height() >= 140);
+        QCOMPARE(table->rowCount(), paths.size());
+        QVERIFY(table->isColumnHidden(3));
+        QVERIFY(!table->horizontalScrollBar()->isVisible());
+        QVERIFY(!table->item(0, 1)->toolTip().isEmpty());
+        QVERIFY(table->mapTo(resultPane, QPoint()).y()
+                < detail->mapTo(resultPane, QPoint()).y());
+        const QRect frontRect(front->mapTo(resultPane, QPoint()), front->size());
+        const QRect backRect(back->mapTo(resultPane, QPoint()), back->size());
+        const QRect rejectRect(reject->mapTo(resultPane, QPoint()), reject->size());
+        QCOMPARE(frontRect.center().y(), backRect.center().y());
+        QCOMPARE(backRect.center().y(), rejectRect.center().y());
+
+        int row = -1;
+        int column = -1;
+        int rowSpan = 0;
+        int columnSpan = 0;
+        filters->getItemPosition(filters->indexOf(
+            page.findChild<QPushButton *>(
+                QStringLiteral("unprocessedBatchFilterButton"))),
+            &row, &column, &rowSpan, &columnSpan);
+        QCOMPARE(row, 1);
+    }
+
+    void wideBatchLayoutRestoresElapsedColumn() {
+        InspectionPage page;
+        page.resize(1920, 900);
+        page.setMode(InspectionMode::Batch);
+        page.show();
+        QCoreApplication::processEvents();
+
+        auto *table = page.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        auto *result = page.findChild<QLabel *>(QStringLiteral("resultLabel"));
+        QVERIFY(table != nullptr);
+        QVERIFY(result != nullptr);
+        QVERIFY(!table->isColumnHidden(3));
+        QVERIFY(!result->property("compact").toBool());
+    }
+
+    void narrowResultTargetIsElidedButPreservesFullTooltip() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(
+            directory,
+            QStringLiteral("超长文件名_批量复核结果_需要完整保留在工具提示中_"
+                           "同时在窄栏中间省略但不能丢失原始文件名.png"));
+        QVERIFY(!path.isEmpty());
+
+        InspectionPage page;
+        page.resize(1037, 620);
+        page.setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("M1"));
+        page.setBackendAvailable(true, false, QString());
+        page.beginBatch({path}, QStringLiteral("m1"));
+        page.handleBackendResponse(
+            QStringLiteral("predict"), predictionResponse(QStringLiteral("front")));
+        page.show();
+        QCoreApplication::processEvents();
+
+        auto *target = page.findChild<QLabel *>(
+            QStringLiteral("currentResultTargetLabel"));
+        QVERIFY(target != nullptr);
+        QVERIFY(target->toolTip().contains(QFileInfo(path).fileName()));
+        QVERIFY(target->text().size() < target->toolTip().size());
+    }
+
     void batchIdsAreNonEmptyAndUnique() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());
@@ -543,7 +662,8 @@ private slots:
         auto *front = page.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
         auto *back = page.findChild<QPushButton *>(QStringLiteral("confirmBackButton"));
         auto *reject = page.findChild<QPushButton *>(QStringLiteral("rejectConfirmationButton"));
-        auto *layout = page.findChild<QVBoxLayout *>(QStringLiteral("confirmationActionsLayout"));
+        auto *layout = page.findChild<QHBoxLayout *>(
+            QStringLiteral("confirmationActionsLayout"));
         QVERIFY(front != nullptr);
         QVERIFY(back != nullptr);
         QVERIFY(reject != nullptr);

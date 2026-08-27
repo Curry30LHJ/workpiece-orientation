@@ -4,6 +4,7 @@ QWidget[panel="true"], QFrame[panel="true"] { background: #FFFFFF; border: 1px s
 QLabel { background: transparent; color: #17212B; }
 QLabel[sectionHeading="true"] { color: #17212B; font-size: 17px; font-weight: 600; }
 QLabel#resultLabel { color: #17212B; font-size: 40px; font-weight: 600; }
+QLabel#resultLabel[compact="true"] { font-size: 30px; }
 
 QPushButton { background: #FFFFFF; color: #24313D; border: 1px solid #C9D2DC; border-radius: 5px; min-height: 32px; padding: 0 12px; }
 QPushButton:hover { background: #F7F9FB; border-color: #9AA9B8; }

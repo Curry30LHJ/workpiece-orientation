@@ -7,6 +7,8 @@
 
 #include "inspectiontypes.h"
 
+class QEvent;
+
 namespace Ui {
 class InspectionPage;
 }
@@ -56,6 +58,9 @@ signals:
     void rejectionRequested(const QString &recordId);
     void batchFinished(bool stopped);
 
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
 private:
     struct ModeState {
         QString imagePath;
@@ -83,6 +88,8 @@ private:
     void updateBatchSummary();
     void renderActiveState();
     void renderRecord(const InspectionRecord &record);
+    void updateResponsivePresentation();
+    void setCurrentResultTargetText(const QString &text);
     void updateActionOrder(const QString &predictedOrientation);
     void updateActionAvailability();
     void updateRecordDisposition(const QString &recordId, BatchDisposition disposition,
@@ -119,4 +126,5 @@ private:
     bool changingBatchSelection_ = false;
     bool batchRunning_ = false;
     bool stopRequested_ = false;
+    bool compactResultLayout_ = false;
 };
