@@ -274,6 +274,13 @@ def test_workpiece_summary_reports_unequal_counts_and_rules(tmp_path):
     assert summary["geometry_rule_count"] == 2
     assert summary["geometry_status"] == "ok"
     assert summary["detectable"] is True
+    assert summary["fast_cache"] == {
+        "state": "not_ready",
+        "completed": 0,
+        "total": 0,
+        "elapsed_ms": 0.0,
+        "error": None,
+    }
 
 
 def test_details_return_all_unequal_and_over_thirty_templates(tmp_path):

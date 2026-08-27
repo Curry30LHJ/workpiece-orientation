@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import json
 import logging
@@ -11,6 +11,7 @@ from typing import Any, Sequence
 import uuid
 
 from src.image_io import read_color_image
+from src.fast_cache_jobs import FastCacheJobManager
 from src.interference_masks import build_active_mask_map, validate_region
 from src.orientation_classifier import TemplateCache
 from src.workpiece_library import (
@@ -45,7 +46,8 @@ class ActiveWorkpieceSnapshot:
 class WorkpieceCatalog:
     """Own persistent lifecycle transitions and classifier cache publication."""
 
-    def __init__(self, library: WorkpieceLibrary, classifier: Any, geometry_profiles: Any | None = None):
+    def __init__(self, library: WorkpieceLibrary, classifier: Any, geometry_profiles: Any | None = None,
+                 fast_jobs: FastCacheJobManager | None = None):
         self.library = library
         self.classifier = classifier
         self.geometry_profiles = geometry_profiles
@@ -53,10 +55,100 @@ class WorkpieceCatalog:
         self._operations: dict[str, Any] = {}
         self._operation_events: dict[str, threading.Event] = {}
         self._snapshots: dict[str, ActiveWorkpieceSnapshot] = {}
+        self.fast_jobs = fast_jobs or FastCacheJobManager()
 
     def _activate(self, record: WorkpieceRecord, cache: TemplateCache) -> None:
         self._snapshots[record.id] = ActiveWorkpieceSnapshot(record, cache)
         self.classifier.set_template_cache(record.id, cache)
+
+    def _fast_cache_enabled(self) -> bool:
+        return (
+            getattr(self.classifier, "inference_mode", None) in {"fast_geometry", "compare"}
+            and callable(getattr(self.classifier, "build_fast_runtime_cache", None))
+            and callable(getattr(self.classifier, "save_fast_runtime_cache", None))
+        )
+
+    def _schedule_fast_cache(self, record: WorkpieceRecord, cache: TemplateCache) -> None:
+        if not self._fast_cache_enabled() or getattr(cache, "fast_runtime", None) is not None:
+            return
+        geometry_revision = getattr(cache, "geometry_profile_revision", None)
+        geometry_profile = getattr(cache, "geometry_profile", None)
+
+        def build(progress):
+            return self.classifier.build_fast_runtime_cache(
+                record,
+                geometry_profile,
+                progress,
+            )
+
+        def publish(runtime) -> bool:
+            with self._lock:
+                current = self._snapshots.get(record.id)
+                if (
+                    current is None
+                    or current.record.revision != record.revision
+                    or getattr(current.cache, "geometry_profile_revision", None) != geometry_revision
+                ):
+                    return False
+                updated_cache = replace(current.cache, fast_runtime=runtime)
+                self.classifier.save_fast_runtime_cache(current.record, runtime)
+                self._activate(current.record, updated_cache)
+                return True
+
+        self.fast_jobs.schedule(
+            workpiece_id=record.id,
+            library_revision=record.revision,
+            geometry_profile_revision=geometry_revision,
+            build=build,
+            publish=publish,
+        )
+
+    def _build_fast_candidate(
+        self,
+        record: WorkpieceRecord,
+        cache: TemplateCache,
+    ) -> TemplateCache:
+        if not self._fast_cache_enabled():
+            return cache
+        runtime = self.classifier.build_fast_runtime_cache(
+            record,
+            getattr(cache, "geometry_profile", None),
+            None,
+        )
+        return replace(cache, fast_runtime=runtime)
+
+    def fast_cache_status(self, workpiece_id: str) -> dict[str, Any]:
+        job = self.fast_jobs.snapshot(workpiece_id)
+        with self._lock:
+            current = self._snapshots.get(workpiece_id)
+            ready = current is not None and getattr(current.cache, "fast_runtime", None) is not None
+            current_revision = None if current is None else current.record.revision
+            geometry_revision = (
+                None if current is None else getattr(current.cache, "geometry_profile_revision", None)
+            )
+        if job is not None and (
+            current is None
+            or job.library_revision == current_revision
+            and job.geometry_profile_revision == geometry_revision
+        ):
+            state = "not_ready" if job.state == "stale" and current is not None else job.state
+            return {
+                "state": state,
+                "completed": job.completed,
+                "total": job.total,
+                "elapsed_ms": job.elapsed_ms,
+                "error": job.error,
+            }
+        return {
+            "state": "ready" if ready else "not_ready",
+            "completed": 0,
+            "total": 0,
+            "elapsed_ms": 0.0,
+            "error": None,
+        }
+
+    def shutdown(self) -> None:
+        self.fast_jobs.shutdown()
 
     def capture_snapshot(self, workpiece_id: str) -> ActiveWorkpieceSnapshot:
         with self._lock:
@@ -118,6 +210,7 @@ class WorkpieceCatalog:
             )
             self._activate(record, cache)
             self._save_template_cache(record, cache)
+            self._schedule_fast_cache(record, cache)
             return record, cache
 
     @staticmethod
@@ -180,6 +273,7 @@ class WorkpieceCatalog:
                         stable = False
                         break
                 summaries.append(summary)
+                summary["fast_cache"] = self.fast_cache_status(record.id)
             if not stable:
                 continue
             with self._lock:
@@ -222,6 +316,7 @@ class WorkpieceCatalog:
                 raise
             with self._lock:
                 if self._record_is_current(record, geometry_profiles):
+                    summary["fast_cache"] = self.fast_cache_status(record.id)
                     return {**summary, "templates": templates}
         with self._lock:
             self.library.get(workpiece_id)
@@ -363,6 +458,14 @@ class WorkpieceCatalog:
                 candidate = self._prepare_legacy_annotation_cache(record)
                 if candidate is None:
                     raise WorkpieceCatalogError("no active legacy annotation cache is available")
+                target = replace(record, revision=expected_revision + 1)
+            candidate = self._build_fast_candidate(target, candidate)
+            with self._lock:
+                record = self.library.get(workpiece_id)
+                if record.revision != expected_revision:
+                    raise WorkpieceCatalogError(
+                        f"Workpiece revision changed: expected {expected_revision}, current {record.revision}"
+                    )
                 updated = self.library.replace_geometry_profile_pointers(
                     workpiece_id,
                     expected_revision=expected_revision,
@@ -568,13 +671,38 @@ class WorkpieceCatalog:
             candidate = None
             if geometry_profiles is not None:
                 try:
-                    candidate = geometry_profiles.rebuild_active_cache(record.id, record)
-                    if candidate is None:
-                        candidate = self._prepare_legacy_annotation_cache(
-                            record,
-                            base_cache=base_cache,
-                        )
                     geometry_profiles.sync_library_revision(record)
+                    if getattr(self.classifier, "inference_mode", None) == "fast_geometry":
+                        profile_snapshot = geometry_profiles.snapshot(record.id)
+                        active_revision = profile_snapshot.get("active_revision")
+                        active_profile = profile_snapshot.get("active")
+                        if type(active_revision) is int and isinstance(active_profile, dict):
+                            runtime_profile = dict(active_profile)
+                            runtime_profile["profile_revision"] = active_revision
+                            runtime = getattr(base_cache, "fast_runtime", None)
+                            runtime_revision = getattr(runtime, "geometry_profile_revision", None)
+                            if isinstance(runtime, dict):
+                                runtime_revision = runtime.get("geometry_profile_revision")
+                            candidate = replace(
+                                base_cache,
+                                geometry_profile=runtime_profile,
+                                geometry_profile_revision=active_revision,
+                                fast_runtime=runtime if runtime_revision == active_revision else None,
+                            )
+                    else:
+                        if getattr(self.classifier, "inference_mode", None) == "compare":
+                            candidate = geometry_profiles.rebuild_active_cache(
+                                record.id,
+                                record,
+                                build_fast_runtime=False,
+                            )
+                        else:
+                            candidate = geometry_profiles.rebuild_active_cache(record.id, record)
+                        if candidate is None:
+                            candidate = self._prepare_legacy_annotation_cache(
+                                record,
+                                base_cache=base_cache,
+                            )
                 except Exception as exc:
                     LOGGER.warning("Unable to restore active geometry profile for %s: %s", record.id, exc)
             else:
@@ -593,6 +721,10 @@ class WorkpieceCatalog:
                     current = self._snapshots.get(record.id)
                     if current is not None and current.record.revision == record.revision:
                         self._activate(record, candidate)
+            with self._lock:
+                current = self._snapshots.get(record.id)
+            if current is not None and current.record.revision == record.revision:
+                self._schedule_fast_cache(current.record, current.cache)
         return recovered
 
     def predict(self, workpiece_id: str, image_path: Path):
@@ -656,6 +788,7 @@ class WorkpieceCatalog:
                 except Exception:
                     LOGGER.debug("Ignoring append progress callback failure", exc_info=True)
             record = self.commit_prepared_append(prepared, effective)
+            self._schedule_fast_cache(record, effective)
             return record, effective
         except Exception:
             self.library.abort_prepared(prepared)
@@ -674,6 +807,14 @@ class WorkpieceCatalog:
         """Switch the persistent geometry pointer and runtime cache together."""
         def action():
             with self._lock:
+                current = self.library.get(workpiece_id)
+                if current.revision != expected_revision:
+                    raise StaleWorkpieceRevisionError(
+                        f"Workpiece revision changed: expected {expected_revision}, current {current.revision}"
+                    )
+                target = replace(current, revision=expected_revision + 1)
+            prepared_cache = self._build_fast_candidate(target, candidate_cache)
+            with self._lock:
                 record = self.library.replace_geometry_profile_pointers(
                     workpiece_id,
                     expected_revision=expected_revision,
@@ -683,8 +824,9 @@ class WorkpieceCatalog:
                 # set_template_cache is an in-memory reference swap; it does not
                 # run model inference.  The durable cache writer stores only the
                 # unmasked base cache so recovery can rebuild any active profile.
-                self._activate(record, candidate_cache)
-                self._save_template_cache(record, candidate_cache)
+                self._activate(record, prepared_cache)
+                self._save_template_cache(record, prepared_cache)
+                self._schedule_fast_cache(record, prepared_cache)
                 return record
 
         return self._idempotent(operation_id, action)
@@ -748,6 +890,7 @@ class WorkpieceCatalog:
                     if current is not None and current.record.revision == record.revision:
                         self._activate(record, effective)
             self._save_template_cache(record, effective)
+            self._schedule_fast_cache(record, effective)
             return record
 
         return self._idempotent(operation_id, action)

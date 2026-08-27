@@ -7,7 +7,7 @@ document format by the catalog in the next implementation step.
 
 from __future__ import annotations
 
-from copy import deepcopy
+from copy import copy, deepcopy
 import json
 import logging
 import math
@@ -652,7 +652,13 @@ class GeometryMaskProfiles:
             document["library_revision"] = int(record.revision)
             _atomic_write_json(self._profile_root(record) / "profile.json", document)
 
-    def rebuild_active_cache(self, workpiece_id: str, record: Any | None = None) -> Any | None:
+    def rebuild_active_cache(
+        self,
+        workpiece_id: str,
+        record: Any | None = None,
+        *,
+        build_fast_runtime: bool = True,
+    ) -> Any | None:
         """Build the active geometry view from its immutable revision file."""
         with self._lock:
             record = record or self._record(workpiece_id)
@@ -670,6 +676,13 @@ class GeometryMaskProfiles:
                 LOGGER.warning("Unable to load active geometry profile %s: %s", path, exc)
                 return None
             classifier = getattr(self.catalog, "classifier", None)
+            if (
+                not build_fast_runtime
+                and getattr(classifier, "inference_mode", None) in {"fast_geometry", "compare"}
+                and getattr(classifier, "fast_engine", None) is not None
+            ):
+                classifier = copy(classifier)
+                classifier.fast_engine = None
             prepare = getattr(classifier, "prepare_geometry_cache", None)
             if not callable(prepare):
                 return None
