@@ -34,9 +34,9 @@ from scripts.benchmark_adaptive_local_search import (
     CaseSpec,
     _build_case_specs,
     _build_input_fingerprint,
-    _canonical_sha256,
     _collect_environment,
     _ensure_project_import_path,
+    _fingerprint_validation_issues,
     _json_default,
     _load_m1_cache,
     _sha256,
@@ -346,88 +346,23 @@ def audit_case_specs(
     return inventory, queries
 
 
-def _is_sha256(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value.lower())
-    )
-
-
-def _validate_input_fingerprint(value: Any, mode: str) -> dict[str, Any]:
-    prefix = f"{mode} input fingerprint"
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{prefix} must be an object")
-    fingerprint = dict(value)
-    required = {
-        "schema_version",
-        "git",
-        "project_sources",
-        "model",
-        "m1_artifacts",
-        "selections",
-        "overall_sha256",
-    }
-    missing = sorted(required - set(fingerprint))
-    if missing:
-        raise ValueError(f"{prefix} is incomplete: {', '.join(missing)}")
-    if fingerprint.get("schema_version") != 1:
-        raise ValueError(f"{prefix} schema_version must be 1")
-    overall = fingerprint.get("overall_sha256")
-    body = {
-        key: item
-        for key, item in fingerprint.items()
-        if key != "overall_sha256"
-    }
-    if not _is_sha256(overall) or overall != _canonical_sha256(body):
-        raise ValueError(f"{prefix} overall_sha256 is missing or stale")
-
-    git = fingerprint.get("git")
-    if (
-        not isinstance(git, Mapping)
-        or not isinstance(git.get("head"), str)
-        or not git.get("head")
-        or not _is_sha256(git.get("tracked_binary_diff_sha256"))
-    ):
-        raise ValueError(f"{prefix} git reproducibility section is invalid")
-    for name in ("project_sources", "model"):
-        section = fingerprint.get(name)
-        if (
-            not isinstance(section, Mapping)
-            or not isinstance(section.get("files"), list)
-            or not section.get("files")
-            or not _is_sha256(section.get("aggregate_sha256"))
-        ):
-            raise ValueError(f"{prefix} {name} section is invalid")
-    artifacts = fingerprint.get("m1_artifacts")
-    if not isinstance(artifacts, Mapping) or not {
-        "manifest",
-        "template_cache",
-        "active_geometry_profile",
-    }.issubset(artifacts):
-        raise ValueError(f"{prefix} M1 artifact section is incomplete")
-    selections = fingerprint.get("selections")
-    if not isinstance(selections, Mapping) or set(selections) != set(RELEASE_CASES):
-        raise ValueError(f"{prefix} selections must contain exactly M1, M2, and M7")
-    for case in RELEASE_CASES:
-        selection = selections[case]
-        if (
-            not isinstance(selection, Mapping)
-            or not _is_sha256(selection.get("aggregate_sha256"))
-        ):
-            raise ValueError(f"{prefix} {case} selection is invalid")
-    return fingerprint
-
-
 def _shared_input_fingerprint(
     legacy_payload: Mapping[str, Any], fast_payload: Mapping[str, Any]
 ) -> dict[str, Any]:
-    legacy = _validate_input_fingerprint(
-        legacy_payload.get("input_fingerprint"), "legacy"
-    )
-    fast = _validate_input_fingerprint(
-        fast_payload.get("input_fingerprint"), "fast_geometry"
-    )
+    fingerprints: dict[str, dict[str, Any]] = {}
+    for mode, payload in (
+        ("legacy", legacy_payload),
+        ("fast_geometry", fast_payload),
+    ):
+        fingerprint = payload.get("input_fingerprint")
+        issues = _fingerprint_validation_issues(fingerprint)
+        if issues:
+            raise ValueError(
+                f"{mode} input fingerprint is invalid: " + "; ".join(issues)
+            )
+        fingerprints[mode] = dict(fingerprint)
+    legacy = fingerprints["legacy"]
+    fast = fingerprints["fast_geometry"]
     if legacy != fast:
         raise ValueError("input fingerprints differ")
     return legacy
@@ -789,47 +724,76 @@ def _assert_fast_worker_is_local_feature_free() -> None:
         )
 
 
+class _FastWorkerLocalFeatureViolation(RuntimeError):
+    def __init__(self, entry_point: str, counts: Mapping[str, int]):
+        self.entry_point = entry_point
+        self.local_feature_call_counts = dict(counts)
+        super().__init__(
+            f"fast worker attempted forbidden {entry_point} processing"
+        )
+
+
 class _FastWorkerLocalGuard:
     """Make every forbidden local-feature entry point executable evidence."""
 
-    def __init__(self, classifier: Any):
+    def __init__(self, classifier: Any = None):
         self.classifier = classifier
         self._counts = {"ALIKED": 0, "LightGlue": 0, "ORB": 0}
         self._original_extract_features: Any = None
         self._original_score_feature_pair: Any = None
         self._original_orb_create: Any = None
         self._installed = False
+        self._classifier_guarded = False
 
     def _blocker(self, name: str) -> Callable[..., Any]:
         def blocked(*args: Any, **kwargs: Any) -> Any:
             del args, kwargs
             self._counts[name] += 1
-            raise RuntimeError(f"fast worker attempted forbidden {name} processing")
+            raise _FastWorkerLocalFeatureViolation(name, self._counts)
 
         return blocked
 
     def install(self) -> None:
         _assert_fast_worker_is_local_feature_free()
+        if not self._installed:
+            self._original_orb_create = cv2.ORB_create
+            cv2.ORB_create = self._blocker("ORB")
+            self._installed = True
+        if self.classifier is not None and not self._classifier_guarded:
+            try:
+                self.bind_classifier(self.classifier)
+            except Exception:
+                self.close()
+                raise
+
+    def bind_classifier(self, classifier: Any) -> None:
+        if not self._installed:
+            raise RuntimeError("fast worker ORB guard must be installed before model load")
+        _assert_fast_worker_is_local_feature_free()
         for field in ("extractor", "matcher", "device"):
-            if getattr(self.classifier, field, None) is not None:
+            if getattr(classifier, field, None) is not None:
+                self.close()
                 raise RuntimeError(
                     f"fast worker classifier {field} must be absent"
                 )
-        if self._installed:
-            return
-        self._original_extract_features = self.classifier._extract_features
-        self._original_score_feature_pair = self.classifier._score_feature_pair
-        self._original_orb_create = cv2.ORB_create
-        self.classifier._extract_features = self._blocker("ALIKED")
-        self.classifier._score_feature_pair = self._blocker("LightGlue")
-        cv2.ORB_create = self._blocker("ORB")
-        self._installed = True
+        self.classifier = classifier
+        self._original_extract_features = classifier._extract_features
+        self._original_score_feature_pair = classifier._score_feature_pair
+        self._classifier_guarded = True
+        try:
+            classifier._extract_features = self._blocker("ALIKED")
+            classifier._score_feature_pair = self._blocker("LightGlue")
+        except Exception:
+            self.close()
+            raise
 
     def counts(self) -> dict[str, int]:
         return dict(self._counts)
 
     def assert_clean(self) -> None:
         _assert_fast_worker_is_local_feature_free()
+        if self.classifier is None or not self._classifier_guarded:
+            raise RuntimeError("fast worker classifier guard is missing")
         for field in ("extractor", "matcher", "device"):
             if getattr(self.classifier, field, None) is not None:
                 raise RuntimeError(
@@ -840,12 +804,15 @@ class _FastWorkerLocalGuard:
             raise RuntimeError(f"fast worker attempted local-feature processing: {attempted}")
 
     def close(self) -> None:
-        if not self._installed:
-            return
-        self.classifier._extract_features = self._original_extract_features
-        self.classifier._score_feature_pair = self._original_score_feature_pair
-        cv2.ORB_create = self._original_orb_create
-        self._installed = False
+        try:
+            if self._classifier_guarded and self.classifier is not None:
+                self.classifier._extract_features = self._original_extract_features
+                self.classifier._score_feature_pair = self._original_score_feature_pair
+                self._classifier_guarded = False
+        finally:
+            if self._installed:
+                cv2.ORB_create = self._original_orb_create
+                self._installed = False
 
 
 def _result_geometry_metadata(
@@ -1035,15 +1002,17 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
         project_root, model_dir, library_dir, args.m1_workpiece_id, specs
     )
     fixed_mode = str(args.worker_mode)
-    classifier = OrientationClassifier.load(
-        project_root, model_dir, inference_mode=fixed_mode
-    )
-    if classifier.inference_mode != fixed_mode:
-        raise RuntimeError("classifier changed the immutable worker mode")
-    guard = _FastWorkerLocalGuard(classifier) if fixed_mode == "fast_geometry" else None
-    if guard is not None:
-        guard.install()
+    guard = _FastWorkerLocalGuard() if fixed_mode == "fast_geometry" else None
     try:
+        if guard is not None:
+            guard.install()
+        classifier = OrientationClassifier.load(
+            project_root, model_dir, inference_mode=fixed_mode
+        )
+        if classifier.inference_mode != fixed_mode:
+            raise RuntimeError("classifier changed the immutable worker mode")
+        if guard is not None:
+            guard.bind_classifier(classifier)
         caches = _build_worker_caches(classifier, specs, library_dir)
         worker = {
             "pid": os.getpid(),
@@ -1189,9 +1158,13 @@ def main() -> int:
     try:
         payload = _run_worker(args)
     except Exception as exc:
+        error = {"type": type(exc).__name__, "message": str(exc)}
+        local_counts = getattr(exc, "local_feature_call_counts", None)
+        if isinstance(local_counts, Mapping):
+            error["local_feature_call_counts"] = dict(local_counts)
         payload = {
             "mode": args.worker_mode,
-            "error": {"type": type(exc).__name__, "message": str(exc)},
+            "error": error,
             "environment": _collect_environment(Path(args.project_root)),
         }
         _write_json(args.worker_output, payload)

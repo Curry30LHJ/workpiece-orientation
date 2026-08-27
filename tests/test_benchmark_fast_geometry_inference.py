@@ -57,11 +57,37 @@ def _fingerprint(marker: str = "same") -> dict:
             json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
 
-    file_row = {
-        "path": "src/orientation_classifier.py",
-        "size": 123,
-        "sha256": digest(f"source:{marker}"),
-    }
+    def file_row(path: str) -> dict:
+        return {
+            "path": path,
+            "size": 123,
+            "sha256": digest(f"{marker}:{path}"),
+        }
+
+    source_files = [
+        file_row("src/geometry_profile_schema.py"),
+        file_row("src/model_execution_gate.py"),
+    ]
+    model_files = [file_row("inference.pdmodel")]
+    selections = {}
+    for case in ("M1", "M2", "M7"):
+        case_payload = {}
+        template_count = 28 if case == "M1" else adaptive.TEMPLATE_COUNT
+        for direction in ("front", "back"):
+            case_payload[direction] = {
+                "templates": [
+                    file_row(f"data/{case}/{direction}/template-{index:02d}.png")
+                    for index in range(template_count)
+                ],
+                "queries": [
+                    file_row(f"data/{case}/{direction}/query-{index:02d}.png")
+                    for index in range(adaptive.QUERY_COUNT)
+                ],
+            }
+        case_payload["template_query_overlap_count"] = 0
+        case_payload["aggregate_sha256"] = digest(case_payload)
+        selections[case] = case_payload
+
     body = {
         "schema_version": 1,
         "git": {
@@ -70,25 +96,43 @@ def _fingerprint(marker: str = "same") -> dict:
             "tracked_changed_paths": [],
         },
         "project_sources": {
-            "files": [file_row],
-            "aggregate_sha256": digest([file_row]),
+            "files": source_files,
+            "aggregate_sha256": digest(source_files),
         },
         "model": {
-            "files": [{**file_row, "path": "inference.pdmodel"}],
-            "aggregate_sha256": digest(f"model:{marker}"),
+            "files": model_files,
+            "aggregate_sha256": digest(model_files),
         },
         "m1_artifacts": {
-            "manifest": {"status": "present", "file": file_row},
-            "template_cache": {"status": "present", "file": file_row},
+            "manifest": {
+                "status": "present",
+                "file": file_row("library/m1/manifest.json"),
+            },
+            "template_cache": {
+                "status": "present",
+                "file": file_row("library/m1/.template_cache.pkl"),
+            },
             "active_geometry_profile": {
                 "status": "not_configured",
                 "revision": None,
                 "file": None,
             },
         },
-        "selections": {case: {"aggregate_sha256": digest(f"{case}:{marker}")} for case in ("M1", "M2", "M7")},
+        "selections": selections,
     }
     return {**body, "overall_sha256": digest(body)}
+
+
+def _refresh_outer_fingerprint(fingerprint: dict) -> dict:
+    body = {
+        key: value
+        for key, value in fingerprint.items()
+        if key != "overall_sha256"
+    }
+    overall = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {**body, "overall_sha256": overall}
 
 
 def _accuracy_row(identity: str, label: str, *, expected: str = "front", review: bool = False) -> dict:
@@ -224,6 +268,64 @@ def test_compare_rejects_incomplete_or_invalid_input_fingerprint(fingerprint):
 
     with pytest.raises(ValueError, match="legacy input fingerprint"):
         combine_worker_payloads(legacy, fast)
+
+
+@pytest.mark.parametrize(
+    ("section", "expected_issue"),
+    [
+        ("project_sources", "project source aggregate sha256 is stale"),
+        ("model", "model aggregate sha256 is stale"),
+    ],
+)
+def test_compare_rejects_stale_inventory_aggregate_with_fresh_outer_hash(
+    section, expected_issue
+):
+    fingerprint = _fingerprint()
+    fingerprint[section]["aggregate_sha256"] = "f" * 64
+    fingerprint = _refresh_outer_fingerprint(fingerprint)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"legacy input fingerprint.*{expected_issue}",
+    ):
+        benchmark._shared_input_fingerprint(
+            {"input_fingerprint": fingerprint},
+            {"input_fingerprint": json.loads(json.dumps(fingerprint))},
+        )
+
+
+@pytest.mark.parametrize("case", ["M1", "M2", "M7"])
+def test_compare_rejects_stale_selection_aggregate_with_fresh_outer_hash(case):
+    fingerprint = _fingerprint()
+    fingerprint["selections"][case]["aggregate_sha256"] = "f" * 64
+    fingerprint = _refresh_outer_fingerprint(fingerprint)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"legacy input fingerprint.*{case} selection aggregate sha256 is stale",
+    ):
+        benchmark._shared_input_fingerprint(
+            {"input_fingerprint": fingerprint},
+            {"input_fingerprint": json.loads(json.dumps(fingerprint))},
+        )
+
+
+def test_compare_rejects_malformed_artifact_inventory_with_fresh_outer_hash():
+    fingerprint = _fingerprint()
+    fingerprint["m1_artifacts"]["template_cache"] = {
+        "status": "present",
+        "file": {"path": "C:\\absolute-cache.pkl"},
+    }
+    fingerprint = _refresh_outer_fingerprint(fingerprint)
+
+    with pytest.raises(
+        ValueError,
+        match=r"legacy input fingerprint.*M1 template_cache file path",
+    ):
+        benchmark._shared_input_fingerprint(
+            {"input_fingerprint": fingerprint},
+            {"input_fingerprint": json.loads(json.dumps(fingerprint))},
+        )
 
 
 def test_groups_use_fitted_metadata_and_published_rule_fields_not_filenames():
@@ -628,6 +730,91 @@ def test_fast_worker_guards_count_and_reject_every_local_entry_point():
         assert guard.counts() == {"ALIKED": 1, "LightGlue": 1, "ORB": 1}
     finally:
         guard.close()
+
+
+def test_fast_worker_guards_orb_during_classifier_load_and_restores(
+    monkeypatch, tmp_path
+):
+    from src.orientation_classifier import OrientationClassifier
+
+    project_root = tmp_path / "project"
+    model_dir = tmp_path / "model"
+    library_dir = tmp_path / "library"
+    for directory in (project_root, model_dir, library_dir):
+        directory.mkdir()
+
+    classifier = SimpleNamespace(
+        inference_mode="fast_geometry",
+        extractor=None,
+        matcher=None,
+        device=None,
+        _extract_features=lambda *args, **kwargs: None,
+        _score_feature_pair=lambda *args, **kwargs: None,
+    )
+
+    def load_with_forbidden_orb(*args, **kwargs):
+        del args, kwargs
+        cv2.ORB_create()
+        return classifier
+
+    monkeypatch.setattr(OrientationClassifier, "load", staticmethod(load_with_forbidden_orb))
+    monkeypatch.setattr(benchmark, "_build_case_specs", lambda *args: [])
+    monkeypatch.setattr(benchmark, "audit_case_specs", lambda specs: ({}, []))
+    monkeypatch.setattr(benchmark, "_build_input_fingerprint", lambda *args: _fingerprint())
+    monkeypatch.setattr(benchmark, "_build_worker_caches", lambda *args: {})
+    original_orb_create = cv2.ORB_create
+    args = Namespace(
+        project_root=project_root,
+        model_dir=model_dir,
+        library_dir=library_dir,
+        m1_workpiece_id="m1",
+        worker_mode="fast_geometry",
+        warmup=0,
+        repeats=1,
+        minimum_measured_samples=1,
+    )
+
+    with pytest.raises(RuntimeError, match="ORB") as captured:
+        benchmark._run_worker(args)
+
+    assert captured.value.local_feature_call_counts == {
+        "ALIKED": 0,
+        "LightGlue": 0,
+        "ORB": 1,
+    }
+    assert cv2.ORB_create is original_orb_create
+
+
+def test_worker_error_json_preserves_local_guard_counters(monkeypatch, tmp_path):
+    output = tmp_path / "worker.json"
+    error = benchmark._FastWorkerLocalFeatureViolation(
+        "ORB",
+        {"ALIKED": 0, "LightGlue": 0, "ORB": 1},
+    )
+
+    def fail_worker(args):
+        del args
+        raise error
+
+    monkeypatch.setattr(benchmark, "_run_worker", fail_worker)
+    monkeypatch.setattr(benchmark, "_collect_environment", lambda project_root: {})
+    monkeypatch.setattr(sys, "argv", [
+        "benchmark_fast_geometry_inference.py",
+        "--worker-mode", "fast_geometry",
+        "--worker-output", str(output),
+        "--project-root", str(tmp_path / "project"),
+        "--model-dir", str(tmp_path / "model"),
+        "--library-dir", str(tmp_path / "library"),
+        "--m1-workpiece-id", "m1",
+    ])
+
+    assert benchmark.main() == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["error"]["local_feature_call_counts"] == {
+        "ALIKED": 0,
+        "LightGlue": 0,
+        "ORB": 1,
+    }
 
 
 @pytest.mark.parametrize("field", ["extractor", "matcher", "device"])
