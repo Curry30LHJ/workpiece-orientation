@@ -112,7 +112,12 @@ def fit_ridge_head(
             train = ~np.array([c == class_name and s == source for c, s in zip(classes, sources)])
             if len(set(y[train])) < 2:
                 continue
-            w, b = _fit(x[train], y[train], weights[train], regularization)
+            fold_y = y[train]
+            fold_weights = np.empty(len(fold_y), dtype=np.float64)
+            for target in (1.0, -1.0):
+                target_rows = fold_y == target
+                fold_weights[target_rows] = 0.5 / np.count_nonzero(target_rows)
+            w, b = _fit(x[train], fold_y, fold_weights, regularization)
             for row, target in zip(x[held_original], y[held_original]):
                 margins.append((float(row @ w + b), float(target)))
         if margins:
@@ -126,10 +131,11 @@ def fit_ridge_head(
             candidates.append((0, 0, 0.0, regularization, [], False))
     if not candidates:
         raise ValueError("regularization_grid must not be empty")
-    selected = min(candidates, key=lambda candidate: candidate[:4])
-    regularization = selected[3]
+    usable_candidates = [candidate for candidate in candidates if candidate[5]]
+    selected = min(usable_candidates, key=lambda candidate: candidate[:4]) if usable_candidates else None
+    regularization = selected[3] if selected is not None else 1.0
     final_weights, final_bias = _fit(x, y, weights, regularization)
-    valid_margins = selected[4]
+    valid_margins = selected[4] if selected is not None else []
     if valid_margins:
         correct = [abs(margin) for margin, target in valid_margins if (margin >= 0) == (target >= 0)]
         review_threshold = float(np.clip(0.5 * min(correct), 0.01, 0.25)) if correct else 0.25

@@ -45,6 +45,7 @@ def test_one_plus_one_builds_but_marks_small_margin_for_review():
     decision = predict_ridge(head, np.array([0.51, 0.49], np.float32))
     assert decision.needs_review is True
     assert head.training_summary["validation_status"] == "few_shot_unverified"
+    assert head.regularization == 1.0
 
 
 def test_fit_is_bitwise_deterministic():
@@ -78,3 +79,32 @@ def test_leave_one_source_out_excludes_rotations_from_the_held_out_source():
     )
     assert head.training_summary["validation_folds"] == 4
     assert head.training_summary["validation_grouping"] == "leave_one_source_out"
+
+
+def test_leave_one_source_out_validation_does_not_leak_held_out_rotation():
+    front = np.array([[-1.0, -1.0], [-1.0, 2.0], [-2.0, 1.0], [2.0, -1.0]], np.float32)
+    back = np.array([[2.0, 0.0], [1.0, 2.0], [1.0, 0.0], [-2.0, -1.0]], np.float32)
+    head = fit_ridge_head(
+        front,
+        back,
+        front_source_ids=[0, 0, 1, 1],
+        back_source_ids=[0, 0, 1, 1],
+        front_original_rows=[True, False, True, False],
+        back_original_rows=[True, False, True, False],
+        regularization_grid=[1.0],
+    )
+    assert head.training_summary["validation_status"] == "cross_validation_failed"
+
+
+def test_validation_rebalances_class_weights_after_each_source_is_held_out():
+    front = np.array([[2.0, 1.0], [1.0, 0.0], [1.0, 2.0], [0.0, 1.0]], np.float32)
+    back = np.array([[-1.0, 2.0], [-1.0, 1.0], [-2.0, -1.0], [0.0, 2.0]], np.float32)
+    head = fit_ridge_head(
+        front,
+        back,
+        front_source_ids=[0, 0, 1, 1],
+        back_source_ids=[0, 0, 1, 1],
+        front_original_rows=[True, False, True, False],
+        back_original_rows=[True, False, True, False],
+    )
+    assert head.regularization == 10.0
