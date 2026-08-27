@@ -21,7 +21,7 @@ from src.orientation_tcp_service import (
     ServiceStartupError,
     configure_diagnostic_logging,
 )
-from src.orientation_classifier import PropagationModelError
+from src.orientation_classifier import OrientationClassifierError, PropagationModelError
 from src.workpiece_catalog import WorkpieceCatalog
 from src.workpiece_library import WorkpieceLibrary
 from src.geometry_mask_profiles import (
@@ -105,6 +105,12 @@ class FakeLibrary:
         self.register_calls.append((name, front_images, back_images, replace))
         if progress_callback is not None:
             progress_callback({"phase": "features", "completed": 1, "total": len(front_images) + len(back_images)})
+            progress_callback({"phase": "fast_originals", "completed": 1, "total": 3})
+            progress_callback({"phase": "fast_originals", "completed": 3, "total": 3})
+            progress_callback({"phase": "fast_augmentation", "completed": 11, "total": 33})
+            progress_callback({"phase": "fast_augmentation", "completed": 33, "total": 33})
+            progress_callback({"phase": "fast_ridge", "completed": 0, "total": 1})
+            progress_callback({"phase": "fast_ridge", "completed": 1, "total": 1})
         return (
             SimpleNamespace(
                 id="m7",
@@ -615,6 +621,221 @@ def test_register_with_progress_flag_streams_before_final_response(client):
     assert messages[-1]["template_counts"] == {"front": 2, "back": 1}
 
 
+def test_register_forwards_fast_original_augmentation_and_ridge_progress(client):
+    assert client.request("hello")["ok"] is True
+    client.send_raw(json.dumps({
+        "version": 1,
+        "request_id": "fast-progress",
+        "command": "register",
+        "name": "M7",
+        "front_images": ["front-1.png", "front-2.png"],
+        "back_images": ["back-1.png"],
+        "progress_events": True,
+    }).encode("utf-8") + b"\n")
+
+    progress = []
+    while True:
+        message = client.read()
+        if message.get("event") == "progress" and message["progress"]["phase"].startswith("fast_"):
+            progress.append(message["progress"])
+        if message.get("ok") is True:
+            break
+
+    assert progress == [
+        {"phase": "fast_originals", "completed": 1, "total": 3},
+        {"phase": "fast_originals", "completed": 3, "total": 3},
+        {"phase": "fast_augmentation", "completed": 11, "total": 33},
+        {"phase": "fast_augmentation", "completed": 33, "total": 33},
+        {"phase": "fast_ridge", "completed": 0, "total": 1},
+        {"phase": "fast_ridge", "completed": 1, "total": 1},
+    ]
+
+
+def _dispatcher_with_catalog(catalog):
+    dispatcher = OrientationCommandDispatcher(FakeClassifier(), FakeLibrary())
+    dispatcher.runtime._snapshot = replace(dispatcher.runtime.snapshot(), catalog=catalog)
+    return dispatcher
+
+
+def _predict_request(request_id="fast-predict"):
+    return {
+        "version": 1,
+        "request_id": request_id,
+        "command": "predict",
+        "workpiece_id": "m7",
+        "image_path": "query.png",
+    }
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ("FAST_CACHE_NOT_READY: cache is queued", "FAST_CACHE_NOT_READY"),
+        ("FAST_CACHE_REVISION_MISMATCH: library revision differs", "FAST_CACHE_REVISION_MISMATCH"),
+        ("FAST_FEATURE_INVALID: embedding must be finite", "FAST_FEATURE_INVALID"),
+    ],
+)
+def test_fast_hard_failures_map_to_stable_error_without_label(message, expected_code):
+    class FailingCatalog:
+        def predict(self, workpiece_id, image_path):
+            raise OrientationClassifierError(message)
+
+        def fast_cache_status(self, workpiece_id):
+            return {"state": "not_ready", "completed": 0, "total": 0, "elapsed_ms": 0.0, "error": None}
+
+    response = _dispatcher_with_catalog(FailingCatalog()).dispatch(_predict_request(expected_code))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == expected_code
+    assert "label" not in response
+
+
+def test_fast_cache_build_failure_maps_to_stable_error_code():
+    class FailedCatalog:
+        def predict(self, workpiece_id, image_path):
+            raise OrientationClassifierError("FAST_CACHE_NOT_READY: runtime is unavailable")
+
+        def fast_cache_status(self, workpiece_id):
+            return {
+                "state": "failed",
+                "completed": 7,
+                "total": 10,
+                "elapsed_ms": 12.5,
+                "error": "GPU allocation failed; retry registration",
+            }
+
+    response = _dispatcher_with_catalog(FailedCatalog()).dispatch(_predict_request("failed-job"))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "FAST_CACHE_BUILD_FAILED"
+    assert "GPU allocation failed; retry registration" in response["error"]["message"]
+    assert "label" not in response
+
+
+def test_fast_cache_capability_unavailable_is_not_reported_as_build_failure():
+    class CapabilityCatalog:
+        def predict(self, workpiece_id, image_path):
+            raise OrientationClassifierError("FAST_CACHE_NOT_READY: runtime is unavailable")
+
+        def fast_cache_status(self, workpiece_id):
+            return {
+                "state": "not_ready",
+                "completed": 0,
+                "total": 0,
+                "elapsed_ms": 0.0,
+                "error": "FAST_CACHE_CAPABILITY_UNAVAILABLE: persistence is unavailable",
+            }
+
+    response = _dispatcher_with_catalog(CapabilityCatalog()).dispatch(_predict_request("capability"))
+
+    assert response["error"]["code"] == "FAST_CACHE_CAPABILITY_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    ["FAST_GEOMETRY_LOW_CONFIDENCE", "FAST_CLASSIFIER_LOW_MARGIN", "FAST_MODE_NOT_VALIDATED"],
+)
+def test_fast_review_conditions_remain_predictions_with_labels(reason_code):
+    class ReviewCatalog:
+        def predict(self, workpiece_id, image_path):
+            return {
+                "label": "back",
+                "needs_review": True,
+                "review_reason_codes": [reason_code],
+            }
+
+    response = _dispatcher_with_catalog(ReviewCatalog()).dispatch(_predict_request(reason_code))
+
+    assert response["ok"] is True
+    assert response["label"] == "back"
+    assert response["needs_review"] is True
+    assert response["review_reason_codes"] == [reason_code]
+
+
+def test_register_returns_actual_fast_cache_state_and_training_metadata():
+    fast_runtime = SimpleNamespace(
+        cache_revision="fast-revision-9",
+        template_counts={"front": 5, "back": 12},
+        training_summary={"validation_status": "validated", "original_samples": 17},
+    )
+
+    class RegisterCatalog:
+        def register(self, name, front_images, back_images, replace, *, progress_callback=None):
+            return (
+                SimpleNamespace(id="m9", name=name, front_images=tuple(range(5)), back_images=tuple(range(12))),
+                SimpleNamespace(fast_runtime=fast_runtime),
+            )
+
+        def fast_cache_status(self, workpiece_id):
+            return {"state": "ready", "completed": 17, "total": 17, "elapsed_ms": 8.0, "error": None}
+
+    response = _dispatcher_with_catalog(RegisterCatalog()).dispatch({
+        "version": 1,
+        "request_id": "register-fast-state",
+        "command": "register",
+        "name": "M9",
+        "front_images": [f"front-{index}.png" for index in range(5)],
+        "back_images": [f"back-{index}.png" for index in range(12)],
+    })
+
+    assert response["ok"] is True
+    assert response["template_counts"] == {"front": 5, "back": 12}
+    assert response["fast_cache_state"] == "ready"
+    assert response["fast_cache_revision"] == "fast-revision-9"
+    assert response["training_summary"] == {
+        "validation_status": "validated",
+        "original_samples": 17,
+    }
+
+
+def test_list_workpieces_preserves_complete_fast_cache_object():
+    fast_cache = {
+        "state": "running",
+        "completed": 19,
+        "total": 44,
+        "elapsed_ms": 123.5,
+        "error": None,
+    }
+
+    class ListingCatalog:
+        def list_workpiece_summaries(self):
+            return [{"id": "m7", "name": "M7", "fast_cache": fast_cache}]
+
+    response = _dispatcher_with_catalog(ListingCatalog()).dispatch({
+        "version": 1,
+        "request_id": "list-fast-state",
+        "command": "list_workpieces",
+    })
+
+    assert response["ok"] is True
+    assert response["workpieces"][0]["fast_cache"] == fast_cache
+
+
+def test_shutdown_stops_fast_cache_jobs_once_before_listener_close():
+    events = []
+
+    class ShutdownCatalog:
+        geometry_profiles = None
+
+        def shutdown(self):
+            events.append("fast_jobs")
+
+    class RecordingListener:
+        def close(self):
+            events.append("listener")
+
+    runtime = ServiceRuntime()
+    runtime._snapshot = replace(runtime.snapshot(), status="ready", catalog=ShutdownCatalog())
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    server._listener.close()
+    server._listener = RecordingListener()
+
+    server.request_shutdown()
+    server.request_shutdown()
+
+    assert events == ["fast_jobs", "listener"]
+
+
 def test_message_over_one_mib_returns_message_too_large_and_closes(client):
     client.send_raw(b'{"x":"' + b"x" * (1024 * 1024) + b'"}\n')
 
@@ -1044,8 +1265,8 @@ def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication
         geometry_calibrator = None
 
         @classmethod
-        def load(cls, project_root, model_dir, *, local_search_mode):
-            events.append(f"model-loaded:{local_search_mode}")
+        def load(cls, project_root, model_dir, *, local_search_mode, inference_mode):
+            events.append(f"model-loaded:{local_search_mode}:{inference_mode}")
             return cls()
 
     class LoadedLibrary:
@@ -1097,11 +1318,12 @@ def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication
         tmp_path / "models",
         tmp_path / "library",
         local_search_mode="exhaustive",
+        inference_mode="fast_geometry",
     )
 
     assert runtime.snapshot().status == "ready"
     assert events == [
-        "model-loaded:exhaustive",
+        "model-loaded:exhaustive:fast_geometry",
         "profiles-created",
         "recovered",
         "evolution-created",

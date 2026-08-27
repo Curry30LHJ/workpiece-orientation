@@ -13,7 +13,7 @@ from pathlib import Path
 import os
 import shutil
 import uuid
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from src.image_io import read_color_image
 from src.orientation_classifier import TEMPLATE_CACHE_FILE_NAME, TemplateCache
@@ -73,11 +73,40 @@ class PreparedTemplateUpdate:
     consumed: bool = False
 
 
-CacheProgressCallback = Callable[[str, int, int], None]
+CacheProgressCallback = Callable[..., None]
 CacheBuilder = Callable[[Sequence[Path], Sequence[Path], CacheProgressCallback | None], TemplateCache]
 CacheLoader = Callable[[WorkpieceRecord], TemplateCache | None]
 CacheSaver = Callable[[WorkpieceRecord, TemplateCache], None]
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _adapt_cache_progress(
+    report: ProgressCallback,
+    *,
+    front_count: int,
+    total: int,
+) -> CacheProgressCallback:
+    """Normalize legacy and structured cache-builder progress."""
+
+    def cache_progress(*args: Any) -> None:
+        if len(args) == 1 and isinstance(args[0], Mapping):
+            event = dict(args[0])
+            if (
+                not isinstance(event.get("phase"), str)
+                or type(event.get("completed")) is not int
+                or type(event.get("total")) is not int
+            ):
+                raise TypeError("Structured progress requires phase, completed, and total")
+            report(event)
+            return
+        if len(args) == 3:
+            label, completed, _side_total = args
+            offset = front_count if label == "back" else 0
+            report({"phase": "features", "completed": offset + completed, "total": total})
+            return
+        raise TypeError("Progress callback expects an event dictionary or label, completed, total")
+
+    return cache_progress
 
 
 def _call_cache_builder(
@@ -457,15 +486,11 @@ class WorkpieceLibrary:
             )
             report({"phase": "features", "completed": 0, "total": total})
 
-            def cache_progress(label: str, completed: int, side_total: int) -> None:
-                offset = len(front) if label == "back" else 0
-                report({"phase": "features", "completed": offset + completed, "total": total})
-
             cache = _call_cache_builder(
                 build_cache,
                 staged_front,
                 staged_back,
-                cache_progress,
+                _adapt_cache_progress(report, front_count=len(front), total=total),
                 library_revision=1,
             )
             report({"phase": "committing", "completed": total, "total": total})
@@ -604,15 +629,11 @@ class WorkpieceLibrary:
             )
             report({"phase": "features", "completed": 0, "total": total})
 
-            def cache_progress(label: str, completed: int, side_total: int) -> None:
-                offset = len(all_front) if label == "back" else 0
-                report({"phase": "features", "completed": offset + completed, "total": total})
-
             cache = _call_cache_builder(
                 build_cache,
                 staged_front,
                 staged_back,
-                cache_progress,
+                _adapt_cache_progress(report, front_count=len(all_front), total=total),
                 library_revision=base_record.revision + 1,
             )
             staged_record = WorkpieceRecord(

@@ -22,8 +22,10 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.orientation_classifier import (
+    DEFAULT_INFERENCE_MODE,
     DEFAULT_LOCAL_SEARCH_MODE,
     ImageUnreadableError,
+    INFERENCE_MODES,
     LOCAL_SEARCH_MODES,
     OrientationClassifier,
     OrientationClassifierError,
@@ -78,6 +80,18 @@ GEOMETRY_ERROR_CODES = {
     GeometryContextMismatchError: "GEOMETRY_CONTEXT_MISMATCH",
     GeometryCacheRevisionMismatchError: "PROFILE_CACHE_REVISION_MISMATCH",
 }
+FAST_HARD_ERROR_CODES = {
+    "FAST_CACHE_NOT_READY",
+    "FAST_CACHE_REVISION_MISMATCH",
+    "FAST_CACHE_BUILD_FAILED",
+    "FAST_FEATURE_INVALID",
+    "FAST_CACHE_CAPABILITY_UNAVAILABLE",
+}
+
+
+def _prefixed_fast_error_code(error: object) -> str | None:
+    code = str(error).partition(":")[0].strip()
+    return code if code in FAST_HARD_ERROR_CODES else None
 
 
 def configure_diagnostic_logging(library_dir: Path) -> logging.Handler:
@@ -259,6 +273,38 @@ class OrientationCommandDispatcher:
     @classmethod
     def _error(cls, request_id: object, code: str, message: str) -> dict[str, object]:
         return cls._response(request_id, ok=False, error={"code": code, "message": message})
+
+    @classmethod
+    def _fast_prediction_error(
+        cls,
+        request_id: object,
+        catalog: Any,
+        workpiece_id: str,
+        exc: BaseException,
+    ) -> dict[str, object] | None:
+        code = _prefixed_fast_error_code(exc)
+        if code != "FAST_CACHE_NOT_READY":
+            return None if code is None else cls._error(request_id, code, str(exc))
+
+        status = None
+        status_reader = getattr(catalog, "fast_cache_status", None)
+        if callable(status_reader):
+            try:
+                status = status_reader(workpiece_id)
+            except Exception:
+                LOGGER.debug("Unable to read fast cache status after prediction failure", exc_info=True)
+        if isinstance(status, Mapping):
+            status_error = status.get("error")
+            status_code = _prefixed_fast_error_code(status_error) if status_error else None
+            if status_code == "FAST_CACHE_CAPABILITY_UNAVAILABLE":
+                return cls._error(request_id, status_code, str(status_error))
+            if status.get("state") == "failed":
+                return cls._error(
+                    request_id,
+                    "FAST_CACHE_BUILD_FAILED",
+                    str(status_error or exc),
+                )
+        return cls._error(request_id, code, str(exc))
 
     def dispatch(
         self,
@@ -639,6 +685,23 @@ class OrientationCommandDispatcher:
                     replace,
                     progress_callback=progress_callback if progress_events else None,
                 )
+                fast_status_reader = getattr(catalog, "fast_cache_status", None)
+                fast_status = fast_status_reader(record.id) if callable(fast_status_reader) else {}
+                response_cache = cache
+                if isinstance(fast_status, Mapping) and fast_status.get("state") == "ready":
+                    capture_snapshot = getattr(catalog, "capture_snapshot", None)
+                    if callable(capture_snapshot):
+                        current = capture_snapshot(record.id)
+                        if getattr(current.record, "revision", None) == record.revision:
+                            response_cache = current.cache
+                fast_runtime = getattr(response_cache, "fast_runtime", None)
+                if isinstance(response_cache, Mapping):
+                    fast_runtime = response_cache.get("fast_runtime")
+                fast_cache_revision = getattr(fast_runtime, "cache_revision", None)
+                training_summary = getattr(fast_runtime, "training_summary", None)
+                if isinstance(fast_runtime, Mapping):
+                    fast_cache_revision = fast_runtime.get("cache_revision")
+                    training_summary = fast_runtime.get("training_summary")
                 return self._response(
                     request_id,
                     ok=True,
@@ -647,6 +710,9 @@ class OrientationCommandDispatcher:
                         "front": len(record.front_images),
                         "back": len(record.back_images),
                     },
+                    fast_cache_state=fast_status.get("state") if isinstance(fast_status, Mapping) else None,
+                    fast_cache_revision=fast_cache_revision,
+                    training_summary=training_summary,
                     elapsed_ms=(time.perf_counter() - started) * 1000.0,
                 )
             if command == "predict":
@@ -659,9 +725,17 @@ class OrientationCommandDispatcher:
                 try:
                     catalog = runtime.catalog or WorkpieceCatalog(runtime.library, runtime.classifier)
                     prediction = catalog.predict(workpiece_id, Path(image_path))
-                except OrientationClassifierError:
-                    raise
                 except Exception as exc:
+                    fast_error = self._fast_prediction_error(
+                        request_id,
+                        catalog,
+                        workpiece_id,
+                        exc,
+                    )
+                    if fast_error is not None:
+                        return fast_error
+                    if isinstance(exc, OrientationClassifierError):
+                        raise
                     LOGGER.exception("Orientation classifier failed")
                     return self._error(request_id, "MODEL_ERROR", str(exc))
                 return self._response(request_id, ok=True, **prediction)
@@ -759,6 +833,8 @@ class OrientationTcpServer:
         self.dispatcher = dispatcher
         self.handshake_timeout_seconds = float(handshake_timeout_seconds)
         self._stop_event = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
         self._client_state_lock = threading.Lock()
         self._handshake_in_progress = False
         self._active_client = False
@@ -910,8 +986,14 @@ class OrientationTcpServer:
         self._listener.close()
 
     def request_shutdown(self) -> None:
-        self._stop_event.set()
+        with self._shutdown_lock:
+            if self._shutdown_requested:
+                return
+            self._shutdown_requested = True
+            self._stop_event.set()
         runtime = self.dispatcher.runtime.snapshot()
+        if runtime.catalog is not None and hasattr(runtime.catalog, "shutdown"):
+            runtime.catalog.shutdown()
         if runtime.evolution is not None and hasattr(runtime.evolution, "shutdown"):
             runtime.evolution.shutdown()
         profiles = getattr(runtime.catalog, "geometry_profiles", None)
@@ -929,12 +1011,14 @@ def _load_runtime(
     model_dir: Path,
     library_dir: Path,
     local_search_mode: str = DEFAULT_LOCAL_SEARCH_MODE,
+    inference_mode: str = DEFAULT_INFERENCE_MODE,
 ) -> None:
     try:
         classifier = OrientationClassifier.load(
             project_root,
             model_dir,
             local_search_mode=local_search_mode,
+            inference_mode=inference_mode,
         )
         library = WorkpieceLibrary(library_dir)
         catalog = WorkpieceCatalog(library, classifier)
@@ -964,6 +1048,11 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         choices=LOCAL_SEARCH_MODES,
         default=DEFAULT_LOCAL_SEARCH_MODE,
     )
+    parser.add_argument(
+        "--inference-mode",
+        choices=INFERENCE_MODES,
+        default=DEFAULT_INFERENCE_MODE,
+    )
     return parser
 
 
@@ -986,6 +1075,7 @@ def main() -> None:
             args.model_dir,
             args.library_dir,
             args.local_search_mode,
+            args.inference_mode,
         ),
         name="orientation-model-loader",
         daemon=True,

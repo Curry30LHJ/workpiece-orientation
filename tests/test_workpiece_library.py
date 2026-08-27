@@ -734,6 +734,61 @@ def test_register_reports_progress_without_affecting_cache_result(tmp_path):
     assert any(event["phase"] == "committing" for event in events)
 
 
+def test_register_adapts_legacy_and_structured_builder_progress_to_dicts(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "lib")
+    events = []
+
+    def mixed_progress_builder(front, back, progress_callback=None):
+        progress_callback("front", 1, len(front))
+        progress_callback({
+            "phase": "fast_originals",
+            "completed": 2,
+            "total": 3,
+            "unit": "templates",
+        })
+        progress_callback({
+            "phase": "fast_augmentation",
+            "completed": 11,
+            "total": 33,
+            "unit": "augmented_samples",
+        })
+        progress_callback({
+            "phase": "fast_ridge",
+            "completed": 1,
+            "total": 1,
+            "unit": "ridge_head",
+        })
+        return fake_builder(front, back)
+
+    library.register(
+        "M7",
+        image_set(tmp_path, "front", 10, 1),
+        image_set(tmp_path, "back", 20, 2),
+        False,
+        mixed_progress_builder,
+        progress_callback=events.append,
+    )
+
+    builder_events = [
+        event for event in events
+        if event["phase"] in {"features", "fast_originals", "fast_augmentation", "fast_ridge"}
+        and event["completed"] > 0
+    ]
+    assert all(isinstance(event, dict) for event in builder_events)
+    assert all({"phase", "completed", "total"} <= event.keys() for event in builder_events)
+    assert builder_events == [
+        {"phase": "features", "completed": 1, "total": 3},
+        {"phase": "fast_originals", "completed": 2, "total": 3, "unit": "templates"},
+        {
+            "phase": "fast_augmentation",
+            "completed": 11,
+            "total": 33,
+            "unit": "augmented_samples",
+        },
+        {"phase": "fast_ridge", "completed": 1, "total": 1, "unit": "ridge_head"},
+    ]
+
+
 def test_annotation_document_reads_legacy_groups_and_only_safe_groups_as_active(tmp_path):
     library = WorkpieceLibrary(tmp_path / "library")
     record, _ = library.register(
