@@ -709,7 +709,10 @@ def test_post_run_fast_worker_guard_rejects_loaded_local_stack(monkeypatch):
         benchmark._assert_fast_worker_is_local_feature_free()
 
 
-def test_fast_worker_guards_count_and_reject_every_local_entry_point():
+def test_fast_worker_guards_count_and_reject_every_local_entry_point(monkeypatch):
+    monkeypatch.setattr(
+        benchmark, "_assert_fast_worker_is_local_feature_free", lambda: None
+    )
     classifier = SimpleNamespace(
         extractor=None,
         matcher=None,
@@ -737,6 +740,9 @@ def test_fast_worker_guards_orb_during_classifier_load_and_restores(
 ):
     from src.orientation_classifier import OrientationClassifier
 
+    monkeypatch.setattr(
+        benchmark, "_assert_fast_worker_is_local_feature_free", lambda: None
+    )
     project_root = tmp_path / "project"
     model_dir = tmp_path / "model"
     library_dir = tmp_path / "library"
@@ -818,7 +824,12 @@ def test_worker_error_json_preserves_local_guard_counters(monkeypatch, tmp_path)
 
 
 @pytest.mark.parametrize("field", ["extractor", "matcher", "device"])
-def test_fast_worker_guard_rejects_initialized_local_classifier_state(field):
+def test_fast_worker_guard_rejects_initialized_local_classifier_state(
+    field, monkeypatch
+):
+    monkeypatch.setattr(
+        benchmark, "_assert_fast_worker_is_local_feature_free", lambda: None
+    )
     classifier = SimpleNamespace(
         extractor=None,
         matcher=None,
