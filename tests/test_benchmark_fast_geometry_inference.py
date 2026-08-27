@@ -51,6 +51,46 @@ def _query(identity: str, expected: str = "front") -> dict:
     }
 
 
+def _fingerprint(marker: str = "same") -> dict:
+    def digest(value) -> str:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    file_row = {
+        "path": "src/orientation_classifier.py",
+        "size": 123,
+        "sha256": digest(f"source:{marker}"),
+    }
+    body = {
+        "schema_version": 1,
+        "git": {
+            "head": "a" * 40,
+            "tracked_binary_diff_sha256": digest(f"diff:{marker}"),
+            "tracked_changed_paths": [],
+        },
+        "project_sources": {
+            "files": [file_row],
+            "aggregate_sha256": digest([file_row]),
+        },
+        "model": {
+            "files": [{**file_row, "path": "inference.pdmodel"}],
+            "aggregate_sha256": digest(f"model:{marker}"),
+        },
+        "m1_artifacts": {
+            "manifest": {"status": "present", "file": file_row},
+            "template_cache": {"status": "present", "file": file_row},
+            "active_geometry_profile": {
+                "status": "not_configured",
+                "revision": None,
+                "file": None,
+            },
+        },
+        "selections": {case: {"aggregate_sha256": digest(f"{case}:{marker}")} for case in ("M1", "M2", "M7")},
+    }
+    return {**body, "overall_sha256": digest(body)}
+
+
 def _accuracy_row(identity: str, label: str, *, expected: str = "front", review: bool = False) -> dict:
     return {
         **_query(identity, expected),
@@ -104,6 +144,7 @@ def test_report_keeps_unique_accuracy_rows_and_every_fast_repeat():
             _accuracy_row("q2", "back", expected="back"),
         ],
         "selection_inventory": {"M1": {"marker": "same"}},
+        "input_fingerprint": _fingerprint(),
     }
     fast = {
         "mode": "fast_geometry",
@@ -117,8 +158,9 @@ def test_report_keeps_unique_accuracy_rows_and_every_fast_repeat():
             for index, identity in enumerate(("q1", "q2", "q3", "q1", "q2", "q3"))
         ],
         "rule_effects": [],
-        "enabled_rule_directions": [],
+        "enabled_rule_targets": [],
         "selection_inventory": {"M1": {"marker": "same"}},
+        "input_fingerprint": _fingerprint(),
     }
 
     report = combine_worker_payloads(legacy, fast)
@@ -127,6 +169,61 @@ def test_report_keeps_unique_accuracy_rows_and_every_fast_repeat():
     assert all(set(row) >= {"legacy", "fast"} for row in report["accuracy_rows"])
     assert len(report["latency_rows"]) == 6
     assert report["latency_rows"] == fast["latency_rows"]
+
+
+def test_compare_rejects_different_complete_input_fingerprints_before_gates():
+    legacy = {
+        "mode": "legacy",
+        "accuracy_rows": [_accuracy_row("q1", "front")],
+        "selection_inventory": {"M1": {"marker": "same"}},
+        "input_fingerprint": _fingerprint("legacy-model"),
+    }
+    fast = {
+        "mode": "fast_geometry",
+        "accuracy_rows": [_accuracy_row("q1", "front")],
+        "latency_rows": [
+            {"query_identity": "q1", "measurement_index": 0, "timings_ms": {"total": 5.0}}
+        ],
+        "enabled_rule_targets": [],
+        "rule_effects": [],
+        "selection_inventory": {"M1": {"marker": "same"}},
+        "input_fingerprint": _fingerprint("fast-model"),
+    }
+
+    with pytest.raises(ValueError, match="input fingerprints differ"):
+        combine_worker_payloads(legacy, fast)
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    [
+        None,
+        {},
+        {"overall_sha256": "a" * 64},
+        {**_fingerprint(), "overall_sha256": ""},
+    ],
+)
+def test_compare_rejects_incomplete_or_invalid_input_fingerprint(fingerprint):
+    legacy = {
+        "mode": "legacy",
+        "accuracy_rows": [_accuracy_row("q1", "front")],
+        "selection_inventory": {"M1": {"marker": "same"}},
+        "input_fingerprint": fingerprint,
+    }
+    fast = {
+        "mode": "fast_geometry",
+        "accuracy_rows": [_accuracy_row("q1", "front")],
+        "latency_rows": [
+            {"query_identity": "q1", "measurement_index": 0, "timings_ms": {"total": 5.0}}
+        ],
+        "enabled_rule_targets": [],
+        "rule_effects": [],
+        "selection_inventory": {"M1": {"marker": "same"}},
+        "input_fingerprint": _fingerprint(),
+    }
+
+    with pytest.raises(ValueError, match="legacy input fingerprint"):
+        combine_worker_payloads(legacy, fast)
 
 
 def test_groups_use_fitted_metadata_and_published_rule_fields_not_filenames():
@@ -143,6 +240,7 @@ def test_groups_use_fitted_metadata_and_published_rule_fields_not_filenames():
         "mode": "legacy",
         "accuracy_rows": [legacy_row],
         "selection_inventory": {"M1": {"marker": "same"}},
+        "input_fingerprint": _fingerprint(),
     }
     fast = {
         "mode": "fast_geometry",
@@ -151,8 +249,9 @@ def test_groups_use_fitted_metadata_and_published_rule_fields_not_filenames():
             {"query_identity": "opaque-id", "measurement_index": 0, "timings_ms": {"total": 5.0}}
         ],
         "rule_effects": [],
-        "enabled_rule_directions": [],
+        "enabled_rule_targets": [],
         "selection_inventory": {"M1": {"marker": "same"}},
+        "input_fingerprint": _fingerprint(),
     }
 
     report = combine_worker_payloads(legacy, fast)
@@ -281,7 +380,7 @@ def test_case_specs_are_exactly_m1_m2_m7_and_sha256_disjoint(monkeypatch, tmp_pa
     monkeypatch.setattr(adaptive, "TEMPLATE_COUNT", 1)
     specs = adaptive._build_case_specs(project_root, library_root, workpiece_id)
 
-    inventory, queries = audit_case_specs(project_root, specs)
+    inventory, queries = audit_case_specs(specs)
 
     assert [spec.name for spec in specs] == ["M1", "M2", "M7"]
     assert list(inventory) == ["M1", "M2", "M7"]
@@ -302,10 +401,13 @@ def test_case_specs_are_exactly_m1_m2_m7_and_sha256_disjoint(monkeypatch, tmp_pa
 
 
 def test_enabled_rule_effect_requires_nonempty_mask_and_embedding_change():
-    enabled = ["front", "back"]
+    enabled = [
+        {"case": "M1", "direction": "front"},
+        {"case": "M1", "direction": "back"},
+    ]
     identical = [
-        {"direction": "front", "query_identity": "q1", "mask_pixels": 100, "mask_ratio": 0.1, "embedding_distance": 0.0},
-        {"direction": "back", "query_identity": "q2", "mask_pixels": 0, "mask_ratio": 0.0, "embedding_distance": 2.0},
+        {"case": "M1", "direction": "front", "query_identity": "q1", "mask_pixels": 100, "mask_ratio": 0.1, "embedding_distance": 0.0},
+        {"case": "M1", "direction": "back", "query_identity": "q2", "mask_pixels": 0, "mask_ratio": 0.0, "embedding_distance": 2.0},
     ]
 
     failed = evaluate_rule_effects(enabled, identical)
@@ -313,21 +415,45 @@ def test_enabled_rule_effect_requires_nonempty_mask_and_embedding_change():
         enabled,
         identical
         + [
-            {"direction": "front", "query_identity": "q3", "mask_pixels": 20, "mask_ratio": 0.02, "embedding_distance": 1.1e-6},
-            {"direction": "back", "query_identity": "q4", "mask_pixels": 30, "mask_ratio": 0.03, "embedding_distance": 0.3},
+            {"case": "M1", "direction": "front", "query_identity": "q3", "mask_pixels": 20, "mask_ratio": 0.02, "embedding_distance": 1.1e-6},
+            {"case": "M1", "direction": "back", "query_identity": "q4", "mask_pixels": 30, "mask_ratio": 0.03, "embedding_distance": 0.3},
         ],
     )
 
     assert failed["passed"] is False
-    assert failed["missing_directions"] == ["front", "back"]
+    assert failed["missing_targets"] == enabled
     assert passed["passed"] is True
     assert [row["query_identity"] for row in passed["evidence"]] == ["q3", "q4"]
+
+
+def test_rule_effect_is_scoped_by_case_and_direction():
+    targets = [
+        {"case": "M1", "direction": "front"},
+        {"case": "M7", "direction": "front"},
+    ]
+    evidence = [
+        {
+            "case": "M1",
+            "direction": "front",
+            "query_identity": "m1-front",
+            "mask_pixels": 50,
+            "mask_ratio": 0.05,
+            "embedding_distance": 0.2,
+        }
+    ]
+
+    result = evaluate_rule_effects(targets, evidence)
+
+    assert result["passed"] is False
+    assert result["missing_targets"] == [{"case": "M7", "direction": "front"}]
+    assert result["evidence"][0]["case"] == "M1"
 
 
 def test_parent_launches_separate_immutable_workers_and_joins_by_identity(tmp_path):
     commands = []
 
     def fake_run(command, *, check):
+        assert check is False
         commands.append(command)
         mode = command[command.index("--worker-mode") + 1]
         output = Path(command[command.index("--worker-output") + 1])
@@ -336,6 +462,7 @@ def test_parent_launches_separate_immutable_workers_and_joins_by_identity(tmp_pa
                 "mode": mode,
                 "accuracy_rows": [_accuracy_row("q2", "back", expected="back"), _accuracy_row("q1", "front")],
                 "selection_inventory": {"M1": {"marker": "same"}},
+                "input_fingerprint": _fingerprint(),
             }
         else:
             payload = {
@@ -345,11 +472,13 @@ def test_parent_launches_separate_immutable_workers_and_joins_by_identity(tmp_pa
                     {"query_identity": "q1", "measurement_index": 0, "timings_ms": {"total": 9.0}},
                     {"query_identity": "q2", "measurement_index": 1, "timings_ms": {"total": 10.0}},
                 ],
-                "enabled_rule_directions": [],
+                "enabled_rule_targets": [],
                 "rule_effects": [],
                 "selection_inventory": {"M1": {"marker": "same"}},
+                "input_fingerprint": _fingerprint(),
             }
         output.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(returncode=0)
 
     args = Namespace(
         project_root=tmp_path / "project",
@@ -376,6 +505,68 @@ def test_parent_launches_separate_immutable_workers_and_joins_by_identity(tmp_pa
     assert fast_command[fast_command.index("--warmup") + 1] == "2"
     assert fast_command[fast_command.index("--repeats") + 1] == "3"
     assert fast_command[fast_command.index("--minimum-measured-samples") + 1] == "8"
+    assert "--output" not in fast_command
+    assert "--max-p95-ms" not in fast_command
+    assert "--max-added-errors" not in fast_command
+    assert "--max-review-rate" not in fast_command
+
+
+def test_failed_worker_payload_and_return_code_are_preserved_in_parent_report(
+    monkeypatch, tmp_path
+):
+    args = Namespace(
+        project_root=tmp_path / "project",
+        model_dir=tmp_path / "model",
+        library_dir=tmp_path / "library",
+        m1_workpiece_id="m1",
+        warmup=2,
+        repeats=1,
+        minimum_measured_samples=8,
+        output=tmp_path / "report.json",
+        max_p95_ms=25.0,
+        max_added_errors=0,
+        max_review_rate=0.05,
+    )
+
+    def fake_run(command, *, check):
+        assert check is False
+        mode = command[command.index("--worker-mode") + 1]
+        output = Path(command[command.index("--worker-output") + 1])
+        payload = {
+            "mode": mode,
+            "error": {
+                "type": "SyntheticWorkerFailure",
+                "message": "model load failed",
+                "details": {"stage": "load"},
+            },
+        }
+        output.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(returncode=7)
+
+    with pytest.raises(benchmark.WorkerProcessError) as captured:
+        run_isolated_workers(args, run_command=fake_run)
+
+    error = captured.value
+    assert error.mode == "legacy"
+    assert error.return_code == 7
+    assert error.payload["error"]["details"] == {"stage": "load"}
+
+    monkeypatch.setattr(benchmark, "_build_case_specs", lambda *args: [])
+    monkeypatch.setattr(benchmark, "audit_case_specs", lambda specs: ({}, []))
+    monkeypatch.setattr(
+        benchmark,
+        "run_isolated_workers",
+        lambda args: (_ for _ in ()).throw(error),
+    )
+
+    assert benchmark._run_parent(args) == 2
+    report = json.loads(args.output.read_text(encoding="utf-8"))
+    assert report["worker_failure"] == {
+        "mode": "legacy",
+        "return_code": 7,
+        "payload": error.payload,
+    }
+    assert report["error"]["type"] == "WorkerProcessError"
 
 
 def test_fast_m1_cache_path_never_calls_legacy_template_cache_loader(monkeypatch, tmp_path):
@@ -406,10 +597,52 @@ def test_fast_m1_cache_path_never_calls_legacy_template_cache_loader(monkeypatch
 
 
 def test_post_run_fast_worker_guard_rejects_loaded_local_stack(monkeypatch):
-    monkeypatch.setitem(sys.modules, "torch.task8_probe", ModuleType("torch.task8_probe"))
+    monkeypatch.setitem(
+        sys.modules,
+        "src.soft_center_matcher",
+        ModuleType("src.soft_center_matcher"),
+    )
 
     with pytest.raises(RuntimeError, match="local-feature stack"):
         benchmark._assert_fast_worker_is_local_feature_free()
+
+
+def test_fast_worker_guards_count_and_reject_every_local_entry_point():
+    classifier = SimpleNamespace(
+        extractor=None,
+        matcher=None,
+        device=None,
+        _extract_features=lambda *args, **kwargs: "aliked",
+        _score_feature_pair=lambda *args, **kwargs: "lightglue",
+    )
+    guard = benchmark._FastWorkerLocalGuard(classifier)
+    guard.install()
+    try:
+        assert guard.counts() == {"ALIKED": 0, "LightGlue": 0, "ORB": 0}
+        with pytest.raises(RuntimeError, match="ALIKED"):
+            classifier._extract_features(None)
+        with pytest.raises(RuntimeError, match="LightGlue"):
+            classifier._score_feature_pair(None, None, None, None)
+        with pytest.raises(RuntimeError, match="ORB"):
+            cv2.ORB_create()
+        assert guard.counts() == {"ALIKED": 1, "LightGlue": 1, "ORB": 1}
+    finally:
+        guard.close()
+
+
+@pytest.mark.parametrize("field", ["extractor", "matcher", "device"])
+def test_fast_worker_guard_rejects_initialized_local_classifier_state(field):
+    classifier = SimpleNamespace(
+        extractor=None,
+        matcher=None,
+        device=None,
+        _extract_features=lambda *args, **kwargs: None,
+        _score_feature_pair=lambda *args, **kwargs: None,
+    )
+    setattr(classifier, field, object())
+
+    with pytest.raises(RuntimeError, match=field):
+        benchmark._FastWorkerLocalGuard(classifier).install()
 
 
 def test_json_report_serializes_numpy_evidence_without_losing_values(tmp_path):
@@ -444,6 +677,24 @@ def test_cli_help_runs_when_script_is_invoked_by_path():
 
     assert completed.returncode == 0, completed.stderr
     assert "--minimum-measured-samples" in completed.stdout
+
+
+def test_internal_worker_parser_does_not_require_parent_output_or_gates(tmp_path):
+    args = _build_parser(worker=True).parse_args([
+        "--worker-mode", "fast_geometry",
+        "--worker-output", str(tmp_path / "worker.json"),
+        "--project-root", str(tmp_path / "project"),
+        "--model-dir", str(tmp_path / "model"),
+        "--library-dir", str(tmp_path / "library"),
+        "--m1-workpiece-id", "m1",
+        "--warmup", "2",
+        "--repeats", "3",
+        "--minimum-measured-samples", "8",
+    ])
+
+    assert args.worker_mode == "fast_geometry"
+    assert not hasattr(args, "output")
+    assert not hasattr(args, "max_p95_ms")
 
 
 @pytest.mark.parametrize(

@@ -34,6 +34,7 @@ from scripts.benchmark_adaptive_local_search import (
     CaseSpec,
     _build_case_specs,
     _build_input_fingerprint,
+    _canonical_sha256,
     _collect_environment,
     _ensure_project_import_path,
     _json_default,
@@ -64,32 +65,55 @@ def summarize_latencies(samples: Sequence[float]) -> dict[str, float | int]:
 
 
 def evaluate_rule_effects(
-    enabled_directions: Sequence[str],
+    enabled_targets: Sequence[Mapping[str, Any]],
     evidence_rows: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Require one real non-empty mask and changed embedding per direction."""
-    ordered = list(dict.fromkeys(str(item) for item in enabled_directions))
+    """Require a real non-empty mask and changed embedding for every case/direction."""
+    ordered: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for raw in enabled_targets:
+        if not isinstance(raw, Mapping):
+            raise ValueError("enabled rule target must be an object")
+        case = str(raw.get("case", ""))
+        direction = str(raw.get("direction", ""))
+        workpiece_id = raw.get("workpiece_id")
+        if not case or direction not in {"front", "back"}:
+            raise ValueError("enabled rule target requires case and direction")
+        key = (case, direction, None if workpiece_id is None else str(workpiece_id))
+        if key in seen:
+            continue
+        seen.add(key)
+        target = {"case": case, "direction": direction}
+        if workpiece_id is not None:
+            target["workpiece_id"] = str(workpiece_id)
+        ordered.append(target)
+
     selected: list[dict[str, Any]] = []
-    missing: list[str] = []
-    for direction in ordered:
+    missing: list[dict[str, str]] = []
+    for target in ordered:
         match = next(
             (
                 dict(row)
                 for row in evidence_rows
-                if row.get("direction") == direction
+                if row.get("case") == target["case"]
+                and row.get("direction") == target["direction"]
+                and (
+                    "workpiece_id" not in target
+                    or row.get("workpiece_id") == target["workpiece_id"]
+                )
                 and int(row.get("mask_pixels", 0)) > 0
                 and float(row.get("embedding_distance", 0.0)) > EFFECT_DISTANCE_EPSILON
             ),
             None,
         )
         if match is None:
-            missing.append(direction)
+            missing.append(dict(target))
         else:
             selected.append(match)
     return {
         "passed": not missing,
-        "enabled_directions": ordered,
-        "missing_directions": missing,
+        "enabled_rule_targets": ordered,
+        "missing_targets": missing,
         "evidence": selected,
         "all_attempts": [dict(row) for row in evidence_rows],
     }
@@ -154,7 +178,7 @@ def pairwise_accuracy(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _safe_result(result: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_prediction_result(result: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(result, Mapping):
         raise ValueError("predictor result must be an object")
     timings = result.get("timings_ms")
@@ -195,7 +219,7 @@ def run_fast_measurements(
     for measurement_index in range(measured_count):
         query = queries[measurement_index % len(queries)]
         identity = identities[measurement_index % len(queries)]
-        result = _safe_result(predict(query))
+        result = _normalize_prediction_result(predict(query))
         if identity not in accuracy_by_identity:
             accuracy_by_identity[identity] = {**dict(query), "result": result}
         latency_rows.append({
@@ -251,11 +275,9 @@ def _inventory_row(
 
 
 def audit_case_specs(
-    project_root: Path,
     specs: Iterable[CaseSpec],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Decode and content-audit the exact release selection before inference."""
-    del project_root  # Paths are deliberately recorded as absolute paths.
     ordered_specs = list(specs)
     if [spec.name for spec in ordered_specs] != list(RELEASE_CASES):
         raise ValueError("release cases must be exactly M1, M2, M7 in that order")
@@ -324,6 +346,93 @@ def audit_case_specs(
     return inventory, queries
 
 
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value.lower())
+    )
+
+
+def _validate_input_fingerprint(value: Any, mode: str) -> dict[str, Any]:
+    prefix = f"{mode} input fingerprint"
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{prefix} must be an object")
+    fingerprint = dict(value)
+    required = {
+        "schema_version",
+        "git",
+        "project_sources",
+        "model",
+        "m1_artifacts",
+        "selections",
+        "overall_sha256",
+    }
+    missing = sorted(required - set(fingerprint))
+    if missing:
+        raise ValueError(f"{prefix} is incomplete: {', '.join(missing)}")
+    if fingerprint.get("schema_version") != 1:
+        raise ValueError(f"{prefix} schema_version must be 1")
+    overall = fingerprint.get("overall_sha256")
+    body = {
+        key: item
+        for key, item in fingerprint.items()
+        if key != "overall_sha256"
+    }
+    if not _is_sha256(overall) or overall != _canonical_sha256(body):
+        raise ValueError(f"{prefix} overall_sha256 is missing or stale")
+
+    git = fingerprint.get("git")
+    if (
+        not isinstance(git, Mapping)
+        or not isinstance(git.get("head"), str)
+        or not git.get("head")
+        or not _is_sha256(git.get("tracked_binary_diff_sha256"))
+    ):
+        raise ValueError(f"{prefix} git reproducibility section is invalid")
+    for name in ("project_sources", "model"):
+        section = fingerprint.get(name)
+        if (
+            not isinstance(section, Mapping)
+            or not isinstance(section.get("files"), list)
+            or not section.get("files")
+            or not _is_sha256(section.get("aggregate_sha256"))
+        ):
+            raise ValueError(f"{prefix} {name} section is invalid")
+    artifacts = fingerprint.get("m1_artifacts")
+    if not isinstance(artifacts, Mapping) or not {
+        "manifest",
+        "template_cache",
+        "active_geometry_profile",
+    }.issubset(artifacts):
+        raise ValueError(f"{prefix} M1 artifact section is incomplete")
+    selections = fingerprint.get("selections")
+    if not isinstance(selections, Mapping) or set(selections) != set(RELEASE_CASES):
+        raise ValueError(f"{prefix} selections must contain exactly M1, M2, and M7")
+    for case in RELEASE_CASES:
+        selection = selections[case]
+        if (
+            not isinstance(selection, Mapping)
+            or not _is_sha256(selection.get("aggregate_sha256"))
+        ):
+            raise ValueError(f"{prefix} {case} selection is invalid")
+    return fingerprint
+
+
+def _shared_input_fingerprint(
+    legacy_payload: Mapping[str, Any], fast_payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    legacy = _validate_input_fingerprint(
+        legacy_payload.get("input_fingerprint"), "legacy"
+    )
+    fast = _validate_input_fingerprint(
+        fast_payload.get("input_fingerprint"), "fast_geometry"
+    )
+    if legacy != fast:
+        raise ValueError("input fingerprints differ")
+    return legacy
+
+
 def _key_accuracy_rows(payload: Mapping[str, Any], mode: str) -> dict[str, dict[str, Any]]:
     if payload.get("mode") != mode:
         raise ValueError(f"expected {mode} worker payload")
@@ -389,6 +498,7 @@ def combine_worker_payloads(
     max_added_errors: int = 0,
     max_review_rate: float = 0.05,
 ) -> dict[str, Any]:
+    shared_fingerprint = _shared_input_fingerprint(legacy_payload, fast_payload)
     legacy = _key_accuracy_rows(legacy_payload, "legacy")
     fast = _key_accuracy_rows(fast_payload, "fast_geometry")
     if set(legacy) != set(fast):
@@ -444,7 +554,7 @@ def combine_worker_payloads(
         for code in row["fast"].get("review_reason_codes", []) or ["unspecified"]
     )
     rule_effects = evaluate_rule_effects(
-        fast_payload.get("enabled_rule_directions", []),
+        fast_payload.get("enabled_rule_targets", []),
         fast_payload.get("rule_effects", []),
     )
     gates = evaluate_gates(
@@ -486,8 +596,8 @@ def combine_worker_payloads(
             "fast_geometry": dict(fast_payload.get("worker") or {}),
         },
         "fingerprints": {
-            "legacy": legacy_payload.get("input_fingerprint"),
-            "fast_geometry": fast_payload.get("input_fingerprint"),
+            "legacy": shared_fingerprint,
+            "fast_geometry": shared_fingerprint,
         },
         "environment": fast_payload.get("environment") or legacy_payload.get("environment"),
     }
@@ -521,6 +631,18 @@ def _rate(value: str) -> float:
     return result
 
 
+class WorkerProcessError(RuntimeError):
+    """A worker failed after optionally publishing structured error evidence."""
+
+    def __init__(self, mode: str, return_code: int, payload: Mapping[str, Any]):
+        self.mode = mode
+        self.return_code = int(return_code)
+        self.payload = dict(payload)
+        error = self.payload.get("error")
+        detail = error.get("message") if isinstance(error, Mapping) else str(error or "unknown error")
+        super().__init__(f"{mode} worker exited with code {self.return_code}: {detail}")
+
+
 def _worker_command(args: argparse.Namespace, mode: str, output: Path) -> list[str]:
     if mode not in ENGINE_MODES:
         raise ValueError(f"unsupported worker mode: {mode}")
@@ -536,10 +658,6 @@ def _worker_command(args: argparse.Namespace, mode: str, output: Path) -> list[s
         "--warmup", str(args.warmup),
         "--repeats", str(args.repeats),
         "--minimum-measured-samples", str(args.minimum_measured_samples),
-        "--output", str(Path(args.output).resolve()),
-        "--max-p95-ms", str(args.max_p95_ms),
-        "--max-added-errors", str(args.max_added_errors),
-        "--max-review-rate", str(args.max_review_rate),
     ]
 
 
@@ -555,12 +673,31 @@ def run_isolated_workers(
         for mode in ENGINE_MODES:
             output = temporary_root / f"{mode}.json"
             command = _worker_command(args, mode, output)
-            run_command(command, check=True)
-            payload = json.loads(output.read_text(encoding="utf-8"))
+            completed = run_command(command, check=False)
+            return_code = int(getattr(completed, "returncode", 0))
+            if output.is_file():
+                try:
+                    payload = json.loads(output.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    payload = {
+                        "mode": mode,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": f"worker output is not valid JSON: {exc}",
+                        },
+                    }
+            else:
+                payload = {
+                    "mode": mode,
+                    "error": {
+                        "type": "WorkerOutputMissing",
+                        "message": "worker produced no JSON output",
+                    },
+                }
+            if return_code != 0 or payload.get("error"):
+                raise WorkerProcessError(mode, return_code, payload)
             if payload.get("mode") != mode:
                 raise ValueError(f"{mode} worker changed its immutable mode")
-            if payload.get("error"):
-                raise RuntimeError(f"{mode} worker failed: {payload['error']}")
             payloads[mode] = payload
     return payloads
 
@@ -634,19 +771,81 @@ def _load_fast_m1_cache(
 
 
 def _assert_fast_worker_is_local_feature_free() -> None:
+    forbidden_roots = (
+        "torch",
+        "lightglue",
+        "aliked",
+        "src.aliked_lightglue_matcher",
+        "src.soft_center_matcher",
+    )
     forbidden = sorted(
         name
         for name in sys.modules
-        if name == "torch"
-        or name.startswith("torch.")
-        or name == "lightglue"
-        or name.startswith("lightglue.")
-        or name.startswith("aliked")
+        if any(name == root or name.startswith(root + ".") for root in forbidden_roots)
     )
     if forbidden:
         raise RuntimeError(
             "fast worker loaded the local-feature stack: " + ", ".join(forbidden[:10])
         )
+
+
+class _FastWorkerLocalGuard:
+    """Make every forbidden local-feature entry point executable evidence."""
+
+    def __init__(self, classifier: Any):
+        self.classifier = classifier
+        self._counts = {"ALIKED": 0, "LightGlue": 0, "ORB": 0}
+        self._original_extract_features: Any = None
+        self._original_score_feature_pair: Any = None
+        self._original_orb_create: Any = None
+        self._installed = False
+
+    def _blocker(self, name: str) -> Callable[..., Any]:
+        def blocked(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            self._counts[name] += 1
+            raise RuntimeError(f"fast worker attempted forbidden {name} processing")
+
+        return blocked
+
+    def install(self) -> None:
+        _assert_fast_worker_is_local_feature_free()
+        for field in ("extractor", "matcher", "device"):
+            if getattr(self.classifier, field, None) is not None:
+                raise RuntimeError(
+                    f"fast worker classifier {field} must be absent"
+                )
+        if self._installed:
+            return
+        self._original_extract_features = self.classifier._extract_features
+        self._original_score_feature_pair = self.classifier._score_feature_pair
+        self._original_orb_create = cv2.ORB_create
+        self.classifier._extract_features = self._blocker("ALIKED")
+        self.classifier._score_feature_pair = self._blocker("LightGlue")
+        cv2.ORB_create = self._blocker("ORB")
+        self._installed = True
+
+    def counts(self) -> dict[str, int]:
+        return dict(self._counts)
+
+    def assert_clean(self) -> None:
+        _assert_fast_worker_is_local_feature_free()
+        for field in ("extractor", "matcher", "device"):
+            if getattr(self.classifier, field, None) is not None:
+                raise RuntimeError(
+                    f"fast worker classifier {field} must remain absent"
+                )
+        attempted = {name: count for name, count in self._counts.items() if count}
+        if attempted:
+            raise RuntimeError(f"fast worker attempted local-feature processing: {attempted}")
+
+    def close(self) -> None:
+        if not self._installed:
+            return
+        self.classifier._extract_features = self._original_extract_features
+        self.classifier._score_feature_pair = self._original_score_feature_pair
+        cv2.ORB_create = self._original_orb_create
+        self._installed = False
 
 
 def _result_geometry_metadata(
@@ -715,7 +914,7 @@ def _predict_query(
     result = classifier.predict_with_cache(
         cache, query_paths[str(query["query_identity"])], library_revision=revision
     )
-    cleaned = _safe_result(result)
+    cleaned = _normalize_prediction_result(result)
     cleaned.update(_result_geometry_metadata(query, cleaned, cache))
     return cleaned
 
@@ -735,8 +934,10 @@ def _legacy_accuracy_rows(
     ]
 
 
-def _enabled_rule_directions(caches: Mapping[str, tuple[Any, int | None]]) -> list[str]:
-    result: list[str] = []
+def _enabled_rule_targets(
+    caches: Mapping[str, tuple[Any, int | None]],
+) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
     for case in RELEASE_CASES:
         cache, _ = caches[case]
         compiled = getattr(getattr(cache, "fast_runtime", None), "compiled_geometry", None)
@@ -747,8 +948,8 @@ def _enabled_rule_directions(caches: Mapping[str, tuple[Any, int | None]]) -> li
                 isinstance(rule, Mapping) and rule.get("enabled", True)
                 for rule in profile.get("rules", [])
             ):
-                result.append(direction)
-    return list(dict.fromkeys(result))
+                result.append({"case": case, "direction": direction})
+    return result
 
 
 def _rule_effect_rows(
@@ -756,9 +957,12 @@ def _rule_effect_rows(
     caches: Mapping[str, tuple[Any, int | None]],
     query_paths: Mapping[str, Path],
     queries: Sequence[Mapping[str, Any]],
-    enabled_directions: Sequence[str],
+    enabled_targets: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    pending = set(enabled_directions)
+    pending = {
+        (str(target.get("case", "")), str(target.get("direction", "")))
+        for target in enabled_targets
+    }
     evidence: list[dict[str, Any]] = []
     for query in queries:
         if not pending:
@@ -774,8 +978,10 @@ def _rule_effect_rows(
         variants = classifier.fast_engine.geometry.build_variants(
             image, runtime.compiled_geometry
         )
+        case = str(query["case"])
         for slot, direction in ((1, "front"), (2, "back")):
-            if direction not in pending:
+            target = (case, direction)
+            if target not in pending:
                 continue
             diagnostic = variants.directions.get(direction, {})
             ratio = float(diagnostic.get("ignored_ratio", 0.0)) if isinstance(diagnostic, Mapping) else 0.0
@@ -792,6 +998,7 @@ def _rule_effect_rows(
                     )
                 )
             row = {
+                "case": case,
                 "direction": direction,
                 "query_identity": query["query_identity"],
                 "image_path": query["image_path"],
@@ -802,7 +1009,7 @@ def _rule_effect_rows(
             }
             evidence.append(row)
             if mask_pixels > 0 and distance > EFFECT_DISTANCE_EPSILON:
-                pending.remove(direction)
+                pending.remove(target)
     return evidence
 
 
@@ -816,7 +1023,7 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
     if not library_dir.is_dir():
         raise FileNotFoundError(f"library directory not found: {library_dir}")
     specs = _build_case_specs(project_root, library_dir, args.m1_workpiece_id)
-    inventory, queries = audit_case_specs(project_root, specs)
+    inventory, queries = audit_case_specs(specs)
     query_paths = {
         query["query_identity"]: Path(query["image_path"])
         for query in queries
@@ -833,48 +1040,56 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
     )
     if classifier.inference_mode != fixed_mode:
         raise RuntimeError("classifier changed the immutable worker mode")
-    if fixed_mode == "fast_geometry":
-        _assert_fast_worker_is_local_feature_free()
-    caches = _build_worker_caches(classifier, specs, library_dir)
-    common = {
-        "mode": fixed_mode,
-        "selection_inventory": inventory,
-        "input_fingerprint": input_fingerprint,
-        "environment": _collect_environment(project_root),
-        "worker": {
+    guard = _FastWorkerLocalGuard(classifier) if fixed_mode == "fast_geometry" else None
+    if guard is not None:
+        guard.install()
+    try:
+        caches = _build_worker_caches(classifier, specs, library_dir)
+        worker = {
             "pid": os.getpid(),
             "mode": fixed_mode,
             "transport": "isolated subprocess",
-            "local_feature_call_counts": {"ALIKED": 0, "LightGlue": 0, "ORB": 0}
-            if fixed_mode == "fast_geometry" else None,
-        },
-    }
-    if fixed_mode == "legacy":
+            "local_feature_call_counts": None,
+        }
+        common = {
+            "mode": fixed_mode,
+            "selection_inventory": inventory,
+            "input_fingerprint": input_fingerprint,
+            "environment": _collect_environment(project_root),
+            "worker": worker,
+        }
+        if fixed_mode == "legacy":
+            return {
+                **common,
+                "accuracy_rows": _legacy_accuracy_rows(
+                    classifier, caches, query_paths, queries
+                ),
+            }
+
+        measured = run_fast_measurements(
+            queries,
+            lambda query: _predict_query(classifier, caches, query_paths, query),
+            warmup=args.warmup,
+            repeats=args.repeats,
+            minimum_measured_samples=args.minimum_measured_samples,
+        )
+        enabled = _enabled_rule_targets(caches)
+        rule_effects = _rule_effect_rows(
+            classifier, caches, query_paths, queries, enabled
+        )
+        if guard is None:  # Defensive: fixed mode is immutable above.
+            raise RuntimeError("fast worker local-feature guard is missing")
+        guard.assert_clean()
+        worker["local_feature_call_counts"] = guard.counts()
         return {
             **common,
-            "accuracy_rows": _legacy_accuracy_rows(
-                classifier, caches, query_paths, queries
-            ),
+            **measured,
+            "enabled_rule_targets": enabled,
+            "rule_effects": rule_effects,
         }
-
-    measured = run_fast_measurements(
-        queries,
-        lambda query: _predict_query(classifier, caches, query_paths, query),
-        warmup=args.warmup,
-        repeats=args.repeats,
-        minimum_measured_samples=args.minimum_measured_samples,
-    )
-    enabled = _enabled_rule_directions(caches)
-    rule_effects = _rule_effect_rows(
-        classifier, caches, query_paths, queries, enabled
-    )
-    _assert_fast_worker_is_local_feature_free()
-    return {
-        **common,
-        **measured,
-        "enabled_rule_directions": enabled,
-        "rule_effects": rule_effects,
-    }
+    finally:
+        if guard is not None:
+            guard.close()
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -893,7 +1108,7 @@ def _run_parent(args: argparse.Namespace) -> int:
         specs = _build_case_specs(
             project_root, Path(args.library_dir).resolve(), args.m1_workpiece_id
         )
-        audit_case_specs(project_root, specs)
+        audit_case_specs(specs)
         payloads = run_isolated_workers(args)
         report = combine_worker_payloads(
             payloads["legacy"],
@@ -927,11 +1142,17 @@ def _run_parent(args: argparse.Namespace) -> int:
                 "failures": [{"name": "benchmark_execution", "actual": type(exc).__name__, "limit": "success"}],
             },
         }
+        if isinstance(exc, WorkerProcessError):
+            report["worker_failure"] = {
+                "mode": exc.mode,
+                "return_code": exc.return_code,
+                "payload": exc.payload,
+            }
     _write_json(output, report)
     return 0 if report.get("passed") else 2
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(*, worker: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Benchmark isolated legacy and lightweight geometry orientation inference"
     )
@@ -942,25 +1163,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=_non_negative_int, default=50)
     parser.add_argument("--repeats", type=_positive_int, default=1)
     parser.add_argument("--minimum-measured-samples", type=_positive_int, default=1000)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--max-p95-ms", type=_positive_float, default=25.0)
-    parser.add_argument("--max-added-errors", type=_non_negative_int, default=0)
-    parser.add_argument("--max-review-rate", type=_rate, default=0.05)
-    parser.add_argument(
-        "--worker-mode", choices=ENGINE_MODES, help=argparse.SUPPRESS
-    )
-    parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
+    if worker:
+        parser.add_argument(
+            "--worker-mode", choices=ENGINE_MODES, required=True, help=argparse.SUPPRESS
+        )
+        parser.add_argument(
+            "--worker-output", type=Path, required=True, help=argparse.SUPPRESS
+        )
+    else:
+        parser.add_argument("--output", type=Path, required=True)
+        parser.add_argument("--max-p95-ms", type=_positive_float, default=25.0)
+        parser.add_argument("--max-added-errors", type=_non_negative_int, default=0)
+        parser.add_argument("--max-review-rate", type=_rate, default=0.05)
     return parser
 
 
 def main() -> int:
-    args = _build_parser().parse_args()
-    if args.worker_mode is None:
-        if args.worker_output is not None:
-            raise SystemExit("--worker-output is internal and requires --worker-mode")
+    worker = any(
+        argument == "--worker-mode" or argument.startswith("--worker-mode=")
+        for argument in sys.argv[1:]
+    )
+    args = _build_parser(worker=worker).parse_args()
+    if not worker:
         return _run_parent(args)
-    if args.worker_output is None:
-        raise SystemExit("--worker-output is required in worker mode")
     try:
         payload = _run_worker(args)
     except Exception as exc:
