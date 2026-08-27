@@ -786,7 +786,10 @@ void WorkpieceLibraryPage::rebuildWorkpieceList() {
         browsedWorkpieceId_.clear();
         workpieceDetails_ = QJsonObject();
         ui->templateDetailsTable->setRowCount(0);
-        ui->workpieceDetailsSummaryLabel->setText(QStringLiteral("请选择工件查看详情"));
+        presentLabel(ui->workpieceDetailsSummaryLabel,
+                     QStringLiteral("请选择工件查看详情"),
+                     QStringLiteral("neutral"));
+        showMessage(QString());
         ui->recycleNameConfirmationEdit->clear();
     }
 }

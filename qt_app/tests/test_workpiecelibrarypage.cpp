@@ -628,6 +628,55 @@ private slots:
         QCOMPARE(message->property("messageKind").toString(), QStringLiteral("neutral"));
     }
 
+    void searchFilteringResetsCacheAndErrorMessageKinds_data() {
+        QTest::addColumn<QString>("cacheState");
+        QTest::addColumn<QString>("initialDetailKind");
+
+        QTest::newRow("ready") << QStringLiteral("ready") << QStringLiteral("success");
+        QTest::newRow("failed") << QStringLiteral("failed") << QStringLiteral("error");
+    }
+
+    void searchFilteringResetsCacheAndErrorMessageKinds() {
+        QFETCH(QString, cacheState);
+        QFETCH(QString, initialDetailKind);
+
+        WorkpieceLibraryPage page;
+        page.setWorkpieces(QJsonArray{
+            summary(QStringLiteral("m-selected"), QStringLiteral("Selected"), 4, 5),
+            summary(QStringLiteral("m-visible"), QStringLiteral("Visible"), 4, 5),
+        }, QString());
+        auto *search = page.findChild<QLineEdit *>(QStringLiteral("librarySearchEdit"));
+        auto *list = page.findChild<QListWidget *>(QStringLiteral("libraryWorkpieceList"));
+        auto *detail = page.findChild<QLabel *>(
+            QStringLiteral("workpieceDetailsSummaryLabel"));
+        auto *message = page.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"));
+        QVERIFY(search != nullptr);
+        QVERIFY(list != nullptr);
+        QVERIFY(detail != nullptr);
+        QVERIFY(message != nullptr);
+        list->setCurrentRow(0);
+
+        QJsonObject details = summary(
+            QStringLiteral("m-selected"), QStringLiteral("Selected"), 4, 5);
+        details.insert(QStringLiteral("fast_cache"), QJsonObject{
+            {QStringLiteral("state"), cacheState},
+            {QStringLiteral("error"), QStringLiteral("构建失败")},
+        });
+        page.setWorkpieceDetails(details);
+        page.setOperationError(QStringLiteral("OLD_ERROR"), QStringLiteral("旧错误"));
+        QCOMPARE(detail->property("messageKind").toString(), initialDetailKind);
+        QCOMPARE(message->property("messageKind").toString(), QStringLiteral("error"));
+
+        search->setText(QStringLiteral("Visible"));
+
+        QCOMPARE(list->count(), 1);
+        QCOMPARE(page.browsedWorkpieceId(), QString());
+        QCOMPARE(detail->text(), QStringLiteral("请选择工件查看详情"));
+        QCOMPARE(detail->property("messageKind").toString(), QStringLiteral("neutral"));
+        QVERIFY(message->text().isEmpty());
+        QCOMPARE(message->property("messageKind").toString(), QStringLiteral("neutral"));
+    }
+
     void detailFailureReplacesReadyCacheWithErrorPlaceholder() {
         WorkpieceLibraryPage page;
         QJsonObject ready = summary(
