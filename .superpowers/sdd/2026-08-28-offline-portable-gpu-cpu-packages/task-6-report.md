@@ -36,13 +36,13 @@ PowerShell parser: scripts/build_portable_backend.ps1 # parsed
 git diff --check                                      # clean
 ```
 
-## Built bundle audit and smoke evidence
+## Historical first bundle audit and smoke attempt (resolved)
 
 The existing GPU onedir output was audited in place (no release artifact was added to Git): 3,287 files totaling 4,393,004,346 bytes (~4.09 GiB). Size is dominated by 2.94 GiB of NVIDIA CUDA libraries and 1.15 GiB of Paddle libraries. The CPU build completed successfully with 3,266 files totaling 649,934,304 bytes (~0.605 GiB) and contains no NVIDIA directory or CUDA DLLs.
 
 Archive and filesystem scans found no Torch, LightGlue, faiss, sklearn, visualdl, soft-center matcher, ALIKED/local matcher, or benchmark runtime modules. The only name matches were Paddle compatibility header files under `paddle/include/.../compat/torch`; these are headers, not imported runtime code. GPU cuDNN train DLLs are shipped by the Paddle CUDA runtime alongside inference DLLs.
 
-An external-model/data smoke was attempted against both EXEs using the real model directory and inference YAML, temporary writable data roots, structured hello/loading polling, and shutdown. Both editions reached `loading_model` then failed deterministically with `MODEL_LOAD_FAILED: No module named 'sklearn'`: PaddleClas 2.6.0 unconditionally imports `sklearn.metrics` during `RecPredictor` construction, while the required `sklearn` exclusion removes it from the frozen archive. No prediction or shutdown handshake could proceed after this startup failure; generated smoke data/logs remain under ignored `release_staging` only. This dependency/spec conflict requires a follow-up decision before claiming offline smoke success.
+An initial external-model/data smoke attempt against both EXEs reached `loading_model` and failed with `MODEL_LOAD_FAILED: No module named 'sklearn'`. This was a historical failure caused by PaddleClas' optional imports conflicting with the required `sklearn` exclusion; the import-only compatibility layer in fix round 4 resolved it. A subsequent attempt then exposed the legacy two-file model format (`inference.pdmodel` + `inference.pdiparams` without `inference.json`), which fix round 5 resolved. These failures are retained as diagnostic history only; they do not describe the final bundle status.
 
 ## Fix round 4 — import-only PaddleClas compatibility
 
@@ -80,7 +80,7 @@ git diff --check                                      # clean
 
 ## Environment/build attempt
 
-The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Conda environments. After the initial Paddle download interruption, both locked Paddle distributions became available in their respective environments and the CPU PyInstaller build completed. Subsequent onedir audit and smoke results (including the startup dependency failure) are recorded below; no successful offline smoke is claimed.
+The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Conda environments. After an initial Paddle download interruption, both locked Paddle distributions became available and both editions were rebuilt successfully after the compatibility fixes. The historical download/startup failures above are superseded by the final fix-round-5 build and smoke evidence below.
 
 ## Files
 
@@ -96,20 +96,22 @@ The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Co
 
 ## Self-review / concerns
 
-- Real GPU/CPU freezing and smoke remain pending because the locked Paddle wheels were not available within the authorized build attempt. The build scripts are intentionally fail-fast when an edition environment is incomplete.
+- Real GPU/CPU freezing and smoke initially failed during dependency/model-format compatibility work; fix round 5 completed both builds and the end-to-end smoke. The build scripts remain intentionally fail-fast when an edition environment is incomplete.
 - `paddleclas==2.6.0` brings optional development packages (for example faiss/sklearn/visualdl); the spec excludes these modules from the frozen backend as required.
 
 The faiss placeholder now raises an explicit `RuntimeError` on any attribute access; the compatibility regression covers this contract.
 
-## Fix round 5 — legacy two-file model loading
+## Final result — fix round 5 legacy two-file model loading
 
 The supplied model is the legacy `inference.pdmodel` + `inference.pdiparams(.info)` format. `create_rec_predictor` now temporarily advertises Paddle 2.5 to PaddleClas so it selects `Config(model_file, params_file)`, and temporarily disables `ir_optim` only for that construction (restoring all values afterward). CPU MKLDNN remains enabled for the packaged configuration. Focused regression tests cover format detection, temporary version/config flags, restoration, and optional import stubs.
 
-Both editions were rebuilt successfully after this change. Final onedir sizes are GPU 4,393,004,263 bytes (3,287 files) and CPU 649,936,161 bytes (3,266 files). External-model smoke passed for both editions: hello progressed through loading to Ready, one front and one back workpiece template set registered, predictions returned `front` and `back`, shutdown returned success, and each backend exited with code 0. Smoke used temporary data roots and left the shipped package data untouched.
+Both editions were rebuilt successfully after this change. Final onedir sizes are GPU 4,393,004,263 bytes (3,287 files) and CPU 649,936,161 bytes (3,266 files). The reproducible smoke runner is `release_staging/smoke_backend.py`; it was invoked as `E:\python\anaconda3\envs\shitu\python.exe release_staging/smoke_backend.py cpu <free-port>` and the equivalent `gpu` command. It uses the external model/YAML/data paths documented in the script and writes logs under `release_staging/smoke-data-cpu/logs/orientation-service.log` and `release_staging/smoke-data-gpu/logs/orientation-service.log`.
 
-## Fix round 4 build and smoke results
+Both smoke runs passed: hello progressed through `loading_model` to `ready`, registration accepted front/back templates, predictions returned `front` and `back`, shutdown returned `ok: true`, and each process exited with code `0`. Temporary smoke data remained under `release_staging`; the shipped package data and model directory were not modified. `release_staging/` and `deploy/pyinstaller-work/` are intentionally untracked local build outputs and were not added to any commit.
 
-Both editions were rebuilt from commit `9067c48` with Python 3.10.20/PyInstaller 6.22.2. The compatibility regression passed (`1 passed`, with the metadata/spec/env checks at `6 passed`). The rebuilt executables no longer fail on missing sklearn/faiss; however, real external-model smoke is blocked by the supplied model directory: Paddle 3.2.2 reports `Cannot open .../inference.json` while the directory contains only `inference.pdmodel`, `inference.pdiparams`, and `.info`. GPU and CPU therefore both stop at `loading_model` with `MODEL_LOAD_FAILED`; register/predict/shutdown cannot be exercised until a Paddle-3-compatible model export (including `inference.json`) is supplied. No large build outputs were added to Git; they remain under ignored `release_staging`.
+## Historical fix round 4 build and smoke results (superseded)
+
+Both editions were rebuilt from commit `9067c48` with Python 3.10.20/PyInstaller 6.22.2. The compatibility regression passed, but smoke then stopped at `loading_model` because Paddle 3.2.2 looked for `inference.json` in the supplied legacy model directory. This is the historical model-format failure fixed in round 5; the final round-5 smoke above is the authoritative result.
 
 ## Fix round 1 — exclusion coverage
 
