@@ -30,6 +30,7 @@ from src.geometry_calibration import filter_features_by_mask
 from src.geometry_calibration import geometry_feature_mask
 from src.geometry_profile_schema import materialize_runtime_profile
 from src.model_execution_gate import PriorityModelGate
+from src.model_fingerprint import model_directory_sha256
 from src.fast_geometry import FastGeometryProcessor
 from src.fast_orientation import FastOrientationEngine, FastRuntimeCache
 
@@ -48,6 +49,8 @@ TEMPLATE_CACHE_FILE_NAME = ".template_cache.pkl"
 FAST_RUNTIME_CACHE_FILE_NAME = ".fast_runtime_cache.pkl"
 INFERENCE_MODES = ("legacy", "fast_geometry", "compare")
 DEFAULT_INFERENCE_MODE = "legacy"
+COMPUTE_DEVICES = ("gpu", "cpu")
+DEFAULT_COMPUTE_DEVICE = "gpu"
 _GEOMETRY_REVISION_FROM_RECORD = object()
 
 
@@ -56,6 +59,18 @@ LOGGER = logging.getLogger(__name__)
 
 class OrientationClassifierError(RuntimeError):
     """Base error for service-facing classifier failures."""
+
+
+class ComputeDeviceError(OrientationClassifierError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class ModelFingerprintError(OrientationClassifierError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 class WorkpieceNotFoundError(OrientationClassifierError):
@@ -219,6 +234,27 @@ def _validate_inference_mode(value: str) -> str:
     return mode
 
 
+def _validate_compute_device(value: str) -> str:
+    device = str(value).strip().lower()
+    if device not in COMPUTE_DEVICES:
+        raise ValueError("compute_device must be 'gpu' or 'cpu'")
+    return device
+
+
+def _select_paddle_device(paddle: Any, device: str) -> str:
+    if device == "gpu":
+        if not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() < 1:
+            raise ComputeDeviceError("GPU_UNAVAILABLE", "未检测到可用的 NVIDIA GPU/Paddle GPU 运行时")
+        paddle.set_device("gpu:0")
+        if not str(paddle.device.get_device()).startswith("gpu"):
+            raise ComputeDeviceError("DEVICE_MISMATCH", "Paddle 未实际使用 GPU")
+        return "gpu"
+    paddle.set_device("cpu")
+    if not str(paddle.device.get_device()).startswith("cpu"):
+        raise ComputeDeviceError("DEVICE_MISMATCH", "Paddle 未实际使用 CPU")
+    return "cpu"
+
+
 def _validate_model_fingerprint(value: str) -> str:
     fingerprint = str(value).strip()
     if not fingerprint:
@@ -244,6 +280,7 @@ class OrientationClassifier:
         inference_mode: str = DEFAULT_INFERENCE_MODE,
         model_fingerprint: str = "unconfigured",
         fast_engine: FastOrientationEngine | None = None,
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
     ) -> None:
         self.global_predictor = global_predictor
         self.extractor = extractor
@@ -256,6 +293,7 @@ class OrientationClassifier:
         self.local_search_mode = _validate_local_search_mode(local_search_mode)
         self.inference_mode = _validate_inference_mode(inference_mode)
         self.model_fingerprint = _validate_model_fingerprint(model_fingerprint)
+        self.compute_device = _validate_compute_device(compute_device)
         self.fast_engine = fast_engine
         self._inference_lock = threading.RLock()
         self._template_caches: dict[str, TemplateCache] = {}
@@ -274,17 +312,7 @@ class OrientationClassifier:
 
     @staticmethod
     def _model_directory_fingerprint(model_dir: Path) -> str:
-        digest = hashlib.sha256()
-        root = Path(model_dir)
-        for path in sorted(
-            (item for item in root.rglob("*") if item.is_file()),
-            key=lambda item: item.relative_to(root).as_posix(),
-        ):
-            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        return digest.hexdigest()
+        return model_directory_sha256(model_dir)
 
     @classmethod
     def load(
@@ -294,9 +322,22 @@ class OrientationClassifier:
         *,
         local_search_mode: str = DEFAULT_LOCAL_SEARCH_MODE,
         inference_mode: str = DEFAULT_INFERENCE_MODE,
+        paddle_config_path: Path | None = None,
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        expected_model_fingerprint: str | None = None,
     ) -> "OrientationClassifier":
         """Load the production Paddle and Torch models lazily at service startup."""
         inference_mode = _validate_inference_mode(inference_mode)
+        compute_device = _validate_compute_device(compute_device)
+        model_fingerprint = cls._model_directory_fingerprint(model_dir)
+        if (
+            expected_model_fingerprint is not None
+            and str(expected_model_fingerprint).strip() != model_fingerprint
+        ):
+            raise ModelFingerprintError(
+                "MODEL_FINGERPRINT_MISMATCH",
+                "模型目录指纹与期望值不一致",
+            )
         extractor = matcher = device = None
         if inference_mode in {"legacy", "compare"}:
             # On Windows, Paddle and PyTorch can expose incompatible DLLs when
@@ -304,17 +345,31 @@ class OrientationClassifier:
             from src.aliked_lightglue_matcher import build_models
 
             extractor, matcher, device = build_models(MAX_NUM_KEYPOINTS)
+        import paddle
         from paddleclas.deploy.python.predict_rec import RecPredictor
         from paddleclas.deploy.utils import config as paddle_config
 
-        config_path = project_root / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml"
+        selected_compute_device = _select_paddle_device(paddle, compute_device)
+        config_path = paddle_config_path or (
+            project_root / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml"
+        )
         config = paddle_config.get_config(str(config_path), show=False)
         config.Global.rec_inference_model_dir = str(model_dir)
-        config.Global.use_gpu = True
-        config.Global.enable_mkldnn = False
+        config.Global.use_gpu = compute_device == "gpu"
+        config.Global.enable_mkldnn = compute_device == "cpu"
         config.Global.enable_benchmark = False
         config.Global.gpu_mem = 1024
         global_predictor = RecPredictor(config)
+        try:
+            embeddings = list(global_predictor.predict([np.zeros((512, 512, 3), dtype=np.uint8)]))
+            embedding = np.asarray(embeddings[0], dtype=np.float32) if len(embeddings) == 1 else None
+            if embedding is None or embedding.size == 0 or not np.all(np.isfinite(embedding)):
+                raise ValueError("Paddle returned an invalid embedding")
+        except Exception as exc:
+            raise ComputeDeviceError(
+                "RUNTIME_SELF_CHECK_FAILED",
+                "Paddle 推理运行时自检失败",
+            ) from exc
         from src.geometry_calibration import GeometryCalibrator
 
         calibrator = GeometryCalibrator()
@@ -326,7 +381,8 @@ class OrientationClassifier:
             geometry_calibrator=calibrator,
             local_search_mode=local_search_mode,
             inference_mode=inference_mode,
-            model_fingerprint=cls._model_directory_fingerprint(model_dir),
+            model_fingerprint=model_fingerprint,
+            compute_device=selected_compute_device,
         )
         classifier.fast_engine = FastOrientationEngine(
             classifier._global_embeddings,

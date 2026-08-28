@@ -16,8 +16,10 @@ import numpy as np
 import pytest
 
 from src.orientation_classifier import (
+    ComputeDeviceError,
     ImageUnreadableError,
     LocalSearchResult,
+    ModelFingerprintError,
     OrientationClassifier,
     OrientationClassifierError,
     PropagationModelError,
@@ -1072,14 +1074,21 @@ def test_legacy_load_rebuilds_fast_built_base_missing_local_features(classifier,
     assert classifier.extractor.calls == 2
 
 
-def test_fast_load_does_not_construct_aliked_or_lightglue(tmp_path, monkeypatch):
-    import src.aliked_lightglue_matcher as local_stack
-
-    monkeypatch.setattr(
-        local_stack,
-        "build_models",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local stack loaded")),
+def _install_fake_paddle_runtime(monkeypatch, *, compiled=True, gpu_count=1):
+    selected = []
+    paddle = types.ModuleType("paddle")
+    paddle.is_compiled_with_cuda = lambda: compiled
+    paddle.set_device = lambda value: selected.append(value) or value
+    paddle.device = SimpleNamespace(
+        cuda=SimpleNamespace(device_count=lambda: gpu_count),
+        get_device=lambda: selected[-1] if selected else "cpu",
     )
+    monkeypatch.setitem(sys.modules, "paddle", paddle)
+    return selected
+
+
+def _install_fake_paddleclas(monkeypatch):
+    captured = {}
     paddleclas = types.ModuleType("paddleclas")
     deploy = types.ModuleType("paddleclas.deploy")
     python_module = types.ModuleType("paddleclas.deploy.python")
@@ -1089,19 +1098,127 @@ def test_fast_load_does_not_construct_aliked_or_lightglue(tmp_path, monkeypatch)
 
     class FakeRecPredictor:
         def __init__(self, config):
-            self.config = config
+            captured["config"] = config
 
         def predict(self, images):
-            return [np.asarray([1.0, 0.0], dtype=np.float32) for _ in images]
+            captured.setdefault("predict_calls", []).append(len(images))
+            return [np.asarray([1.0, 0.0], np.float32) for _ in images]
+
+    def get_config(path, show=False):
+        captured["config_path"] = path
+        config = SimpleNamespace(Global=SimpleNamespace())
+        captured["config"] = config
+        return config
 
     predict_rec.RecPredictor = FakeRecPredictor
-    config_module.get_config = lambda *_args, **_kwargs: SimpleNamespace(Global=SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "paddleclas", paddleclas)
-    monkeypatch.setitem(sys.modules, "paddleclas.deploy", deploy)
-    monkeypatch.setitem(sys.modules, "paddleclas.deploy.python", python_module)
-    monkeypatch.setitem(sys.modules, "paddleclas.deploy.python.predict_rec", predict_rec)
-    monkeypatch.setitem(sys.modules, "paddleclas.deploy.utils", utils)
-    monkeypatch.setitem(sys.modules, "paddleclas.deploy.utils.config", config_module)
+    config_module.get_config = get_config
+    for name, module in {
+        "paddleclas": paddleclas,
+        "paddleclas.deploy": deploy,
+        "paddleclas.deploy.python": python_module,
+        "paddleclas.deploy.python.predict_rec": predict_rec,
+        "paddleclas.deploy.utils": utils,
+        "paddleclas.deploy.utils.config": config_module,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return captured
+
+
+@pytest.mark.parametrize(
+    "device,use_gpu,mkldnn,selected_device",
+    [("gpu", True, False, "gpu:0"), ("cpu", False, True, "cpu")],
+)
+def test_load_configures_requested_paddle_device(
+    tmp_path, monkeypatch, device, use_gpu, mkldnn, selected_device
+):
+    captured = _install_fake_paddleclas(monkeypatch)
+    selected = _install_fake_paddle_runtime(monkeypatch)
+    yaml_path = tmp_path / "部署 配置.yaml"
+    yaml_path.write_text("Global: {}\n", encoding="utf-8")
+    loaded = OrientationClassifier.load(
+        tmp_path,
+        tmp_path / "模型",
+        paddle_config_path=yaml_path,
+        compute_device=device,
+        inference_mode="fast_geometry",
+    )
+    assert captured["config_path"] == str(yaml_path)
+    assert captured["config"].Global.use_gpu is use_gpu
+    assert captured["config"].Global.enable_mkldnn is mkldnn
+    assert selected == [selected_device]
+    assert captured["predict_calls"] == [1]
+    assert loaded.compute_device == device
+
+
+def test_gpu_load_refuses_missing_cuda_without_cpu_fallback(tmp_path, monkeypatch):
+    _install_fake_paddleclas(monkeypatch)
+    _install_fake_paddle_runtime(monkeypatch, compiled=False, gpu_count=0)
+    with pytest.raises(ComputeDeviceError) as error:
+        OrientationClassifier.load(
+            tmp_path,
+            tmp_path / "model",
+            compute_device="gpu",
+            inference_mode="fast_geometry",
+        )
+    assert error.value.code == "GPU_UNAVAILABLE"
+
+
+def test_load_rejects_unknown_compute_device(tmp_path):
+    with pytest.raises(ValueError, match="compute_device"):
+        OrientationClassifier.load(
+            tmp_path,
+            tmp_path / "model",
+            compute_device="automatic",
+            inference_mode="fast_geometry",
+        )
+
+
+def test_cpu_load_never_probes_cuda(tmp_path, monkeypatch):
+    _install_fake_paddleclas(monkeypatch)
+    _install_fake_paddle_runtime(monkeypatch)
+    paddle = sys.modules["paddle"]
+
+    def unexpected_cuda_probe():
+        raise AssertionError("CPU edition probed CUDA")
+
+    paddle.is_compiled_with_cuda = unexpected_cuda_probe
+    paddle.device.cuda.device_count = unexpected_cuda_probe
+    loaded = OrientationClassifier.load(
+        tmp_path,
+        tmp_path / "model",
+        compute_device="cpu",
+        inference_mode="fast_geometry",
+    )
+    assert loaded.compute_device == "cpu"
+
+
+def test_load_rejects_wrong_expected_model_fingerprint(tmp_path, monkeypatch):
+    _install_fake_paddleclas(monkeypatch)
+    _install_fake_paddle_runtime(monkeypatch)
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "inference.pdmodel").write_bytes(b"model")
+    with pytest.raises(ModelFingerprintError) as error:
+        OrientationClassifier.load(
+            tmp_path,
+            model_dir,
+            compute_device="gpu",
+            expected_model_fingerprint="0" * 64,
+            inference_mode="fast_geometry",
+        )
+    assert error.value.code == "MODEL_FINGERPRINT_MISMATCH"
+
+
+def test_fast_load_does_not_construct_aliked_or_lightglue(tmp_path, monkeypatch):
+    import src.aliked_lightglue_matcher as local_stack
+
+    monkeypatch.setattr(
+        local_stack,
+        "build_models",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local stack loaded")),
+    )
+    _install_fake_paddleclas(monkeypatch)
+    _install_fake_paddle_runtime(monkeypatch)
 
     loaded = OrientationClassifier.load(
         tmp_path,
