@@ -160,7 +160,7 @@ M2/M7 使用现有确定性选择辅助函数实际产生的 20+20 模板；旧�
 
 ```text
 E:\python\anaconda3\envs\shitu\python.exe -m pytest tests -q -p no:cacheprovider
-590 passed, 3 skipped
+590 passed, 3 skipped in 31.58s
 ```
 
 三个 skip 是 `tests/test_orientation_service_integration.py` 的 M1/M2/M7 参数用例；按文档要求，未设置 `WORKPIECE_ORIENTATION_RUN_INTEGRATION=1` 时跳过生产服务集成测试。正式生产模型验收由上面的独立 benchmark 完成。
