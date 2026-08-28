@@ -65,6 +65,7 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
                   model_dir: Path, output_root: Path, repository_root: Path | None = None,
                   guide: Path | None = None, notices: Path | None = None, git_commit: str = "unknown") -> PackageLayout:
     edition = edition.lower()
+    if edition not in {"gpu", "cpu"} or not re.fullmatch(r"\d+\.\d+\.\d+", version): raise ValueError("invalid edition or version")
     for source in (qt_release_dir, backend_dir, model_dir):
         if not Path(source).is_dir(): raise NotADirectoryError(source)
     root = Path(output_root) / f"{edition}-{version}" / f"WorkpieceOrientation-{edition.upper()}"
@@ -189,7 +190,7 @@ def path_relative(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def collect_licenses(destination: Path, distributions: Iterable[str] = ("python", "pyinstaller", "paddlepaddle", "paddlepaddle-gpu", "paddleclas", "numpy", "opencv-python"), paddleclas_license: Path | None = None) -> Path:
+def collect_licenses(destination: Path, distributions: Iterable[str] = ("pyinstaller", "paddlepaddle", "paddleclas", "numpy", "opencv-python"), paddleclas_license: Path | None = None, python_license: Path | None = None) -> Path:
     destination = Path(destination); destination.mkdir(parents=True, exist_ok=True); index = []
     for name in distributions:
         try: dist = importlib.metadata.distribution(name)
@@ -205,6 +206,9 @@ def collect_licenses(destination: Path, distributions: Iterable[str] = ("python"
     if paddleclas_license:
         if not Path(paddleclas_license).is_file(): raise PackageAuditError("PaddleClas license text is missing")
         shutil.copy2(paddleclas_license, destination / "PaddleClas-LICENSE")
+    if python_license:
+        if not Path(python_license).is_file(): raise PackageAuditError("Python license text is missing")
+        shutil.copy2(python_license, destination / "Python-LICENSE"); index.append("Python: Python-LICENSE")
     (destination / "index.txt").write_text("\n".join(index) + "\n", encoding="utf-8"); return destination / "index.txt"
 
 
