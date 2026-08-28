@@ -6,6 +6,10 @@ param(
     [string]$QtBin = 'E:\QT\5.14\5.14.2\msvc2017_64\bin',
     [string]$WindeployQt = '',
     [string]$SmokeScript = '',
+    [string]$SmokeDatasetRoot = '',
+    [int]$SmokeFrontTemplateCount = 5,
+    [int]$SmokeBackTemplateCount = 10,
+    [int]$SmokeSeed = 20260813,
     [string]$ModelPath = '',
     [string]$OutputRoot = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'release_staging')
 )
@@ -39,6 +43,10 @@ foreach ($ed in $editions) {
     if (-not (Test-Path -LiteralPath $pythonLicense)) { throw "Python license not found beside interpreter: $pythonLicense" }
     & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$package')/'third_party_licenses', distributions=('pyinstaller','$paddleDist','paddleclas','numpy','opencv-python'), python_license=Path(r'$pythonLicense'))"
     if ($SmokeScript -and (Test-Path -LiteralPath $SmokeScript)) { & $SmokeScript -PythonExecutable $py -ProjectRoot $package }
+    elseif ($SmokeDatasetRoot) {
+        & $py (Join-Path $repo 'scripts\smoke_portable_package.py') --package-root $package --dataset-root $SmokeDatasetRoot --front-template-count $SmokeFrontTemplateCount --back-template-count $SmokeBackTemplateCount --seed $SmokeSeed --report (Join-Path $stagingRoot 'reports' "$ed-smoke.json")
+        if ($LASTEXITCODE -ne 0) { throw "Portable smoke failed for $ed" }
+    }
     $label = $ed.ToUpper()
     & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$package'); roots=[Path(r'$repo'),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); a=zip_package(p,Path(r'$repo')/'release_artifacts'/f'WorkpieceOrientation-$label-x64-$Version.zip'); write_sha256(a)"
 }

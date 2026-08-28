@@ -3,7 +3,8 @@ param(
         'test_appconfig', 'test_backendclient', 'test_backendprocessmanager',
         'test_annotationmanager', 'test_appfoundation', 'test_inspectionpage',
         'test_workpiecelibrarypage', 'test_geometryrulecanvas',
-        'test_geometryrulespage', 'test_mainwindow'
+        'test_geometryrulespage', 'test_mainwindow',
+        'test_startupsmokecontroller'
     ),
     [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
     [string]$QtBin = 'E:\QT\5.14\5.14.2\msvc2017_64\bin',

@@ -24,7 +24,8 @@ SOURCES += \
     annotationcanvas.cpp \
     annotationmanager.cpp \
     annotationeditor.cpp \
-    taskstatuswidget.cpp
+    taskstatuswidget.cpp \
+    startupsmokecontroller.cpp
 
 HEADERS += \
     appconfig.h \
@@ -43,7 +44,8 @@ HEADERS += \
     annotationcanvas.h \
     annotationmanager.h \
     annotationeditor.h \
-    taskstatuswidget.h
+    taskstatuswidget.h \
+    startupsmokecontroller.h
 
 FORMS += mainwindow.ui \
          inspectionpage.ui \
