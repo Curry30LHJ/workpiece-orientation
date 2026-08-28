@@ -1,7 +1,10 @@
 QT += widgets network
 CONFIG += c++17
 TEMPLATE = app
-TARGET = workpiece_orientation
+TARGET = WorkpieceOrientation
+VERSION = 1.0.0
+QMAKE_TARGET_PRODUCT = Workpiece Orientation
+QMAKE_TARGET_DESCRIPTION = Workpiece front/back inspection
 QMAKE_CXXFLAGS += /utf-8
 
 SOURCES += \
