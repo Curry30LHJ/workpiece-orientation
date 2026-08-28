@@ -44,6 +44,10 @@ Archive and filesystem scans found no Torch, LightGlue, faiss, sklearn, visualdl
 
 An external-model/data smoke was attempted against both EXEs using the real model directory and inference YAML, temporary writable data roots, structured hello/loading polling, and shutdown. Both editions reached `loading_model` then failed deterministically with `MODEL_LOAD_FAILED: No module named 'sklearn'`: PaddleClas 2.6.0 unconditionally imports `sklearn.metrics` during `RecPredictor` construction, while the required `sklearn` exclusion removes it from the frozen archive. No prediction or shutdown handshake could proceed after this startup failure; generated smoke data/logs remain under ignored `release_staging` only. This dependency/spec conflict requires a follow-up decision before claiming offline smoke success.
 
+## Fix round 4 — import-only PaddleClas compatibility
+
+To preserve the required `sklearn`/`faiss` PyInstaller exclusions without changing inference semantics, `src.paddleclas_inference_compat.py` now registers six failing sklearn metric/preprocessing callables and an empty faiss module only when those optional packages are unavailable. `OrientationClassifier.load` invokes the helper immediately before importing PaddleClas. A regression test removes both modules and blocks optional imports, verifies the stubs permit import and are cleaned up afterward, and confirms the exclusion metadata remains unchanged.
+
 ## Fix round 2 — packaging environment robustness
 
 RED: a static script test failed because `create_packaging_envs.ps1` did not clear a globally inherited `PIP_NO_INDEX` value and had no supported-version guard for an already existing environment.

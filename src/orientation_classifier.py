@@ -31,6 +31,7 @@ from src.geometry_calibration import geometry_feature_mask
 from src.geometry_profile_schema import materialize_runtime_profile
 from src.model_execution_gate import PriorityModelGate
 from src.model_fingerprint import model_directory_sha256
+from src.paddleclas_inference_compat import install_optional_sklearn_stubs
 from src.fast_geometry import FastGeometryProcessor
 from src.fast_orientation import FastOrientationEngine, FastRuntimeCache
 
@@ -346,6 +347,7 @@ class OrientationClassifier:
 
             extractor, matcher, device = build_models(MAX_NUM_KEYPOINTS)
         import paddle
+        install_optional_sklearn_stubs()
         from paddleclas.deploy.python.predict_rec import RecPredictor
         from paddleclas.deploy.utils import config as paddle_config
 

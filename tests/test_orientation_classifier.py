@@ -26,8 +26,32 @@ from src.orientation_classifier import (
     TemplateCache,
     WorkpieceNotFoundError,
 )
+from src.paddleclas_inference_compat import install_optional_sklearn_stubs
 from src.fast_geometry import FastGeometryProcessor
 from src.fast_orientation import FastOrientationEngine
+
+
+def test_paddleclas_sklearn_compat_supports_import_without_sklearn(monkeypatch):
+    for name in ("sklearn", "sklearn.metrics", "sklearn.preprocessing", "faiss"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    real_import = __import__
+
+    def no_sklearn(name, *args, **kwargs):
+        if (name.startswith("sklearn") or name == "faiss") and name not in sys.modules:
+            raise ModuleNotFoundError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", no_sklearn)
+    try:
+        install_optional_sklearn_stubs()
+        metrics = __import__("sklearn.metrics", fromlist=["hamming_loss"])
+        preprocessing = __import__("sklearn.preprocessing", fromlist=["binarize"])
+        assert callable(metrics.hamming_loss)
+        assert callable(preprocessing.binarize)
+        assert "faiss" in sys.modules
+    finally:
+        for name in ("sklearn", "sklearn.metrics", "sklearn.preprocessing", "faiss"):
+            sys.modules.pop(name, None)
 
 
 class FakeGlobalPredictor:
