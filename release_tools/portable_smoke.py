@@ -429,6 +429,12 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         if front.get("label") != "front" or back.get("label") != "back":
             raise RuntimeError("destination prediction mismatch")
         request("get_geometry_mask_profile", workpiece_id=source["workpiece_id"])
+        destination_report.update(
+            workpiece_id=source["workpiece_id"],
+            hello=hello,
+            template_counts=counts,
+            labels={"front": front.get("label"), "back": back.get("label")},
+        )
     except Exception as exc:
         primary_error = exc
         report["error"] = str(exc)
