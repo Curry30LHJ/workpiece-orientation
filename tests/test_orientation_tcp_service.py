@@ -1,6 +1,7 @@
 import json
 from dataclasses import replace
 import logging
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -21,7 +22,13 @@ from src.orientation_tcp_service import (
     ServiceStartupError,
     configure_diagnostic_logging,
 )
-from src.orientation_classifier import OrientationClassifierError, PropagationModelError
+from src.orientation_classifier import (
+    ComputeDeviceError,
+    ModelFingerprintError,
+    OrientationClassifierError,
+    PropagationModelError,
+)
+from src.runtime_data import RuntimeDataError
 from src.workpiece_catalog import WorkpieceCatalog
 from src.workpiece_library import WorkpieceLibrary
 from src.geometry_mask_profiles import (
@@ -1306,18 +1313,42 @@ def test_propagation_model_failure_returns_stable_model_error(client, running_se
 
 
 def test_diagnostic_logging_persists_propagation_context(tmp_path):
-    handler = configure_diagnostic_logging(tmp_path)
+    logs_dir = tmp_path / "diagnostics"
+    handler = configure_diagnostic_logging(logs_dir)
     try:
         logging.getLogger("src.template_evolution").warning(
             "annotation propagation pair failed operation_id=%s workpiece_id=%s group_id=%s source=%s target=%s",
             "op-1", "m7", "glare", "front:00.png", "front:02.png",
         )
         handler.flush()
-        log_path = tmp_path / "diagnostics" / "orientation-service.log"
+        log_path = logs_dir / "orientation-service.log"
         content = log_path.read_text(encoding="utf-8")
         assert "operation_id=op-1" in content
         assert "workpiece_id=m7" in content
         assert "target=front:02.png" in content
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+
+def test_diagnostic_logging_prunes_only_old_files_inside_logs_directory(tmp_path):
+    logs_dir = tmp_path / "data" / "logs"
+    logs_dir.mkdir(parents=True)
+    outside = tmp_path / "must-not-touch.log"
+    outside.write_bytes(b"outside")
+    dated = []
+    for index in range(4):
+        path = logs_dir / f"orientation-service.log.2026-08-{index + 1:02d}"
+        path.write_bytes(b"x" * (8 * 1024 * 1024))
+        os.utime(path, (index + 1, index + 1))
+        dated.append(path)
+
+    handler = configure_diagnostic_logging(logs_dir)
+    try:
+        assert outside.read_bytes() == b"outside"
+        assert not dated[0].exists()
+        assert sum(path.stat().st_size for path in logs_dir.iterdir() if path.is_file()) <= 30 * 1024 * 1024
+        assert handler.backupCount == 14
     finally:
         logging.getLogger().removeHandler(handler)
         handler.close()
@@ -1525,6 +1556,87 @@ def test_listener_reports_loading_then_accepts_ready_handshake():
         thread.join(timeout=2)
 
 
+def test_hello_reports_loading_phase_and_identity():
+    runtime = ServiceRuntime(
+        package_version="1.0.0", edition="gpu", compute_device="gpu",
+        model_fingerprint="a" * 64, instance_token="launch-123",
+    )
+    runtime.update_loading("loading_model", "正在加载 PP-ShiTu 模型", 35)
+    response = OrientationCommandDispatcher(runtime).dispatch({
+        "version": 1, "request_id": "hello-1", "command": "hello"
+    })
+    assert response["ready"] is False
+    assert response["phase"] == "loading_model"
+    assert response["progress"] == 35
+    assert response["package_version"] == "1.0.0"
+    assert response["edition"] == "gpu"
+    assert response["compute_device"] == "gpu"
+    assert response["model_fingerprint"] == "a" * 64
+    assert response["instance_token"] == "launch-123"
+
+
+def test_loading_phase_and_progress_never_regress():
+    runtime = ServiceRuntime()
+    runtime.update_loading("loading_model", "正在加载模型", 35)
+    runtime.update_loading("preparing_data", "迟到的数据检查", 15)
+    snapshot = runtime.snapshot()
+    assert (snapshot.phase, snapshot.progress) == ("loading_model", 35)
+
+
+def test_packaged_shutdown_rejects_wrong_instance_token():
+    runtime = ServiceRuntime(
+        package_version="1.0.0", edition="gpu", compute_device="gpu",
+        model_fingerprint="a" * 64, instance_token="owned-token",
+    )
+    response = OrientationCommandDispatcher(runtime).dispatch({
+        "version": 1, "request_id": "stop-1", "command": "shutdown",
+        "instance_token": "foreign-token",
+    })
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INSTANCE_TOKEN_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("code", "action"),
+    [
+        ("MODEL_LOAD_FAILED", "检查模型文件和后端依赖是否完整，然后重启程序"),
+        ("MODEL_FINGERPRINT_MISMATCH", "恢复本版本随附的完整模型目录，然后重启程序"),
+        ("GPU_UNAVAILABLE", "确认 NVIDIA 显卡和兼容驱动可用；无 NVIDIA GPU 时请改用 CPU 版"),
+        ("DEVICE_MISMATCH", "关闭程序，确认安装包版本与计算设备一致后重新启动"),
+        ("RUNTIME_SELF_CHECK_FAILED", "检查对应版本运行库和驱动，保留日志并联系技术支持"),
+        ("DATA_DIRECTORY_NOT_WRITABLE", "将程序解压到当前用户可写目录，确认 data 未被占用后重启"),
+        ("DATA_VERSION_UNSUPPORTED", "使用支持该 data 版本的软件，或恢复兼容备份"),
+        ("DATA_LAYOUT_AMBIGUOUS", "备份 data 后移除无法识别的文件，禁止合并两个非空 data"),
+        ("DATA_MIGRATION_FAILED", "保留现有 data 和自动备份，查看日志后重试或联系技术支持"),
+        ("FAST_CACHE_BUILD_FAILED", "保留工件库并重启；仍失败时查看日志并重新建立该工件缓存"),
+        ("UNEXPECTED_STARTUP_FAILURE", "查看后端日志并联系技术支持"),
+    ],
+)
+def test_failed_hello_maps_startup_code_to_action_and_keeps_log_path(code, action, tmp_path):
+    log_path = (tmp_path / "logs" / "orientation-service.log").resolve()
+    runtime = ServiceRuntime(log_path=str(log_path))
+    runtime.update_loading("loading_model", "正在加载模型", 35)
+    runtime.set_failed(code, "startup failed")
+
+    response = OrientationCommandDispatcher(runtime).dispatch({
+        "version": 1, "request_id": "failed-hello", "command": "hello",
+    })
+
+    assert response["ok"] is False
+    assert response["phase"] == "loading_model"
+    assert response["progress"] == 35
+    assert response["error_action"] == action
+    assert response["log_path"] == str(log_path)
+    assert str(log_path) not in response["error_action"]
+
+
+def test_development_shutdown_remains_backward_compatible():
+    response = OrientationCommandDispatcher(ServiceRuntime()).dispatch({
+        "version": 1, "request_id": "stop-dev", "command": "shutdown",
+    })
+    assert response["ok"] is True
+
+
 def test_local_search_mode_argument_defaults_to_adaptive(tmp_path):
     parser = service_module._build_argument_parser()
     args = parser.parse_args([
@@ -1551,17 +1663,44 @@ def test_local_search_mode_argument_rejects_unknown_value(tmp_path):
 def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication(monkeypatch, tmp_path):
     runtime = ServiceRuntime()
     events = []
+    phases = []
+    original_update_loading = runtime.update_loading
+
+    def record_loading(phase, message, progress):
+        phases.append(phase)
+        original_update_loading(phase, message, progress)
+
+    runtime.update_loading = record_loading
 
     class LoadedClassifier:
         geometry_calibrator = None
 
+        compute_device = "cpu"
+        model_fingerprint = "b" * 64
+
         @classmethod
-        def load(cls, project_root, model_dir, *, local_search_mode, inference_mode):
+        def load(
+            cls,
+            project_root,
+            model_dir,
+            *,
+            paddle_config_path,
+            compute_device,
+            expected_model_fingerprint,
+            local_search_mode,
+            inference_mode,
+        ):
+            assert runtime.snapshot().phase == "loading_model"
+            assert paddle_config_path == tmp_path / "inference.yaml"
+            assert compute_device == "cpu"
+            assert expected_model_fingerprint == "a" * 64
             events.append(f"model-loaded:{local_search_mode}:{inference_mode}")
             return cls()
 
     class LoadedLibrary:
         def __init__(self, library_dir):
+            assert runtime.snapshot().phase == "restoring_library"
+            assert Path(library_dir) == (tmp_path / "data" / "workpieces").resolve()
             self.library_dir = Path(library_dir)
 
     class LoadedCatalog:
@@ -1607,12 +1746,21 @@ def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication
         runtime,
         tmp_path,
         tmp_path / "models",
-        tmp_path / "library",
+        None,
+        data_root=tmp_path / "data",
+        paddle_config_path=tmp_path / "inference.yaml",
+        compute_device="cpu",
+        model_sha256="a" * 64,
         local_search_mode="exhaustive",
         inference_mode="fast_geometry",
     )
 
     assert runtime.snapshot().status == "ready"
+    assert runtime.snapshot().phase == "ready"
+    assert runtime.snapshot().compute_device == "cpu"
+    assert runtime.snapshot().model_fingerprint == "b" * 64
+    phases.append(runtime.snapshot().phase)
+    assert phases == ["preparing_data", "loading_model", "restoring_library", "ready"]
     assert events == [
         "model-loaded:exhaustive:fast_geometry",
         "profiles-created",
@@ -1621,6 +1769,42 @@ def test_runtime_loader_starts_workers_only_after_recovery_and_ready_publication
         "profiles-started",
         "evolution-started",
     ]
+
+
+@pytest.mark.parametrize(
+    "startup_error",
+    [
+        RuntimeDataError("DATA_MIGRATION_FAILED", "migration failed"),
+        ComputeDeviceError("GPU_UNAVAILABLE", "gpu unavailable"),
+        ModelFingerprintError("MODEL_FINGERPRINT_MISMATCH", "model mismatch"),
+    ],
+)
+def test_runtime_loader_preserves_coded_startup_errors(monkeypatch, tmp_path, startup_error):
+    class FailingClassifier:
+        @classmethod
+        def load(cls, *args, **kwargs):
+            raise startup_error
+
+    if isinstance(startup_error, RuntimeDataError):
+        monkeypatch.setattr(
+            service_module,
+            "prepare_runtime_data",
+            lambda data_root: (_ for _ in ()).throw(startup_error),
+        )
+    else:
+        monkeypatch.setattr(service_module, "OrientationClassifier", FailingClassifier)
+    runtime = ServiceRuntime()
+
+    service_module._load_runtime(
+        runtime,
+        tmp_path,
+        tmp_path / "models",
+        None,
+        data_root=tmp_path / "data",
+    )
+
+    assert runtime.snapshot().status == "failed"
+    assert runtime.snapshot().error_code == startup_error.code
 
 
 def test_service_shutdown_claims_runtime_before_announcing_shutdown():
@@ -1702,7 +1886,7 @@ def test_runtime_loader_failure_reclaims_owned_resources_once(
         geometry_calibrator = None
 
         @classmethod
-        def load(cls, project_root, model_dir, *, local_search_mode, inference_mode):
+        def load(cls, project_root, model_dir, **kwargs):
             return cls()
 
     class LoadedLibrary:
@@ -1842,7 +2026,7 @@ def test_shutdown_during_loading_reclaims_late_catalog_without_starting_workers(
         geometry_calibrator = None
 
         @classmethod
-        def load(cls, project_root, model_dir, *, local_search_mode, inference_mode):
+        def load(cls, project_root, model_dir, **kwargs):
             return cls()
 
     class LoadedLibrary:
@@ -1941,6 +2125,7 @@ def test_main_waits_for_loader_cleanup_after_listener_returns(monkeypatch, tmp_p
         project_root = tmp_path
         model_dir = tmp_path / "models"
         library_dir = tmp_path / "library"
+        parent_pid = 4321
         local_search_mode = "adaptive"
         inference_mode = "legacy"
 
@@ -1961,16 +2146,21 @@ def test_main_waits_for_loader_cleanup_after_listener_returns(monkeypatch, tmp_p
         def request_shutdown(self):
             self.shutdown_calls += 1
 
-    def blocked_loader(*args):
+    def blocked_loader(*args, **kwargs):
         loader_started.set()
         assert release_loader.wait(timeout=2)
         loader_finished.set()
+
+    def record_parent_watchdog(parent_pid, on_parent_exit):
+        holder["parent_pid"] = parent_pid
+        holder["parent_exit_callback"] = on_parent_exit
 
     monkeypatch.setattr(service_module, "_build_argument_parser", lambda: Parser())
     monkeypatch.setattr(service_module, "configure_diagnostic_logging", lambda library_dir: None)
     monkeypatch.setattr(service_module, "_prepare_windows_torch_dll_path", lambda: None)
     monkeypatch.setattr(service_module, "OrientationTcpServer", ReturningServer)
     monkeypatch.setattr(service_module, "_load_runtime", blocked_loader)
+    monkeypatch.setattr(service_module, "start_parent_watchdog", record_parent_watchdog)
 
     def run_main():
         service_module.main()
@@ -1989,6 +2179,8 @@ def test_main_waits_for_loader_cleanup_after_listener_returns(monkeypatch, tmp_p
     assert not main_thread.is_alive()
     assert loader_finished.is_set()
     assert holder["server"].shutdown_calls == 1
+    assert holder["parent_pid"] == 4321
+    assert holder["parent_exit_callback"].__self__ is holder["server"]
 
 
 def test_loading_runtime_accepts_shutdown_before_model_ready():
