@@ -5,6 +5,49 @@ from __future__ import annotations
 import sys
 import types
 from typing import Any
+from pathlib import Path
+
+
+def uses_legacy_model_format(model_dir: Path) -> bool:
+    """Return whether a PP-ShiTu directory uses Paddle's two-file format."""
+    root = Path(model_dir)
+    return (
+        not (root / "inference.json").is_file()
+        and (root / "inference.pdmodel").is_file()
+        and (root / "inference.pdiparams").is_file()
+    )
+
+
+def create_rec_predictor(rec_predictor: Any, config: Any, paddle: Any, model_dir: Path) -> Any:
+    """Construct RecPredictor while supporting legacy two-file model exports."""
+    if not uses_legacy_model_format(model_dir):
+        return rec_predictor(config)
+    original_version = getattr(paddle, "__version__", None)
+    global_config = getattr(config, "Global", None)
+    if global_config is None and isinstance(config, dict):
+        global_config = config.get("Global")
+    previous_mkldnn = None
+    try:
+        # PaddleClas chooses Config(model_dir, 'inference') for Paddle >=2.6,
+        # which requires inference.json.  A temporary 2.5 marker selects its
+        # legacy Config(model_file, params_file) branch without touching files.
+        paddle.__version__ = "2.5.0"
+        if global_config is not None:
+            if isinstance(global_config, dict):
+                previous_mkldnn = global_config.get("enable_mkldnn")
+                global_config["enable_mkldnn"] = False
+            else:
+                previous_mkldnn = getattr(global_config, "enable_mkldnn", None)
+                global_config.enable_mkldnn = False
+        return rec_predictor(config)
+    finally:
+        if global_config is not None and previous_mkldnn is not None:
+            if isinstance(global_config, dict):
+                global_config["enable_mkldnn"] = previous_mkldnn
+            else:
+                global_config.enable_mkldnn = previous_mkldnn
+        if original_version is not None:
+            paddle.__version__ = original_version
 
 
 def install_optional_sklearn_stubs() -> None:

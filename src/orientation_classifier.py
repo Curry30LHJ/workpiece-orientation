@@ -31,7 +31,7 @@ from src.geometry_calibration import geometry_feature_mask
 from src.geometry_profile_schema import materialize_runtime_profile
 from src.model_execution_gate import PriorityModelGate
 from src.model_fingerprint import model_directory_sha256
-from src.paddleclas_inference_compat import install_optional_sklearn_stubs
+from src.paddleclas_inference_compat import create_rec_predictor, install_optional_sklearn_stubs
 from src.fast_geometry import FastGeometryProcessor
 from src.fast_orientation import FastOrientationEngine, FastRuntimeCache
 
@@ -361,7 +361,7 @@ class OrientationClassifier:
         config.Global.enable_mkldnn = compute_device == "cpu"
         config.Global.enable_benchmark = False
         config.Global.gpu_mem = 1024
-        global_predictor = RecPredictor(config)
+        global_predictor = create_rec_predictor(RecPredictor, config, paddle, model_dir)
         try:
             embeddings = list(global_predictor.predict([np.zeros((512, 512, 3), dtype=np.uint8)]))
             embedding = np.asarray(embeddings[0], dtype=np.float32) if len(embeddings) == 1 else None
