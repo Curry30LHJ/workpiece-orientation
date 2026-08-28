@@ -34,7 +34,10 @@ foreach ($ed in $editions) {
     & $py -m release_tools.portable_package stage --edition $ed --version $Version --qt-release-dir $qtRelease --backend-dir $backend --model-dir $model --output-root $stagingRoot --guide (Join-Path $repo 'deploy\使用说明.txt') --notices (Join-Path $repo 'deploy\THIRD_PARTY-NOTICES.txt') --git-commit $gitCommit
     $package = Join-Path $target "WorkpieceOrientation-$($ed.ToUpper())"
     $paddleDist = if ($ed -eq 'gpu') { 'paddlepaddle-gpu' } else { 'paddlepaddle' }
-    & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$package')/'third_party_licenses', distributions=('pyinstaller','$paddleDist','paddleclas','numpy','opencv-python'), python_license=Path(r'$py').parent/'LICENSE.txt')"
+    $pythonLicense = Join-Path (Split-Path $py -Parent) 'LICENSE_PYTHON.txt'
+    if (-not (Test-Path -LiteralPath $pythonLicense)) { $pythonLicense = Join-Path (Split-Path $py -Parent) 'LICENSE.txt' }
+    if (-not (Test-Path -LiteralPath $pythonLicense)) { throw "Python license not found beside interpreter: $pythonLicense" }
+    & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$package')/'third_party_licenses', distributions=('pyinstaller','$paddleDist','paddleclas','numpy','opencv-python'), python_license=Path(r'$pythonLicense'))"
     if ($SmokeScript -and (Test-Path -LiteralPath $SmokeScript)) { & $SmokeScript -PythonExecutable $py -ProjectRoot $package }
     $label = $ed.ToUpper()
     & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$package'); roots=[Path(r'$repo'),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); a=zip_package(p,Path(r'$repo')/'release_artifacts'/f'WorkpieceOrientation-$label-x64-$Version.zip'); write_sha256(a)"
