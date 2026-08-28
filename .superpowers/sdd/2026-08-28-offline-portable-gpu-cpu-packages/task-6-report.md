@@ -52,6 +52,20 @@ git diff --check                                      # clean
 
 The script now sets `$env:PIP_NO_INDEX = ''` before any child process, preserves the official cu118/cpu indexes, and rejects an existing environment unless its reported interpreter is Python 3.10.x.
 
+## Fix round 3 — PyInstaller spec project-root fallback
+
+The first real GPU PyInstaller invocation reached spec evaluation and failed before analysis with `NameError: name '__file__' is not defined` at the project-root default expression (the build environment variable was set, but Python evaluated the default argument eagerly). The regression test was added first and failed on the old `Path(__file__)` expression. The spec now reads `WORKPIECE_PROJECT_ROOT` first and only falls back to `Path.cwd().resolve()`, so spec execution never references an undefined `__file__` while retaining the shared GPU/CPU spec and external model/data contract.
+
+GREEN:
+
+```text
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_backend_bundle.py tests/test_backend_spec.py tests/test_packaging_env_script.py -q -p no:cacheprovider
+......                                                                   [100%]
+6 passed in 0.08s
+python -m py_compile release_tools/backend_bundle.py  # exit 0
+git diff --check                                      # clean
+```
+
 ## Environment/build attempt
 
 The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Conda environments and installed the common dependencies into the GPU environment. The Paddle GPU download/install did not complete (the process was interrupted after prolonged network resolution/download); CPU dependency installation therefore did not start. Neither `paddlepaddle-gpu` nor `paddlepaddle` metadata is present in the respective environments after interruption. Consequently no PyInstaller build or EXE smoke test was run, and no build result is claimed.

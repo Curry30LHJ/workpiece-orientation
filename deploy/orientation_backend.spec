@@ -14,7 +14,8 @@ edition_name = os.environ.get("WORKPIECE_PACKAGE_EDITION", "").strip().lower()
 if not edition_name:
     raise SystemExit("WORKPIECE_PACKAGE_EDITION must be gpu or cpu")
 edition = edition_for(edition_name)
-project_root = Path(os.environ.get("WORKPIECE_PROJECT_ROOT", Path(__file__).resolve().parents[1])).resolve()
+project_root_env = os.environ.get("WORKPIECE_PROJECT_ROOT", "").strip()
+project_root = Path(project_root_env).resolve() if project_root_env else Path.cwd().resolve()
 validate_installed_distributions(edition)
 
 paddle_binaries = collect_dynamic_libs("paddle")
@@ -48,4 +49,3 @@ exe = EXE(
     console=False,
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="orientation_backend")
-
