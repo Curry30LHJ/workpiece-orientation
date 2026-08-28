@@ -3,3 +3,4 @@
 本离线发行包包含 Qt 5.14.2、Python 3.10、PyInstaller 6.22.2、PaddlePaddle 3.2.2、PaddleClas 2.6.0、NumPy、OpenCV 及其依赖。
 GPU 版还包含 NVIDIA CUDA/cuDNN/cuBLAS 运行库；CPU 版不包含 NVIDIA 运行库。
 各组件的完整许可证文本随包置于 third_party_licenses/，索引见其中 index.txt。
+PaddleClas 许可证优先使用仓库 third_party/PaddleClas/LICENSE；该文件不存在时，构建从所选环境的 paddleclas 安装发行包中收集同名许可证。

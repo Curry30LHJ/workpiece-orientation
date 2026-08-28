@@ -171,8 +171,9 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
     for exe in (root / "WorkpieceOrientation.exe", root / "backend" / "orientation_backend.exe"):
         if exe.exists():
             for dep in dependency_checker(exe, root) or []:
-                system = {"kernel32.dll", "user32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "ws2_32.dll", "gdi32.dll", "comdlg32.dll", "msvcp140.dll", "vcruntime140.dll"}
-                if dep.lower() not in system and dep.lower() not in {p.name.lower() for p in root.rglob("*")}: errors.append(f"dependency absent from package: {dep}")
+                d = dep.lower(); system = {"kernel32.dll", "user32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll", "combase.dll", "rpcrt4.dll", "imm32.dll", "version.dll", "ucrtbase.dll", "ws2_32.dll", "gdi32.dll", "comdlg32.dll"}
+                if d.startswith(("api-ms-", "ext-ms-")) or d in system or d.startswith(("msvcp", "vcruntime")): continue
+                if d not in {p.name.lower() for p in root.rglob("*")}: errors.append(f"dependency absent from package: {dep}")
     if errors: raise PackageAuditError("; ".join(errors))
     return {"root": str(root), "edition": edition, "version": version, "files": len([p for p in root.rglob('*') if p.is_file()])}
 
