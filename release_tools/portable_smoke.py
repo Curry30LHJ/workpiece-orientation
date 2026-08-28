@@ -295,7 +295,11 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
                     cleanup_error = exc
         report["process_exit"] = _process_exit_code(process)
         if options.report_path:
-            _persist_report(Path(options.report_path), report)
+            try:
+                _persist_report(Path(options.report_path), report)
+            except Exception:
+                if not primary_error:
+                    raise
         if cleanup_error is not None and not primary_error:
             raise cleanup_error
     return report
@@ -466,7 +470,11 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
             report["error"] = str(primary_error)
         report["ok"] = primary_error is None
         if options.report_path:
-            _persist_report(Path(options.report_path), report)
+            try:
+                _persist_report(Path(options.report_path), report)
+            except Exception:
+                if primary_error is None:
+                    raise
     if primary_error is not None:
         raise primary_error
     return report
