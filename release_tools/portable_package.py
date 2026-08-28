@@ -21,6 +21,13 @@ from src.model_fingerprint import model_directory_sha256
 class PackageAuditError(RuntimeError):
     pass
 
+def _is_system_dependency(name: str, system_roots: Iterable[Path] = ()) -> bool:
+    base = Path(name).name.lower()
+    if base.startswith(("api-ms-", "ext-ms-")): return True
+    roots = [Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32", Path(os.environ.get("SystemRoot", r"C:\Windows")) / "SysWOW64", *map(Path, system_roots)]
+    if any((r / base).is_file() for r in roots): return True
+    return base in {"kernel32.dll", "user32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll", "combase.dll", "rpcrt4.dll", "imm32.dll", "version.dll", "ucrtbase.dll"} or base.startswith(("msvcp", "vcruntime"))
+
 
 @dataclass(frozen=True)
 class PackageLayout:
@@ -142,6 +149,7 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
     try: cfg = json.loads((root / "app_config.json").read_text(encoding="utf-8")); ver = json.loads((root / "version.json").read_text(encoding="utf-8"))
     except Exception as exc: errors.append(f"invalid metadata: {exc}")
     if cfg.get("edition") != edition or cfg.get("compute_device") != edition or cfg.get("package_version") != version: errors.append("edition/device/version mismatch")
+    if ver.get("version") != version or ver.get("edition") != edition or not ver.get("git_commit") or ver.get("git_commit") == "unknown": errors.append("version metadata mismatch")
     if cfg.get("inference_mode") != "fast_geometry" or cfg.get("launch_mode") != "packaged_executable": errors.append("configuration must be packaged fast mode")
     model = root / "models" / "shitu_rec"
     if model.exists():
@@ -162,6 +170,7 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
         raw = file.read_bytes(); text = raw.decode("utf-8", errors="ignore").replace("\\", "/").lower(); text16 = raw.decode("utf-16", errors="ignore").replace("\\", "/").lower()
         if any(token and token in text for token in known_roots) or any(token and token in text16 for token in known_roots): errors.append("absolute path found: " + rel)
         if rel in {"app_config.json", "version.json"} and re.search(r"[a-z]:[/\\]", text): errors.append("absolute path found: " + rel)
+        if rel in {"app_config.json", "version.json"} and (re.search(r"(^|[\"'])/(?!/)[^\s\"']+", text) or re.search(r"\\\\[^\\/]+\\[^\"']+", text)): errors.append("absolute path found: " + rel)
         if "${" in text or "{{" in text: errors.append("unresolved template token: " + rel)
     if edition == "gpu":
         names = {p.name.lower() for p in (root / "backend").rglob("*") if p.is_file()}
@@ -171,8 +180,8 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
     for exe in (root / "WorkpieceOrientation.exe", root / "backend" / "orientation_backend.exe"):
         if exe.exists():
             for dep in dependency_checker(exe, root) or []:
-                d = dep.lower(); system = {"kernel32.dll", "user32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll", "combase.dll", "rpcrt4.dll", "imm32.dll", "version.dll", "ucrtbase.dll", "ws2_32.dll", "gdi32.dll", "comdlg32.dll"}
-                if d.startswith(("api-ms-", "ext-ms-")) or d in system or d.startswith(("msvcp", "vcruntime")): continue
+                d = dep.lower()
+                if _is_system_dependency(d): continue
                 if d not in {p.name.lower() for p in root.rglob("*")}: errors.append(f"dependency absent from package: {dep}")
     if errors: raise PackageAuditError("; ".join(errors))
     return {"root": str(root), "edition": edition, "version": version, "files": len([p for p in root.rglob('*') if p.is_file()])}
