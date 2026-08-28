@@ -120,3 +120,18 @@ def test_manifest_and_zip_use_one_versioned_root(tmp_path: Path):
     digest, filename = checksum.read_text(encoding="ascii").strip().split("  ", 1)
     assert len(digest) == 64
     assert filename == archive.name
+
+
+def test_audit_allows_pyinstaller_internal_pyi_but_rejects_visible_source(tmp_path: Path):
+    root = minimal_stage(tmp_path / "package")
+    (root / "backend" / "_internal").mkdir()
+    (root / "backend" / "_internal" / "runtime.pyi").write_text("types", encoding="utf-8")
+    audit_synthetic(root)
+
+
+def test_manifest_includes_nested_manifest_file(tmp_path: Path):
+    root = minimal_stage(tmp_path / "package")
+    nested = root / "third_party_licenses" / "manifest.json"
+    nested.write_text("{}", encoding="utf-8")
+    manifest = write_manifest(root, edition="gpu", version="1.0.0")
+    assert any(item["path"] == "third_party_licenses/manifest.json" for item in manifest["files"])
