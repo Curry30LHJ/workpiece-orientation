@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import uuid
 
 
@@ -77,6 +78,11 @@ def _owned_directory(root: Path, directory: Path) -> None:
         raise RuntimeDataError("DATA_LAYOUT_AMBIGUOUS", f"Unsafe data layout path: {directory}")
 
 
+def _is_reparse_point(path: Path) -> bool:
+    attributes = getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0)
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def _write_metadata(metadata: Path) -> None:
     temporary = metadata.with_name(f".{metadata.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -95,7 +101,14 @@ def _clear_owned_temp(paths: RuntimeDataPaths) -> None:
     _owned_directory(paths.root, paths.temp)
     try:
         for child in paths.temp.iterdir():
-            if child.is_dir() and not child.is_symlink():
+            if child.is_symlink():
+                child.unlink()
+            elif _is_reparse_point(child):
+                if child.is_dir():
+                    child.rmdir()
+                else:
+                    child.unlink()
+            elif child.is_dir():
                 shutil.rmtree(child)
             else:
                 child.unlink()

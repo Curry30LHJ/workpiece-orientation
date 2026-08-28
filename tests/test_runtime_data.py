@@ -129,6 +129,31 @@ def test_versioned_temp_symlink_is_rejected_without_clearing_outside_root(tmp_pa
     assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
+def test_temp_cleanup_removes_nested_junction_without_traversing_it(tmp_path: Path):
+    paths = prepare_runtime_data(tmp_path / "data")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    ordinary = paths.temp / "ordinary"
+    ordinary.mkdir()
+    (ordinary / "stale.tmp").write_text("stale", encoding="utf-8")
+    junction = paths.temp / "outside-junction"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    prepare_runtime_data(paths.root)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not junction.exists()
+    assert not ordinary.exists()
+
+
 def test_legacy_runtime_data_preserves_configured_library_directory(tmp_path: Path):
     library_dir = tmp_path / "legacy library"
     paths = legacy_runtime_data(library_dir)
