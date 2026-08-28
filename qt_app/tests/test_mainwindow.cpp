@@ -2912,6 +2912,51 @@ private slots:
         QVERIFY(status->text().contains(QStringLiteral("已连接")));
     }
 
+    void managedReconnectLoadingPreservesRecoveringUntilReadyOrFailure() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37658), &client, &launcher);
+        MainWindow window(&client, &manager);
+        auto *status = window.findChild<QLabel *>(
+            QStringLiteral("backendStatusLabel"));
+        auto *modelDetail = window.findChild<QLabel *>(
+            QStringLiteral("backendModelDetailLabel"));
+        QVERIFY(status != nullptr);
+        QVERIFY(modelDetail != nullptr);
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onBackendReady", Qt::DirectConnection));
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientTransportFailed", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("CONNECTION_LOST")),
+            Q_ARG(QString, QStringLiteral("连接已断开"))));
+        QVERIFY(status->text().contains(QStringLiteral("正在重连")));
+
+        emit manager.backendLoading(QStringLiteral("loading_model"),
+                                    QStringLiteral("重连后加载模型"), 60);
+
+        QVERIFY(status->text().contains(QStringLiteral("正在重连")));
+        QVERIFY(!status->text().contains(QStringLiteral("正在加载 PP-ShiTu 模型")));
+        QVERIFY(modelDetail->text().contains(QStringLiteral("重连后加载模型")));
+        QVERIFY(modelDetail->text().contains(QStringLiteral("60%")));
+
+        emit manager.backendReady();
+        QVERIFY(status->text().contains(QStringLiteral("已连接")));
+
+        QVERIFY(QMetaObject::invokeMethod(
+            &window, "onClientTransportFailed", Qt::DirectConnection,
+            Q_ARG(QString, QStringLiteral("CONNECTION_LOST")),
+            Q_ARG(QString, QStringLiteral("再次断开"))));
+        emit manager.backendLoading(QStringLiteral("restoring_library"),
+                                    QStringLiteral("恢复工件库"), 80);
+        emit manager.backendUnavailable(QStringLiteral("恢复失败"),
+                                        QStringLiteral("RECOVERY_FAILED"),
+                                        QStringLiteral("请重试"),
+                                        QStringLiteral("data/logs"));
+        QVERIFY(status->text().contains(QStringLiteral("不可用")));
+        QCOMPARE(status->property("messageKind").toString(), QStringLiteral("error"));
+    }
+
     void unmanagedClientErrorRemainsDirectlyVisible() {
         BackendClient client;
         MainWindow window(&client, nullptr);

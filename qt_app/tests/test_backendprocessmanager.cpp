@@ -65,6 +65,16 @@ class HandshakeServer : public QObject {
     Q_OBJECT
 
 public:
+    enum class HelloBehavior {
+        Ready,
+        ErrorResponse,
+        BadJson,
+        WrongProtocol,
+        WrongService,
+        NoResponse,
+        CloseImmediately,
+    };
+
     explicit HandshakeServer(QObject *parent = nullptr) : QObject(parent) {
         connect(&server, &QTcpServer::newConnection, this, &HandshakeServer::acceptConnection);
     }
@@ -74,6 +84,8 @@ public:
     quint16 port() const { return server.serverPort(); }
     void setLoadingResponses(int count) { loadingResponses = count; }
     QString shutdownToken() const { return lastShutdownToken; }
+    void setRespondToShutdown(bool respond) { respondToShutdown = respond; }
+    void setHelloBehavior(HelloBehavior behavior) { helloBehavior = behavior; }
     void disconnectClient() {
         if (socket != nullptr) socket->abort();
     }
@@ -105,6 +117,34 @@ private slots:
             const QJsonObject object = request.object();
             const QString id = object.value(QStringLiteral("request_id")).toString();
             if (object.value(QStringLiteral("command")).toString() == QStringLiteral("hello")) {
+                if (helloBehavior == HelloBehavior::ErrorResponse) {
+                    send({{"version", 1}, {"request_id", id}, {"ok", false},
+                          {"error", QJsonObject{{"code", "STARTUP_REJECTED"},
+                                                {"message", "rejected"}}}});
+                    continue;
+                }
+                if (helloBehavior == HelloBehavior::BadJson) {
+                    socket->write("not-json\n");
+                    socket->flush();
+                    continue;
+                }
+                if (helloBehavior == HelloBehavior::WrongProtocol) {
+                    send({{"version", 2}, {"request_id", id}, {"ok", true},
+                          {"service", "workpiece-orientation"}, {"ready", true}});
+                    continue;
+                }
+                if (helloBehavior == HelloBehavior::WrongService) {
+                    send({{"version", 1}, {"request_id", id}, {"ok", true},
+                          {"service", "foreign-service"}, {"ready", true}});
+                    continue;
+                }
+                if (helloBehavior == HelloBehavior::NoResponse) {
+                    continue;
+                }
+                if (helloBehavior == HelloBehavior::CloseImmediately) {
+                    socket->abort();
+                    continue;
+                }
                 if (loadingResponses > 0) {
                     --loadingResponses;
                     send({{"version", 1}, {"request_id", id}, {"ok", true},
@@ -125,8 +165,10 @@ private slots:
                 }
             } else if (object.value(QStringLiteral("command")).toString() == QStringLiteral("shutdown")) {
                 lastShutdownToken = object.value(QStringLiteral("instance_token")).toString();
-                send({{"version", 1}, {"request_id", id}, {"ok", true}});
-                socket->disconnectFromHost();
+                if (respondToShutdown) {
+                    send({{"version", 1}, {"request_id", id}, {"ok", true}});
+                    socket->disconnectFromHost();
+                }
             }
         }
     }
@@ -147,6 +189,8 @@ private:
     QString modelFingerprint;
     QString token;
     QString lastShutdownToken;
+    bool respondToShutdown = true;
+    HelloBehavior helloBehavior = HelloBehavior::Ready;
 };
 
 class TestBackendProcessManager : public QObject {
@@ -273,6 +317,47 @@ private slots:
         manager.start();
 
         QTRY_COMPARE_WITH_TIMEOUT(unavailableSpy.count(), 1, 1000);
+        QCOMPARE(unavailableSpy.at(0).at(1).toString(),
+                 QStringLiteral("BACKEND_INSTANCE_CONFLICT"));
+        QCOMPARE(launcher.startCalls, 0);
+        QCOMPARE(launcher.terminateCalls, 0);
+        QCOMPARE(launcher.killCalls, 0);
+    }
+
+    void packagedTcpContactFailuresAreInstanceConflicts_data() {
+        QTest::addColumn<int>("behavior");
+        QTest::newRow("hello-ok-false")
+            << int(HandshakeServer::HelloBehavior::ErrorResponse);
+        QTest::newRow("bad-json") << int(HandshakeServer::HelloBehavior::BadJson);
+        QTest::newRow("wrong-protocol")
+            << int(HandshakeServer::HelloBehavior::WrongProtocol);
+        QTest::newRow("wrong-service")
+            << int(HandshakeServer::HelloBehavior::WrongService);
+        QTest::newRow("accepted-timeout")
+            << int(HandshakeServer::HelloBehavior::NoResponse);
+        QTest::newRow("immediate-close")
+            << int(HandshakeServer::HelloBehavior::CloseImmediately);
+    }
+
+    void packagedTcpContactFailuresAreInstanceConflicts() {
+        QFETCH(int, behavior);
+        HandshakeServer server;
+        server.setHelloBehavior(static_cast<HandshakeServer::HelloBehavior>(behavior));
+        QVERIFY(server.listen(0));
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        AppConfig config = packagedConfigFor(server.port());
+        if (static_cast<HandshakeServer::HelloBehavior>(behavior)
+            == HandshakeServer::HelloBehavior::NoResponse) {
+            config.startupTimeoutMs = 50;
+            config.requestTimeoutMs = 500;
+        }
+        BackendProcessManager manager(config, &client, &launcher);
+        QSignalSpy unavailableSpy(&manager, &BackendProcessManager::backendUnavailable);
+
+        manager.start();
+
+        QTRY_COMPARE_WITH_TIMEOUT(unavailableSpy.count(), 1, 1500);
         QCOMPARE(unavailableSpy.at(0).at(1).toString(),
                  QStringLiteral("BACKEND_INSTANCE_CONFLICT"));
         QCOMPARE(launcher.startCalls, 0);
@@ -622,6 +707,115 @@ private slots:
         manager.shutdownOwnedService();
 
         QTRY_COMPARE_WITH_TIMEOUT(server.shutdownToken(), launchedToken, 1000);
+    }
+
+    void shutdownAckWaitsForGracefulProcessExit() {
+        const quint16 port = unusedPort();
+        HandshakeServer server;
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        AppConfig config = configFor(port, 1000);
+        BackendProcessManager manager(config, &client, &launcher);
+        QObject::connect(&launcher, &FakeProcessLauncher::startRequested, &server, [&]() {
+            server.setIdentity(config.packageVersion, config.edition, config.computeDevice,
+                               config.modelSha256,
+                               argumentValue(launcher.lastArguments,
+                                             QStringLiteral("--instance-token")));
+            QVERIFY(server.listen(port));
+        });
+        QSignalSpy readySpy(&manager, &BackendProcessManager::backendReady);
+        manager.start();
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1500);
+        launcher.delayExit = true;
+        const QString launchedToken = argumentValue(
+            launcher.lastArguments, QStringLiteral("--instance-token"));
+
+        manager.shutdownOwnedService();
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.shutdownToken(), launchedToken, 1000);
+        QTest::qWait(40);
+        QCOMPARE(launcher.terminateCalls, 0);
+        QCOMPARE(launcher.killCalls, 0);
+        launcher.finish(0);
+        QTest::qWait(200);
+        QCOMPARE(launcher.terminateCalls, 0);
+        QCOMPARE(launcher.killCalls, 0);
+    }
+
+    void shutdownWithoutResponseEscalatesTerminateThenKillOnce() {
+        const quint16 port = unusedPort();
+        HandshakeServer server;
+        server.setRespondToShutdown(false);
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        AppConfig config = configFor(port, 1000);
+        BackendProcessManager manager(config, &client, &launcher);
+        QObject::connect(&launcher, &FakeProcessLauncher::startRequested, &server, [&]() {
+            server.setIdentity(config.packageVersion, config.edition, config.computeDevice,
+                               config.modelSha256,
+                               argumentValue(launcher.lastArguments,
+                                             QStringLiteral("--instance-token")));
+            QVERIFY(server.listen(port));
+        });
+        QSignalSpy readySpy(&manager, &BackendProcessManager::backendReady);
+        manager.start();
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1500);
+        launcher.delayExit = true;
+        const QString launchedToken = argumentValue(
+            launcher.lastArguments, QStringLiteral("--instance-token"));
+
+        manager.shutdownOwnedService();
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.shutdownToken(), launchedToken, 1000);
+        QTest::qWait(40);
+        QCOMPARE(launcher.terminateCalls, 0);
+        QCOMPARE(launcher.killCalls, 0);
+        QTRY_COMPARE_WITH_TIMEOUT(launcher.terminateCalls, 1, 500);
+        QCOMPARE(launcher.killCalls, 0);
+        QTRY_COMPARE_WITH_TIMEOUT(launcher.killCalls, 1, 500);
+        QTest::qWait(150);
+        QCOMPARE(launcher.terminateCalls, 1);
+        QCOMPARE(launcher.killCalls, 1);
+    }
+
+    void stopDuringLaunchIgnoresLateProcessCallbacks() {
+        const quint16 port = unusedPort();
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        BackendProcessManager manager(configFor(port, 1000), &client, &launcher);
+        QSignalSpy unavailableSpy(&manager, &BackendProcessManager::backendUnavailable);
+        manager.start();
+        QTRY_COMPARE_WITH_TIMEOUT(launcher.startCalls, 1, 1000);
+
+        manager.shutdownOwnedService();
+        emit launcher.failed(QStringLiteral("late launch failure"));
+        launcher.finish(23);
+        QTest::qWait(50);
+
+        QCOMPARE(unavailableSpy.count(), 0);
+        QCOMPARE(launcher.terminateCalls, 0);
+        QCOMPARE(launcher.killCalls, 0);
+    }
+
+    void terminalFailureIgnoresLaterProcessExit() {
+        const quint16 port = unusedPort();
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        BackendProcessManager manager(configFor(port, 1000), &client, &launcher);
+        QSignalSpy unavailableSpy(&manager, &BackendProcessManager::backendUnavailable);
+        manager.start();
+        QTRY_COMPARE_WITH_TIMEOUT(launcher.startCalls, 1, 1000);
+
+        emit client.transportFailed(
+            1, QStringLiteral("SERVICE_FAILURE"), QStringLiteral("terminal failure"),
+            QJsonObject{{QStringLiteral("action"), QStringLiteral("stop")},
+                        {QStringLiteral("log_path"), QStringLiteral("data/logs")}});
+        QTRY_COMPARE_WITH_TIMEOUT(unavailableSpy.count(), 1, 1000);
+
+        launcher.finish(37);
+        QTest::qWait(50);
+
+        QCOMPARE(unavailableSpy.count(), 1);
     }
 };
 

@@ -1,5 +1,6 @@
 #include "backendprocessmanager.h"
 
+#include <QAbstractSocket>
 #include <QCoreApplication>
 #include <QDir>
 #include <QJsonObject>
@@ -42,6 +43,12 @@ BackendProcessManager::BackendProcessManager(const AppConfig &config, BackendCli
             this, &BackendProcessManager::onHandshakeSucceeded);
     connect(client_, &BackendClient::transportFailed,
             this, &BackendProcessManager::onTransportFailed);
+    connect(client_, &BackendClient::stateChanged, this,
+            [this](BackendClient::State state, const QString &) {
+        if (!launchRequested_ && state == BackendClient::State::Handshaking) {
+            prelaunchProbeConnected_ = true;
+        }
+    });
     connect(client_, &BackendClient::responseReceived,
             this, &BackendProcessManager::onResponseReceived);
     connect(launcher_, &ProcessLauncher::failed, this, &BackendProcessManager::onProcessFailed);
@@ -59,8 +66,10 @@ void BackendProcessManager::start() {
     stopEscalationTimer_->stop();
     client_->disconnectFromService();
     shuttingDown_ = false;
+    terminalFailure_ = false;
     launchRequested_ = false;
     launchedProcess_ = false;
+    prelaunchProbeConnected_ = false;
     reusingExternalDevelopmentService_ = false;
     launchInstanceToken_.clear();
     readyInstanceToken_.clear();
@@ -76,11 +85,13 @@ void BackendProcessManager::restart() {
     ++startupGeneration_;
     retryTimer_->stop();
     startupTimer_->stop();
+    terminalFailure_ = false;
     backendProgress_ = 0;
     if (!owned_) {
         client_->disconnectFromService();
         launchRequested_ = false;
         launchedProcess_ = false;
+        prelaunchProbeConnected_ = false;
         launchInstanceToken_.clear();
         readyInstanceToken_.clear();
         startupTimer_->start(config_.startupTimeoutMs);
@@ -112,14 +123,20 @@ void BackendProcessManager::shutdownOwnedService() {
     startupTimer_->stop();
     stopEscalationTimer_->stop();
     restartPhase_ = RestartPhase::Idle;
-    if (!owned_ || shuttingDown_) {
+    if (shuttingDown_) {
         client_->disconnectFromService();
         return;
     }
     shuttingDown_ = true;
+    if (!owned_) {
+        client_->disconnectFromService();
+        return;
+    }
     if (client_->state() == BackendClient::State::Ready && canControlOwnedProcess()) {
+        restartPhase_ = RestartPhase::GracefulStop;
         client_->sendRequest(QStringLiteral("shutdown"),
                              {{QStringLiteral("instance_token"), launchInstanceToken_}});
+        stopEscalationTimer_->start(stopEscalationIntervalMs());
     } else if (launcher_->isRunning() && canControlOwnedProcess()) {
         stoppingOwnedProcess_ = true;
         launcher_->terminate();
@@ -227,6 +244,22 @@ void BackendProcessManager::onTransportFailed(quint64 generation, const QString 
         || restartPhase_ != RestartPhase::Idle) {
         return;
     }
+    if (config_.launchMode == BackendLaunchMode::PackagedExecutable
+        && !launchRequested_ && prelaunchProbeConnected_) {
+        markUnavailable(QStringLiteral("检测到其他后端实例占用当前端口"),
+                        QStringLiteral("BACKEND_INSTANCE_CONFLICT"),
+                        kConflictAction, configuredLogPath());
+        return;
+    }
+    const bool connectionRefused = code == QStringLiteral("CONNECTION_ERROR")
+        && details.value(QStringLiteral("socket_error")).toInt(-1)
+            == int(QAbstractSocket::ConnectionRefusedError);
+    if (config_.launchMode == BackendLaunchMode::PackagedExecutable
+        && !launchRequested_ && !connectionRefused) {
+        markUnavailable(message, QStringLiteral("BACKEND_CONNECTION_ERROR"),
+                        kStartAction, configuredLogPath());
+        return;
+    }
     if (code == QStringLiteral("CONNECTION_ERROR")
         || code == QStringLiteral("CONNECTION_LOST")
         || code == QStringLiteral("TIMEOUT")) {
@@ -278,6 +311,13 @@ void BackendProcessManager::onStartupTimeout() {
         return;
     }
     retryTimer_->stop();
+    if (config_.launchMode == BackendLaunchMode::PackagedExecutable
+        && !launchRequested_ && prelaunchProbeConnected_) {
+        markUnavailable(QStringLiteral("检测到其他后端实例占用当前端口"),
+                        QStringLiteral("BACKEND_INSTANCE_CONFLICT"),
+                        kConflictAction, configuredLogPath());
+        return;
+    }
     if (!launchRequested_) {
         launchBackend();
         startupTimer_->start(config_.startupTimeoutMs);
@@ -307,7 +347,8 @@ void BackendProcessManager::onStopEscalationTimeout() {
 }
 
 void BackendProcessManager::onProcessFailed(const QString &message) {
-    if (restartPhase_ != RestartPhase::Idle) {
+    if (shuttingDown_ || terminalFailure_
+        || restartPhase_ != RestartPhase::Idle) {
         return;
     }
     retryTimer_->stop();
@@ -319,6 +360,20 @@ void BackendProcessManager::onProcessFailed(const QString &message) {
 
 void BackendProcessManager::onProcessFinished(int exitCode) {
     launchedProcess_ = false;
+    if (shuttingDown_) {
+        Q_UNUSED(exitCode)
+        stopEscalationTimer_->stop();
+        restartPhase_ = RestartPhase::Idle;
+        stoppingOwnedProcess_ = false;
+        if (owned_) {
+            owned_ = false;
+            emit serviceOwnershipChanged(false);
+        }
+        return;
+    }
+    if (terminalFailure_) {
+        return;
+    }
     if (restartPhase_ != RestartPhase::Idle) {
         Q_UNUSED(exitCode)
         relaunchAfterRestartExit();
@@ -353,8 +408,10 @@ void BackendProcessManager::relaunchAfterRestartExit() {
 }
 
 void BackendProcessManager::launchBackend() {
+    terminalFailure_ = false;
     launchRequested_ = true;
     launchedProcess_ = true;
+    prelaunchProbeConnected_ = false;
     reusingExternalDevelopmentService_ = false;
     owned_ = false;
     readyInstanceToken_.clear();
@@ -377,6 +434,7 @@ void BackendProcessManager::markUnavailable(const QString &reason, const QString
                                             const QString &logPath) {
     retryTimer_->stop();
     startupTimer_->stop();
+    terminalFailure_ = true;
     ++startupGeneration_;
     client_->disconnectFromService();
     emit backendUnavailable(reason, code, action, logPath);

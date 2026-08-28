@@ -1523,6 +1523,8 @@ void MainWindow::onBackendReady() {
 
 void MainWindow::onBackendLoading(const QString &phase, const QString &message,
                                   int progress) {
+    const bool recovering = manager_ != nullptr && backendEverReady_
+        && backendPresentationState_ == BackendUiState::Recovering;
     backendReadyHandled_ = false;
     backendReady_ = false;
     clientBusy_ = false;
@@ -1532,7 +1534,7 @@ void MainWindow::onBackendLoading(const QString &phase, const QString &message,
         geometryRulesPage_->setBusy(true);
     }
     BackendStatusDetails details;
-    details.state = BackendUiState::Loading;
+    details.state = recovering ? BackendUiState::Recovering : BackendUiState::Loading;
     const QHash<QString, QString> phaseLabels{
         {QStringLiteral("starting_process"), QStringLiteral("正在启动后端")},
         {QStringLiteral("loading_runtime"), QStringLiteral("正在加载运行环境")},
@@ -1543,17 +1545,21 @@ void MainWindow::onBackendLoading(const QString &phase, const QString &message,
     const QString phaseLabel = phaseLabels.value(
         phase, message.isEmpty() ? QStringLiteral("后端正在加载") : message);
     const int displayProgress = qBound(0, progress, 100);
-    details.connectionDetail = phaseLabel;
+    details.connectionDetail = recovering
+        ? QStringLiteral("正在重新连接") : phaseLabel;
     details.modelDetail = message.isEmpty()
         ? QStringLiteral("%1（%2%）").arg(phaseLabel).arg(displayProgress)
         : QStringLiteral("%1（%2%）").arg(message).arg(displayProgress);
+    if (recovering) details.recentError = backendRecoveryDetail_;
     details.canRestart = manager_ != nullptr;
     presentBackendState(details);
-    appHeader_->setBackendState(BackendUiState::Loading, phaseLabel);
-    if (auto *statusLabel = appHeader_->findChild<QLabel *>(
-            QStringLiteral("backendStatusLabel"))) {
-        statusLabel->setText(phaseLabel);
-        statusLabel->setToolTip(phaseLabel);
+    if (!recovering) {
+        appHeader_->setBackendState(BackendUiState::Loading, phaseLabel);
+        if (auto *statusLabel = appHeader_->findChild<QLabel *>(
+                QStringLiteral("backendStatusLabel"))) {
+            statusLabel->setText(phaseLabel);
+            statusLabel->setToolTip(phaseLabel);
+        }
     }
     showLibraryMessage(message.isEmpty() ? QStringLiteral("正在加载模型，请稍候…") : message);
     updateButtonStates();

@@ -64,8 +64,10 @@ private:
     bool owned_ = false;
     bool launchedProcess_ = false;
     bool launchRequested_ = false;
+    bool prelaunchProbeConnected_ = false;
     bool reusingExternalDevelopmentService_ = false;
     bool shuttingDown_ = false;
+    bool terminalFailure_ = false;
     bool stoppingOwnedProcess_ = false;
     RestartPhase restartPhase_ = RestartPhase::Idle;
     quint64 startupGeneration_ = 0;

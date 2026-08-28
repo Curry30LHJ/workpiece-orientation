@@ -140,6 +140,63 @@ private slots:
                  QStringLiteral("1.0.0"));
     }
 
+    void loadingReceiverCanDisconnectWithoutRetryingHello() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            server.sendJson(loadingHelloResponse(
+                request.value(QStringLiteral("request_id")).toString()));
+        });
+        QObject::connect(&client, &BackendClient::handshakeLoading, &client,
+                         [&](quint64, const QJsonObject &) {
+            client.disconnectFromService();
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000, 1);
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.requests().size(), 1, 1000);
+        QTest::qWait(600);
+        QCOMPARE(server.requests().size(), 1);
+        QCOMPARE(client.state(), BackendClient::State::Disconnected);
+    }
+
+    void loadingReceiverCanReconnectWithoutStaleHelloOrRequestId() {
+        FakeTcpServer loadingServer;
+        FakeTcpServer replacementServer;
+        QVERIFY(loadingServer.start());
+        QVERIFY(replacementServer.start());
+        BackendClient client;
+        QSignalSpy readySpy(&client, &BackendClient::handshakeSucceeded);
+        QSignalSpy transportSpy(&client, &BackendClient::transportFailed);
+        QObject::connect(&loadingServer, &FakeTcpServer::requestReceived,
+                         &loadingServer, [&](const QJsonObject &request) {
+            loadingServer.sendJson(loadingHelloResponse(
+                request.value(QStringLiteral("request_id")).toString()));
+        });
+        QObject::connect(&client, &BackendClient::handshakeLoading, &client,
+                         [&](quint64 generation, const QJsonObject &) {
+            if (generation == 1) {
+                client.connectToService(QHostAddress::LocalHost,
+                                        replacementServer.port(), 1000, 2);
+            }
+        });
+
+        client.connectToService(QHostAddress::LocalHost, loadingServer.port(), 1000, 1);
+
+        QTRY_COMPARE_WITH_TIMEOUT(replacementServer.requests().size(), 1, 1000);
+        const QString replacementRequestId = replacementServer.requests().constFirst()
+            .value(QStringLiteral("request_id")).toString();
+        QVERIFY(!replacementRequestId.isEmpty());
+        QTest::qWait(600);
+        QCOMPARE(replacementServer.requests().size(), 1);
+        replacementServer.sendJson(helloResponse(replacementRequestId));
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1000);
+        QCOMPARE(readySpy.at(0).at(0).toULongLong(), quint64(2));
+        QCOMPARE(transportSpy.count(), 0);
+    }
+
     void buffersPartialAndMultipleResponses() {
         FakeTcpServer server;
         QVERIFY(server.start());

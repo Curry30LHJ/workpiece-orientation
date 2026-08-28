@@ -152,11 +152,11 @@ void BackendClient::onDisconnected() {
 }
 
 void BackendClient::onSocketError(QAbstractSocket::SocketError error) {
-    Q_UNUSED(error)
     if (state_ == State::Disconnected) {
         return;
     }
-    failTransport(QStringLiteral("CONNECTION_ERROR"), socket_->errorString());
+    failTransport(QStringLiteral("CONNECTION_ERROR"), socket_->errorString(),
+                  QJsonObject{{QStringLiteral("socket_error"), int(error)}});
 }
 
 void BackendClient::onRequestTimeout() {
@@ -218,8 +218,8 @@ void BackendClient::handleResponse(const QJsonObject &response) {
             requestTimer_->stop();
             handshakeRequestId_.clear();
             setState(State::Handshaking, message);
-            emit handshakeLoading(connectionGeneration_, response);
             handshakeRetryTimer_->start();
+            emit handshakeLoading(connectionGeneration_, response);
             return;
         }
         if (!response.value(QStringLiteral("ready")).toBool()) {
