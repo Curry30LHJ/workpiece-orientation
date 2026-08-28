@@ -11,13 +11,16 @@ param(
 )
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $stagingRoot = [IO.Path]::GetFullPath($OutputRoot)
-if (-not $stagingRoot.StartsWith(([IO.Path]::GetFullPath((Join-Path $repo 'release_staging'))), [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputRoot must remain under release_staging' }
+$ownedRoot = ([IO.Path]::GetFullPath((Join-Path $repo 'release_staging'))).TrimEnd('\') + '\'
+if (-not $stagingRoot.StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputRoot must remain under release_staging' }
+$windeploy = if ($WindeployQt) { $WindeployQt } else { Join-Path $QtBin 'windeployqt.exe' }
+if (-not (Test-Path -LiteralPath $windeploy)) { throw "windeployqt not found: $windeploy" }
 $editions = if ($Edition -eq 'all') { @('gpu','cpu') } else { @($Edition) }
 $qtBuild = Join-Path $repo "qt_app\build-portable-$Version"
 if (Test-Path -LiteralPath $qtBuild) { Remove-Item -LiteralPath $qtBuild -Recurse -Force }
 & (Join-Path $repo 'scripts\build_qt5.ps1') -ProjectRoot $repo -QtBin $QtBin -BuildDir $qtBuild -SkipRuntimeConfig
 $qtRelease = Join-Path $qtBuild 'release'
-if ($WindeployQt) { & $WindeployQt '--release' '--compiler-runtime' '--no-translations' (Join-Path $qtRelease 'WorkpieceOrientation.exe') }
+& $windeploy '--release' '--compiler-runtime' '--no-translations' (Join-Path $qtRelease 'WorkpieceOrientation.exe')
 foreach ($ed in $editions) {
     $target = Join-Path $stagingRoot "$ed-$Version"
     if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
@@ -25,10 +28,10 @@ foreach ($ed in $editions) {
     & (Join-Path $repo 'scripts\build_portable_backend.ps1') -Edition $ed -Python $py -ProjectRoot $repo -OutputRoot $stagingRoot
     $backend = Join-Path $stagingRoot "backend-$ed\orientation_backend"
     $model = if ($ModelPath) { $ModelPath } else { Join-Path $repo 'models\shitu_rec' }
-    & $py -m release_tools.portable_package stage --edition $ed --version $Version --qt-release-dir $qtRelease --backend-dir $backend --model-dir $model --output-root $stagingRoot
+    & $py -m release_tools.portable_package stage --edition $ed --version $Version --qt-release-dir $qtRelease --backend-dir $backend --model-dir $model --output-root $stagingRoot --guide (Join-Path $repo 'deploy\使用说明.txt') --notices (Join-Path $repo 'deploy\THIRD_PARTY-NOTICES.txt')
     $package = Join-Path $target "WorkpieceOrientation-$($ed.ToUpper())"
     & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$package')/'third_party_licenses', paddleclas_license=Path(r'$repo')/'third_party'/'PaddleClas'/'LICENSE')"
     if ($SmokeScript -and (Test-Path -LiteralPath $SmokeScript)) { & $SmokeScript -PythonExecutable $py -ProjectRoot $package }
     $label = $ed.ToUpper()
-    & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$package'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=[Path(r'$repo')],dependency_checker=lambda e,r:[]); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=[Path(r'$repo')],dependency_checker=lambda e,r:[]); a=zip_package(p,Path(r'$repo')/'release_artifacts'/f'WorkpieceOrientation-$label-x64-$Version.zip'); write_sha256(a)"
+    & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$package'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=[Path(r'$repo')]); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=[Path(r'$repo')]); a=zip_package(p,Path(r'$repo')/'release_artifacts'/f'WorkpieceOrientation-$label-x64-$Version.zip'); write_sha256(a)"
 }

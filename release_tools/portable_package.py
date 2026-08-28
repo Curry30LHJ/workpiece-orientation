@@ -63,7 +63,7 @@ def _copy_tree(src: Path, dst: Path) -> None:
 
 def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_dir: Path,
                   model_dir: Path, output_root: Path, repository_root: Path | None = None,
-                  guide: Path | None = None, notices: Path | None = None) -> PackageLayout:
+                  guide: Path | None = None, notices: Path | None = None, git_commit: str = "unknown") -> PackageLayout:
     edition = edition.lower()
     root = Path(output_root) / f"{edition}-{version}" / f"WorkpieceOrientation-{edition.upper()}"
     if root.exists():
@@ -101,13 +101,12 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
     licenses = root / "third_party_licenses"
     licenses.mkdir()
     (licenses / "index.txt").write_text("Third-party license texts are listed in THIRD_PARTY-NOTICES.txt.\n", encoding="utf-8")
-    if guide and Path(guide).exists(): shutil.copy2(guide, root / "使用说明.txt")
-    elif not (root / "使用说明.txt").exists(): (root / "使用说明.txt").write_text("离线使用说明\n", encoding="utf-8")
-    if notices and Path(notices).exists(): shutil.copy2(notices, root / "THIRD_PARTY-NOTICES.txt")
-    elif not (root / "THIRD_PARTY-NOTICES.txt").exists(): (root / "THIRD_PARTY-NOTICES.txt").write_text("Third-party notices\n", encoding="utf-8")
+    if not guide or not Path(guide).is_file(): raise FileNotFoundError("offline guide is required")
+    if not notices or not Path(notices).is_file(): raise FileNotFoundError("third-party notices are required")
+    shutil.copy2(guide, root / "使用说明.txt"); shutil.copy2(notices, root / "THIRD_PARTY-NOTICES.txt")
     model_sha = model_directory_sha256(model_target)
     (root / "app_config.json").write_text(json.dumps(build_release_config(edition=edition, version=version, model_sha256=model_sha), indent=2), encoding="utf-8")
-    metadata = {"version": version, "edition": edition, "git_commit": "unknown", "build_utc": datetime.now(timezone.utc).isoformat(), "python": "3.10", "paddle": "3.2.2", "paddleclas": "2.6.0", "pyinstaller": "6.22.2", "qt": "5.14.2", "model_sha256": model_sha}
+    metadata = {"version": version, "edition": edition, "git_commit": git_commit, "build_utc": datetime.now(timezone.utc).isoformat(), "python": "3.10", "paddle": "3.2.2", "paddleclas": "2.6.0", "pyinstaller": "6.22.2", "qt": "5.14.2", "model_sha256": model_sha}
     (root / "version.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return PackageLayout(root, edition, version)
 
@@ -148,18 +147,18 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
     for file in root.rglob("*"):
         if not file.is_file(): continue
         rel = file.relative_to(root).as_posix().lower(); name = file.name.lower()
-        if file.suffix.lower() in {".py", ".pyi"}: errors.append("Python source is not allowed: " + rel)
+        if file.suffix.lower() == ".py" or (file.suffix.lower() == ".pyi" and "/_internal/" not in "/" + rel): errors.append("Python source is not allowed: " + rel)
         if file.suffix.lower() in {".pdb", ".obj"} or any(x in rel for x in ("test", "report", "fixture", "manual")): errors.append("development artifact: " + rel)
         if edition == "cpu" and any(tok in name for tok in ("cuda", "cudnn", "cublas", "nvidia")): errors.append("CUDA runtime in CPU package: " + rel)
         data_rel = rel.startswith("data/")
-        if data_rel and any(tok in name for tok in ("rule", "cache", "manifest")) and name != "data_layout.json": errors.append("shipped data artifact: " + rel)
+        if data_rel and any(tok in rel.split("/") for tok in ("rules", "cache", "manifest")) and name != "data_layout.json": errors.append("shipped data artifact: " + rel)
         raw = file.read_bytes(); text = raw.decode("utf-8", errors="ignore").replace("\\", "/").lower(); text16 = raw.decode("utf-16", errors="ignore").replace("\\", "/").lower()
         if any(token and token in text for token in known_roots) or any(token and token in text16 for token in known_roots): errors.append("absolute path found: " + rel)
         if rel in {"app_config.json", "version.json"} and re.search(r"[a-z]:[/\\]", text): errors.append("absolute path found: " + rel)
         if "${" in text or "{{" in text: errors.append("unresolved template token: " + rel)
     if edition == "gpu":
-        names = {p.name.lower() for p in (root / "backend").glob("*")}
-        if not any("paddle" in n and n.endswith(".dll") for n in names): errors.append("Paddle GPU runtime missing")
+        names = {p.name.lower() for p in (root / "backend").rglob("*") if p.is_file()}
+        if not any("paddle" in n and Path(n).suffix in {".dll", ".pyd"} for n in names): errors.append("Paddle GPU runtime missing")
         for family in ("cudnn", "cublas", "cudart"):
             if not any(family in n for n in names): errors.append(f"NVIDIA runtime family missing: {family}")
     for exe in (root / "WorkpieceOrientation.exe", root / "backend" / "orientation_backend.exe"):
@@ -172,14 +171,18 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
 
 def write_manifest(root: Path, *, edition: str, version: str) -> dict[str, object]:
     files = []
-    for path in sorted(p for p in Path(root).rglob("*") if p.is_file() and p.name != "manifest.json"):
+    for path in sorted(p for p in Path(root).rglob("*") if p.is_file() and path_relative(p, root) != "manifest.json"):
         data = path.read_bytes(); files.append({"path": path.relative_to(root).as_posix(), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
     manifest = {"version": version, "edition": edition, "files": files}
     (Path(root) / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
 
 
-def collect_licenses(destination: Path, distributions: Iterable[str] = ("python", "pyinstaller", "paddlepaddle", "paddleclas", "numpy", "opencv-python"), paddleclas_license: Path | None = None) -> Path:
+def path_relative(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def collect_licenses(destination: Path, distributions: Iterable[str] = ("python", "pyinstaller", "paddlepaddle", "paddlepaddle-gpu", "paddleclas", "numpy", "opencv-python"), paddleclas_license: Path | None = None) -> Path:
     destination = Path(destination); destination.mkdir(parents=True, exist_ok=True); index = []
     for name in distributions:
         try: dist = importlib.metadata.distribution(name)
@@ -191,7 +194,9 @@ def collect_licenses(destination: Path, distributions: Iterable[str] = ("python"
         if copied: index.append(f"{name} {dist.version}: {', '.join(copied)}")
         elif name.lower() in {"paddlepaddle", "paddlepaddle-gpu", "paddleclas", "pyinstaller"}:
             raise PackageAuditError(f"missing license text for {name}")
-    if paddleclas_license and Path(paddleclas_license).exists(): shutil.copy2(paddleclas_license, destination / "PaddleClas-LICENSE")
+    if paddleclas_license:
+        if not Path(paddleclas_license).is_file(): raise PackageAuditError("PaddleClas license text is missing")
+        shutil.copy2(paddleclas_license, destination / "PaddleClas-LICENSE")
     (destination / "index.txt").write_text("\n".join(index) + "\n", encoding="utf-8"); return destination / "index.txt"
 
 
@@ -209,9 +214,10 @@ def write_sha256(archive: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True); stage = sub.add_parser("stage")
     for arg in ("edition", "version", "qt-release-dir", "backend-dir", "model-dir", "output-root"): stage.add_argument("--" + arg, required=True)
+    stage.add_argument("--guide", required=True); stage.add_argument("--notices", required=True)
     args = parser.parse_args()
     if args.command == "stage":
-        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root)); print(result.root)
+        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), guide=Path(args.guide), notices=Path(args.notices)); print(result.root)
 
 
 if __name__ == "__main__": main()
