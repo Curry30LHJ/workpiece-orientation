@@ -121,14 +121,39 @@ def _prefixed_fast_error_code(error: object) -> str | None:
     return code if code in FAST_HARD_ERROR_CODES else None
 
 
-def _prune_diagnostic_logs(logs_dir: Path, maximum_bytes: int = 30 * 1024 * 1024) -> None:
+def _diagnostic_log_series(handler: TimedRotatingFileHandler) -> list[Path]:
+    log_path = Path(handler.baseFilename)
+    backup_prefix = f"{log_path.name}."
     files = []
-    total = 0
-    for child in logs_dir.iterdir():
+    for child in log_path.parent.iterdir():
         if child.is_symlink() or not child.is_file():
             continue
-        stat = child.stat()
-        files.append((stat.st_mtime_ns, child, stat.st_size))
+        if child.name == log_path.name:
+            files.append(child)
+            continue
+        if not child.name.startswith(backup_prefix):
+            continue
+        suffix = child.name[len(backup_prefix):]
+        if handler.extMatch.fullmatch(suffix):
+            files.append(child)
+    return files
+
+
+def _prune_diagnostic_logs(
+    handler: TimedRotatingFileHandler,
+    maximum_bytes: int = 30 * 1024 * 1024,
+) -> None:
+    log_path = Path(handler.baseFilename)
+    backups = sorted(path for path in _diagnostic_log_series(handler) if path != log_path)
+    excess = max(0, len(backups) - handler.backupCount)
+    for path in backups[:excess]:
+        path.unlink()
+
+    files = []
+    total = 0
+    for path in _diagnostic_log_series(handler):
+        stat = path.stat()
+        files.append((stat.st_mtime_ns, path, stat.st_size))
         total += stat.st_size
     for _modified, path, size in sorted(files):
         if total <= maximum_bytes:
@@ -156,7 +181,19 @@ def configure_diagnostic_logging(logs_dir: Path) -> logging.Handler:
         root_logger.removeHandler(existing)
         existing.close()
 
-    _prune_diagnostic_logs(logs_dir)
+    retention_probe = TimedRotatingFileHandler(
+        log_path,
+        when="midnight",
+        interval=1,
+        backupCount=14,
+        encoding="utf-8",
+        utc=False,
+        delay=True,
+    )
+    try:
+        _prune_diagnostic_logs(retention_probe)
+    finally:
+        retention_probe.close()
     handler = TimedRotatingFileHandler(
         log_path,
         when="midnight",

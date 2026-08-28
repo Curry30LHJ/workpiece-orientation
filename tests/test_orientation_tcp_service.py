@@ -1336,6 +1336,9 @@ def test_diagnostic_logging_prunes_only_old_files_inside_logs_directory(tmp_path
     logs_dir.mkdir(parents=True)
     outside = tmp_path / "must-not-touch.log"
     outside.write_bytes(b"outside")
+    unrelated = logs_dir / "operator-note.txt"
+    unrelated.write_bytes(b"keep")
+    os.utime(unrelated, (0, 0))
     dated = []
     for index in range(4):
         path = logs_dir / f"orientation-service.log.2026-08-{index + 1:02d}"
@@ -1346,9 +1349,32 @@ def test_diagnostic_logging_prunes_only_old_files_inside_logs_directory(tmp_path
     handler = configure_diagnostic_logging(logs_dir)
     try:
         assert outside.read_bytes() == b"outside"
+        assert unrelated.read_bytes() == b"keep"
         assert not dated[0].exists()
         assert sum(path.stat().st_size for path in logs_dir.iterdir() if path.is_file()) <= 30 * 1024 * 1024
         assert handler.backupCount == 14
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+
+def test_diagnostic_logging_retains_only_latest_fourteen_daily_backups(tmp_path):
+    logs_dir = tmp_path / "data" / "logs"
+    logs_dir.mkdir(parents=True)
+    backups = []
+    for day in range(1, 17):
+        path = logs_dir / f"orientation-service.log.2026-08-{day:02d}"
+        path.write_bytes(f"backup-{day}".encode("ascii"))
+        os.utime(path, (day, day))
+        backups.append(path)
+    unrelated = logs_dir / "operator-note.txt"
+    unrelated.write_text("keep", encoding="utf-8")
+
+    handler = configure_diagnostic_logging(logs_dir)
+    try:
+        remaining = sorted(logs_dir.glob("orientation-service.log.2026-08-??"))
+        assert remaining == backups[-14:]
+        assert unrelated.read_text(encoding="utf-8") == "keep"
     finally:
         logging.getLogger().removeHandler(handler)
         handler.close()
