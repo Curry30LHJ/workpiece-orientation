@@ -40,6 +40,24 @@ class SmokeReport(dict):
             raise AttributeError(name) from exc
 
 
+def _persist_report(path: Path | None, report: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _process_exit_code(process: Any) -> int | None:
+    value = getattr(process, "returncode", None)
+    if value is None:
+        try:
+            value = process.poll()
+        except Exception:
+            value = None
+    return value
+
+
 class _JsonSocket:
     def __init__(self, sock: socket.socket):
         self.sock = sock
@@ -95,8 +113,11 @@ def _copy_to_long_temp(root: Path, factory: Callable[..., Path] | None) -> Path:
     else:
         base = Path(tempfile.mkdtemp(prefix="离线 smoke portable package "))
         target = base / ("x" * max(1, 190 - len(str(base))))
+    # A factory is allowed to choose the location, but an existing location is
+    # never safe to reuse: doing so could overwrite another smoke run or the
+    # caller's package data.
     if target.exists():
-        shutil.rmtree(target)
+        raise FileExistsError(f"temporary package target already exists: {target}")
     shutil.copytree(root, target)
     if factory is None and len(str(target.resolve())) < 180:
         raise RuntimeError("temporary package path is shorter than portability requirement")
@@ -130,29 +151,44 @@ def _real_process_factory(args: list[str], *, cwd: str, token: str) -> subproces
 
 def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | None = None,
               socket_factory: Callable[..., Any] | None = None,
-              temp_root_factory: Callable[..., Path] | None = None) -> dict[str, Any]:
+              temp_root_factory: Callable[..., Path] | None = None,
+              free_port_factory: Callable[[], int] | None = None,
+              port_factory: Callable[[], int] | None = None) -> dict[str, Any]:
     """Run a packaged protocol smoke test. Factories make the workflow unit-testable."""
     if options.package_root is None:
         raise ValueError("package_root is required")
     package = Path(options.package_root).resolve()
-    config = _package_config(package)
-    templates, held_out = split_labels(Path(options.dataset_root), options.front_template_count, options.seed)
-    front = [str(p) for p in templates["0"]]
-    back = [str(p) for p in templates["1"]]
-    template_hashes = {hashlib.sha256(p.read_bytes()).digest() for p in (*templates["0"], *templates["1"])}
-    def held_out_query(label: str) -> Path:
-        for candidate in held_out[label]:
-            if hashlib.sha256(candidate.read_bytes()).digest() not in template_hashes:
-                return candidate
-        raise ValueError(f"no held-out query distinct from templates for label {label}")
-    front_query, back_query = str(held_out_query("0")), str(held_out_query("1"))
+    report: SmokeReport = SmokeReport(ok=False, package_root=str(package), commands=[], results=[])
+    try:
+        config = _package_config(package)
+        templates, held_out = split_labels(Path(options.dataset_root), options.front_template_count, options.seed)
+        front = [str(p) for p in templates["0"]]
+        back = [str(p) for p in templates["1"]]
+        template_hashes = {hashlib.sha256(p.read_bytes()).digest() for p in (*templates["0"], *templates["1"])}
+        def held_out_query(label: str) -> Path:
+            for candidate in held_out[label]:
+                if hashlib.sha256(candidate.read_bytes()).digest() not in template_hashes:
+                    return candidate
+            raise ValueError(f"no held-out query distinct from templates for label {label}")
+        front_query, back_query = str(held_out_query("0")), str(held_out_query("1"))
+    except Exception as exc:
+        report["error"] = str(exc)
+        report["process_exit"] = None
+        _persist_report(options.report_path, report)
+        raise
     process_factory = process_factory or _real_process_factory
-    port = _free_port()
-    temp_package = _copy_to_long_temp(package, temp_root_factory)
-    config = _package_config(temp_package)
-    process = _start_backend(temp_package, config, port, process_factory)
+    port = (free_port_factory or port_factory or _free_port)()
+    try:
+        temp_package = _copy_to_long_temp(package, temp_root_factory)
+        config = _package_config(temp_package)
+        process = _start_backend(temp_package, config, port, process_factory)
+    except Exception as exc:
+        report["error"] = str(exc)
+        report["process_exit"] = None
+        _persist_report(options.report_path, report)
+        raise
     client = None
-    report: SmokeReport = SmokeReport(ok=False, package_root=str(package), edition=config.get("edition"), commands=[], results=[])
+    report["edition"] = config.get("edition")
     deadline = time.monotonic() + options.timeout_seconds
     try:
         if socket_factory is None:
@@ -173,10 +209,14 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
                 client = socket_factory("127.0.0.1", port)
 
         def request(command: str, **fields: Any) -> dict[str, Any]:
-            response = _ok(client.request(command, **fields), command)
             report["commands"].append(command)
-            report["results"].append({"command": command, "response": response})
-            return response
+            try:
+                raw_response = client.request(command, **fields)
+            except Exception as exc:
+                report["results"].append({"command": command, "error": str(exc)})
+                raise
+            report["results"].append({"command": command, "response": raw_response})
+            return _ok(raw_response, command)
 
         while True:
             hello = request("hello")
@@ -233,19 +273,28 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
                 pass
     except Exception as exc:
         report["error"] = str(exc)
-        report["process_exit"] = getattr(process, "returncode", None)
         raise
     finally:
+        primary_error = "error" in report
+        cleanup_error: Exception | None = None
         if client is not None:
-            try: client.close()
-            except Exception: pass
+            try:
+                client.close()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if getattr(process, "poll", lambda: 0)() is None:
-            try: process.terminate(); process.wait(timeout=10)
-            except Exception: pass
+            try:
+                process.terminate()
+                process.wait(timeout=10)
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        report["process_exit"] = _process_exit_code(process)
         if options.report_path:
-            Path(options.report_path).parent.mkdir(parents=True, exist_ok=True)
-            report.setdefault("process_exit", getattr(process, "returncode", None))
-            Path(options.report_path).write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            _persist_report(Path(options.report_path), report)
+        if cleanup_error is not None and not primary_error:
+            raise cleanup_error
     return report
 
 
@@ -254,56 +303,160 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
     if not options.source_package_root or not options.destination_package_root:
         raise ValueError("source_package_root and destination_package_root are required")
     destination = Path(options.destination_package_root).resolve()
-    workpieces = destination / "data" / "workpieces"
-    if workpieces.exists() and any(workpieces.iterdir()):
-        raise RuntimeError("destination package data must be empty before portability copy")
-    source = run_smoke(SmokeOptions(package_root=options.source_package_root, dataset_root=options.dataset_root,
-        front_template_count=options.front_template_count, back_template_count=options.back_template_count,
-        seed=options.seed, timeout_seconds=options.timeout_seconds), **factories)
+    report = SmokeReport(ok=False, source_package_root=str(Path(options.source_package_root).resolve()),
+                         destination_package_root=str(destination), commands=[], results=[])
+
+    def ensure_empty_data(root: Path) -> None:
+        data = root / "data"
+        if not data.exists():
+            return
+        allowed = {"workpieces", "rules", "cache", "logs", "temp", "data_layout.json"}
+        for entry in data.iterdir():
+            if entry.name not in allowed:
+                raise RuntimeError("destination package data must be empty before portability copy")
+            if entry.is_file():
+                if entry.name != "data_layout.json":
+                    raise RuntimeError("destination package data must be empty before portability copy")
+            elif any(entry.rglob("*")):
+                raise RuntimeError("destination package data must be empty before portability copy")
+
+    try:
+        ensure_empty_data(destination)
+    except Exception as exc:
+        report["error"] = str(exc)
+        _persist_report(options.report_path, report)
+        raise
+    source_factories = dict(factories)
+    try:
+        source = run_smoke(
+            SmokeOptions(package_root=options.source_package_root, dataset_root=options.dataset_root,
+                         front_template_count=options.front_template_count, back_template_count=options.back_template_count,
+                         seed=options.seed, timeout_seconds=options.timeout_seconds),
+            process_factory=source_factories.get("process_factory"),
+            socket_factory=source_factories.get("socket_factory"),
+            temp_root_factory=source_factories.get("temp_root_factory"),
+            free_port_factory=source_factories.get("free_port_factory"),
+            port_factory=source_factories.get("port_factory"),
+        )
+    except Exception as exc:
+        report["error"] = str(exc)
+        _persist_report(options.report_path, report)
+        raise
+    report["source"] = source
     src_data = Path(source["temp_package"]) / "data"
-    destination_factory = factories.get("temp_root_factory")
+    destination_factory = factories.get("destination_temp_root_factory") or factories.get("temp_root_factory")
     if destination_factory is not None:
-        original_factory = destination_factory
-        destination_factory = lambda: Path(original_factory()).with_name(Path(original_factory()).name + "-destination")
-    dest_copy = _copy_to_long_temp(destination, destination_factory)
-    shutil.rmtree(dest_copy / "data")
-    shutil.copytree(src_data, dest_copy / "data")
-    # A destination run against copied data must not register a second workpiece.
-    cfg = _package_config(dest_copy); process_factory = factories.get("process_factory") or _real_process_factory
-    port = _free_port(); process = _start_backend(dest_copy, cfg, port, process_factory); client = None; hello = {}
+        candidate = Path(destination_factory())
+        source_temp = Path(source["temp_package"]).resolve()
+        if candidate.resolve() == source_temp:
+            candidate = candidate.with_name(candidate.name + "-destination")
+        destination_factory = lambda candidate=candidate: candidate
+    try:
+        dest_copy = _copy_to_long_temp(destination, destination_factory)
+        # The copied destination must also be empty; this catches a factory that
+        # returned an already-populated package independently of the original root.
+        ensure_empty_data(dest_copy)
+        shutil.rmtree(dest_copy / "data")
+        shutil.copytree(src_data, dest_copy / "data")
+        cfg = _package_config(dest_copy)
+        process_factory = factories.get("process_factory") or _real_process_factory
+    port = (factories.get("free_port_factory") or factories.get("port_factory") or _free_port)()
+        process = _start_backend(dest_copy, cfg, port, process_factory)
+    except Exception as exc:
+        report["error"] = str(exc)
+        _persist_report(options.report_path, report)
+        raise
+    client = None
+    hello: dict[str, Any] = {}
+    destination_report: dict[str, Any] = {"commands": [], "results": []}
+    primary_error: Exception | None = None
+
+    def request(command: str, **fields: Any) -> dict[str, Any]:
+        destination_report["commands"].append(command)
+        try:
+            raw = client.request(command, **fields)
+        except Exception as exc:
+            destination_report["results"].append({"command": command, "error": str(exc)})
+            raise
+        destination_report["results"].append({"command": command, "response": raw})
+        return _ok(raw, command)
+
     try:
         sf = factories.get("socket_factory")
-        client = sf("127.0.0.1", port) if sf else _JsonSocket(socket.create_connection(("127.0.0.1", port), timeout=5))
+        if sf:
+            try:
+                client = sf("127.0.0.1", port, timeout=5)
+            except TypeError:
+                client = sf("127.0.0.1", port)
+        else:
+            client = _JsonSocket(socket.create_connection(("127.0.0.1", port), timeout=5))
         deadline = time.monotonic() + options.timeout_seconds
         while True:
-            hello = _ok(client.request("hello"), "hello")
-            if hello.get("ready") is True: break
-            if hello.get("status") != "loading" or time.monotonic() >= deadline: raise RuntimeError("destination did not become ready")
+            hello = request("hello")
+            if hello.get("ready") is True:
+                break
+            if hello.get("status") != "loading" or time.monotonic() >= deadline:
+                raise RuntimeError("destination did not become ready")
             time.sleep(0.25)
-        listed = _ok(client.request("list_workpieces"), "list_workpieces")
+        listed = request("list_workpieces")
         item = next((x for x in listed.get("workpieces", []) if x.get("id") == source["workpiece_id"]), None)
         if item is None:
             raise RuntimeError("copied workpiece missing on destination")
-        counts = item.get("template_counts") or item.get("templates")
-        if counts is None: raise RuntimeError("destination response omitted template counts")
-        if counts != source["template_counts"]: raise RuntimeError("destination template counts mismatch")
-        front = _ok(client.request("predict", workpiece_id=source["workpiece_id"], image_path=source["front_query"]), "predict")
-        back = _ok(client.request("predict", workpiece_id=source["workpiece_id"], image_path=source["back_query"]), "predict")
-        if front.get("label") != "front" or back.get("label") != "back": raise RuntimeError("destination prediction mismatch")
-        _ok(client.request("get_geometry_mask_profile", workpiece_id=source["workpiece_id"]), "get_geometry_mask_profile")
-        result = SmokeReport(ok=True, source=source, destination={"workpiece_id": source["workpiece_id"], "hello": hello, "template_counts": counts, "labels": {"front": front.get("label"), "back": back.get("label")}, "process_exit": process.returncode, "commands": [{"command":"hello","response":hello},{"command":"list_workpieces","response":listed},{"command":"predict","response":front},{"command":"predict","response":back}]})
-        if options.report_path:
-            Path(options.report_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(options.report_path).write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        return result
+        counts = item.get("template_counts")
+        if not isinstance(counts, dict):
+            raise RuntimeError("destination response omitted template counts")
+        if counts != source["template_counts"]:
+            raise RuntimeError("destination template counts mismatch")
+        front = request("predict", workpiece_id=source["workpiece_id"], image_path=source["front_query"])
+        back = request("predict", workpiece_id=source["workpiece_id"], image_path=source["back_query"])
+        if front.get("label") != "front" or back.get("label") != "back":
+            raise RuntimeError("destination prediction mismatch")
+        request("get_geometry_mask_profile", workpiece_id=source["workpiece_id"])
+    except Exception as exc:
+        primary_error = exc
+        report["error"] = str(exc)
     finally:
-        if client:
-            client.request("shutdown", instance_token=hello.get("instance_token"))
-            process.wait(timeout=10)
-            if process.returncode != 0: raise RuntimeError(f"destination exited with code {process.returncode}")
-            client.close()
-        if process.poll() is None:
-            process.terminate(); process.wait(timeout=10)
+        shutdown_error: Exception | None = None
+        if client is not None and hello.get("instance_token"):
+            try:
+                request("shutdown", instance_token=hello["instance_token"])
+            except Exception as exc:
+                shutdown_error = exc
+        try:
+            if getattr(process, "poll", lambda: None)() is None:
+                process.wait(timeout=10)
+        except Exception as exc:
+            if shutdown_error is None:
+                shutdown_error = exc
+        report["destination"] = destination_report
+        report["commands"] = list(report.get("source", {}).get("commands", [])) + list(destination_report["commands"])
+        report["results"] = list(report.get("source", {}).get("results", [])) + list(destination_report["results"])
+        destination_report["process_exit"] = _process_exit_code(process)
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                if shutdown_error is None:
+                    shutdown_error = exc
+        if getattr(process, "poll", lambda: 0)() is None:
+            try:
+                process.terminate(); process.wait(timeout=10)
+            except Exception as exc:
+                if shutdown_error is None:
+                    shutdown_error = exc
+        destination_report["process_exit"] = _process_exit_code(process)
+        if primary_error is None and shutdown_error is not None:
+            primary_error = shutdown_error
+            report["error"] = str(shutdown_error)
+        if primary_error is None and destination_report["process_exit"] not in (None, 0):
+            primary_error = RuntimeError(f"destination exited with code {destination_report['process_exit']}")
+            report["error"] = str(primary_error)
+        report["ok"] = primary_error is None
+        if options.report_path:
+            _persist_report(Path(options.report_path), report)
+    if primary_error is not None:
+        raise primary_error
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -334,4 +487,4 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["SmokeOptions", "SmokeReport", "run_smoke", "main"]
+__all__ = ["SmokeOptions", "SmokeReport", "run_smoke", "run_portability", "main"]

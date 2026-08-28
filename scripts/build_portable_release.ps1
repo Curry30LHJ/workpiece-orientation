@@ -5,6 +5,7 @@ param(
     [string]$CpuPython = 'E:\python\anaconda3\envs\shitu\python.exe',
     [string]$QtBin = 'E:\QT\5.14\5.14.2\msvc2017_64\bin',
     [string]$WindeployQt = '',
+    [switch]$SkipSmoke,
     [string]$SmokeScript = '',
     [string]$SmokeDatasetRoot = '',
     [int]$SmokeFrontTemplateCount = 5,
@@ -20,9 +21,15 @@ $stagingRoot = [IO.Path]::GetFullPath($OutputRoot)
 $ownedRootPath = [IO.Path]::GetFullPath((Join-Path $repo 'release_staging')).TrimEnd('\')
 $ownedRoot = $ownedRootPath + '\'
 if ($stagingRoot -ne $ownedRootPath -and -not $stagingRoot.StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputRoot must remain under release_staging' }
+$editions = if ($Edition -eq 'all') { @('gpu','cpu') } else { @($Edition) }
+if ($SmokeScript) {
+    throw 'SmokeScript is no longer supported; use the built-in smoke CLI (or -SkipSmoke explicitly).'
+}
+if (-not $SkipSmoke -and [string]::IsNullOrWhiteSpace($SmokeDatasetRoot)) {
+    throw 'SmokeDatasetRoot is required unless -SkipSmoke is explicitly specified.'
+}
 $windeploy = if ($WindeployQt) { $WindeployQt } else { Join-Path $QtBin 'windeployqt.exe' }
 if (-not (Test-Path -LiteralPath $windeploy)) { throw "windeployqt not found: $windeploy" }
-$editions = if ($Edition -eq 'all') { @('gpu','cpu') } else { @($Edition) }
 $qtBuild = Join-Path $repo "qt_app\build-portable-$Version"
 if (Test-Path -LiteralPath $qtBuild) { Remove-Item -LiteralPath $qtBuild -Recurse -Force }
 & (Join-Path $repo 'scripts\build_qt5.ps1') -ProjectRoot $repo -QtBin $QtBin -BuildDir $qtBuild -SkipRuntimeConfig
@@ -42,8 +49,7 @@ foreach ($ed in $editions) {
     if (-not (Test-Path -LiteralPath $pythonLicense)) { $pythonLicense = Join-Path (Split-Path $py -Parent) 'LICENSE.txt' }
     if (-not (Test-Path -LiteralPath $pythonLicense)) { throw "Python license not found beside interpreter: $pythonLicense" }
     & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$package')/'third_party_licenses', distributions=('pyinstaller','$paddleDist','paddleclas','numpy','opencv-python'), python_license=Path(r'$pythonLicense'))"
-    if ($SmokeScript -and (Test-Path -LiteralPath $SmokeScript)) { & $SmokeScript -PythonExecutable $py -ProjectRoot $package }
-    elseif ($SmokeDatasetRoot) {
+    if (-not $SkipSmoke) {
         & $py (Join-Path $repo 'scripts\smoke_portable_package.py') --package-root $package --dataset-root $SmokeDatasetRoot --front-template-count $SmokeFrontTemplateCount --back-template-count $SmokeBackTemplateCount --seed $SmokeSeed --report (Join-Path $stagingRoot 'reports' "$ed-smoke.json")
         if ($LASTEXITCODE -ne 0) { throw "Portable smoke failed for $ed" }
     }
