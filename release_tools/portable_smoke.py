@@ -348,6 +348,11 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         )
     except Exception as exc:
         report["error"] = str(exc)
+        partial = getattr(exc, "smoke_report", None)
+        if isinstance(partial, dict):
+            report["source"] = partial
+            report["commands"] = list(partial.get("commands", []))
+            report["results"] = list(partial.get("results", []))
         _persist_report(options.report_path, report)
         raise
     report["source"] = source
@@ -368,7 +373,7 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         shutil.copytree(src_data, dest_copy / "data")
         cfg = _package_config(dest_copy)
         process_factory = factories.get("process_factory") or _real_process_factory
-    port = (factories.get("free_port_factory") or factories.get("port_factory") or _free_port)()
+        port = (factories.get("free_port_factory") or factories.get("port_factory") or _free_port)()
         process = _start_backend(dest_copy, cfg, port, process_factory)
     except Exception as exc:
         report["error"] = str(exc)
