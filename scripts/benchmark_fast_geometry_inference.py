@@ -19,6 +19,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import cv2
@@ -219,7 +220,11 @@ def run_fast_measurements(
     for measurement_index in range(measured_count):
         query = queries[measurement_index % len(queries)]
         identity = identities[measurement_index % len(queries)]
-        result = _normalize_prediction_result(predict(query))
+        started = perf_counter()
+        prediction = predict(query)
+        elapsed_ms = (perf_counter() - started) * 1000.0
+        result = _normalize_prediction_result(prediction)
+        result["timings_ms"]["total"] = elapsed_ms
         if identity not in accuracy_by_identity:
             accuracy_by_identity[identity] = {**dict(query), "result": result}
         latency_rows.append({

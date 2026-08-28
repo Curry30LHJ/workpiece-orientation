@@ -370,8 +370,11 @@ def test_groups_use_fitted_metadata_and_published_rule_fields_not_filenames():
     }
 
 
-def test_warmups_are_excluded_from_measured_distribution():
+def test_warmups_are_excluded_from_measured_distribution(monkeypatch):
     calls = []
+    clock = iter([10.0, 10.001, 20.0, 20.002, 30.0, 30.003])
+
+    monkeypatch.setattr(benchmark, "perf_counter", lambda: next(clock))
 
     def predict(query):
         calls.append(query["query_identity"])
@@ -387,9 +390,51 @@ def test_warmups_are_excluded_from_measured_distribution():
     )
 
     assert len(calls) == 8
-    assert [row["timings_ms"]["total"] for row in result["latency_rows"]] == [1.0, 2.0, 3.0]
+    assert [row["timings_ms"]["total"] for row in result["latency_rows"]] == pytest.approx(
+        [1.0, 2.0, 3.0]
+    )
     assert result["latency_summary"]["samples"] == 3
-    assert result["latency_summary"]["max_ms"] == 3.0
+    assert result["latency_summary"]["max_ms"] == pytest.approx(3.0)
+
+
+def test_measurement_total_wraps_complete_predict_before_benchmark_postprocessing(
+    monkeypatch,
+):
+    events = []
+    clock = iter([10.0, 10.025])
+
+    def fake_perf_counter():
+        events.append("clock")
+        return next(clock)
+
+    def predict(query):
+        events.append("predict")
+        response = _prediction("front", elapsed=4.0)
+        events.append("response_constructed")
+        return response
+
+    original_normalize = benchmark._normalize_prediction_result
+
+    def normalize(result):
+        events.append("normalize")
+        return original_normalize(result)
+
+    monkeypatch.setattr(benchmark, "perf_counter", fake_perf_counter, raising=False)
+    monkeypatch.setattr(benchmark, "_normalize_prediction_result", normalize)
+
+    result = benchmark.run_fast_measurements(
+        [_query("q0")],
+        predict,
+        warmup=0,
+        repeats=1,
+        minimum_measured_samples=1,
+    )
+
+    timings = result["latency_rows"][0]["timings_ms"]
+    assert events == ["clock", "predict", "response_constructed", "clock", "normalize"]
+    assert timings["total"] == pytest.approx(25.0)
+    assert timings["decode"] == 1.0
+    assert timings["geometry_fit"] == 2.0
 
 
 def test_minimum_samples_cycles_queries_deterministically_without_duplicate_accuracy():
