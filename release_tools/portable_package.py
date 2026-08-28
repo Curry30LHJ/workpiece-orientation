@@ -170,7 +170,7 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
         raw = file.read_bytes(); text = raw.decode("utf-8", errors="ignore").replace("\\", "/").lower(); text16 = raw.decode("utf-16", errors="ignore").replace("\\", "/").lower()
         if any(token and token in text for token in known_roots) or any(token and token in text16 for token in known_roots): errors.append("absolute path found: " + rel)
         if rel in {"app_config.json", "version.json"} and re.search(r"[a-z]:[/\\]", text): errors.append("absolute path found: " + rel)
-        if rel in {"app_config.json", "version.json"} and (re.search(r"(^|[\"'])/(?!/)[^\s\"']+", text) or re.search(r"\\\\[^\\/]+\\[^\"']+", text)): errors.append("absolute path found: " + rel)
+        if rel in {"app_config.json", "version.json"} and (re.search(r"(^|[\"'])/(?!/)[^\s\"']+", text) or re.search(r"(^|[\"'])//[^\s\"']+", text) or re.search(r"\\\\[^\\/]+\\[^\"']+", raw.decode("utf-8", errors="ignore"))): errors.append("absolute path found: " + rel)
         if "${" in text or "{{" in text: errors.append("unresolved template token: " + rel)
     if edition == "gpu":
         names = {p.name.lower() for p in (root / "backend").rglob("*") if p.is_file()}
