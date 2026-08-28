@@ -139,6 +139,8 @@ def pyinstaller_excludes() -> tuple[str, ...]:
         "lightglue.*",
         "src.aliked_lightglue_matcher",
         "src.local_sift_matcher",
+        "src.soft_center_matcher",
+        "src.soft_center_matcher.*",
         "faiss",
         "faiss.*",
         "sklearn",
@@ -152,6 +154,9 @@ def pyinstaller_excludes() -> tuple[str, ...]:
         "src.train",
         "benchmark",
         "src.benchmark",
+        "scripts.benchmark_*",
+        "scripts.benchmark_adaptive_local_search",
+        "scripts.benchmark_geometry_rule_inference",
         "scripts.benchmark_fast_geometry_inference",
         "scripts.benchmark_portable_service",
     )

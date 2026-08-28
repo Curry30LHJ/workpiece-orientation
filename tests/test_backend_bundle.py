@@ -32,7 +32,17 @@ def test_cpu_rejects_gpu_paddle_in_same_environment():
 
 def test_fast_bundle_excludes_local_matcher_stack():
     excluded = set(pyinstaller_excludes())
-    assert {"torch", "lightglue", "src.aliked_lightglue_matcher", "src.local_sift_matcher", "faiss", "visualdl"} <= excluded
+    assert {
+        "torch",
+        "lightglue",
+        "src.aliked_lightglue_matcher",
+        "src.local_sift_matcher",
+        "src.soft_center_matcher",
+        "faiss",
+        "visualdl",
+        "scripts.benchmark_adaptive_local_search",
+        "scripts.benchmark_geometry_rule_inference",
+    } <= excluded
 
 
 def test_validation_requires_exact_versions_and_python():
@@ -40,4 +50,3 @@ def test_validation_requires_exact_versions_and_python():
         validate_installed_distributions(edition_for("gpu"), {**_packages(), "paddleclas": "2.5.0"}, python_version=(3, 10), is_64bit=True)
     with pytest.raises(BundleEnvironmentError, match="Python 3.10"):
         validate_installed_distributions(edition_for("gpu"), _packages(), python_version=(3, 11), is_64bit=True)
-

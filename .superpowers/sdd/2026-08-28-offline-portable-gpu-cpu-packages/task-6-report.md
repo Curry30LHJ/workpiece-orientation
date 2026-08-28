@@ -57,3 +57,16 @@ The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Co
 - Real GPU/CPU freezing and smoke remain pending because the locked Paddle wheels were not available within the authorized build attempt. The build scripts are intentionally fail-fast when an edition environment is incomplete.
 - `paddleclas==2.6.0` brings optional development packages (for example faiss/sklearn/visualdl); the spec excludes these modules from the frozen backend as required.
 
+## Fix round 1 — exclusion coverage
+
+Review identified missing exclusions for the soft-center matcher and two existing repository benchmark modules. The test was extended first and produced the expected RED failure (`src.soft_center_matcher`, `scripts.benchmark_adaptive_local_search`, and `scripts.benchmark_geometry_rule_inference` absent from the exclusion set). Added those exact modules plus safe wildcard forms (`src.soft_center_matcher.*`, `scripts.benchmark_*`).
+
+GREEN:
+
+```text
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_backend_bundle.py -q -p no:cacheprovider
+....                                                                     [100%]
+4 passed in 0.03s
+python -m py_compile release_tools/backend_bundle.py  # exit 0
+git diff --check                                      # clean
+```
