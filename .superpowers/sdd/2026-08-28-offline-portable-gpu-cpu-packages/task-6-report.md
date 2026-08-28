@@ -99,6 +99,10 @@ The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Co
 - Real GPU/CPU freezing and smoke remain pending because the locked Paddle wheels were not available within the authorized build attempt. The build scripts are intentionally fail-fast when an edition environment is incomplete.
 - `paddleclas==2.6.0` brings optional development packages (for example faiss/sklearn/visualdl); the spec excludes these modules from the frozen backend as required.
 
+## Fix round 4 build and smoke results
+
+Both editions were rebuilt from commit `9067c48` with Python 3.10.20/PyInstaller 6.22.2. The compatibility regression passed (`1 passed`, with the metadata/spec/env checks at `6 passed`). The rebuilt executables no longer fail on missing sklearn/faiss; however, real external-model smoke is blocked by the supplied model directory: Paddle 3.2.2 reports `Cannot open .../inference.json` while the directory contains only `inference.pdmodel`, `inference.pdiparams`, and `.info`. GPU and CPU therefore both stop at `loading_model` with `MODEL_LOAD_FAILED`; register/predict/shutdown cannot be exercised until a Paddle-3-compatible model export (including `inference.json`) is supplied. No large build outputs were added to Git; they remain under ignored `release_staging`.
+
 ## Fix round 1 — exclusion coverage
 
 Review identified missing exclusions for the soft-center matcher and two existing repository benchmark modules. The test was extended first and produced the expected RED failure (`src.soft_center_matcher`, `scripts.benchmark_adaptive_local_search`, and `scripts.benchmark_geometry_rule_inference` absent from the exclusion set). Added those exact modules plus safe wildcard forms (`src.soft_center_matcher.*`, `scripts.benchmark_*`).
