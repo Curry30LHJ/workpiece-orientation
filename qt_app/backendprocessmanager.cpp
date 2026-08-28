@@ -56,7 +56,13 @@ BackendProcessManager::BackendProcessManager(const AppConfig &config, BackendCli
 }
 
 BackendProcessManager::~BackendProcessManager() {
-    shutdownOwnedService();
+    retryTimer_->stop();
+    startupTimer_->stop();
+    stopEscalationTimer_->stop();
+    client_->disconnectFromService();
+    if (launcher_->isRunning() && canControlOwnedProcess()) {
+        launcher_->kill();
+    }
 }
 
 void BackendProcessManager::start() {
@@ -66,6 +72,7 @@ void BackendProcessManager::start() {
     stopEscalationTimer_->stop();
     client_->disconnectFromService();
     shuttingDown_ = false;
+    shutdownFinishedEmitted_ = false;
     terminalFailure_ = false;
     launchRequested_ = false;
     launchedProcess_ = false;
@@ -118,18 +125,23 @@ void BackendProcessManager::restart() {
 }
 
 void BackendProcessManager::shutdownOwnedService() {
+    if (shuttingDown_) {
+        return;
+    }
     ++startupGeneration_;
     retryTimer_->stop();
     startupTimer_->stop();
     stopEscalationTimer_->stop();
     restartPhase_ = RestartPhase::Idle;
-    if (shuttingDown_) {
-        client_->disconnectFromService();
-        return;
-    }
     shuttingDown_ = true;
+    shutdownFinishedEmitted_ = false;
     if (!owned_) {
         client_->disconnectFromService();
+        completeShutdown();
+        return;
+    }
+    if (!launcher_->isRunning() || !canControlOwnedProcess()) {
+        completeShutdown();
         return;
     }
     if (client_->state() == BackendClient::State::Ready && canControlOwnedProcess()) {
@@ -139,7 +151,11 @@ void BackendProcessManager::shutdownOwnedService() {
         stopEscalationTimer_->start(stopEscalationIntervalMs());
     } else if (launcher_->isRunning() && canControlOwnedProcess()) {
         stoppingOwnedProcess_ = true;
+        restartPhase_ = RestartPhase::TerminateWait;
         launcher_->terminate();
+        if (launcher_->isRunning()) {
+            stopEscalationTimer_->start(stopEscalationIntervalMs());
+        }
     }
 }
 
@@ -343,6 +359,9 @@ void BackendProcessManager::onStopEscalationTimeout() {
     if (restartPhase_ == RestartPhase::TerminateWait) {
         restartPhase_ = RestartPhase::KillWait;
         launcher_->kill();
+        if (shuttingDown_) {
+            completeShutdown();
+        }
     }
 }
 
@@ -362,13 +381,7 @@ void BackendProcessManager::onProcessFinished(int exitCode) {
     launchedProcess_ = false;
     if (shuttingDown_) {
         Q_UNUSED(exitCode)
-        stopEscalationTimer_->stop();
-        restartPhase_ = RestartPhase::Idle;
-        stoppingOwnedProcess_ = false;
-        if (owned_) {
-            owned_ = false;
-            emit serviceOwnershipChanged(false);
-        }
+        completeShutdown();
         return;
     }
     if (terminalFailure_) {
@@ -390,6 +403,23 @@ void BackendProcessManager::onProcessFinished(int exitCode) {
                         QStringLiteral("BACKEND_PROCESS_EXITED"),
                         kStartAction, configuredLogPath());
     }
+}
+
+void BackendProcessManager::completeShutdown() {
+    if (shutdownFinishedEmitted_) {
+        return;
+    }
+    stopEscalationTimer_->stop();
+    restartPhase_ = RestartPhase::Idle;
+    stoppingOwnedProcess_ = false;
+    launchedProcess_ = false;
+    client_->disconnectFromService();
+    if (owned_) {
+        owned_ = false;
+        emit serviceOwnershipChanged(false);
+    }
+    shutdownFinishedEmitted_ = true;
+    emit shutdownFinished();
 }
 
 void BackendProcessManager::relaunchAfterRestartExit() {

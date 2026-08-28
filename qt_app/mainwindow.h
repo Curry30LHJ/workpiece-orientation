@@ -257,6 +257,8 @@ private:
     quint64 pendingNavigationRefreshTransactionId_ = 0;
     bool pendingNavigationResponseIncludedMandatory_ = false;
     bool skipDirtyCloseGuardOnce_ = false;
+    bool backendShutdownPending_ = false;
+    bool backendShutdownComplete_ = false;
     GeometrySaveIntent geometrySaveIntent_ = GeometrySaveIntent::None;
     GeometrySaveIntent stagedGeometrySaveIntent_ = GeometrySaveIntent::None;
     QString stagedGeometrySaveWorkpieceId_;

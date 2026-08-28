@@ -185,6 +185,102 @@ public:
     bool isRunning() const override { return false; }
 };
 
+class WindowShutdownLauncher : public ProcessLauncher {
+    Q_OBJECT
+
+public:
+    explicit WindowShutdownLauncher(QObject *parent = nullptr) : ProcessLauncher(parent) {}
+
+    bool start(const QString &, const QStringList &arguments, const QString &) override {
+        lastArguments = arguments;
+        running = true;
+        emit startRequested();
+        emit started();
+        return true;
+    }
+
+    void terminate() override { ++terminateCalls; }
+    void kill() override { ++killCalls; }
+    bool isRunning() const override { return running; }
+
+    void finish(int exitCode) {
+        running = false;
+        emit finished(exitCode);
+    }
+
+    QStringList lastArguments;
+    int terminateCalls = 0;
+    int killCalls = 0;
+    bool running = false;
+
+signals:
+    void startRequested();
+};
+
+class WindowShutdownServer : public QObject {
+    Q_OBJECT
+
+public:
+    explicit WindowShutdownServer(QObject *parent = nullptr) : QObject(parent) {
+        connect(&server_, &QTcpServer::newConnection,
+                this, &WindowShutdownServer::acceptConnection);
+    }
+
+    bool listen(quint16 port) {
+        return server_.listen(QHostAddress::LocalHost, port);
+    }
+    void setInstanceToken(const QString &token) { instanceToken_ = token; }
+    int shutdownCount() const { return shutdownCount_; }
+    QString shutdownToken() const { return shutdownToken_; }
+
+private slots:
+    void acceptConnection() {
+        socket_ = server_.nextPendingConnection();
+        connect(socket_, &QTcpSocket::readyRead,
+                this, &WindowShutdownServer::readRequests);
+    }
+
+    void readRequests() {
+        buffer_ += socket_->readAll();
+        while (buffer_.contains('\n')) {
+            const int newline = buffer_.indexOf('\n');
+            const QJsonDocument document = QJsonDocument::fromJson(buffer_.left(newline));
+            buffer_.remove(0, newline + 1);
+            if (!document.isObject()) continue;
+            const QJsonObject request = document.object();
+            const QString command = request.value(QStringLiteral("command")).toString();
+            const QString requestId = request.value(QStringLiteral("request_id")).toString();
+            if (command == QStringLiteral("hello")) {
+                send({{"version", 1}, {"request_id", requestId}, {"ok", true},
+                      {"service", "workpiece-orientation"}, {"ready", true},
+                      {"package_version", "dev"}, {"edition", "dev"},
+                      {"compute_device", "gpu"}, {"model_fingerprint", ""},
+                      {"instance_token", instanceToken_}});
+            } else if (command == QStringLiteral("list_workpieces")) {
+                send({{"version", 1}, {"request_id", requestId}, {"ok", true},
+                      {"workpieces", QJsonArray()}});
+            } else if (command == QStringLiteral("shutdown")) {
+                ++shutdownCount_;
+                shutdownToken_ = request.value(QStringLiteral("instance_token")).toString();
+                send({{"version", 1}, {"request_id", requestId}, {"ok", true}});
+            }
+        }
+    }
+
+private:
+    void send(const QJsonObject &object) {
+        socket_->write(QJsonDocument(object).toJson(QJsonDocument::Compact) + "\n");
+        socket_->flush();
+    }
+
+    QTcpServer server_;
+    QTcpSocket *socket_ = nullptr;
+    QByteArray buffer_;
+    QString instanceToken_;
+    QString shutdownToken_;
+    int shutdownCount_ = 0;
+};
+
 class RegistrationServer : public QObject {
     Q_OBJECT
 
@@ -910,6 +1006,20 @@ private:
         config.requestTimeoutMs = 500;
         config.backendScript = QStringLiteral("service.py");
         return config;
+    }
+
+    static quint16 unusedPort() {
+        QTcpServer probe;
+        if (!probe.listen(QHostAddress::LocalHost, 0)) return 0;
+        const quint16 port = probe.serverPort();
+        probe.close();
+        return port;
+    }
+
+    static QString argumentValue(const QStringList &arguments, const QString &name) {
+        const int index = arguments.indexOf(name);
+        return index >= 0 && index + 1 < arguments.size()
+            ? arguments.at(index + 1) : QString();
     }
 
     static QStringList writeImages(QTemporaryDir &dir, const QString &prefix, int count) {
@@ -5033,6 +5143,61 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 500);
         QCOMPARE(promptCount, 1);
         QCOMPARE(server.requests().size(), requestsBeforeClose);
+    }
+
+    void ownedBackendCloseWaitsForShutdownWhileEventLoopIsActive() {
+        const quint16 port = unusedPort();
+        QVERIFY(port != 0);
+        WindowShutdownServer server;
+        BackendClient client;
+        WindowShutdownLauncher launcher;
+        AppConfig config = configFor(port);
+        config.requestTimeoutMs = 100;
+        config.startupTimeoutMs = 1000;
+        BackendProcessManager manager(config, &client, &launcher);
+        MainWindow window(&client, &manager);
+        QObject::connect(&launcher, &WindowShutdownLauncher::startRequested,
+                         &server, [&]() {
+            server.setInstanceToken(argumentValue(
+                launcher.lastArguments, QStringLiteral("--instance-token")));
+            QVERIFY(server.listen(port));
+        });
+        QSignalSpy readySpy(&manager, &BackendProcessManager::backendReady);
+        manager.start();
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QVERIFY(manager.ownedByThisSession());
+        window.show();
+        QCoreApplication::processEvents();
+
+        QVERIFY(!window.close());
+        QVERIFY(!window.close());
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.shutdownCount(), 1, 1000);
+        QCOMPARE(server.shutdownToken(), argumentValue(
+            launcher.lastArguments, QStringLiteral("--instance-token")));
+        QVERIFY(window.isVisible());
+        QCOMPARE(launcher.terminateCalls, 0);
+        QCOMPARE(launcher.killCalls, 0);
+
+        launcher.finish(0);
+
+        QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 1000);
+    }
+
+    void unownedBackendCloseDoesNotWaitForShutdown() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37658), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QSignalSpy shutdownSpy(&manager, &BackendProcessManager::shutdownFinished);
+        window.show();
+        QCoreApplication::processEvents();
+
+        QVERIFY(window.close());
+
+        QVERIFY(!window.isVisible());
+        QCOMPARE(shutdownSpy.count(), 0);
     }
 
     void cancelClosePreservesWindowAndTaskState() {

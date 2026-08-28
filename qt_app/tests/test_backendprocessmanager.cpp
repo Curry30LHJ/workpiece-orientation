@@ -778,6 +778,69 @@ private slots:
         QCOMPARE(launcher.killCalls, 1);
     }
 
+    void ownedNotReadyShutdownEscalatesTerminateThenKill() {
+        const quint16 port = unusedPort();
+        HandshakeServer server;
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        AppConfig config = configFor(port, 1000);
+        BackendProcessManager manager(config, &client, &launcher);
+        QObject::connect(&launcher, &FakeProcessLauncher::startRequested, &server, [&]() {
+            server.setIdentity(config.packageVersion, config.edition, config.computeDevice,
+                               config.modelSha256,
+                               argumentValue(launcher.lastArguments,
+                                             QStringLiteral("--instance-token")));
+            QVERIFY(server.listen(port));
+        });
+        QSignalSpy readySpy(&manager, &BackendProcessManager::backendReady);
+        QSignalSpy shutdownSpy(&manager, &BackendProcessManager::shutdownFinished);
+        manager.start();
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1500);
+        QVERIFY(manager.ownedByThisSession());
+        launcher.delayExit = true;
+        client.disconnectFromService();
+        QCOMPARE(client.state(), BackendClient::State::Disconnected);
+
+        manager.shutdownOwnedService();
+
+        QCOMPARE(launcher.terminateCalls, 1);
+        QCOMPARE(launcher.killCalls, 0);
+        QCOMPARE(shutdownSpy.count(), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(launcher.killCalls, 1, 500);
+        QCOMPARE(shutdownSpy.count(), 1);
+        QTest::qWait(150);
+        QCOMPARE(launcher.terminateCalls, 1);
+        QCOMPARE(launcher.killCalls, 1);
+        QCOMPARE(shutdownSpy.count(), 1);
+    }
+
+    void ownedDestructorUsesImmediateKillFallback() {
+        const quint16 port = unusedPort();
+        HandshakeServer server;
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        launcher.delayExit = true;
+        AppConfig config = configFor(port, 1000);
+        auto *manager = new BackendProcessManager(config, &client, &launcher);
+        QObject::connect(&launcher, &FakeProcessLauncher::startRequested, &server, [&]() {
+            server.setIdentity(config.packageVersion, config.edition, config.computeDevice,
+                               config.modelSha256,
+                               argumentValue(launcher.lastArguments,
+                                             QStringLiteral("--instance-token")));
+            QVERIFY(server.listen(port));
+        });
+        QSignalSpy readySpy(manager, &BackendProcessManager::backendReady);
+        manager->start();
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1500);
+        QVERIFY(manager->ownedByThisSession());
+
+        delete manager;
+
+        QCOMPARE(launcher.terminateCalls, 0);
+        QCOMPARE(launcher.killCalls, 1);
+        QVERIFY(server.shutdownToken().isEmpty());
+    }
+
     void stopDuringLaunchIgnoresLateProcessCallbacks() {
         const quint16 port = unusedPort();
         BackendClient client;

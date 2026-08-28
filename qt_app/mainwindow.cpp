@@ -265,6 +265,10 @@ bool MainWindow::hasActiveTask() const {
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {
+    if (backendShutdownPending_) {
+        event->ignore();
+        return;
+    }
     if (pendingNavigationKind_ != PendingNavigationKind::None) {
         event->ignore();
         return;
@@ -288,6 +292,13 @@ void MainWindow::closeEvent(QCloseEvent *event) {
     }
     if (hasActiveTask()
         && promptForActiveTaskClose() == ActiveTaskCloseDecision::ContinueRunning) {
+        event->ignore();
+        return;
+    }
+    if (manager_ != nullptr && !backendShutdownComplete_
+        && manager_->ownedByThisSession()) {
+        backendShutdownPending_ = true;
+        manager_->shutdownOwnedService();
         event->ignore();
         return;
     }
@@ -620,6 +631,12 @@ void MainWindow::connectBackendSignals() {
                 this, &MainWindow::onBackendLoading);
         connect(manager_, &BackendProcessManager::backendUnavailable,
                 this, &MainWindow::onBackendUnavailable);
+        connect(manager_, &BackendProcessManager::shutdownFinished, this, [this]() {
+            if (!backendShutdownPending_) return;
+            backendShutdownPending_ = false;
+            backendShutdownComplete_ = true;
+            QTimer::singleShot(0, this, [this]() { close(); });
+        });
     }
 }
 

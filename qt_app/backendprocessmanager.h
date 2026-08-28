@@ -30,6 +30,7 @@ signals:
                             const QString &action = QString(),
                             const QString &logPath = QString());
     void serviceOwnershipChanged(bool owned);
+    void shutdownFinished();
 
 private slots:
     void tryConnect();
@@ -48,6 +49,7 @@ private:
 
     void launchBackend();
     void relaunchAfterRestartExit();
+    void completeShutdown();
     void markUnavailable(const QString &reason, const QString &code,
                          const QString &action, const QString &logPath = QString());
     QString backendProgram() const;
@@ -67,6 +69,7 @@ private:
     bool prelaunchProbeConnected_ = false;
     bool reusingExternalDevelopmentService_ = false;
     bool shuttingDown_ = false;
+    bool shutdownFinishedEmitted_ = false;
     bool terminalFailure_ = false;
     bool stoppingOwnedProcess_ = false;
     RestartPhase restartPhase_ = RestartPhase::Idle;
