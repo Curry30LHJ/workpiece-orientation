@@ -13,8 +13,9 @@ $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $gitCommit = (& git -C $repo rev-parse HEAD 2>$null); if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitCommit)) { throw 'Unable to determine git commit' }
 $stagingRoot = [IO.Path]::GetFullPath($OutputRoot)
-$ownedRoot = ([IO.Path]::GetFullPath((Join-Path $repo 'release_staging'))).TrimEnd('\') + '\'
-if (-not $stagingRoot.StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputRoot must remain under release_staging' }
+$ownedRootPath = [IO.Path]::GetFullPath((Join-Path $repo 'release_staging')).TrimEnd('\')
+$ownedRoot = $ownedRootPath + '\'
+if ($stagingRoot -ne $ownedRootPath -and -not $stagingRoot.StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputRoot must remain under release_staging' }
 $windeploy = if ($WindeployQt) { $WindeployQt } else { Join-Path $QtBin 'windeployqt.exe' }
 if (-not (Test-Path -LiteralPath $windeploy)) { throw "windeployqt not found: $windeploy" }
 $editions = if ($Edition -eq 'all') { @('gpu','cpu') } else { @($Edition) }
@@ -32,7 +33,8 @@ foreach ($ed in $editions) {
     $model = if ($ModelPath) { $ModelPath } else { Join-Path $repo 'models\shitu_rec' }
     & $py -m release_tools.portable_package stage --edition $ed --version $Version --qt-release-dir $qtRelease --backend-dir $backend --model-dir $model --output-root $stagingRoot --guide (Join-Path $repo 'deploy\使用说明.txt') --notices (Join-Path $repo 'deploy\THIRD_PARTY-NOTICES.txt') --git-commit $gitCommit
     $package = Join-Path $target "WorkpieceOrientation-$($ed.ToUpper())"
-    & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$package')/'third_party_licenses', paddleclas_license=Path(r'$repo')/'third_party'/'PaddleClas'/'LICENSE')"
+    $paddleDist = if ($ed -eq 'gpu') { 'paddlepaddle-gpu' } else { 'paddlepaddle' }
+    & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$package')/'third_party_licenses', distributions=('python','pyinstaller','$paddleDist','paddleclas','numpy','opencv-python'), paddleclas_license=Path(r'$repo')/'third_party'/'PaddleClas'/'LICENSE')"
     if ($SmokeScript -and (Test-Path -LiteralPath $SmokeScript)) { & $SmokeScript -PythonExecutable $py -ProjectRoot $package }
     $label = $ed.ToUpper()
     & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$package'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=[Path(r'$repo')]); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=[Path(r'$repo')]); a=zip_package(p,Path(r'$repo')/'release_artifacts'/f'WorkpieceOrientation-$label-x64-$Version.zip'); write_sha256(a)"

@@ -71,6 +71,7 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
     if root.exists():
         out = Path(output_root).resolve(); target = root.resolve()
         if out not in target.parents: raise PackageAuditError("staging path escapes output root")
+        if root.is_symlink(): raise PackageAuditError("refusing to remove reparse-point staging path")
         shutil.rmtree(root)
     root.mkdir(parents=True)
     qt_release_dir, backend_dir, model_dir = map(Path, (qt_release_dir, backend_dir, model_dir))
@@ -127,10 +128,10 @@ def run_dumpbin(executable: Path, package_root: Path) -> list[str]:
     if not machine: raise PackageAuditError(f"unable to determine machine type for {executable.name}")
     if machine.group(1).lower() not in {"8664"}:
         raise PackageAuditError(f"{executable.name} is not an x64 executable")
-    return re.findall(r"^[ ]{8}([A-Za-z0-9_.-]+\.dll)$", result.stdout, flags=re.MULTILINE | re.IGNORECASE)
+    return re.findall(r"^\s*([A-Za-z0-9_.-]+\.dll)\s*$", result.stdout, flags=re.MULTILINE | re.IGNORECASE)
 
 
-def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: Iterable[Path] = (), dependency_checker: Callable[[Path, Path], list[str]] = run_dumpbin) -> dict[str, object]:
+def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: Iterable[Path] = (), runtime_roots: Iterable[Path] = (), dependency_checker: Callable[[Path, Path], list[str]] = run_dumpbin) -> dict[str, object]:
     root = Path(root); edition = edition.lower(); errors: list[str] = []
     required = ["WorkpieceOrientation.exe", "backend/orientation_backend.exe", "backend/resources/inference_general.yaml", "app_config.json", "version.json", "models/shitu_rec/inference.pdmodel", "models/shitu_rec/inference.pdiparams", "models/shitu_rec/inference.pdiparams.info", "data/data_layout.json", "data/workpieces", "third_party_licenses/index.txt", "THIRD_PARTY-NOTICES.txt", "使用说明.txt"]
     for rel in required:
@@ -148,7 +149,7 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
     wp = root / "data" / "workpieces"
     if wp.exists() and any(wp.iterdir()): errors.append("workpieces library must be empty")
     forbidden = [str(Path(p)).replace("\\", "/").rstrip("/").lower() for p in forbidden_roots]
-    known_roots = forbidden + [str(Path(os.environ.get("USERPROFILE", ""))).replace("\\", "/").rstrip("/").lower(), str(Path(os.sys.executable).parent).replace("\\", "/").rstrip("/").lower()]
+    known_roots = forbidden + [str(Path(p)).replace("\\", "/").rstrip("/").lower() for p in runtime_roots] + [str(Path(os.environ.get("USERPROFILE", ""))).replace("\\", "/").rstrip("/").lower(), str(Path(os.sys.executable).parent).replace("\\", "/").rstrip("/").lower()]
     for file in root.rglob("*"):
         if not file.is_file(): continue
         rel = file.relative_to(root).as_posix().lower(); name = file.name.lower()
@@ -192,7 +193,8 @@ def collect_licenses(destination: Path, distributions: Iterable[str] = ("python"
     destination = Path(destination); destination.mkdir(parents=True, exist_ok=True); index = []
     for name in distributions:
         try: dist = importlib.metadata.distribution(name)
-        except importlib.metadata.PackageNotFoundError: continue
+        except importlib.metadata.PackageNotFoundError:
+            raise PackageAuditError(f"required distribution missing: {name}")
         copied = []
         for f in dist.files or []:
             if Path(f).name.upper().startswith(("LICENSE", "COPYING")):
