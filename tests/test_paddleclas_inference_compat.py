@@ -18,11 +18,12 @@ def test_legacy_predictor_temporarily_selects_old_paddle_config(tmp_path: Path):
     (tmp_path / "inference.pdiparams").write_bytes(b"params")
     paddle = SimpleNamespace(__version__="3.2.2")
     seen = []
-    config = SimpleNamespace(Global=SimpleNamespace(enable_mkldnn=True))
+    config = SimpleNamespace(Global=SimpleNamespace(enable_mkldnn=True, ir_optim=True))
 
     def predictor(_config):
         seen.append(paddle.__version__)
-        assert _config.Global.enable_mkldnn is False
+        assert _config.Global.enable_mkldnn is True
+        assert _config.Global.ir_optim is False
         return object()
 
     result = create_rec_predictor(predictor, config, paddle, tmp_path)
@@ -30,3 +31,4 @@ def test_legacy_predictor_temporarily_selects_old_paddle_config(tmp_path: Path):
     assert seen == ["2.5.0"]
     assert paddle.__version__ == "3.2.2"
     assert config.Global.enable_mkldnn is True
+    assert config.Global.ir_optim is True

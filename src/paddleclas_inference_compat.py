@@ -26,7 +26,7 @@ def create_rec_predictor(rec_predictor: Any, config: Any, paddle: Any, model_dir
     global_config = getattr(config, "Global", None)
     if global_config is None and isinstance(config, dict):
         global_config = config.get("Global")
-    previous_mkldnn = None
+    previous_ir_optim = None
     try:
         # PaddleClas chooses Config(model_dir, 'inference') for Paddle >=2.6,
         # which requires inference.json.  A temporary 2.5 marker selects its
@@ -34,18 +34,18 @@ def create_rec_predictor(rec_predictor: Any, config: Any, paddle: Any, model_dir
         paddle.__version__ = "2.5.0"
         if global_config is not None:
             if isinstance(global_config, dict):
-                previous_mkldnn = global_config.get("enable_mkldnn")
-                global_config["enable_mkldnn"] = False
+                previous_ir_optim = global_config.get("ir_optim")
+                global_config["ir_optim"] = False
             else:
-                previous_mkldnn = getattr(global_config, "enable_mkldnn", None)
-                global_config.enable_mkldnn = False
+                previous_ir_optim = getattr(global_config, "ir_optim", None)
+                global_config.ir_optim = False
         return rec_predictor(config)
     finally:
-        if global_config is not None and previous_mkldnn is not None:
+        if global_config is not None and previous_ir_optim is not None:
             if isinstance(global_config, dict):
-                global_config["enable_mkldnn"] = previous_mkldnn
+                global_config["ir_optim"] = previous_ir_optim
             else:
-                global_config.enable_mkldnn = previous_mkldnn
+                global_config.ir_optim = previous_ir_optim
         if original_version is not None:
             paddle.__version__ = original_version
 
