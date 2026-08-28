@@ -43,6 +43,7 @@ E:\python\anaconda3\envs\shitu\python.exe scripts\benchmark_fast_geometry_infere
   --library-dir E:\Project\wang\pp_813\runtime_library `
   --m1-workpiece-id 31f082d1a04e486b9345846f4d585033 `
   --warmup 50 `
+  --repeats 1 `
   --minimum-measured-samples 1000 `
   --max-p95-ms 25 `
   --max-added-errors 0 `
