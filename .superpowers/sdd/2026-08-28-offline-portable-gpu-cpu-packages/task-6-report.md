@@ -101,6 +101,12 @@ The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Co
 
 The faiss placeholder now raises an explicit `RuntimeError` on any attribute access; the compatibility regression covers this contract.
 
+## Fix round 5 — legacy two-file model loading
+
+The supplied model is the legacy `inference.pdmodel` + `inference.pdiparams(.info)` format. `create_rec_predictor` now temporarily advertises Paddle 2.5 to PaddleClas so it selects `Config(model_file, params_file)`, and temporarily disables `ir_optim` only for that construction (restoring all values afterward). CPU MKLDNN remains enabled for the packaged configuration. Focused regression tests cover format detection, temporary version/config flags, restoration, and optional import stubs.
+
+Both editions were rebuilt successfully after this change. Final onedir sizes are GPU 4,393,004,263 bytes (3,287 files) and CPU 649,936,161 bytes (3,266 files). External-model smoke passed for both editions: hello progressed through loading to Ready, one front and one back workpiece template set registered, predictions returned `front` and `back`, shutdown returned success, and each backend exited with code 0. Smoke used temporary data roots and left the shipped package data untouched.
+
 ## Fix round 4 build and smoke results
 
 Both editions were rebuilt from commit `9067c48` with Python 3.10.20/PyInstaller 6.22.2. The compatibility regression passed (`1 passed`, with the metadata/spec/env checks at `6 passed`). The rebuilt executables no longer fail on missing sklearn/faiss; however, real external-model smoke is blocked by the supplied model directory: Paddle 3.2.2 reports `Cannot open .../inference.json` while the directory contains only `inference.pdmodel`, `inference.pdiparams`, and `.info`. GPU and CPU therefore both stop at `loading_model` with `MODEL_LOAD_FAILED`; register/predict/shutdown cannot be exercised until a Paddle-3-compatible model export (including `inference.json`) is supplied. No large build outputs were added to Git; they remain under ignored `release_staging`.
