@@ -36,6 +36,14 @@ PowerShell parser: scripts/build_portable_backend.ps1 # parsed
 git diff --check                                      # clean
 ```
 
+## Built bundle audit and smoke evidence
+
+The existing GPU onedir output was audited in place (no release artifact was added to Git): 3,287 files totaling 4,393,004,346 bytes (~4.09 GiB). Size is dominated by 2.94 GiB of NVIDIA CUDA libraries and 1.15 GiB of Paddle libraries. The CPU build completed successfully with 3,266 files totaling 649,934,304 bytes (~0.605 GiB) and contains no NVIDIA directory or CUDA DLLs.
+
+Archive and filesystem scans found no Torch, LightGlue, faiss, sklearn, visualdl, soft-center matcher, ALIKED/local matcher, or benchmark runtime modules. The only name matches were Paddle compatibility header files under `paddle/include/.../compat/torch`; these are headers, not imported runtime code. GPU cuDNN train DLLs are shipped by the Paddle CUDA runtime alongside inference DLLs.
+
+An external-model/data smoke was attempted against both EXEs using the real model directory and inference YAML, temporary writable data roots, structured hello/loading polling, and shutdown. Both editions reached `loading_model` then failed deterministically with `MODEL_LOAD_FAILED: No module named 'sklearn'`: PaddleClas 2.6.0 unconditionally imports `sklearn.metrics` during `RecPredictor` construction, while the required `sklearn` exclusion removes it from the frozen archive. No prediction or shutdown handshake could proceed after this startup failure; generated smoke data/logs remain under ignored `release_staging` only. This dependency/spec conflict requires a follow-up decision before claiming offline smoke success.
+
 ## Fix round 2 — packaging environment robustness
 
 RED: a static script test failed because `create_packaging_envs.ps1` did not clear a globally inherited `PIP_NO_INDEX` value and had no supported-version guard for an already existing environment.
@@ -68,7 +76,7 @@ git diff --check                                      # clean
 
 ## Environment/build attempt
 
-The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Conda environments and installed the common dependencies into the GPU environment. The Paddle GPU download/install did not complete (the process was interrupted after prolonged network resolution/download); CPU dependency installation therefore did not start. Neither `paddlepaddle-gpu` nor `paddlepaddle` metadata is present in the respective environments after interruption. Consequently no PyInstaller build or EXE smoke test was run, and no build result is claimed.
+The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Conda environments. After the initial Paddle download interruption, both locked Paddle distributions became available in their respective environments and the CPU PyInstaller build completed. Subsequent onedir audit and smoke results (including the startup dependency failure) are recorded below; no successful offline smoke is claimed.
 
 ## Files
 
