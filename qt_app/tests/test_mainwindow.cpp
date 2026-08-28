@@ -219,7 +219,9 @@ private slots:
             const QString requestId = request.value(QStringLiteral("request_id")).toString();
             if (command == QStringLiteral("hello")) {
                 send({{"version", 1}, {"request_id", requestId}, {"ok", true},
-                      {"service", "workpiece-orientation"}, {"ready", true}});
+                      {"service", "workpiece-orientation"}, {"ready", true},
+                      {"package_version", "dev"}, {"edition", "dev"},
+                      {"compute_device", "gpu"}, {"model_fingerprint", ""}});
             } else if (command == QStringLiteral("register") && registerAttempts_++ == 0) {
                 send({{"version", 1}, {"request_id", requestId}, {"ok", false},
                       {"error", QJsonObject{{"code", "WORKPIECE_EXISTS"}, {"message", "exists"}}}});
@@ -306,7 +308,9 @@ private slots:
             const QString requestId = request.value(QStringLiteral("request_id")).toString();
             if (command == QStringLiteral("hello")) {
                 send({{"version", 1}, {"request_id", requestId}, {"ok", true},
-                      {"service", "workpiece-orientation"}, {"ready", true}});
+                      {"service", "workpiece-orientation"}, {"ready", true},
+                      {"package_version", "dev"}, {"edition", "dev"},
+                      {"compute_device", "gpu"}, {"model_fingerprint", ""}});
             } else if (command == QStringLiteral("list_workpieces")) {
                 ++listCount_;
                 if (disconnectNextListRefresh_) {
@@ -450,7 +454,9 @@ private slots:
             const QString requestId = request.value(QStringLiteral("request_id")).toString();
             if (command == QStringLiteral("hello")) {
                 send({{"version", 1}, {"request_id", requestId}, {"ok", true},
-                      {"service", "workpiece-orientation"}, {"ready", true}});
+                      {"service", "workpiece-orientation"}, {"ready", true},
+                      {"package_version", "dev"}, {"edition", "dev"},
+                      {"compute_device", "gpu"}, {"model_fingerprint", ""}});
             } else if (command == QStringLiteral("list_workpieces")) {
                 ++listWorkpieceCount_;
                 if (holdWorkpieceResponses_) {
@@ -695,7 +701,11 @@ private slots:
             if (command == QStringLiteral("hello")) {
                 send(QJsonObject{{QStringLiteral("version"), 1}, {QStringLiteral("request_id"), requestId},
                                  {QStringLiteral("ok"), true}, {QStringLiteral("service"), QStringLiteral("workpiece-orientation")},
-                                 {QStringLiteral("ready"), true}});
+                                 {QStringLiteral("ready"), true},
+                                 {QStringLiteral("package_version"), QStringLiteral("dev")},
+                                 {QStringLiteral("edition"), QStringLiteral("dev")},
+                                 {QStringLiteral("compute_device"), QStringLiteral("gpu")},
+                                 {QStringLiteral("model_fingerprint"), QString()}});
             } else if (command == QStringLiteral("list_workpieces")) {
                 ++listWorkpieceCount_;
                 if (holdWorkpieceRefresh_) {
@@ -2693,14 +2703,88 @@ private slots:
         BackendProcessManager manager(configFor(37651), &client, &launcher);
         MainWindow window(&client, &manager);
 
-        emit manager.backendLoading(QStringLiteral("模型加载中"));
+        emit manager.backendLoading(QStringLiteral("loading_model"),
+                                    QStringLiteral("模型加载中"), 60);
 
         auto *inspectionPage = window.findChild<InspectionPage *>();
         QVERIFY(inspectionPage != nullptr);
-        QVERIFY(window.findChild<QLabel *>(QStringLiteral("backendStatusLabel"))->text().contains(QStringLiteral("模型加载中")));
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("backendStatusLabel"))
+                    ->text().contains(QStringLiteral("正在加载 PP-ShiTu 模型")));
         QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("registerButton"))->isEnabled());
         QVERIFY(!inspectionPage->findChild<QPushButton *>(
                      QStringLiteral("predictButton"))->isEnabled());
+    }
+
+    void managedStartupPhasesNeverExposeDisconnectedOrError() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37655), &client, &launcher);
+        MainWindow window(&client, &manager);
+        auto *status = window.findChild<QLabel *>(QStringLiteral("backendStatusLabel"));
+        QVERIFY(status != nullptr);
+
+        const QList<QPair<QString, QString>> phases{
+            {QStringLiteral("starting_process"), QStringLiteral("正在启动后端")},
+            {QStringLiteral("loading_runtime"), QStringLiteral("正在加载运行环境")},
+            {QStringLiteral("preparing_data"), QStringLiteral("正在检查数据目录")},
+            {QStringLiteral("loading_model"), QStringLiteral("正在加载 PP-ShiTu 模型")},
+            {QStringLiteral("restoring_library"), QStringLiteral("正在恢复工件库和缓存")},
+        };
+        int progress = 0;
+        for (const auto &phase : phases) {
+            emit manager.backendLoading(phase.first, QStringLiteral("服务原始消息"), progress);
+            progress += 20;
+            QVERIFY(status->text().contains(phase.second));
+            QVERIFY(!status->text().contains(QStringLiteral("未连接")));
+            QVERIFY(!status->text().contains(QStringLiteral("不可用")));
+            QVERIFY(status->property("messageKind").toString() != QStringLiteral("error"));
+        }
+
+        emit manager.backendReady();
+        QVERIFY(status->text().contains(QStringLiteral("已连接")));
+        QVERIFY(status->property("messageKind").toString() != QStringLiteral("error"));
+    }
+
+    void readyWithEmptyLibraryShowsNormalEmptyState() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37656), &client, &launcher);
+        MainWindow window(&client, &manager);
+
+        emit manager.backendReady();
+        emit client.responseReceived(QStringLiteral("list_workpieces"),
+                                     QJsonObject{{"workpieces", QJsonArray()}});
+
+        auto *status = window.findChild<QLabel *>(QStringLiteral("backendStatusLabel"));
+        auto *message = window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"));
+        QVERIFY(status != nullptr);
+        QVERIFY(message != nullptr);
+        QVERIFY(status->text().contains(QStringLiteral("已连接")));
+        QVERIFY(status->property("messageKind").toString() != QStringLiteral("error"));
+        QVERIFY(message->text().contains(QStringLiteral("工件库为空")));
+    }
+
+    void managedFailurePreservesStructuredDetailsWithoutChangingPhaseLabel() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37657), &client, &launcher);
+        MainWindow window(&client, &manager);
+
+        emit manager.backendUnavailable(QStringLiteral("服务拒绝启动"),
+                                        QStringLiteral("SERVICE_CODE"),
+                                        QStringLiteral("原始处理动作"),
+                                        QStringLiteral("D:/service/logs/raw.log"));
+
+        auto *status = window.findChild<QLabel *>(QStringLiteral("backendStatusLabel"));
+        auto *details = window.findChild<QLabel *>(QStringLiteral("backendRecentErrorLabel"));
+        QVERIFY(status != nullptr);
+        QVERIFY(details != nullptr);
+        QVERIFY(status->text().contains(QStringLiteral("不可用")));
+        QVERIFY(!status->text().contains(QStringLiteral("SERVICE_CODE")));
+        QVERIFY(!status->text().contains(QStringLiteral("原始处理动作")));
+        QVERIFY(details->text().contains(QStringLiteral("SERVICE_CODE")));
+        QVERIFY(details->text().contains(QStringLiteral("原始处理动作")));
+        QVERIFY(details->text().contains(QStringLiteral("D:/service/logs/raw.log")));
     }
 
     void managedStartupDoesNotExposeRetryChurn() {
@@ -2744,17 +2828,21 @@ private slots:
             QStringLiteral("backendStatusLabel"));
         QVERIFY(status != nullptr);
 
-        emit manager.backendLoading(QStringLiteral("正在加载权重"));
-        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+        emit manager.backendLoading(QStringLiteral("loading_model"),
+                                    QStringLiteral("正在加载权重"), 50);
+        QVERIFY(status->text().contains(QStringLiteral("正在加载 PP-ShiTu 模型")));
         QVERIFY(QMetaObject::invokeMethod(
             &window, "onClientStateChanged", Qt::DirectConnection,
             Q_ARG(BackendClient::State, BackendClient::State::Disconnected),
             Q_ARG(QString, QStringLiteral("后端连接已断开"))));
-        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+        QVERIFY(status->text().contains(QStringLiteral("正在加载 PP-ShiTu 模型")));
 
         emit manager.backendUnavailable(QStringLiteral("后端启动超时"));
         QVERIFY(status->text().contains(QStringLiteral("不可用")));
-        QVERIFY(status->toolTip().contains(QStringLiteral("后端启动超时")));
+        auto *recentError = window.findChild<QLabel *>(
+            QStringLiteral("backendRecentErrorLabel"));
+        QVERIFY(recentError != nullptr);
+        QVERIFY(recentError->text().contains(QStringLiteral("后端启动超时")));
         QVERIFY(QMetaObject::invokeMethod(
             &window, "onClientStateChanged", Qt::DirectConnection,
             Q_ARG(BackendClient::State, BackendClient::State::Disconnected),
@@ -2773,21 +2861,22 @@ private slots:
 
         QVERIFY(QMetaObject::invokeMethod(
             &window, "onBackendReady", Qt::DirectConnection));
-        emit manager.backendLoading(QStringLiteral("模型正在重新加载"));
-        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+        emit manager.backendLoading(QStringLiteral("loading_model"),
+                                    QStringLiteral("模型正在重新加载"), 50);
+        QVERIFY(status->text().contains(QStringLiteral("正在加载 PP-ShiTu 模型")));
 
         QVERIFY(QMetaObject::invokeMethod(
             &window, "onClientTransportFailed", Qt::DirectConnection,
             Q_ARG(QString, QStringLiteral("MODEL_LOADING")),
             Q_ARG(QString, QStringLiteral("模型正在重新加载"))));
-        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+        QVERIFY(status->text().contains(QStringLiteral("正在加载 PP-ShiTu 模型")));
         QVERIFY(!status->text().contains(QStringLiteral("不可用")));
         QVERIFY(!status->text().contains(QStringLiteral("正在重连")));
         QVERIFY(QMetaObject::invokeMethod(
             &window, "onClientStateChanged", Qt::DirectConnection,
             Q_ARG(BackendClient::State, BackendClient::State::Connecting),
             Q_ARG(QString, QStringLiteral("再次探测后端"))));
-        QVERIFY(status->text().contains(QStringLiteral("模型加载中")));
+        QVERIFY(status->text().contains(QStringLiteral("正在加载 PP-ShiTu 模型")));
     }
 
     void managedConnectionLossShowsOneRecoveryStateUntilReady() {
@@ -2844,7 +2933,7 @@ private slots:
         QVERIFY(!imagePath.isEmpty());
         BackendClient client;
         MainWindow window(&client, nullptr);
-        emit client.handshakeSucceeded();
+        emit client.handshakeSucceeded(0, QJsonObject());
         window.setInspectionImagePath(imagePath);
         emit client.responseReceived(QStringLiteral("predict"),
                                      QJsonObject{{"label", "front"}, {"needs_review", false}});
@@ -2852,7 +2941,8 @@ private slots:
         QVERIFY(inspectionPage != nullptr);
         QVERIFY(inspectionPage->findChild<QLabel *>(
                     QStringLiteral("resultLabel"))->text().contains(QStringLiteral("正面")));
-        emit client.transportFailed(QStringLiteral("CONNECTION_LOST"), QStringLiteral("lost"));
+        emit client.transportFailed(0, QStringLiteral("CONNECTION_LOST"),
+                                    QStringLiteral("lost"));
         QVERIFY(inspectionPage->findChild<QLabel *>(
                     QStringLiteral("resultLabel"))->text().contains(QStringLiteral("正面")));
         QCOMPARE(inspectionPage->findChild<InspectionImageView *>()->imagePath(), imagePath);
@@ -2863,7 +2953,7 @@ private slots:
     void predictionShowsRawEvidenceWithoutPercentConfidence() {
         BackendClient client;
         MainWindow window(&client, nullptr);
-        emit client.handshakeSucceeded();
+        emit client.handshakeSucceeded(0, QJsonObject());
         emit client.responseReceived(QStringLiteral("predict"), QJsonObject{
             {"label", "back"}, {"global_scores", QJsonObject{{"front", 0.91}, {"back", 0.88}}},
             {"global_margin", 0.03}, {"local_prediction", "front"},
@@ -3038,10 +3128,7 @@ private slots:
         const int refreshCountBeforeReconnect = server.listWorkpieceCount();
 
         server.disconnectClient();
-        QTRY_VERIFY(client.state() == BackendClient::State::Disconnected
-                    || client.state() == BackendClient::State::Error);
         server.setHoldWorkpieceResponses(false);
-        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
         QTRY_COMPARE_WITH_TIMEOUT(server.listWorkpieceCount(),
                                   refreshCountBeforeReconnect + 1, 1000);
@@ -3400,7 +3487,8 @@ private slots:
         const QString evidence = window.findChild<QTextEdit *>(
             QStringLiteral("evidenceTextEdit"))->toPlainText();
 
-        emit client.transportFailed(QStringLiteral("CONNECTION_LOST"), QStringLiteral("lost"));
+        emit client.transportFailed(0, QStringLiteral("CONNECTION_LOST"),
+                                    QStringLiteral("lost"));
         QCOMPARE(table->rowCount(), 2);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("currentImageLabel"))
                     ->text().contains(QStringLiteral("disconnect-1.png")));
@@ -3424,7 +3512,8 @@ private slots:
 
         window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
         QTRY_COMPARE(server.confirmationCount(), 1);
-        emit client.transportFailed(QStringLiteral("CONNECTION_LOST"), QStringLiteral("lost"));
+        emit client.transportFailed(0, QStringLiteral("CONNECTION_LOST"),
+                                    QStringLiteral("lost"));
 
         QCOMPARE(table->item(0, 4)->text(), QStringLiteral("提交失败"));
         QCOMPARE(table->currentRow(), 0);
@@ -3456,10 +3545,7 @@ private slots:
         frontButton->click();
         QTRY_COMPARE(server.confirmationCount(), 1);
         server.disconnectClient();
-        QTRY_VERIFY(client.state() == BackendClient::State::Disconnected
-                    || client.state() == BackendClient::State::Error);
         server.setHoldConfirmations(false);
-        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
         QTRY_VERIFY(frontButton->isEnabled());
 

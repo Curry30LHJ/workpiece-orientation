@@ -12,6 +12,8 @@ QProcessLauncher::QProcessLauncher(QObject *parent)
 }
 
 bool QProcessLauncher::start(const QString &program, const QStringList &arguments, const QString &workingDirectory) {
+    process_->setStandardOutputFile(QProcess::nullDevice());
+    process_->setStandardErrorFile(QProcess::nullDevice());
     process_->setProgram(program);
     process_->setArguments(arguments);
     process_->setWorkingDirectory(workingDirectory);

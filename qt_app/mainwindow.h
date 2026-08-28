@@ -76,8 +76,10 @@ private slots:
                                   int libraryRevision, int draftRevision);
 
     void onBackendReady();
-    void onBackendLoading(const QString &message);
-    void onBackendUnavailable(const QString &reason);
+    void onBackendLoading(const QString &phase, const QString &message, int progress);
+    void onBackendUnavailable(const QString &reason, const QString &code = QString(),
+                              const QString &action = QString(),
+                              const QString &logPath = QString());
     void onClientStateChanged(BackendClient::State state, const QString &detail);
     void onClientProgress(const QString &command, const QJsonObject &progress);
     void onClientResponse(const QString &command, const QJsonObject &response);
@@ -205,6 +207,7 @@ private:
     BackendUiState backendPresentationState_ = BackendUiState::Disconnected;
     bool backendEverReady_ = false;
     QString backendRecoveryDetail_;
+    bool backendFailureIsRecoverable_ = false;
     bool clientBusy_ = false;
     QTimer *evolutionPollTimer_ = nullptr;
     QTimer *geometryPollTimer_ = nullptr;

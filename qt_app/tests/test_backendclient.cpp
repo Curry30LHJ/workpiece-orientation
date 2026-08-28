@@ -20,6 +20,7 @@ public:
     bool start() { return server.listen(QHostAddress::LocalHost, 0); }
     quint16 port() const { return server.serverPort(); }
     const QList<QJsonObject> &requests() const { return received; }
+    int connectionCount() const { return connectionCount_; }
 
     void sendJson(const QJsonObject &object) {
         QVERIFY(socket != nullptr);
@@ -47,6 +48,7 @@ signals:
 
 private slots:
     void acceptConnection() {
+        ++connectionCount_;
         socket = server.nextPendingConnection();
         connect(socket, &QTcpSocket::readyRead, this, &FakeTcpServer::readRequests);
     }
@@ -70,6 +72,7 @@ private:
     QTcpSocket *socket = nullptr;
     QByteArray buffer;
     QList<QJsonObject> received;
+    int connectionCount_ = 0;
 };
 
 class TestBackendClient : public QObject {
@@ -83,7 +86,8 @@ private:
     static QJsonObject loadingHelloResponse(const QString &requestId) {
         return {{"version", 1}, {"request_id", requestId}, {"ok", true},
                 {"service", "workpiece-orientation"}, {"ready", false},
-                {"status", "loading"}, {"message", "模型加载中"}};
+                {"status", "loading"}, {"phase", "loading_model"},
+                {"message", "模型加载中"}, {"progress", 50}};
     }
 
     static void connectWithHello(FakeTcpServer &server, BackendClient &client) {
@@ -97,6 +101,45 @@ private:
     }
 
 private slots:
+    void loadingHandshakeStaysConnectedUntilReady() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        int helloCount = 0;
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            if (request.value(QStringLiteral("command")).toString() != QStringLiteral("hello")) {
+                return;
+            }
+            ++helloCount;
+            const QString id = request.value(QStringLiteral("request_id")).toString();
+            QJsonObject response{{"version", 1}, {"request_id", id}, {"ok", true},
+                                 {"service", "workpiece-orientation"},
+                                 {"package_version", "1.0.0"}, {"edition", "gpu"},
+                                 {"compute_device", "gpu"},
+                                 {"model_fingerprint", QString(64, QLatin1Char('a'))},
+                                 {"instance_token", "launch-123"}};
+            response.insert(QStringLiteral("ready"), helloCount > 2);
+            response.insert(QStringLiteral("status"), helloCount > 2 ? "ready" : "loading");
+            response.insert(QStringLiteral("phase"), helloCount > 1 ? "loading_model" : "loading_runtime");
+            response.insert(QStringLiteral("message"), "正在加载");
+            response.insert(QStringLiteral("progress"), helloCount > 2 ? 100 : helloCount * 30);
+            server.sendJson(response);
+        });
+        BackendClient client;
+        QSignalSpy loadingSpy(&client, &BackendClient::handshakeLoading);
+        QSignalSpy readySpy(&client, &BackendClient::handshakeSucceeded);
+        QSignalSpy transportSpy(&client, &BackendClient::transportFailed);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000, 7);
+        QTRY_COMPARE_WITH_TIMEOUT(loadingSpy.count(), 2, 2500);
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 2500);
+        QCOMPARE(server.connectionCount(), 1);
+        QCOMPARE(transportSpy.count(), 0);
+        QCOMPARE(readySpy.at(0).at(0).toULongLong(), quint64(7));
+        QCOMPARE(readySpy.at(0).at(1).toJsonObject()
+                     .value(QStringLiteral("package_version")).toString(),
+                 QStringLiteral("1.0.0"));
+    }
+
     void buffersPartialAndMultipleResponses() {
         FakeTcpServer server;
         QVERIFY(server.start());
@@ -169,11 +212,12 @@ private slots:
         QCOMPARE(failureSpy.at(0).at(0).toString(), QStringLiteral("SERVER_BUSY"));
     }
 
-    void reportsModelLoadingAsRetryableFailure() {
+    void reportsModelLoadingWithoutTransportFailure() {
         FakeTcpServer server;
         QVERIFY(server.start());
         BackendClient client;
-        QSignalSpy failureSpy(&client, &BackendClient::requestFailed);
+        QSignalSpy loadingSpy(&client, &BackendClient::handshakeLoading);
+        QSignalSpy failureSpy(&client, &BackendClient::transportFailed);
         QObject::connect(&server, &FakeTcpServer::requestReceived, &server, [&](const QJsonObject &request) {
             if (request.value(QStringLiteral("command")).toString() == QStringLiteral("hello")) {
                 server.sendJson(loadingHelloResponse(request.value(QStringLiteral("request_id")).toString()));
@@ -182,9 +226,60 @@ private slots:
 
         client.connectToService(QHostAddress::LocalHost, server.port(), 1000);
 
-        QTRY_VERIFY_WITH_TIMEOUT(failureSpy.count() == 1, 1000);
-        QCOMPARE(failureSpy.at(0).at(0).toString(), QStringLiteral("MODEL_LOADING"));
-        QCOMPARE(failureSpy.at(0).at(1).toString(), QStringLiteral("模型加载中"));
+        QTRY_COMPARE_WITH_TIMEOUT(loadingSpy.count(), 1, 1000);
+        QCOMPARE(loadingSpy.at(0).at(1).toJsonObject()
+                     .value(QStringLiteral("message")).toString(),
+                 QStringLiteral("模型加载中"));
+        QCOMPARE(failureSpy.count(), 0);
+    }
+
+    void rejectsLoadingProgressOutsideProtocolRange() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy transportSpy(&client, &BackendClient::transportFailed);
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            QJsonObject response = loadingHelloResponse(
+                request.value(QStringLiteral("request_id")).toString());
+            response.insert(QStringLiteral("progress"), 101);
+            server.sendJson(response);
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000, 9);
+
+        QTRY_COMPARE_WITH_TIMEOUT(transportSpy.count(), 1, 1000);
+        QCOMPARE(transportSpy.at(0).at(0).toULongLong(), quint64(9));
+        QCOMPARE(transportSpy.at(0).at(1).toString(), QStringLiteral("PROTOCOL_ERROR"));
+    }
+
+    void handshakeFailurePreservesStructuredDetails() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy transportSpy(&client, &BackendClient::transportFailed);
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            server.sendJson({
+                {"version", 1},
+                {"request_id", request.value(QStringLiteral("request_id")).toString()},
+                {"ok", false},
+                {"error", QJsonObject{{"code", "SERVICE_FAILURE"},
+                                      {"message", "服务原始消息"},
+                                      {"action", "原始动作"},
+                                      {"log_path", "D:/service/raw.log"}}},
+            });
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000, 11);
+
+        QTRY_COMPARE_WITH_TIMEOUT(transportSpy.count(), 1, 1000);
+        QCOMPARE(transportSpy.at(0).at(0).toULongLong(), quint64(11));
+        QCOMPARE(transportSpy.at(0).at(1).toString(), QStringLiteral("SERVICE_FAILURE"));
+        const QJsonObject details = transportSpy.at(0).at(3).toJsonObject();
+        QCOMPARE(details.value(QStringLiteral("action")).toString(), QStringLiteral("原始动作"));
+        QCOMPARE(details.value(QStringLiteral("log_path")).toString(),
+                 QStringLiteral("D:/service/raw.log"));
     }
 
     void timesOutOneOutstandingRequest() {
@@ -329,7 +424,7 @@ private slots:
         server.sendFragments({QByteArray("{bad-json}\n")});
 
         QTRY_COMPARE_WITH_TIMEOUT(transportSpy.count(), 1, 1000);
-        QCOMPARE(transportSpy.at(0).at(0).toString(), QStringLiteral("PROTOCOL_ERROR"));
+        QCOMPARE(transportSpy.at(0).at(1).toString(), QStringLiteral("PROTOCOL_ERROR"));
         QCOMPARE(commandSpy.count(), 0);
         QVERIFY(client.state() != BackendClient::State::Ready);
     }

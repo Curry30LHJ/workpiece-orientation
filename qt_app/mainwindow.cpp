@@ -476,7 +476,9 @@ void MainWindow::applyWorkpieceListResponse(const QJsonObject &response,
             activeMandatoryRefreshTransactionId_ = 0;
         }
     }
-    showLibraryMessage(QStringLiteral("工件列表已刷新"));
+    showLibraryMessage(workpieces.isEmpty()
+                           ? QStringLiteral("工件库为空，可先注册工件")
+                           : QStringLiteral("工件列表已刷新"));
     updateButtonStates();
 }
 
@@ -594,8 +596,10 @@ void MainWindow::connectBackendSignals() {
     if (client_ == nullptr) {
         return;
     }
-    connect(client_, &BackendClient::handshakeSucceeded,
-            this, &MainWindow::onBackendReady);
+    if (manager_ == nullptr) {
+        connect(client_, &BackendClient::handshakeSucceeded,
+                this, &MainWindow::onBackendReady);
+    }
     connect(client_, &BackendClient::stateChanged,
             this, &MainWindow::onClientStateChanged);
     connect(client_, &BackendClient::progressReceived,
@@ -604,8 +608,11 @@ void MainWindow::connectBackendSignals() {
             this, &MainWindow::onClientResponse);
     connect(client_, &BackendClient::commandFailed,
             this, &MainWindow::onClientCommandFailed);
-    connect(client_, &BackendClient::transportFailed,
-            this, &MainWindow::onClientTransportFailed);
+    connect(client_, &BackendClient::transportFailed, this,
+            [this](quint64, const QString &code, const QString &message,
+                   const QJsonObject &) {
+                onClientTransportFailed(code, message);
+            });
     if (manager_ != nullptr) {
         connect(manager_, &BackendProcessManager::backendReady,
                 this, &MainWindow::onBackendReady);
@@ -1514,7 +1521,8 @@ void MainWindow::onBackendReady() {
     }
 }
 
-void MainWindow::onBackendLoading(const QString &message) {
+void MainWindow::onBackendLoading(const QString &phase, const QString &message,
+                                  int progress) {
     backendReadyHandled_ = false;
     backendReady_ = false;
     clientBusy_ = false;
@@ -1525,15 +1533,34 @@ void MainWindow::onBackendLoading(const QString &message) {
     }
     BackendStatusDetails details;
     details.state = BackendUiState::Loading;
-    details.connectionDetail = QStringLiteral("已连接");
-    details.modelDetail = message.isEmpty() ? QStringLiteral("模型加载中") : message;
+    const QHash<QString, QString> phaseLabels{
+        {QStringLiteral("starting_process"), QStringLiteral("正在启动后端")},
+        {QStringLiteral("loading_runtime"), QStringLiteral("正在加载运行环境")},
+        {QStringLiteral("preparing_data"), QStringLiteral("正在检查数据目录")},
+        {QStringLiteral("loading_model"), QStringLiteral("正在加载 PP-ShiTu 模型")},
+        {QStringLiteral("restoring_library"), QStringLiteral("正在恢复工件库和缓存")},
+    };
+    const QString phaseLabel = phaseLabels.value(
+        phase, message.isEmpty() ? QStringLiteral("后端正在加载") : message);
+    const int displayProgress = qBound(0, progress, 100);
+    details.connectionDetail = phaseLabel;
+    details.modelDetail = message.isEmpty()
+        ? QStringLiteral("%1（%2%）").arg(phaseLabel).arg(displayProgress)
+        : QStringLiteral("%1（%2%）").arg(message).arg(displayProgress);
     details.canRestart = manager_ != nullptr;
     presentBackendState(details);
+    appHeader_->setBackendState(BackendUiState::Loading, phaseLabel);
+    if (auto *statusLabel = appHeader_->findChild<QLabel *>(
+            QStringLiteral("backendStatusLabel"))) {
+        statusLabel->setText(phaseLabel);
+        statusLabel->setToolTip(phaseLabel);
+    }
     showLibraryMessage(message.isEmpty() ? QStringLiteral("正在加载模型，请稍候…") : message);
     updateButtonStates();
 }
 
-void MainWindow::onBackendUnavailable(const QString &reason) {
+void MainWindow::onBackendUnavailable(const QString &reason, const QString &code,
+                                      const QString &action, const QString &logPath) {
     const CommandOwner interruptedOwner = pendingOwner_;
     const QString interruptedTask = pendingCommand_;
     const quint64 interruptedRefreshTransactionId = pendingRefreshTransactionId_;
@@ -1632,13 +1659,24 @@ void MainWindow::onBackendUnavailable(const QString &reason) {
                                               QStringLiteral("CONNECTION_LOST"), reason);
     }
     BackendStatusDetails details;
-    details.state = BackendUiState::Error;
-    details.connectionDetail = QStringLiteral("连接中断");
-    details.modelDetail = QStringLiteral("状态未知");
+    details.state = backendFailureIsRecoverable_
+        ? BackendUiState::Recovering : BackendUiState::Error;
+    details.connectionDetail = backendFailureIsRecoverable_
+        ? QStringLiteral("正在重新连接") : QStringLiteral("连接中断");
+    details.modelDetail = backendFailureIsRecoverable_
+        ? QStringLiteral("等待后端恢复") : QStringLiteral("状态未知");
     details.currentTask = interruptedTask;
-    details.recentError = reason;
+    QStringList errorDetails;
+    if (!reason.isEmpty()) errorDetails.append(reason);
+    if (!code.isEmpty()) errorDetails.append(QStringLiteral("错误代码：%1").arg(code));
+    if (!action.isEmpty()) errorDetails.append(QStringLiteral("处理建议：%1").arg(action));
+    if (!logPath.isEmpty()) errorDetails.append(QStringLiteral("日志：%1").arg(logPath));
+    details.recentError = errorDetails.join(QLatin1Char('\n'));
     details.canRestart = true;
     presentBackendState(details);
+    if (!backendFailureIsRecoverable_) {
+        appHeader_->setBackendState(BackendUiState::Error, QString());
+    }
     showLibraryMessage(hasPreservedWork
                            ? QStringLiteral("后端连接中断，未完成操作结果未知；请重连后刷新：%1").arg(reason)
                            : reason,
@@ -1663,6 +1701,12 @@ void MainWindow::pollEvolutionJobs() {
 
 void MainWindow::onClientStateChanged(BackendClient::State state, const QString &detail) {
     clientBusy_ = state == BackendClient::State::Busy;
+    if (manager_ != nullptr && !backendReadyHandled_) {
+        backendReady_ = false;
+        clientBusy_ = false;
+        updateButtonStates();
+        return;
+    }
     if (state != BackendClient::State::Ready && state != BackendClient::State::Busy) {
         backendReadyHandled_ = false;
     }
@@ -2200,8 +2244,10 @@ void MainWindow::onClientTransportFailed(const QString &code, const QString &mes
         return;
     }
 
-    onBackendUnavailable(message);
     if (manager_ != nullptr && backendEverReady_ && recoverableTransport) {
+        backendFailureIsRecoverable_ = true;
+        onBackendUnavailable(message);
+        backendFailureIsRecoverable_ = false;
         backendRecoveryDetail_ = message;
         BackendStatusDetails details;
         details.state = BackendUiState::Recovering;
@@ -2210,7 +2256,9 @@ void MainWindow::onClientTransportFailed(const QString &code, const QString &mes
         details.recentError = message;
         details.canRestart = true;
         presentBackendState(details);
+        return;
     }
+    onBackendUnavailable(message);
 }
 
 void MainWindow::updateButtonStates() {
