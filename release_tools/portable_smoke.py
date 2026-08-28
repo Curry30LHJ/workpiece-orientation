@@ -174,6 +174,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
     except Exception as exc:
         report["error"] = str(exc)
         report["process_exit"] = None
+        setattr(exc, "smoke_report", report)
         _persist_report(options.report_path, report)
         raise
     process_factory = process_factory or _real_process_factory
@@ -185,6 +186,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
     except Exception as exc:
         report["error"] = str(exc)
         report["process_exit"] = None
+        setattr(exc, "smoke_report", report)
         _persist_report(options.report_path, report)
         raise
     client = None
@@ -273,6 +275,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
                 pass
     except Exception as exc:
         report["error"] = str(exc)
+        setattr(exc, "smoke_report", report)
         raise
     finally:
         primary_error = "error" in report
@@ -324,6 +327,11 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         ensure_empty_data(destination)
     except Exception as exc:
         report["error"] = str(exc)
+        partial = getattr(exc, "smoke_report", None)
+        if isinstance(partial, dict):
+            report["source"] = partial
+            report["commands"] = list(partial.get("commands", []))
+            report["results"] = list(partial.get("results", []))
         _persist_report(options.report_path, report)
         raise
     source_factories = dict(factories)
