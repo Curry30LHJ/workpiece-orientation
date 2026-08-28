@@ -45,4 +45,10 @@ def install_optional_sklearn_stubs() -> None:
     try:
         import faiss  # type: ignore[import-not-found]
     except (ImportError, ModuleNotFoundError):
-        sys.modules.setdefault("faiss", types.ModuleType("faiss"))
+        faiss_stub = types.ModuleType("faiss")
+
+        def missing_faiss_attribute(name: str) -> Any:
+            raise RuntimeError(f"faiss is unavailable in the inference bundle: {name}")
+
+        faiss_stub.__getattr__ = missing_faiss_attribute  # type: ignore[attr-defined]
+        sys.modules.setdefault("faiss", faiss_stub)

@@ -49,6 +49,8 @@ def test_paddleclas_sklearn_compat_supports_import_without_sklearn(monkeypatch):
         assert callable(metrics.hamming_loss)
         assert callable(preprocessing.binarize)
         assert "faiss" in sys.modules
+        with pytest.raises(RuntimeError, match="faiss is unavailable"):
+            sys.modules["faiss"].read_index("unused")
     finally:
         for name in ("sklearn", "sklearn.metrics", "sklearn.preprocessing", "faiss"):
             sys.modules.pop(name, None)
