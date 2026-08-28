@@ -9,7 +9,9 @@ param(
     [string]$ModelPath = '',
     [string]$OutputRoot = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'release_staging')
 )
+$ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$gitCommit = (& git -C $repo rev-parse HEAD 2>$null); if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitCommit)) { throw 'Unable to determine git commit' }
 $stagingRoot = [IO.Path]::GetFullPath($OutputRoot)
 $ownedRoot = ([IO.Path]::GetFullPath((Join-Path $repo 'release_staging'))).TrimEnd('\') + '\'
 if (-not $stagingRoot.StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputRoot must remain under release_staging' }
@@ -28,7 +30,7 @@ foreach ($ed in $editions) {
     & (Join-Path $repo 'scripts\build_portable_backend.ps1') -Edition $ed -Python $py -ProjectRoot $repo -OutputRoot $stagingRoot
     $backend = Join-Path $stagingRoot "backend-$ed\orientation_backend"
     $model = if ($ModelPath) { $ModelPath } else { Join-Path $repo 'models\shitu_rec' }
-    & $py -m release_tools.portable_package stage --edition $ed --version $Version --qt-release-dir $qtRelease --backend-dir $backend --model-dir $model --output-root $stagingRoot --guide (Join-Path $repo 'deploy\使用说明.txt') --notices (Join-Path $repo 'deploy\THIRD_PARTY-NOTICES.txt')
+    & $py -m release_tools.portable_package stage --edition $ed --version $Version --qt-release-dir $qtRelease --backend-dir $backend --model-dir $model --output-root $stagingRoot --guide (Join-Path $repo 'deploy\使用说明.txt') --notices (Join-Path $repo 'deploy\THIRD_PARTY-NOTICES.txt') --git-commit $gitCommit
     $package = Join-Path $target "WorkpieceOrientation-$($ed.ToUpper())"
     & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$package')/'third_party_licenses', paddleclas_license=Path(r'$repo')/'third_party'/'PaddleClas'/'LICENSE')"
     if ($SmokeScript -and (Test-Path -LiteralPath $SmokeScript)) { & $SmokeScript -PythonExecutable $py -ProjectRoot $package }

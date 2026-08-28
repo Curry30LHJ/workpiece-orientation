@@ -65,8 +65,12 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
                   model_dir: Path, output_root: Path, repository_root: Path | None = None,
                   guide: Path | None = None, notices: Path | None = None, git_commit: str = "unknown") -> PackageLayout:
     edition = edition.lower()
+    for source in (qt_release_dir, backend_dir, model_dir):
+        if not Path(source).is_dir(): raise NotADirectoryError(source)
     root = Path(output_root) / f"{edition}-{version}" / f"WorkpieceOrientation-{edition.upper()}"
     if root.exists():
+        out = Path(output_root).resolve(); target = root.resolve()
+        if out not in target.parents: raise PackageAuditError("staging path escapes output root")
         shutil.rmtree(root)
     root.mkdir(parents=True)
     qt_release_dir, backend_dir, model_dir = map(Path, (qt_release_dir, backend_dir, model_dir))
@@ -120,7 +124,8 @@ def run_dumpbin(executable: Path, package_root: Path) -> list[str]:
     if headers.returncode != 0 or result.returncode != 0:
         raise PackageAuditError(f"dumpbin failed for {executable.name}")
     machine = re.search(r"\b([0-9a-f]{3,4})\s+machine\b", headers.stdout, flags=re.IGNORECASE)
-    if machine and machine.group(1).lower() not in {"8664"}:
+    if not machine: raise PackageAuditError(f"unable to determine machine type for {executable.name}")
+    if machine.group(1).lower() not in {"8664"}:
         raise PackageAuditError(f"{executable.name} is not an x64 executable")
     return re.findall(r"^[ ]{8}([A-Za-z0-9_.-]+\.dll)$", result.stdout, flags=re.MULTILINE | re.IGNORECASE)
 
@@ -164,7 +169,8 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
     for exe in (root / "WorkpieceOrientation.exe", root / "backend" / "orientation_backend.exe"):
         if exe.exists():
             for dep in dependency_checker(exe, root) or []:
-                if dep.lower() not in {p.name.lower() for p in root.rglob("*")}: errors.append(f"dependency absent from package: {dep}")
+                system = {"kernel32.dll", "user32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "ws2_32.dll", "gdi32.dll", "comdlg32.dll", "msvcp140.dll", "vcruntime140.dll"}
+                if dep.lower() not in system and dep.lower() not in {p.name.lower() for p in root.rglob("*")}: errors.append(f"dependency absent from package: {dep}")
     if errors: raise PackageAuditError("; ".join(errors))
     return {"root": str(root), "edition": edition, "version": version, "files": len([p for p in root.rglob('*') if p.is_file()])}
 
@@ -214,10 +220,10 @@ def write_sha256(archive: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True); stage = sub.add_parser("stage")
     for arg in ("edition", "version", "qt-release-dir", "backend-dir", "model-dir", "output-root"): stage.add_argument("--" + arg, required=True)
-    stage.add_argument("--guide", required=True); stage.add_argument("--notices", required=True)
+    stage.add_argument("--guide", required=True); stage.add_argument("--notices", required=True); stage.add_argument("--git-commit", required=True)
     args = parser.parse_args()
     if args.command == "stage":
-        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), guide=Path(args.guide), notices=Path(args.notices)); print(result.root)
+        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), guide=Path(args.guide), notices=Path(args.notices), git_commit=args.git_commit); print(result.root)
 
 
 if __name__ == "__main__": main()
