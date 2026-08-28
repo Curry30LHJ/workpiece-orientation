@@ -1,0 +1,12 @@
+PyInstaller==6.22.2
+paddleclas==2.6.0
+numpy==1.24.4
+opencv-python==4.6.0.66
+easydict==1.13
+gast==0.3.3
+Pillow==12.1.0
+prettytable==3.18.0
+PyYAML==6.0.3
+scipy==1.15.3
+tqdm==4.70.0
+ujson==5.13.0
