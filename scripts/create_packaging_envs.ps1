@@ -5,11 +5,22 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Some developer shells set PIP_NO_INDEX=1 globally.  Packaging must be able
+# to reach the explicitly selected indexes, so child pip/conda processes inherit
+# an explicit empty value.
+$env:PIP_NO_INDEX = ''
 $common = Join-Path $ProjectRoot 'deploy\requirements\common.txt'
 if (-not (Test-Path -LiteralPath $common)) { throw "Missing requirements file: $common" }
 
 function Ensure-Environment([string]$Name) {
-    & $Conda run -n $Name python --version 2>$null | Out-Null
+    $versionOutput = (& $Conda run -n $Name python --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0) {
+        $versionLine = $versionOutput -split '\r?\n' | Where-Object { $_ -match '^Python ' } | Select-Object -First 1
+        if ([string]::IsNullOrWhiteSpace($versionLine) -or $versionLine -notmatch '^Python 3\.10\.') {
+            throw "Packaging environment $Name has unsupported Python version: $versionOutput (Python 3.10.x required)"
+        }
+        return
+    }
     if ($LASTEXITCODE -ne 0) {
         & $Conda create -y -n $Name ("python=" + $PythonVersion)
         if ($LASTEXITCODE -ne 0) { throw "Unable to create conda environment $Name" }

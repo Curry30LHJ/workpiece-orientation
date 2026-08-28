@@ -36,6 +36,22 @@ PowerShell parser: scripts/build_portable_backend.ps1 # parsed
 git diff --check                                      # clean
 ```
 
+## Fix round 2 — packaging environment robustness
+
+RED: a static script test failed because `create_packaging_envs.ps1` did not clear a globally inherited `PIP_NO_INDEX` value and had no supported-version guard for an already existing environment.
+
+GREEN:
+
+```text
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_packaging_env_script.py tests/test_backend_bundle.py -q -p no:cacheprovider
+.....                                                                    [100%]
+5 passed in 0.05s
+PowerShell parser: scripts/create_packaging_envs.ps1  # parsed
+git diff --check                                      # clean
+```
+
+The script now sets `$env:PIP_NO_INDEX = ''` before any child process, preserves the official cu118/cpu indexes, and rejects an existing environment unless its reported interpreter is Python 3.10.x.
+
 ## Environment/build attempt
 
 The authorized `create_packaging_envs.ps1` attempt created the Python 3.10.20 Conda environments and installed the common dependencies into the GPU environment. The Paddle GPU download/install did not complete (the process was interrupted after prolonged network resolution/download); CPU dependency installation therefore did not start. Neither `paddlepaddle-gpu` nor `paddlepaddle` metadata is present in the respective environments after interruption. Consequently no PyInstaller build or EXE smoke test was run, and no build result is claimed.
