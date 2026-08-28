@@ -2,8 +2,11 @@
 
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QDir>
+#include <QFileInfo>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QTemporaryDir>
 
 #include "../appconfig.h"
 #include "../backendclient.h"
@@ -41,6 +44,8 @@ public:
         }
     }
 
+    void release() override { ++releaseCalls; }
+
     void finish(int exitCode) {
         running = false;
         emit finished(exitCode);
@@ -51,6 +56,7 @@ public:
     int startCalls = 0;
     int terminateCalls = 0;
     int killCalls = 0;
+    int releaseCalls = 0;
     bool running = false;
     bool delayExit = false;
     QString lastProgram;
@@ -839,6 +845,55 @@ private slots:
         QCOMPARE(launcher.terminateCalls, 0);
         QCOMPARE(launcher.killCalls, 1);
         QVERIFY(server.shutdownToken().isEmpty());
+    }
+
+    void unverifiedRunningProcessIsReleasedDuringManagerTeardown() {
+        const quint16 port = unusedPort();
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        launcher.delayExit = true;
+        auto *manager = new BackendProcessManager(configFor(port, 1000),
+                                                  &client, &launcher);
+        manager->start();
+        QTRY_COMPARE_WITH_TIMEOUT(launcher.startCalls, 1, 1000);
+        QVERIFY(launcher.isRunning());
+        QVERIFY(!manager->ownedByThisSession());
+
+        delete manager;
+
+        QCOMPARE(launcher.releaseCalls, 1);
+        QCOMPARE(launcher.terminateCalls, 0);
+        QCOMPARE(launcher.killCalls, 0);
+        QVERIFY(launcher.isRunning());
+    }
+
+    void releasedQProcessSurvivesLauncherDestruction() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString markerPath = dir.filePath(QStringLiteral("released.txt"));
+        const QString helperProgram = QStringLiteral(
+            "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
+        QString escapedMarkerPath = QDir::toNativeSeparators(markerPath);
+        escapedMarkerPath.replace(QLatin1Char('\''), QStringLiteral("''"));
+        const QString helperCommand = QStringLiteral(
+            "Start-Sleep -Milliseconds 750; "
+            "[System.IO.File]::WriteAllText('%1', 'released')")
+            .arg(escapedMarkerPath);
+        auto *launcher = new QProcessLauncher;
+        QSignalSpy startedSpy(launcher, &ProcessLauncher::started);
+        QVERIFY(launcher->start(helperProgram,
+                                {QStringLiteral("-NoLogo"),
+                                 QStringLiteral("-NoProfile"),
+                                 QStringLiteral("-NonInteractive"),
+                                 QStringLiteral("-Command"), helperCommand},
+                                dir.path()));
+        QTRY_COMPARE_WITH_TIMEOUT(startedSpy.count(), 1, 1000);
+        QVERIFY(launcher->isRunning());
+
+        launcher->release();
+        delete launcher;
+
+        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(markerPath), 5000);
     }
 
     void stopDuringLaunchIgnoresLateProcessCallbacks() {

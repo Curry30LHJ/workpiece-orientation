@@ -60,8 +60,12 @@ BackendProcessManager::~BackendProcessManager() {
     startupTimer_->stop();
     stopEscalationTimer_->stop();
     client_->disconnectFromService();
-    if (launcher_->isRunning() && canControlOwnedProcess()) {
-        launcher_->kill();
+    if (launcher_->isRunning()) {
+        if (canControlOwnedProcess()) {
+            launcher_->kill();
+        } else {
+            launcher_->release();
+        }
     }
 }
 

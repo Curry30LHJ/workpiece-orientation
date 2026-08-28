@@ -182,6 +182,7 @@ public:
     bool start(const QString &, const QStringList &, const QString &) override { return true; }
     void terminate() override {}
     void kill() override {}
+    void release() override {}
     bool isRunning() const override { return false; }
 };
 
@@ -201,6 +202,7 @@ public:
 
     void terminate() override { ++terminateCalls; }
     void kill() override { ++killCalls; }
+    void release() override { running = false; }
     bool isRunning() const override { return running; }
 
     void finish(int exitCode) {
@@ -5183,6 +5185,53 @@ private slots:
         launcher.finish(0);
 
         QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 1000);
+    }
+
+    void ownedBackendActiveTaskPromptsOnceThenClosesAfterShutdown() {
+        const quint16 port = unusedPort();
+        QVERIFY(port != 0);
+        WindowShutdownServer server;
+        BackendClient client;
+        WindowShutdownLauncher launcher;
+        AppConfig config = configFor(port);
+        config.requestTimeoutMs = 100;
+        config.startupTimeoutMs = 1000;
+        BackendProcessManager manager(config, &client, &launcher);
+        MainWindow window(&client, &manager);
+        QObject::connect(&launcher, &WindowShutdownLauncher::startRequested,
+                         &server, [&]() {
+            server.setInstanceToken(argumentValue(
+                launcher.lastArguments, QStringLiteral("--instance-token")));
+            QVERIFY(server.listen(port));
+        });
+        QSignalSpy readySpy(&manager, &BackendProcessManager::backendReady);
+        manager.start();
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QVERIFY(manager.ownedByThisSession());
+        emit client.responseReceived(QStringLiteral("list_evolution_jobs"), QJsonObject{
+            {QStringLiteral("jobs"), QJsonArray{QJsonObject{
+                {QStringLiteral("job_id"), QStringLiteral("close-active-job")},
+                {QStringLiteral("state"), QStringLiteral("building")},
+                {QStringLiteral("phase"), QStringLiteral("features")}}}}});
+        auto *libraryPage = window.findChild<WorkpieceLibraryPage *>();
+        QVERIFY(libraryPage != nullptr);
+        QVERIFY(libraryPage->hasActiveEvolutionTask());
+        window.show();
+        QCoreApplication::processEvents();
+        int promptCount = 0;
+        new MessageBoxButtonSequenceChooser({QStringLiteral("退出应用"),
+                                             QStringLiteral("继续运行")},
+                                            &promptCount);
+
+        QVERIFY(!window.close());
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.shutdownCount(), 1, 1000);
+        QVERIFY(window.isVisible());
+        launcher.finish(0);
+        QTRY_VERIFY_WITH_TIMEOUT(!window.isVisible(), 1000);
+        QCOMPARE(promptCount, 1);
+        QCOMPARE(server.shutdownCount(), 1);
     }
 
     void unownedBackendCloseDoesNotWaitForShutdown() {

@@ -273,7 +273,8 @@ void MainWindow::closeEvent(QCloseEvent *event) {
         event->ignore();
         return;
     }
-    const bool skipDirtyGuard = skipDirtyCloseGuardOnce_;
+    const bool skipAcceptedGuards = retryingAcceptedClose_;
+    const bool skipDirtyGuard = skipDirtyCloseGuardOnce_ || skipAcceptedGuards;
     skipDirtyCloseGuardOnce_ = false;
     if (!skipDirtyGuard && geometryRulesPage_ != nullptr
         && geometryRulesPage_->hasUnsavedChanges()) {
@@ -290,7 +291,7 @@ void MainWindow::closeEvent(QCloseEvent *event) {
             return;
         }
     }
-    if (hasActiveTask()
+    if (!skipAcceptedGuards && hasActiveTask()
         && promptForActiveTaskClose() == ActiveTaskCloseDecision::ContinueRunning) {
         event->ignore();
         return;
@@ -633,9 +634,13 @@ void MainWindow::connectBackendSignals() {
                 this, &MainWindow::onBackendUnavailable);
         connect(manager_, &BackendProcessManager::shutdownFinished, this, [this]() {
             if (!backendShutdownPending_) return;
-            backendShutdownPending_ = false;
             backendShutdownComplete_ = true;
-            QTimer::singleShot(0, this, [this]() { close(); });
+            QTimer::singleShot(0, this, [this]() {
+                backendShutdownPending_ = false;
+                retryingAcceptedClose_ = true;
+                close();
+                retryingAcceptedClose_ = false;
+            });
         });
     }
 }

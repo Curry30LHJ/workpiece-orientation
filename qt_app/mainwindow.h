@@ -259,6 +259,7 @@ private:
     bool skipDirtyCloseGuardOnce_ = false;
     bool backendShutdownPending_ = false;
     bool backendShutdownComplete_ = false;
+    bool retryingAcceptedClose_ = false;
     GeometrySaveIntent geometrySaveIntent_ = GeometrySaveIntent::None;
     GeometrySaveIntent stagedGeometrySaveIntent_ = GeometrySaveIntent::None;
     QString stagedGeometrySaveWorkpieceId_;
