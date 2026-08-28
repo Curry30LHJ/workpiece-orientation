@@ -1,9 +1,11 @@
 #include "appconfig.h"
 
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 
 namespace {
 
@@ -23,6 +25,15 @@ bool readString(const QJsonObject &object, const QString &key, QString *value, Q
     return true;
 }
 
+bool readOptionalString(const QJsonObject &object, const QString &key, QString *value,
+                        QString *error) {
+    const QJsonValue jsonValue = object.value(key);
+    if (jsonValue.isUndefined()) {
+        return true;
+    }
+    return readString(object, key, value, error);
+}
+
 bool requireExistingFile(const QString &path, const QString &key, QString *error) {
     if (!QFileInfo::exists(path) || !QFileInfo(path).isFile()) {
         setError(error, QStringLiteral("Configuration path does not exist: %1 (%2)").arg(key, path));
@@ -34,6 +45,25 @@ bool requireExistingFile(const QString &path, const QString &key, QString *error
 bool requireExistingDirectory(const QString &path, const QString &key, QString *error) {
     if (!QFileInfo::exists(path) || !QFileInfo(path).isDir()) {
         setError(error, QStringLiteral("Configuration path does not exist: %1 (%2)").arg(key, path));
+        return false;
+    }
+    return true;
+}
+
+bool requireDataRootParent(const QString &path, QString *error) {
+    const QFileInfo dataRootInfo(path);
+    if (dataRootInfo.exists()) {
+        if (!dataRootInfo.isDir()) {
+            setError(error, QStringLiteral("Configuration path is not a directory: data_root (%1)")
+                                .arg(path));
+            return false;
+        }
+        return true;
+    }
+    const QString parentPath = dataRootInfo.absolutePath();
+    if (!QFileInfo::exists(parentPath) || !QFileInfo(parentPath).isDir()) {
+        setError(error, QStringLiteral("Configuration data_root parent does not exist: %1 (%2)")
+                            .arg(parentPath, path));
         return false;
     }
     return true;
@@ -55,13 +85,72 @@ std::optional<AppConfig> AppConfig::load(const QString &path, QString *error) {
     }
     const QJsonObject object = document.object();
     AppConfig config;
-    if (!readString(object, QStringLiteral("python_executable"), &config.pythonExecutable, error)
-        || !readString(object, QStringLiteral("backend_script"), &config.backendScript, error)
-        || !readString(object, QStringLiteral("project_root"), &config.projectRoot, error)
+    const QJsonValue launchModeValue = object.value(QStringLiteral("launch_mode"));
+    if (!launchModeValue.isUndefined()) {
+        if (!launchModeValue.isString()) {
+            setError(error, QStringLiteral("launch_mode must be python_script or packaged_executable"));
+            return std::nullopt;
+        }
+        const QString launchMode = launchModeValue.toString().trimmed().toLower();
+        if (launchMode == QStringLiteral("packaged_executable")) {
+            config.launchMode = BackendLaunchMode::PackagedExecutable;
+        } else if (launchMode != QStringLiteral("python_script")) {
+            setError(error, QStringLiteral("launch_mode must be python_script or packaged_executable"));
+            return std::nullopt;
+        }
+    }
+
+    if (!readString(object, QStringLiteral("project_root"), &config.projectRoot, error)
         || !readString(object, QStringLiteral("model_dir"), &config.modelDir, error)
-        || !readString(object, QStringLiteral("library_dir"), &config.libraryDir, error)) {
+        || !readOptionalString(object, QStringLiteral("python_executable"), &config.pythonExecutable,
+                               error)
+        || !readOptionalString(object, QStringLiteral("backend_script"), &config.backendScript, error)
+        || !readOptionalString(object, QStringLiteral("backend_executable"),
+                               &config.backendExecutable, error)
+        || !readOptionalString(object, QStringLiteral("paddle_config"), &config.paddleConfigPath,
+                               error)
+        || !readOptionalString(object, QStringLiteral("library_dir"), &config.libraryDir, error)
+        || !readOptionalString(object, QStringLiteral("data_root"), &config.dataRoot, error)
+        || !readOptionalString(object, QStringLiteral("model_sha256"), &config.modelSha256,
+                               error)
+        || !readOptionalString(object, QStringLiteral("compute_device"), &config.computeDevice,
+                               error)
+        || !readOptionalString(object, QStringLiteral("edition"), &config.edition, error)
+        || !readOptionalString(object, QStringLiteral("package_version"), &config.packageVersion,
+                               error)) {
         return std::nullopt;
     }
+    if (config.launchMode == BackendLaunchMode::PackagedExecutable) {
+        for (const QString &key : {QStringLiteral("backend_executable"),
+                                  QStringLiteral("paddle_config"),
+                                  QStringLiteral("data_root"),
+                                  QStringLiteral("model_sha256"),
+                                  QStringLiteral("compute_device"),
+                                  QStringLiteral("edition"),
+                                  QStringLiteral("package_version")}) {
+            if (!object.contains(key)) {
+                setError(error, QStringLiteral("Missing configuration field: %1").arg(key));
+                return std::nullopt;
+            }
+        }
+    }
+    const QDir configDir = QFileInfo(path).absoluteDir();
+    const auto resolvedPath = [&configDir](const QString &value) {
+        if (value.isEmpty()) {
+            return QString();
+        }
+        return QDir::cleanPath(QFileInfo(value).isAbsolute()
+                                   ? value
+                                   : configDir.absoluteFilePath(value));
+    };
+    config.pythonExecutable = resolvedPath(config.pythonExecutable);
+    config.backendScript = resolvedPath(config.backendScript);
+    config.backendExecutable = resolvedPath(config.backendExecutable);
+    config.projectRoot = resolvedPath(config.projectRoot);
+    config.paddleConfigPath = resolvedPath(config.paddleConfigPath);
+    config.modelDir = resolvedPath(config.modelDir);
+    config.libraryDir = resolvedPath(config.libraryDir);
+    config.dataRoot = resolvedPath(config.dataRoot);
     const QJsonValue searchModeValue = object.value(QStringLiteral("local_search_mode"));
     if (!searchModeValue.isUndefined()) {
         if (!searchModeValue.isString()) {
@@ -123,11 +212,46 @@ std::optional<AppConfig> AppConfig::load(const QString &path, QString *error) {
         setError(error, QStringLiteral("timeouts must be positive"));
         return std::nullopt;
     }
-    if (!requireExistingFile(config.pythonExecutable, QStringLiteral("python_executable"), error)
-        || !requireExistingFile(config.backendScript, QStringLiteral("backend_script"), error)
-        || !requireExistingDirectory(config.projectRoot, QStringLiteral("project_root"), error)
-        || !requireExistingDirectory(config.modelDir, QStringLiteral("model_dir"), error)) {
+    if (config.launchMode == BackendLaunchMode::PythonScript) {
+        if (config.pythonExecutable.isEmpty() || config.backendScript.isEmpty()
+            || config.libraryDir.isEmpty()
+            || !requireExistingFile(config.pythonExecutable, QStringLiteral("python_executable"), error)
+            || !requireExistingFile(config.backendScript, QStringLiteral("backend_script"), error)
+            || !requireExistingDirectory(config.projectRoot, QStringLiteral("project_root"), error)
+            || !requireExistingDirectory(config.modelDir, QStringLiteral("model_dir"), error)) {
+            if (error != nullptr && error->isEmpty()) {
+                setError(error, QStringLiteral("Missing required development configuration field"));
+            }
+            return std::nullopt;
+        }
+    } else if (config.backendExecutable.isEmpty() || config.paddleConfigPath.isEmpty()
+               || config.dataRoot.isEmpty() || config.modelSha256.isEmpty()
+               || config.computeDevice.isEmpty() || config.edition.isEmpty()
+               || config.packageVersion.isEmpty()
+               || !requireExistingFile(config.backendExecutable,
+                                       QStringLiteral("backend_executable"), error)
+               || !requireExistingFile(config.paddleConfigPath, QStringLiteral("paddle_config"), error)
+               || !requireExistingDirectory(config.projectRoot, QStringLiteral("project_root"), error)
+               || !requireExistingDirectory(config.modelDir, QStringLiteral("model_dir"), error)
+               || !requireDataRootParent(config.dataRoot, error)) {
         return std::nullopt;
+    }
+    if (config.launchMode == BackendLaunchMode::PackagedExecutable) {
+        static const QRegularExpression lowercaseSha256(
+            QStringLiteral("^[0-9a-f]{64}$")
+        );
+        if (!lowercaseSha256.match(config.modelSha256).hasMatch()) {
+            setError(error, QStringLiteral("model_sha256 must be a lowercase 64-character SHA-256"));
+            return std::nullopt;
+        }
+        if (config.computeDevice != config.edition) {
+            setError(error, QStringLiteral("edition and compute_device must match"));
+            return std::nullopt;
+        }
+        if (config.inferenceMode != QStringLiteral("fast_geometry")) {
+            setError(error, QStringLiteral("packaged inference_mode must be fast_geometry"));
+            return std::nullopt;
+        }
     }
     config.port = static_cast<quint16>(port);
     config.startupTimeoutMs = startupTimeout;
