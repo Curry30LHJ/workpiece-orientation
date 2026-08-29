@@ -18,6 +18,11 @@ project_root_env = os.environ.get("WORKPIECE_PROJECT_ROOT", "").strip()
 project_root = Path(project_root_env).resolve() if project_root_env else Path.cwd().resolve()
 validate_installed_distributions(edition)
 
+# Paddle is collected as binaries/data only; its Python implementation and
+# the project modules are frozen into the PYZ archive, not delivered as loose
+# source files.  OpenCV's wheel is the one intentional exception: its
+# ``cv2/__init__.py`` loader is required beside the extension and is audited as
+# a third-party dependency loader by ``portable_package``.
 paddle_binaries = collect_dynamic_libs("paddle")
 paddle_datas = collect_data_files("paddle", include_py_files=False)
 cuda_binaries = []

@@ -34,5 +34,12 @@ try {
 $backend = Join-Path $editionRoot 'orientation_backend'
 $exe = Join-Path $backend 'orientation_backend.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "Frozen backend missing orientation_backend.exe: $exe" }
+$visibleSources = @(Get-ChildItem -LiteralPath $backend -Recurse -File -Include '*.py' | Where-Object {
+    $relative = $_.FullName.Substring($backend.Length + 1).Replace('\','/').ToLowerInvariant()
+    -not $relative.StartsWith('_internal/cv2/')
+})
+if ($visibleSources.Count -gt 0) {
+    throw ("Frozen backend contains project Python source: " + (($visibleSources | ForEach-Object { $_.FullName }) -join ', '))
+}
+Write-Output ("Dependency loader sources retained (OpenCV only): " + ((Get-ChildItem -LiteralPath $backend -Recurse -File -Include '*.py' | Measure-Object).Count))
 Write-Output ("Backend bundle ready: " + $backend)
-

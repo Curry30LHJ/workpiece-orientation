@@ -33,7 +33,7 @@ def main() -> int:
         args.output.write_text(json.dumps({"passed": False, "error": {"type": type(exc).__name__, "message": str(exc)},
                                           "process_exit": getattr(exc, "process_exit", None),
                                           "backend_log": getattr(exc, "backend_log", ""),
-                                          "lifecycle": {"shutdown": "not_confirmed"}},
+                                          "lifecycle": getattr(exc, "lifecycle", {"shutdown_confirmed": False})},
                                           ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"benchmark failed: {exc}", file=sys.stderr)
         return 2

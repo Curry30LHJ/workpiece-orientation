@@ -6,7 +6,7 @@ import pytest
 
 from release_tools.portable_package import (
     PackageAuditError, audit_package, build_release_config,
-    write_manifest, write_sha256, zip_package,
+    stage_package, write_manifest, write_sha256, zip_package,
 )
 from src.model_fingerprint import model_directory_sha256
 
@@ -135,3 +135,75 @@ def test_manifest_includes_nested_manifest_file(tmp_path: Path):
     nested.write_text("{}", encoding="utf-8")
     manifest = write_manifest(root, edition="gpu", version="1.0.0")
     assert any(item["path"] == "third_party_licenses/manifest.json" for item in manifest["files"])
+
+
+def test_audit_allows_only_explicit_cv2_dependency_loader_sources(tmp_path: Path):
+    root = minimal_stage(tmp_path / "package")
+    loader = root / "backend" / "_internal" / "cv2"
+    loader.mkdir(parents=True)
+    (loader / "__init__.py").write_text("# required OpenCV loader", encoding="utf-8")
+    audit_synthetic(root)
+    (root / "backend" / "_internal" / "project_module.py").write_text("secret", encoding="utf-8")
+    with pytest.raises(PackageAuditError, match="Python source"):
+        audit_synthetic(root)
+
+
+def test_audit_does_not_scan_binary_payloads_for_text_tokens_or_substrings(tmp_path: Path):
+    root = minimal_stage(tmp_path / "package")
+    (root / "backend" / "random_reportlab.dll").write_bytes(b"MZ${{{{random-bytes")
+    audit_synthetic(root)
+    (root / "backend" / "reports").mkdir()
+    (root / "backend" / "reports" / "build.txt").write_text("generated", encoding="utf-8")
+    with pytest.raises(PackageAuditError, match="development artifact"):
+        audit_synthetic(root)
+
+
+def _minimal_stage_inputs(root: Path):
+    qt = root / "qt"
+    backend = root / "backend-source"
+    model = root / "model"
+    qt.mkdir(parents=True)
+    backend.mkdir(parents=True)
+    model.mkdir(parents=True)
+    (qt / "WorkpieceOrientation.exe").write_bytes(b"MZ-qt")
+    (qt / "platforms").mkdir()
+    (qt / "platforms" / "qwindows.dll").write_bytes(b"MZ")
+    (qt / "Makefile.Debug").write_text("dev", encoding="utf-8")
+    (qt / "unused.h").write_text("dev", encoding="utf-8")
+    (backend / "orientation_backend.exe").write_bytes(b"MZ-backend")
+    (backend / "paddle_inference.dll").write_bytes(b"MZ")
+    (backend / "_internal" / "cv2").mkdir(parents=True)
+    (backend / "_internal" / "cv2" / "__init__.py").write_text("loader", encoding="utf-8")
+    (backend / "_internal" / "project_module.py").write_text("must not ship", encoding="utf-8")
+    (backend / "headers.h").write_text("dev", encoding="utf-8")
+    for name, data in (("inference.pdmodel", b"model"), ("inference.pdiparams", b"params"), ("inference.pdiparams.info", b"info")):
+        (model / name).write_bytes(data)
+    guide = root / "guide.txt"; guide.write_text("guide", encoding="utf-8")
+    notices = root / "notices.txt"; notices.write_text("notices", encoding="utf-8")
+    config = root / "inference_general.yaml"; config.write_text("Global: {}\n", encoding="utf-8")
+    return qt, backend, model, guide, notices, config
+
+
+def test_stage_filters_build_sources_and_requires_inference_config(tmp_path: Path):
+    qt, backend, model, guide, notices, config = _minimal_stage_inputs(tmp_path / "inputs")
+    layout = stage_package(
+        edition="gpu", version="1.0.0", qt_release_dir=qt, backend_dir=backend,
+        model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+        git_commit="0" * 40, paddle_config=config,
+    )
+    assert (layout.root / "backend" / "resources" / "inference_general.yaml").is_file()
+    assert (layout.root / "backend" / "_internal" / "cv2" / "__init__.py").is_file()
+    assert not (layout.root / "backend" / "_internal" / "project_module.py").exists()
+    assert not (layout.root / "backend" / "headers.h").exists()
+    assert not (layout.root / "Makefile.Debug").exists()
+    assert not (layout.root / "unused.h").exists()
+
+
+def test_stage_fails_when_inference_config_is_unavailable(tmp_path: Path):
+    qt, backend, model, guide, notices, _config = _minimal_stage_inputs(tmp_path / "inputs")
+    with pytest.raises(FileNotFoundError, match="inference_general.yaml"):
+        stage_package(
+            edition="gpu", version="1.0.0", qt_release_dir=qt, backend_dir=backend,
+            model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+            git_commit="0" * 40,
+        )

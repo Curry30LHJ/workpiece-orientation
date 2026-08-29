@@ -21,6 +21,65 @@ from src.model_fingerprint import model_directory_sha256
 class PackageAuditError(RuntimeError):
     pass
 
+
+_RUNTIME_DEV_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".obj", ".exp",
+    ".lib", ".pdb", ".ilk", ".map", ".pyi",
+}
+_TEXT_AUDIT_SUFFIXES = {
+    ".cfg", ".conf", ".ini", ".json", ".md", ".ps1", ".py", ".pyi",
+    ".toml", ".txt", ".xml", ".yaml", ".yml",
+}
+_DEPENDENCY_LOADER_PREFIXES = ("backend/_internal/cv2/",)
+_DEVELOPMENT_DIR_NAMES = {"test", "tests", "report", "reports", "fixture", "fixtures", "manual", "manuals"}
+
+
+def _is_dependency_loader(rel: str) -> bool:
+    """Return whether a visible Python file is a required third-party loader.
+
+    The OpenCV wheel ships ``cv2/__init__.py`` and companion loader files as
+    data.  They are not project source and removing them breaks ``import cv2``
+    in the frozen service, so the audit has this explicit, narrow exception.
+    Project modules and all other visible Python source remain forbidden.
+    """
+
+    return any(rel.startswith(prefix) for prefix in _DEPENDENCY_LOADER_PREFIXES)
+
+
+def _should_copy_runtime_file(relative: str, *, backend: bool = False) -> bool:
+    """Keep only files needed by an onedir runtime bundle."""
+
+    path = Path(relative)
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    if suffix in _RUNTIME_DEV_SUFFIXES or suffix == ".rc":
+        return False
+    if name.startswith(("makefile", "moc_", "ui_")):
+        return False
+    if suffix == ".py":
+        return backend and _is_dependency_loader("backend/" + relative.lower())
+    return True
+
+
+def _copy_runtime_tree(src: Path, dst: Path, *, backend: bool = False) -> None:
+    """Copy a tree without shipping build sources or reparse points."""
+
+    src = Path(src)
+    dst = Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in sorted(src.rglob("*")):
+        relative = item.relative_to(src).as_posix()
+        if item.is_symlink():
+            raise PackageAuditError(f"source bundle contains a symlink: {relative}")
+        target = dst / relative
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if item.is_file() and _should_copy_runtime_file(relative, backend=backend):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+
 def _is_system_dependency(name: str, system_roots: Iterable[Path] = ()) -> bool:
     base = Path(name).name.lower()
     if base.startswith(("api-ms-", "ext-ms-")): return True
@@ -70,7 +129,8 @@ def _copy_tree(src: Path, dst: Path) -> None:
 
 def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_dir: Path,
                   model_dir: Path, output_root: Path, repository_root: Path | None = None,
-                  guide: Path | None = None, notices: Path | None = None, git_commit: str = "unknown") -> PackageLayout:
+                  guide: Path | None = None, notices: Path | None = None, git_commit: str = "unknown",
+                  paddle_config: Path | None = None) -> PackageLayout:
     edition = edition.lower()
     if edition not in {"gpu", "cpu"} or not re.fullmatch(r"\d+\.\d+\.\d+", version): raise ValueError("invalid edition or version")
     for source in (qt_release_dir, backend_dir, model_dir):
@@ -83,17 +143,13 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
         shutil.rmtree(root)
     root.mkdir(parents=True)
     qt_release_dir, backend_dir, model_dir = map(Path, (qt_release_dir, backend_dir, model_dir))
-    for item in qt_release_dir.iterdir():
-        if item.suffix.lower() in {".obj", ".cpp", ".h", ".hpp", ".rc", ".exp", ".lib", ".pdb"} or item.name.lower().startswith(("makefile", "moc_", "ui_")):
-            continue
-        if item.name.lower() == "app_config.json":
-            continue
-        target = root / item.name
-        shutil.copytree(item, target, dirs_exist_ok=True) if item.is_dir() else shutil.copy2(item, target)
+    _copy_runtime_tree(qt_release_dir, root)
+    # The package config is generated below; never carry a stale build copy.
+    generated_config = root / "app_config.json"
+    if generated_config.exists():
+        generated_config.unlink()
     (root / "backend").mkdir(exist_ok=True)
-    for item in backend_dir.iterdir():
-        target = root / "backend" / item.name
-        shutil.copytree(item, target, dirs_exist_ok=True) if item.is_dir() else shutil.copy2(item, target)
+    _copy_runtime_tree(backend_dir, root / "backend", backend=True)
     model_target = root / "models" / "shitu_rec"
     model_target.mkdir(parents=True)
     required = {"inference.pdmodel", "inference.pdiparams", "inference.pdiparams.info"}
@@ -105,9 +161,31 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
         raise FileNotFoundError(f"model files missing: {sorted(missing)}")
     resources = root / "backend" / "resources"
     resources.mkdir(parents=True, exist_ok=True)
-    if not (resources / "inference_general.yaml").exists():
-        candidates = list(backend_dir.rglob("inference_general.yaml"))
-        if candidates: shutil.copy2(candidates[0], resources / "inference_general.yaml")
+    config_candidates: list[Path] = []
+    if paddle_config is not None:
+        config_candidates.append(Path(paddle_config))
+    config_candidates.extend([
+        resources / "inference_general.yaml",
+        backend_dir / "resources" / "inference_general.yaml",
+    ])
+    if repository_root is not None:
+        repo = Path(repository_root)
+        config_candidates.extend([
+            repo / "deploy" / "configs" / "inference_general.yaml",
+            repo / "deploy" / "inference_general.yaml",
+            repo / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml",
+        ])
+    config_source = next((candidate for candidate in config_candidates if candidate.is_file()), None)
+    if config_source is None:
+        discovered = sorted(backend_dir.rglob("inference_general.yaml"))
+        config_source = discovered[0] if discovered else None
+    if config_source is None:
+        raise FileNotFoundError("inference_general.yaml is required for the portable backend")
+    if config_source.is_symlink():
+        raise PackageAuditError("inference_general.yaml must not be a symlink")
+    config_target = resources / "inference_general.yaml"
+    if config_source.resolve() != config_target.resolve():
+        shutil.copy2(config_source, config_target)
     (root / "qt.conf").write_text("[Paths]\nPlugins=platforms\nLibraries=.\n", encoding="utf-8")
     data = root / "data"
     for name in ("workpieces", "rules", "cache", "logs", "temp"):
@@ -166,21 +244,35 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
         if cfg.get("model_sha256") != digest or ver.get("model_sha256") != digest: errors.append("model fingerprint mismatch")
     wp = root / "data" / "workpieces"
     if wp.exists() and any(wp.iterdir()): errors.append("workpieces library must be empty")
-    forbidden = [str(Path(p)).replace("\\", "/").rstrip("/").lower() for p in forbidden_roots]
-    known_roots = forbidden + [str(Path(p)).replace("\\", "/").rstrip("/").lower() for p in runtime_roots] + [str(Path(os.environ.get("USERPROFILE", ""))).replace("\\", "/").rstrip("/").lower(), str(Path(os.sys.executable).parent).replace("\\", "/").rstrip("/").lower()]
+    forbidden = [str(Path(p)).replace("\\", "/").rstrip("/").lower() for p in forbidden_roots if str(p).strip()]
+    known_roots = forbidden + [str(Path(p)).replace("\\", "/").rstrip("/").lower() for p in runtime_roots if str(p).strip()]
+    for candidate in (os.environ.get("USERPROFILE", ""), str(Path(os.sys.executable).parent)):
+        normalized = str(candidate).replace("\\", "/").rstrip("/").lower()
+        if normalized and normalized not in {".", "/"}:
+            known_roots.append(normalized)
     for file in root.rglob("*"):
+        if file.is_symlink():
+            errors.append("symlink is not allowed: " + file.relative_to(root).as_posix())
+            continue
         if not file.is_file(): continue
         rel = file.relative_to(root).as_posix().lower(); name = file.name.lower()
-        if file.suffix.lower() == ".py" or (file.suffix.lower() == ".pyi" and "/_internal/" not in "/" + rel): errors.append("Python source is not allowed: " + rel)
-        if file.suffix.lower() in {".pdb", ".obj"} or any(x in rel for x in ("test", "report", "fixture", "manual")): errors.append("development artifact: " + rel)
+        if file.suffix.lower() == ".py" and not _is_dependency_loader(rel): errors.append("Python source is not allowed: " + rel)
+        if file.suffix.lower() == ".pyi" and not rel.startswith("backend/_internal/"): errors.append("Python source is not allowed: " + rel)
+        is_internal_typing_stub = file.suffix.lower() == ".pyi" and rel.startswith("backend/_internal/")
+        if (file.suffix.lower() in _RUNTIME_DEV_SUFFIXES and not is_internal_typing_stub) or file.suffix.lower() == ".rc" or any(part in _DEVELOPMENT_DIR_NAMES for part in rel.split("/")): errors.append("development artifact: " + rel)
         if edition == "cpu" and any(tok in name for tok in ("cuda", "cudnn", "cublas", "nvidia")): errors.append("CUDA runtime in CPU package: " + rel)
         data_rel = rel.startswith("data/")
         if data_rel and any(tok in rel.split("/") for tok in ("rules", "cache", "manifest")) and name != "data_layout.json": errors.append("shipped data artifact: " + rel)
-        raw = file.read_bytes(); text = raw.decode("utf-8", errors="ignore").replace("\\", "/").lower(); text16 = raw.decode("utf-16", errors="ignore").replace("\\", "/").lower()
-        if any(token and token in text for token in known_roots) or any(token and token in text16 for token in known_roots): errors.append("absolute path found: " + rel)
-        if rel in {"app_config.json", "version.json"} and re.search(r"[a-z]:[/\\]", text): errors.append("absolute path found: " + rel)
-        if rel in {"app_config.json", "version.json"} and (re.search(r"(^|[\"'])/(?!/)[^\s\"']+", text) or re.search(r"(^|[\"'])//[^\s\"']+", text) or re.search(r"\\\\[^\\/]+\\[^\"']+", raw.decode("utf-8", errors="ignore"))): errors.append("absolute path found: " + rel)
-        if "${" in text or "{{" in text: errors.append("unresolved template token: " + rel)
+        # Binary payloads routinely contain byte sequences that decode to
+        # ``${``/``{{`` or drive-letter fragments.  Restrict textual checks to
+        # formats where paths and template tokens are meaningful.
+        if file.suffix.lower() in _TEXT_AUDIT_SUFFIXES:
+            raw = file.read_bytes(); text = raw.decode("utf-8", errors="ignore").replace("\\", "/").lower(); text16 = raw.decode("utf-16", errors="ignore").replace("\\", "/").lower()
+            normalized_text = text.replace("//", "/"); normalized_text16 = text16.replace("//", "/")
+            if any(token and token in normalized_text for token in known_roots) or any(token and token in normalized_text16 for token in known_roots): errors.append("absolute path found: " + rel)
+            if rel in {"app_config.json", "version.json"} and re.search(r"[a-z]:[/\\]", text): errors.append("absolute path found: " + rel)
+            if rel in {"app_config.json", "version.json"} and (re.search(r"(^|[\"'])/(?!/)[^\s\"']+", text) or re.search(r"(^|[\"'])//[^\s\"']+", text) or re.search(r"\\\\[^\\/]+\\[^\"']+", raw.decode("utf-8", errors="ignore"))): errors.append("absolute path found: " + rel)
+            if "${" in text or "{{" in text: errors.append("unresolved template token: " + rel)
     if edition == "gpu":
         names = {p.name.lower() for p in (root / "backend").rglob("*") if p.is_file()}
         if not any("paddle" in n and Path(n).suffix in {".dll", ".pyd"} for n in names): errors.append("Paddle GPU runtime missing")
@@ -193,7 +285,7 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
                 if _is_system_dependency(d): continue
                 if d not in {p.name.lower() for p in root.rglob("*")}: errors.append(f"dependency absent from package: {dep}")
     if errors: raise PackageAuditError("; ".join(errors))
-    return {"root": str(root), "edition": edition, "version": version, "files": len([p for p in root.rglob('*') if p.is_file()])}
+    return {"root": str(root), "edition": edition, "version": version, "files": len([p for p in root.rglob('*') if p.is_file()]), "dependency_source_exceptions": sorted(_DEPENDENCY_LOADER_PREFIXES)}
 
 
 def write_manifest(root: Path, *, edition: str, version: str) -> dict[str, object]:
@@ -246,9 +338,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True); stage = sub.add_parser("stage")
     for arg in ("edition", "version", "qt-release-dir", "backend-dir", "model-dir", "output-root"): stage.add_argument("--" + arg, required=True)
     stage.add_argument("--guide", required=True); stage.add_argument("--notices", required=True); stage.add_argument("--git-commit", required=True)
+    stage.add_argument("--repository-root"); stage.add_argument("--paddle-config")
     args = parser.parse_args()
     if args.command == "stage":
-        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), guide=Path(args.guide), notices=Path(args.notices), git_commit=args.git_commit); print(result.root)
+        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), repository_root=Path(args.repository_root) if args.repository_root else None, guide=Path(args.guide), notices=Path(args.notices), git_commit=args.git_commit, paddle_config=Path(args.paddle_config) if args.paddle_config else None); print(result.root)
 
 
 if __name__ == "__main__": main()

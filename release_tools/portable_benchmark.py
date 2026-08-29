@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import socket
 import stat
@@ -18,7 +19,9 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import Counter
 from collections.abc import Mapping, Sequence
+from pathlib import PurePosixPath
 from time import perf_counter
 from typing import Any
 import zipfile
@@ -81,6 +84,19 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_image(path: Path) -> np.ndarray | None:
+    """Read an image even when the Windows path contains non-ASCII text."""
+
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is not None:
+        return image
+    try:
+        encoded = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR) if encoded.size else None
 
 
 def _free_port() -> int:
@@ -180,21 +196,74 @@ def _validate_config(root: Path | str, config: Mapping[str, Any]) -> None:
                 raise ValueError(f"package config path traverses symlink: {key}")
 
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ACCEPTANCE_CASES = ("M1", "M2", "M7")
+
+
+def _strict_sha256(value: object, label: str) -> str:
+    """Return a canonical SHA-256 string, rejecting ambiguous representations."""
+
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a lowercase 64-character SHA-256")
+    return value
+
+
+def _strict_int(value: object, label: str, *, positive: bool = False) -> int:
+    # ``bool`` is an ``int`` subclass, but accepting it in a corpus manifest
+    # makes malformed JSON surprisingly easy to miss.
+    if type(value) is not int or (value <= 0 if positive else value < 0):
+        qualifier = "positive " if positive else "non-negative "
+        raise ValueError(f"{label} must be a {qualifier}integer")
+    return value
+
+
+def _normalise_fingerprint_path(value: object, label: str) -> str:
+    """Validate and normalize a corpus-relative fingerprint path."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} path must be a non-empty string")
+    text = value.replace("\\", "/")
+    path = PurePosixPath(text)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"{label} path must be relative and contained")
+    parts = path.parts
+    if not parts or parts[0] not in {"data", "runtime_library"}:
+        raise ValueError(f"{label} path must start with data/ or runtime_library/")
+    return "/".join(parts)
+
+
+def _source_for_fingerprint(project_root: Path, relative: str, *, case: str,
+                            direction: str) -> Path:
+    """Resolve a fingerprint path and enforce its dataset/direction partition."""
+
+    parts = relative.split("/")
+    orientation_dir = "0" if direction == "front" else "1"
+    if parts[0] == "data":
+        if len(parts) < 4 or parts[1] != f"1_{case}" or parts[2] != orientation_dir:
+            raise ValueError(f"fingerprint path is outside {case}/{direction} dataset: {relative}")
+    elif len(parts) < 3 or parts[-2] != orientation_dir:
+        raise ValueError(f"fingerprint path has invalid direction partition: {relative}")
+    source = (project_root / Path(*parts)).resolve()
+    if project_root.resolve() not in source.parents:
+        raise ValueError(f"fingerprint path escapes corpus root: {relative}")
+    return source
+
+
 def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[Path]], list[dict[str, Any]]]:
     payload = json.loads(Path(spec_path).read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 1 or payload.get("passed") is not True:
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != 1 or payload.get("passed") is not True:
         raise ValueError("acceptance spec schema/passed gate is invalid")
     inventory = payload.get("selection_inventory")
-    if not isinstance(inventory, Mapping):
-        raise ValueError("acceptance spec has no selection_inventory")
-    if set(inventory) != {"M1", "M2", "M7"}:
+    if not isinstance(inventory, Mapping) or set(inventory) != set(_ACCEPTANCE_CASES):
         raise ValueError("acceptance spec must contain exactly M1, M2, and M7")
     fingerprints = ((payload.get("fingerprints") or {}).get("fast_geometry")
                     if isinstance(payload.get("fingerprints"), Mapping) else None)
-    selections_fp = fingerprints.get("selections") if isinstance(fingerprints, Mapping) else None
-    overall_fp = fingerprints.get("overall_sha256") if isinstance(fingerprints, Mapping) else None
-    if not isinstance(selections_fp, Mapping) or not isinstance(overall_fp, str) or len(overall_fp) != 64:
+    if not isinstance(fingerprints, Mapping):
         raise ValueError("acceptance spec is missing fast_geometry fingerprints")
+    selections_fp = fingerprints.get("selections")
+    if not isinstance(selections_fp, Mapping) or set(selections_fp) != set(_ACCEPTANCE_CASES):
+        raise ValueError("acceptance spec is missing fast_geometry selections")
+    overall_fp = _strict_sha256(fingerprints.get("overall_sha256"), "fast_geometry overall fingerprint")
     templates: dict[str, list[Path]] = {}
     queries: list[dict[str, Any]] = []
     template_hashes: set[str] = set()
@@ -202,98 +271,138 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
     overlap_by_case: dict[str, int] = {}
     template_by_case: dict[str, set[str]] = {}
     query_by_case: dict[str, set[str]] = {}
-    for case, details in inventory.items():
+    query_path_by_hash: dict[str, Path] = {}
+
+    for case in _ACCEPTANCE_CASES:
+        details = inventory.get(case)
         if not isinstance(details, Mapping):
             raise ValueError(f"acceptance case {case} details must be an object")
-        if not isinstance(details.get("dataset_path"), str) or not str(details.get("dataset_path")).strip():
+        expected_dataset = f"1_{case}"
+        dataset_text = details.get("dataset_path")
+        if not isinstance(dataset_text, str) or not dataset_text.strip():
             raise ValueError(f"acceptance case {case} has no dataset fingerprint/path")
+        dataset_root = Path(dataset_text)
+        if not dataset_root.is_absolute() or dataset_root.name != expected_dataset or not dataset_root.is_dir():
+            raise ValueError(f"acceptance case {case} dataset_path is invalid")
+        if dataset_root.is_symlink():
+            raise ValueError(f"acceptance case {case} dataset_path must not be a symlink")
+        dataset_root = dataset_root.resolve()
+        if dataset_root.parent.name.lower() != "data":
+            raise ValueError(f"acceptance case {case} dataset_path must be under data/")
+        project_root = dataset_root.parent.parent.resolve()
         case_fp = selections_fp.get(case)
-        if not isinstance(case_fp, Mapping) or not isinstance(case_fp.get("aggregate_sha256"), str) or len(str(case_fp.get("aggregate_sha256"))) != 64:
+        if not isinstance(case_fp, Mapping):
             raise ValueError(f"acceptance case {case} has no aggregate fingerprint")
+        case_aggregate = _strict_sha256(case_fp.get("aggregate_sha256"), f"acceptance case {case} aggregate fingerprint")
         case_body = {k: v for k, v in case_fp.items() if k != "aggregate_sha256"}
-        if _canonical_sha256(case_body) != case_fp.get("aggregate_sha256"):
+        if _canonical_sha256(case_body) != case_aggregate:
             raise ValueError(f"acceptance case {case} aggregate fingerprint mismatch")
-        template_by_case[str(case)] = set()
-        query_by_case[str(case)] = set()
+        template_by_case[case] = set()
+        query_by_case[case] = set()
         for direction in ("front", "back"):
             section = details.get(direction)
             if not isinstance(section, Mapping):
                 raise ValueError(f"acceptance case {case} missing {direction} section")
-            fp_section = selections_fp[case].get(direction) if isinstance(selections_fp[case], Mapping) else None
+            fp_section = case_fp.get(direction)
             if not isinstance(fp_section, Mapping):
                 raise ValueError(f"acceptance fingerprint missing {case}/{direction}")
             for role in ("templates", "queries"):
-                fp_used: set[int] = set()
-                rows = section.get(role, [])
-                if not isinstance(rows, list):
+                rows = section.get(role)
+                fp_rows = fp_section.get(role)
+                if not isinstance(rows, list) or not isinstance(fp_rows, list):
                     raise ValueError(f"acceptance case {case}/{direction} {role} must be a list")
+                if len(rows) != len(fp_rows):
+                    raise ValueError(f"acceptance fingerprint row count mismatch: {case}/{direction}/{role}")
+                fp_identities: list[tuple[str, int, str]] = []
+                for fp_index, item in enumerate(fp_rows):
+                    if not isinstance(item, Mapping):
+                        raise ValueError(f"acceptance fingerprint row is malformed: {case}/{direction}/{role}/{fp_index}")
+                    rel = _normalise_fingerprint_path(item.get("path"), f"{case}/{direction}/{role}/{fp_index}")
+                    size = _strict_int(item.get("size"), f"{case}/{direction}/{role}/{fp_index} size")
+                    digest = _strict_sha256(item.get("sha256"), f"{case}/{direction}/{role}/{fp_index} sha256")
+                    _source_for_fingerprint(project_root, rel, case=case, direction=direction)
+                    # Keep the canonical spelling for resolution; compare
+                    # identities case-insensitively because Windows paths are
+                    # case-insensitive, while the hash remains exact.
+                    fp_identities.append((rel, size, digest))
+                if len({(rel.lower(), size, digest) for rel, size, digest in fp_identities}) != len(fp_identities):
+                    raise ValueError(f"duplicate acceptance fingerprint rows: {case}/{direction}/{role}")
+                inventory_identities: list[tuple[str, int, str]] = []
                 for index, row in enumerate(rows):
-                    if not isinstance(row, Mapping) or not isinstance(row.get("image_path"), str):
-                        raise ValueError(f"acceptance inventory row is malformed: {case}/{direction}/{role}")
-                    if row.get("role") != ("template" if role == "templates" else "query"):
-                        raise ValueError("acceptance inventory row has invalid role")
-                    if row.get("case") != case or row.get("expected_orientation") != direction:
-                        raise ValueError("acceptance inventory row case/direction mismatch")
-                    expected_dataset = f"1_{case}"
-                    if row.get("dataset") != expected_dataset or Path(str(details["dataset_path"])).name != expected_dataset:
-                        raise ValueError("acceptance inventory dataset mismatch")
-                    if not isinstance(row.get("sha256"), str) or len(str(row["sha256"])) != 64:
-                        raise ValueError("acceptance inventory row requires sha256")
-                    source = Path(row["image_path"])
-                    if not source.is_file():
-                        raise FileNotFoundError(source)
-                    destination = temp_root / "data" / "benchmark" / str(case) / direction / f"{index:04d}_{source.name}"
+                    label = f"{case}/{direction}/{role}/{index}"
+                    if not isinstance(row, Mapping) or not isinstance(row.get("image_path"), str) or not row.get("image_path").strip():
+                        raise ValueError(f"acceptance inventory row is malformed: {label}")
+                    if row.get("case") != case or row.get("dataset") != expected_dataset or row.get("role") != ("template" if role == "templates" else "query") or row.get("expected_orientation") != direction:
+                        raise ValueError(f"acceptance inventory row metadata mismatch: {label}")
+                    digest = _strict_sha256(row.get("sha256"), f"{label} sha256")
+                    width = _strict_int(row.get("width"), f"{label} width", positive=True)
+                    height = _strict_int(row.get("height"), f"{label} height", positive=True)
+                    source_input = Path(row["image_path"])
+                    if not source_input.is_absolute() or source_input.is_symlink() or not source_input.is_file():
+                        raise FileNotFoundError(source_input)
+                    source = source_input.resolve()
+                    # Resolve the source to the fingerprint path, rather than
+                    # trusting a suffix/filename heuristic.  This binds the
+                    # acceptance run to the exact corpus selected for it.
+                    rel_candidates = []
+                    for rel, size, fp_digest in fp_identities:
+                        expected_source = _source_for_fingerprint(project_root, rel, case=case, direction=direction)
+                        if expected_source == source:
+                            rel_candidates.append((rel, size, fp_digest))
+                    if len(rel_candidates) != 1:
+                        raise ValueError(f"acceptance inventory/fingerprint path mismatch: {source_input}")
+                    rel, expected_size, expected_digest = rel_candidates[0]
+                    actual_size = source.stat().st_size
+                    declared_size = actual_size
+                    if "size" in row:
+                        declared_size = _strict_int(row.get("size"), f"{label} size")
+                    if actual_size != expected_size or actual_size != declared_size:
+                        raise ValueError(f"acceptance source size mismatch: {source}")
+                    actual_digest = _sha256(source)
+                    if actual_digest != digest or actual_digest != expected_digest:
+                        raise ValueError(f"acceptance source hash mismatch: {source}")
+                    image = _read_image(source)
+                    if image is None or image.shape[1] != width or image.shape[0] != height:
+                        raise ValueError(f"acceptance image dimensions mismatch: {source}")
+                    identity = (rel.lower(), actual_size, actual_digest)
+                    inventory_identities.append(identity)
+                    destination = temp_root / "data" / "benchmark" / case / direction / f"{index:04d}_{source.name}"
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, destination)
-                    if row.get("size") is not None and int(row["size"]) != source.stat().st_size:
-                        raise ValueError(f"acceptance source size mismatch: {source}")
-                    if row.get("sha256") and _sha256(source) != str(row["sha256"]):
-                        raise ValueError(f"acceptance source hash mismatch: {source}")
-                    fp_rows = fp_section.get(role, [])
-                    if not isinstance(fp_rows, list):
-                        raise ValueError(f"acceptance fingerprint rows must be a list: {case}/{direction}/{role}")
-                    normalized = source.as_posix().lower()
-                    anchor = "/data/" if "/data/" in normalized else "/runtime_library/"
-                    rel = normalized.split(anchor, 1)[1] if anchor in normalized else source.name.lower()
-                    rel = (anchor.strip("/") + "/" + rel)
-                    match_index = next((i for i, item in enumerate(fp_rows) if i not in fp_used and isinstance(item, Mapping) and str(item.get("path", "")).lower() == rel and int(item.get("size", -1)) == source.stat().st_size and str(item.get("sha256")) == str(row["sha256"])), None)
-                    if match_index is None:
-                        raise ValueError(f"acceptance inventory/fingerprint mismatch: {source}")
-                    fp_used.add(match_index)
-                    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
-                    if image is None or image.shape[1] != int(row["width"]) or image.shape[0] != int(row["height"]):
-                        raise ValueError(f"acceptance image dimensions mismatch: {source}")
-                    if int(row.get("width", 0)) <= 0 or int(row.get("height", 0)) <= 0:
-                        raise ValueError("acceptance inventory row has invalid dimensions")
                     if role == "templates":
                         templates.setdefault(f"{case}:{direction}", []).append(destination)
-                        if row.get("sha256"):
-                            template_hashes.add(str(row["sha256"]))
-                            template_by_case[str(case)].add(str(row["sha256"]))
+                        template_hashes.add(actual_digest)
+                        template_by_case[case].add(actual_digest)
                     else:
-                        if row.get("expected_orientation") not in {"front", "back"}:
-                            raise ValueError("acceptance query expected_orientation must be front or back")
-                        queries.append({**dict(row), "case": str(case), "direction": direction,
-                                        "image_path": str(destination), "query_identity": str(row.get("query_identity", destination.name))})
-                        if row.get("sha256"):
-                            query_hashes.add(str(row["sha256"]))
-                            query_by_case[str(case)].add(str(row["sha256"]))
-                if len(fp_used) != len(fp_rows):
-                    raise ValueError(f"acceptance fingerprint row count mismatch: {case}/{direction}/{role}")
-        overlap_by_case[str(case)] = len(template_by_case[str(case)] & query_by_case[str(case)])
+                        query_identity = row.get("query_identity")
+                        if not isinstance(query_identity, str) or not query_identity.strip():
+                            raise ValueError(f"{label} query_identity must be a non-empty string")
+                        if actual_digest in query_path_by_hash:
+                            raise ValueError(f"duplicate query SHA-256: {source}")
+                        query_path_by_hash[actual_digest] = source
+                        queries.append({**dict(row), "case": case, "direction": direction,
+                                        "image_path": str(destination), "query_identity": query_identity})
+                        query_hashes.add(actual_digest)
+                        query_by_case[case].add(actual_digest)
+                if Counter(inventory_identities) != Counter(
+                    (rel.lower(), size, digest) for rel, size, digest in fp_identities
+                ):
+                    raise ValueError(f"acceptance inventory/fingerprint multiset mismatch: {case}/{direction}/{role}")
+        overlap_by_case[case] = len(template_by_case[case] & query_by_case[case])
+
     if not templates or not queries:
         raise ValueError("acceptance spec contains no usable templates and queries")
     if template_hashes & query_hashes:
         raise ValueError("acceptance template/query SHA-256 overlap")
     for case, count in overlap_by_case.items():
-        expected_overlap = selections_fp[case].get("template_query_overlap_count", 0)
-        if int(expected_overlap) != count:
+        expected_overlap = _strict_int(selections_fp[case].get("template_query_overlap_count"), f"acceptance {case} overlap count")
+        if expected_overlap != count:
             raise ValueError(f"acceptance overlap count mismatch for {case}")
     body = {k: v for k, v in fingerprints.items() if k != "overall_sha256"}
     if _canonical_sha256(body) != overall_fp:
         raise ValueError("acceptance overall fingerprint mismatch")
     identities = [str(row["query_identity"]) for row in queries]
-    if any(not identity.strip() for identity in identities) or len(set(identities)) != len(identities):
+    if len(set(identities)) != len(identities):
         raise ValueError("acceptance query identities must be unique and non-empty")
     return templates, queries
 
@@ -311,9 +420,20 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
     temp_parent = Path(tempfile.mkdtemp(prefix="portable-benchmark-"))
     process = None
     client = None
+    log_handle = None
+    hello: Mapping[str, Any] | None = None
     completed = False
+    lifecycle: dict[str, Any] = {
+        "process_spawned": False,
+        "connection_established": False,
+        "shutdown_requested": False,
+        "shutdown_confirmed": False,
+        "forced_termination": False,
+        "process_exit": None,
+    }
     report: dict[str, Any] = {"package_zip": str(package_zip), "package_sha256": _sha256(package_zip),
-                              "warmup": warmup, "iterations": iterations, "startup": {}}
+                              "warmup": warmup, "iterations": iterations, "startup": {},
+                              "lifecycle": lifecycle}
     try:
         package_root = temp_parent / "package-copy"
         if package_root.exists() and any(package_root.iterdir()):
@@ -361,11 +481,13 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         log_handle = (temp_parent / "backend.log").open("w+", encoding="utf-8")
         process = subprocess.Popen(args, cwd=str(package_root), stdout=log_handle, stderr=subprocess.STDOUT,
                                    text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        lifecycle["process_spawned"] = True
         report["startup"]["process_spawn_ms"] = (perf_counter() - started) * 1000.0
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
                 client = _Client(socket.create_connection(("127.0.0.1", port), timeout=5))
+                lifecycle["connection_established"] = True
                 break
             except OSError:
                 if process.poll() is not None:
@@ -375,7 +497,6 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 time.sleep(0.1)
         report["startup"]["connection_ms"] = (perf_counter() - started) * 1000.0
         phases: list[dict[str, Any]] = []
-        hello = None
         while time.monotonic() < deadline:
             hello = client.request("hello")
             phases.append({"phase": hello.get("phase"), "status": hello.get("status"), "elapsed_ms": (perf_counter() - started) * 1000.0})
@@ -484,34 +605,77 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
     finally:
         active_error = sys.exc_info()[1]
         shutdown_error = None
+        close_error = None
         if client is not None:
             try:
                 if process is not None and process.poll() is None:
+                    lifecycle["shutdown_requested"] = True
                     client.request("shutdown", instance_token=(hello or {}).get("instance_token", ""))
+                    lifecycle["shutdown_confirmed"] = True
             except Exception as exc:
                 shutdown_error = exc
-            client.close()
+            try:
+                client.close()
+            except Exception as exc:
+                close_error = exc
         if process is not None:
             try:
                 process.wait(timeout=10)
-            except Exception:
-                process.kill()
-                process.wait(timeout=10)
-            if completed and process.returncode not in (None, 0):
-                raise RuntimeError(f"backend exited with code {process.returncode}")
+            except subprocess.TimeoutExpired as exc:
+                lifecycle["forced_termination"] = True
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except Exception as kill_error:
+                    if active_error is None:
+                        active_error = kill_error
+                if shutdown_error is None:
+                    shutdown_error = exc
+            except Exception as exc:
+                if shutdown_error is None:
+                    shutdown_error = exc
+            lifecycle["process_exit"] = process.returncode
+        backend_log = ""
+        if log_handle is not None:
             try:
                 log_handle.flush()
                 log_handle.seek(0)
                 backend_log = log_handle.read()
-                log_handle.close()
             except Exception as exc:
                 backend_log = f"<backend log unavailable: {exc}>"
-            if active_error is not None:
-                setattr(active_error, "process_exit", process.returncode)
-                setattr(active_error, "backend_log", backend_log)
-        if shutdown_error is not None and completed:
-            raise RuntimeError(f"backend shutdown failed: {shutdown_error}") from shutdown_error
+            finally:
+                try:
+                    log_handle.close()
+                except Exception as exc:
+                    if close_error is None:
+                        close_error = exc
+        report["lifecycle"] = dict(lifecycle)
+        report["backend_log"] = backend_log
+        if process is not None:
+            report["process_exit"] = process.returncode
+        if active_error is not None:
+            setattr(active_error, "process_exit", lifecycle.get("process_exit"))
+            setattr(active_error, "backend_log", backend_log)
+            setattr(active_error, "lifecycle", dict(lifecycle))
+        final_error: BaseException | None = None
+        if completed:
+            if process is not None and process.returncode != 0:
+                final_error = RuntimeError(f"backend exited with code {process.returncode}")
+            elif not lifecycle["shutdown_confirmed"]:
+                cause = shutdown_error or close_error
+                final_error = RuntimeError(
+                    f"backend shutdown failed: {cause}" if cause else "backend shutdown was not confirmed"
+                )
+        elif active_error is None and shutdown_error is not None and process is not None and lifecycle["forced_termination"]:
+            # Preserve a useful timeout/termination error when startup failed
+            # without a primary exception.
+            final_error = RuntimeError(f"backend termination failed: {shutdown_error}")
         shutil.rmtree(temp_parent, ignore_errors=True)
+        if final_error is not None and active_error is None:
+            setattr(final_error, "process_exit", lifecycle.get("process_exit"))
+            setattr(final_error, "backend_log", backend_log)
+            setattr(final_error, "lifecycle", dict(lifecycle))
+            raise final_error from shutdown_error
 
 
 __all__ = ["compare_predictions", "run_benchmark", "summarize"]
