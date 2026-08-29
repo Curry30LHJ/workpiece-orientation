@@ -9,6 +9,22 @@ import release_tools.portable_smoke as smoke
 from release_tools.portable_smoke import SmokeOptions, run_portability, run_smoke
 
 
+def test_json_socket_applies_configured_read_timeout():
+    class RawSocket:
+        def __init__(self):
+            self.timeout = None
+
+        def settimeout(self, value):
+            self.timeout = value
+
+        def makefile(self, *_args):
+            return object()
+
+    raw = RawSocket()
+    smoke._JsonSocket(raw, timeout_seconds=37.5)
+    assert raw.timeout == 37.5
+
+
 def test_smoke_wrapper_runs_directly_outside_repo_cwd():
     script = Path(__file__).parents[1] / "scripts" / "smoke_portable_package.py"
     result = subprocess.run(

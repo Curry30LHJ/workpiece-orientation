@@ -83,8 +83,9 @@ def _persist_report_safely(path: Path | None, report: dict[str, Any]) -> Excepti
 
 
 class _JsonSocket:
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock: socket.socket, timeout_seconds: float):
         self.sock = sock
+        self.sock.settimeout(timeout_seconds)
         self.file = sock.makefile("rwb")
 
     def request(self, command: str, **fields: Any) -> dict[str, Any]:
@@ -250,7 +251,10 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         if socket_factory is None:
             while time.monotonic() < deadline:
                 try:
-                    client = _JsonSocket(socket.create_connection(("127.0.0.1", port), timeout=5))
+                    client = _JsonSocket(
+                        socket.create_connection(("127.0.0.1", port), timeout=options.timeout_seconds),
+                        options.timeout_seconds,
+                    )
                     break
                 except OSError:
                     if process.poll() is not None:
@@ -260,7 +264,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
                 raise TimeoutError("backend did not accept a connection")
         else:
             try:
-                client = socket_factory("127.0.0.1", port, timeout=5)
+                client = socket_factory("127.0.0.1", port, timeout=options.timeout_seconds)
             except TypeError:
                 client = socket_factory("127.0.0.1", port)
 
@@ -457,11 +461,14 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         sf = factories.get("socket_factory")
         if sf:
             try:
-                client = sf("127.0.0.1", port, timeout=5)
+                client = sf("127.0.0.1", port, timeout=options.timeout_seconds)
             except TypeError:
                 client = sf("127.0.0.1", port)
         else:
-            client = _JsonSocket(socket.create_connection(("127.0.0.1", port), timeout=5))
+            client = _JsonSocket(
+                socket.create_connection(("127.0.0.1", port), timeout=options.timeout_seconds),
+                options.timeout_seconds,
+            )
         deadline = time.monotonic() + options.timeout_seconds
         while True:
             hello = request("hello")
