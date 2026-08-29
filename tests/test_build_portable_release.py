@@ -1,4 +1,8 @@
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import uuid
 
 
 def test_release_script_exports_repo_on_python_module_path():
@@ -74,12 +78,51 @@ def test_release_script_uses_ascii_temp_copies_for_unicode_guide_and_notices():
     assert "$asciiGuide = Join-Path $asciiInputRoot 'guide.txt'" in script
     assert "$asciiNotices = Join-Path $asciiInputRoot 'notices.txt'" in script
     assert "Get-ChildItem -LiteralPath $deployDir -File -Filter '*.txt'" in script
-    assert "Where-Object { $_.Name -cne 'THIRD_PARTY-NOTICES.txt' }" in script
+    assert "Where-Object { $_.Name -ine 'THIRD_PARTY-NOTICES.txt' }" in script
+    assert "-cne" not in script
     assert "guideCandidates.Count -eq 0" in script
     assert "guideCandidates.Count -gt 1" in script
     assert "'--guide', $asciiGuide, '--notices', $asciiNotices" in script
     assert "finally {" in script
     assert "Remove-Item -LiteralPath $asciiInputRoot -Recurse -Force" in script
+
+
+def test_release_python_boundaries_use_repo_relative_paths():
+    script = (Path(__file__).parents[1] / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
+    assert "Push-Location -LiteralPath $repo" in script
+    assert "'--qt-release-dir', $qtReleaseArg" in script
+    assert "'--backend-dir', $backendArg" in script
+    assert "'--output-root', $stagingRootArg" in script
+    assert "'--repository-root', '.'" in script
+    assert "Path('.')" in script
+    assert "CreateProcessW" in script
+    assert "finally {" in script and "Pop-Location" in script
+
+
+def test_windows_powershell_python_launch_preserves_unicode_argument():
+    powershell = shutil.which("powershell")
+    if powershell is None:
+        return
+    root = Path(__file__).parents[1]
+    stem = f".unicode-launch-{uuid.uuid4().hex}"
+    harness = root / f"{stem}.ps1"
+    target = root / f"{stem}-中文结果.txt"
+    try:
+        harness.write_text(
+            "$python = $args[0]\n"
+            "$target = $args[1]\n"
+            "& $python -c \"import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[1], encoding='utf-8')\" $target\n"
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n",
+            encoding="utf-8-sig",
+        )
+        subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness), sys.executable, str(target)],
+            check=True,
+        )
+        assert target.read_text(encoding="utf-8") == str(target)
+    finally:
+        harness.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
 
 
 def test_backend_source_audit_filters_python_explicitly_for_windows_powershell():
