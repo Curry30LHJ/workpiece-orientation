@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -251,7 +252,12 @@ def _is_reparse_point(path: Path) -> bool:
         import ctypes
 
         attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-        return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+        # ctypes defaults to a signed ``c_int`` on Windows; the documented
+        # INVALID_FILE_ATTRIBUTES value therefore arrives as ``-1`` rather
+        # than ``0xFFFFFFFF`` on some Python builds.
+        if attributes in {-1, 0xFFFFFFFF}:
+            return False
+        return bool(attributes & 0x400)
     except (AttributeError, OSError):
         return False
 
@@ -505,7 +511,10 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         config = json.loads((package_root / "app_config.json").read_text(encoding="utf-8"))
         _validate_config(package_root, config)
         configured_request_timeout = config.get("request_timeout_ms", 120000)
-        if isinstance(configured_request_timeout, bool) or not isinstance(configured_request_timeout, (int, float)) or configured_request_timeout <= 0:
+        if (isinstance(configured_request_timeout, bool)
+                or not isinstance(configured_request_timeout, (int, float))
+                or not math.isfinite(float(configured_request_timeout))
+                or configured_request_timeout <= 0):
             raise ValueError("package config request_timeout_ms must be a positive number")
         request_timeout_seconds = float(configured_request_timeout) / 1000.0
         environment = _environment(config)
