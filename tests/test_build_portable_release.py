@@ -35,7 +35,8 @@ def test_release_script_checks_each_external_build_step_and_passes_paddle_config
         "Package audit/archive failed",
     ):
         assert marker in script
-    assert "--paddle-config $configArg" in script
+    assert "--paddle-config" in script
+    assert "$configArg" in script
 
 
 def test_release_scripts_create_and_resolve_nested_output_root():
@@ -58,3 +59,9 @@ def test_release_script_audits_the_extracted_zip_and_cleans_a_private_temp_root(
     assert "ExtractToDirectory" not in script  # extraction is centralized and hardened in Python
     assert "Extracted ZIP audit failed" in script
     assert "release_artifacts" in script
+
+
+def test_release_script_allows_explicit_msvc_runtime_directory():
+    script = (Path(__file__).parents[1] / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
+    assert "MsvcRuntimeDir" in script
+    assert "--msvc-runtime-dir" in script

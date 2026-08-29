@@ -26,7 +26,7 @@ class PackageAuditError(RuntimeError):
 
 _RUNTIME_DEV_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".obj", ".exp",
-    ".lib", ".pdb", ".ilk", ".map", ".pyi",
+    ".lib", ".pdb", ".ilk", ".map", ".pyi", ".res",
 }
 _TEXT_AUDIT_SUFFIXES = {
     ".cfg", ".conf", ".ini", ".json", ".md", ".ps1", ".py", ".pyi",
@@ -34,6 +34,12 @@ _TEXT_AUDIT_SUFFIXES = {
 }
 _DEPENDENCY_LOADER_PREFIXES = ("backend/_internal/cv2/",)
 _DEVELOPMENT_DIR_NAMES = {"test", "tests", "report", "reports", "fixture", "fixtures", "manual", "manuals"}
+_MSVC_RUNTIME_REQUIRED = ("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll")
+_MSVC_RUNTIME_OPTIONAL = (
+    "MSVCP140_1.dll", "MSVCP140_2.dll", "MSVCP140_ATOMIC_WAIT.dll",
+    "MSVCP140_CODECvt_IDS.dll", "CONCRT140.dll", "VCCORLIB140.dll",
+)
+_MSVC_RUNTIME_ALL = _MSVC_RUNTIME_REQUIRED + _MSVC_RUNTIME_OPTIONAL
 
 
 def _is_dependency_loader(rel: str) -> bool:
@@ -63,22 +69,253 @@ def _should_copy_runtime_file(relative: str, *, backend: bool = False) -> bool:
     return True
 
 
+def _is_reparse_point(path: Path) -> bool:
+    """Detect symlinks and Windows junction/reparse points without resolving them."""
+
+    path = Path(path)
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        # An inaccessible entry must not be treated as a safe regular file.
+        return True
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attributes in {-1, 0xFFFFFFFF}:
+            return False
+        return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except (AttributeError, OSError):
+        return False
+
+
+def _assert_no_reparse_components(path: Path, floor: Path, *, label: str) -> None:
+    """Reject a symlink/junction in any lexical component below ``floor``."""
+
+    path = Path(path)
+    floor = Path(floor)
+    try:
+        relative = path.relative_to(floor)
+    except ValueError as exc:
+        raise PackageAuditError(f"{label} is outside its allowed root: {path}") from exc
+    current = floor
+    for component in relative.parts:
+        current = current / component
+        if _is_reparse_point(current):
+            raise PackageAuditError(f"{label} contains a reparse point: {current}")
+
+
+def _iter_tree_entries(root: Path) -> Iterable[Path]:
+    """Walk a tree without traversing symlinks/junctions."""
+
+    root = Path(root)
+    # Check the root before ``is_dir``: a dangling junction/symlink reports
+    # false from ``is_dir`` and would otherwise make the walk silently empty.
+    if _is_reparse_point(root):
+        raise PackageAuditError(f"runtime tree contains a symlink/reparse point: {root}")
+    if not root.is_dir():
+        return
+    _assert_no_reparse_components(root, root.parent, label="runtime tree")
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories.sort()
+        files.sort()
+        for name in directories:
+            item = current_path / name
+            if _is_reparse_point(item):
+                raise PackageAuditError(f"runtime tree contains a symlink/reparse point: {item.relative_to(root).as_posix()}")
+            yield item
+        for name in files:
+            item = current_path / name
+            if _is_reparse_point(item):
+                raise PackageAuditError(f"runtime tree contains a symlink/reparse point: {item.relative_to(root).as_posix()}")
+            yield item
+
+
+def _iter_tree_files(root: Path) -> Iterable[Path]:
+    for item in _iter_tree_entries(Path(root)):
+        if item.is_file():
+            yield item
+
+
+def _looks_like_x64_runtime_dir(path: Path) -> bool:
+    """Reject explicit x86/SysWOW64 runtime directories."""
+
+    normalized = str(path).replace("\\", "/").lower().rstrip("/")
+    parts = set(normalized.split("/"))
+    if "syswow64" in parts or "x86" in parts or "hostx86" in parts:
+        return False
+    # System32 is the x64 system directory on a 64-bit Windows host.  Known
+    # Visual Studio redist/tool paths are constrained to x64 by their glob.
+    return True
+
+
+def _runtime_dir_files(directory: Path) -> dict[str, Path]:
+    """Return exact-name MSVC runtime files from one candidate directory."""
+
+    directory = Path(directory)
+    if not directory.is_dir() or not _looks_like_x64_runtime_dir(directory):
+        return {}
+    files = {}
+    try:
+        for item in directory.iterdir():
+            if item.is_file() and not _is_reparse_point(item):
+                files[item.name.lower()] = item
+    except OSError:
+        return {}
+    return {name: files[name.lower()] for name in _MSVC_RUNTIME_ALL if name.lower() in files}
+
+
+def _append_runtime_dir(candidates: list[Path], seen: set[str], value: object) -> None:
+    if value is None or not str(value).strip():
+        return
+    try:
+        path = Path(value)
+        if path.is_file():
+            path = path.parent
+        key = str(path).replace("\\", "/").rstrip("/").lower()
+        if key in seen or not path.is_dir() or not _looks_like_x64_runtime_dir(path):
+            return
+        if _is_reparse_point(path):
+            raise PackageAuditError(f"MSVC runtime directory is a reparse point: {path}")
+    except OSError:
+        return
+    seen.add(key)
+    candidates.append(path)
+
+
+def _msvc_runtime_candidates(*, explicit: Path | None = None,
+                             source_roots: Iterable[Path] = ()) -> list[Path]:
+    """Find likely x64 MSVC redist/toolchain directories in preference order."""
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    if explicit is not None:
+        _append_runtime_dir(candidates, seen, explicit)
+
+    # windeployqt may already have copied the compiler runtime into the Qt
+    # release directory.  A frozen backend can also contain a coherent copy.
+    for source in source_roots:
+        source = Path(source)
+        _append_runtime_dir(candidates, seen, source)
+        try:
+            for item in _iter_tree_files(source):
+                if item.name.lower() in {name.lower() for name in _MSVC_RUNTIME_REQUIRED}:
+                    _append_runtime_dir(candidates, seen, item.parent)
+        except PackageAuditError:
+            raise
+        except OSError:
+            continue
+
+    env_values = (
+        os.environ.get("VCToolsRedistDir"), os.environ.get("VCToolsInstallDir"),
+        os.environ.get("VCINSTALLDIR"), os.environ.get("VSINSTALLDIR"),
+    )
+    for value in env_values:
+        if not value:
+            continue
+        root = Path(value)
+        _append_runtime_dir(candidates, seen, root)
+        for pattern in (
+            "*/x64/Microsoft.VC*.CRT", "*/Microsoft.VC*.CRT",
+            "*/bin/Hostx64/x64", "*/bin/HostX64/x64",
+        ):
+            try:
+                for item in sorted(root.glob(pattern), reverse=True):
+                    _append_runtime_dir(candidates, seen, item)
+            except OSError:
+                continue
+
+    # Standard VS 2017/2019/2022 layouts.  ProgramFiles(x86) is checked first
+    # because VS is commonly installed there on this Windows toolchain.
+    program_roots = [
+        os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+    ]
+    for base in program_roots:
+        if not base:
+            continue
+        for year in ("2022", "2019", "2017"):
+            root = Path(base) / "Microsoft Visual Studio" / year
+            for pattern in (
+                "*/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT",
+                "*/VC/Tools/MSVC/*/bin/Hostx64/x64",
+                "*/VC/Tools/MSVC/*/bin/HostX64/x64",
+            ):
+                try:
+                    for item in sorted(root.glob(pattern), reverse=True):
+                        _append_runtime_dir(candidates, seen, item)
+                except OSError:
+                    continue
+
+    # Last-resort x64 system runtime.  This is intentionally after toolchain
+    # candidates so a build never silently mixes an older system copy when a
+    # matching redistributable is available.
+    _append_runtime_dir(
+        candidates, seen,
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32",
+    )
+    return candidates
+
+
+def locate_msvc_runtime_dlls(*, explicit_dir: Path | None = None,
+                             source_roots: Iterable[Path] = ()) -> dict[str, Path]:
+    """Locate one coherent x64 MSVC runtime set for the Qt executable.
+
+    The three DLLs listed in ``_MSVC_RUNTIME_REQUIRED`` are mandatory.  Any
+    compatible side-by-side runtime DLLs found in the same directory are also
+    returned so dependencies such as ``MSVCP140_1.dll`` remain self-contained.
+    """
+
+    required = {name.lower() for name in _MSVC_RUNTIME_REQUIRED}
+    if explicit_dir is not None:
+        explicit_path = Path(explicit_dir)
+        files = _runtime_dir_files(explicit_path)
+        if not required.issubset({name.lower() for name in files}):
+            missing = ", ".join(
+                name for name in _MSVC_RUNTIME_REQUIRED if name.lower() not in {key.lower() for key in files}
+            )
+            raise PackageAuditError(
+                f"explicit MSVC runtime directory is missing: {missing}: {explicit_path}"
+            )
+        return files
+    candidates = _msvc_runtime_candidates(source_roots=source_roots)
+    searched: list[str] = []
+    for directory in candidates:
+        files = _runtime_dir_files(directory)
+        searched.append(str(directory))
+        if required.issubset({name.lower() for name in files}):
+            return files
+    missing = ", ".join(_MSVC_RUNTIME_REQUIRED)
+    locations = "; ".join(searched[:12]) or "no candidate directories"
+    raise PackageAuditError(
+        f"MSVC runtime DLLs are unavailable (required: {missing}); searched: {locations}. "
+        "Install the x64 Visual C++ toolchain/redist or pass --msvc-runtime-dir."
+    )
+
+
 def _copy_runtime_tree(src: Path, dst: Path, *, backend: bool = False) -> None:
     """Copy a tree without shipping build sources or reparse points."""
 
     src = Path(src)
     dst = Path(dst)
+    _assert_no_reparse_components(src, src.parent, label="source bundle")
+    if _is_reparse_point(dst):
+        raise PackageAuditError(f"destination bundle is a reparse point: {dst}")
     dst.mkdir(parents=True, exist_ok=True)
-    for item in sorted(src.rglob("*")):
+    for item in _iter_tree_entries(src):
         relative = item.relative_to(src).as_posix()
-        if item.is_symlink():
-            raise PackageAuditError(f"source bundle contains a symlink: {relative}")
         target = dst / relative
         if item.is_dir():
+            _assert_no_reparse_components(target, dst.parent, label="destination bundle")
             target.mkdir(parents=True, exist_ok=True)
             continue
         if item.is_file() and _should_copy_runtime_file(relative, backend=backend):
             target.parent.mkdir(parents=True, exist_ok=True)
+            _assert_no_reparse_components(target.parent, dst.parent, label="destination bundle")
             shutil.copy2(item, target)
 
 
@@ -86,8 +323,13 @@ def _is_system_dependency(name: str, system_roots: Iterable[Path] = ()) -> bool:
     base = Path(name).name.lower()
     if base.startswith(("api-ms-", "ext-ms-")): return True
     roots = [Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32", Path(os.environ.get("SystemRoot", r"C:\Windows")) / "SysWOW64", *map(Path, system_roots)]
+    # MSVC runtime DLLs must be shipped beside the Qt executable.  Even when
+    # the build host has them in System32, treating them as system dependencies
+    # would let a release pass audit and then fail on an offline clean machine.
+    if base.startswith(("msvcp", "vcruntime", "concrt", "vccorlib")):
+        return False
     if any((r / base).is_file() for r in roots): return True
-    return base in {"kernel32.dll", "user32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll", "combase.dll", "rpcrt4.dll", "imm32.dll", "version.dll", "ucrtbase.dll"} or base.startswith(("msvcp", "vcruntime"))
+    return base in {"kernel32.dll", "user32.dll", "advapi32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll", "combase.dll", "rpcrt4.dll", "imm32.dll", "version.dll", "ucrtbase.dll"}
 
 
 @dataclass(frozen=True)
@@ -132,20 +374,36 @@ def _copy_tree(src: Path, dst: Path) -> None:
 def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_dir: Path,
                   model_dir: Path, output_root: Path, repository_root: Path | None = None,
                   guide: Path | None = None, notices: Path | None = None, git_commit: str = "unknown",
-                  paddle_config: Path | None = None) -> PackageLayout:
+                  paddle_config: Path | None = None,
+                  msvc_runtime_dir: Path | None = None) -> PackageLayout:
     edition = edition.lower()
     if edition not in {"gpu", "cpu"} or not re.fullmatch(r"\d+\.\d+\.\d+", version): raise ValueError("invalid edition or version")
     for source in (qt_release_dir, backend_dir, model_dir):
         if not Path(source).is_dir(): raise NotADirectoryError(source)
+    qt_release_dir, backend_dir, model_dir = map(Path, (qt_release_dir, backend_dir, model_dir))
+    _assert_no_reparse_components(model_dir, model_dir.parent, label="model bundle")
+    # Resolve this before creating the destination so an incomplete package is
+    # never mistaken for a successful stage when windeployqt omitted VC DLLs.
+    msvc_runtime = locate_msvc_runtime_dlls(
+        explicit_dir=Path(msvc_runtime_dir) if msvc_runtime_dir is not None else None,
+        source_roots=(qt_release_dir, backend_dir),
+    )
     root = Path(output_root) / f"{edition}-{version}" / f"WorkpieceOrientation-{edition.upper()}"
     if root.exists():
         out = Path(output_root).resolve(); target = root.resolve()
         if out not in target.parents: raise PackageAuditError("staging path escapes output root")
-        if root.is_symlink(): raise PackageAuditError("refusing to remove reparse-point staging path")
+        if _is_reparse_point(root): raise PackageAuditError("refusing to remove reparse-point staging path")
         shutil.rmtree(root)
     root.mkdir(parents=True)
-    qt_release_dir, backend_dir, model_dir = map(Path, (qt_release_dir, backend_dir, model_dir))
     _copy_runtime_tree(qt_release_dir, root)
+    # Keep VC runtime DLLs at the package root, beside WorkpieceOrientation.exe
+    # (and duplicate only optional side-by-side files that were present in the
+    # same coherent source directory).
+    for name, source in msvc_runtime.items():
+        target = root / name
+        if _is_reparse_point(source):
+            raise PackageAuditError(f"MSVC runtime source is a reparse point: {source}")
+        shutil.copy2(source, target)
     # The package config is generated below; never carry a stale build copy.
     generated_config = root / "app_config.json"
     if generated_config.exists():
@@ -230,9 +488,13 @@ def run_dumpbin(executable: Path, package_root: Path) -> list[str]:
 
 def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: Iterable[Path] = (), runtime_roots: Iterable[Path] = (), dependency_checker: Callable[[Path, Path], list[str]] = run_dumpbin) -> dict[str, object]:
     root = Path(root); edition = edition.lower(); errors: list[str] = []
-    required = ["WorkpieceOrientation.exe", "backend/orientation_backend.exe", "backend/resources/inference_general.yaml", "app_config.json", "version.json", "models/shitu_rec/inference.pdmodel", "models/shitu_rec/inference.pdiparams", "models/shitu_rec/inference.pdiparams.info", "data/data_layout.json", "data/workpieces", "third_party_licenses/index.txt", "THIRD_PARTY-NOTICES.txt", "使用说明.txt"]
+    required = ["WorkpieceOrientation.exe", "backend/orientation_backend.exe", "backend/resources/inference_general.yaml", "app_config.json", "version.json", "models/shitu_rec/inference.pdmodel", "models/shitu_rec/inference.pdiparams", "models/shitu_rec/inference.pdiparams.info", "data/data_layout.json", "data/workpieces", "third_party_licenses/index.txt", "THIRD_PARTY-NOTICES.txt", "使用说明.txt", *_MSVC_RUNTIME_REQUIRED]
     for rel in required:
-        if not (root / rel).exists(): errors.append(f"missing required file: {rel}")
+        if not (root / rel).exists():
+            if rel in _MSVC_RUNTIME_REQUIRED:
+                errors.append(f"MSVC runtime missing: {rel}")
+            else:
+                errors.append(f"missing required file: {rel}")
     cfg = {}
     ver = {}
     try: cfg = json.loads((root / "app_config.json").read_text(encoding="utf-8")); ver = json.loads((root / "version.json").read_text(encoding="utf-8"))
@@ -252,10 +514,13 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
         normalized = str(candidate).replace("\\", "/").rstrip("/").lower()
         if normalized and normalized not in {".", "/"}:
             known_roots.append(normalized)
-    for file in root.rglob("*"):
-        if file.is_symlink():
-            errors.append("symlink is not allowed: " + file.relative_to(root).as_posix())
-            continue
+    try:
+        package_entries = list(_iter_tree_entries(root))
+    except PackageAuditError as exc:
+        errors.append(str(exc))
+        package_entries = []
+    package_files = [entry for entry in package_entries if entry.is_file()]
+    for file in package_files:
         if not file.is_file(): continue
         rel = file.relative_to(root).as_posix().lower(); name = file.name.lower()
         if file.suffix.lower() == ".py" and not _is_dependency_loader(rel): errors.append("Python source is not allowed: " + rel)
@@ -276,7 +541,7 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
             if rel in {"app_config.json", "version.json"} and (re.search(r"(^|[\"'])/(?!/)[^\s\"']+", text) or re.search(r"(^|[\"'])//[^\s\"']+", text) or re.search(r"\\\\[^\\/]+\\[^\"']+", raw.decode("utf-8", errors="ignore"))): errors.append("absolute path found: " + rel)
             if "${" in text or "{{" in text: errors.append("unresolved template token: " + rel)
     if edition == "gpu":
-        names = {p.name.lower() for p in (root / "backend").rglob("*") if p.is_file()}
+        names = {p.name.lower() for p in package_files if p.is_relative_to(root / "backend")}
         if not any("paddle" in n and Path(n).suffix in {".dll", ".pyd"} for n in names): errors.append("Paddle GPU runtime missing")
         for family in ("cudnn", "cublas", "cudart"):
             if not any(family in n for n in names): errors.append(f"NVIDIA runtime family missing: {family}")
@@ -285,14 +550,14 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
             for dep in dependency_checker(exe, root) or []:
                 d = dep.lower()
                 if _is_system_dependency(d): continue
-                if d not in {p.name.lower() for p in root.rglob("*")}: errors.append(f"dependency absent from package: {dep}")
+                if d not in {p.name.lower() for p in package_files}: errors.append(f"dependency absent from package: {dep}")
     if errors: raise PackageAuditError("; ".join(errors))
-    return {"root": str(root), "edition": edition, "version": version, "files": len([p for p in root.rglob('*') if p.is_file()]), "dependency_source_exceptions": sorted(_DEPENDENCY_LOADER_PREFIXES)}
+    return {"root": str(root), "edition": edition, "version": version, "files": len(package_files), "dependency_source_exceptions": sorted(_DEPENDENCY_LOADER_PREFIXES)}
 
 
 def write_manifest(root: Path, *, edition: str, version: str) -> dict[str, object]:
     files = []
-    for path in sorted(p for p in Path(root).rglob("*") if p.is_file() and path_relative(p, root) != "manifest.json"):
+    for path in sorted(p for p in _iter_tree_files(Path(root)) if path_relative(p, root) != "manifest.json"):
         data = path.read_bytes(); files.append({"path": path.relative_to(root).as_posix(), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
     manifest = {"version": version, "edition": edition, "files": files}
     (Path(root) / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -328,9 +593,8 @@ def collect_licenses(destination: Path, distributions: Iterable[str] = ("pyinsta
 def zip_package(root: Path, archive: Path) -> Path:
     root, archive = Path(root), Path(archive); archive.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in sorted(root.rglob("*")):
-            if p.is_symlink():
-                raise PackageAuditError(f"cannot archive symlink: {p.relative_to(root).as_posix()}")
+        entries = sorted(_iter_tree_entries(root))
+        for p in entries:
             arcname = root.name + "/" + p.relative_to(root).as_posix()
             if p.is_dir():
                 z.writestr(arcname.rstrip("/") + "/", "")
@@ -408,12 +672,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True); stage = sub.add_parser("stage")
     for arg in ("edition", "version", "qt-release-dir", "backend-dir", "model-dir", "output-root"): stage.add_argument("--" + arg, required=True)
     stage.add_argument("--guide", required=True); stage.add_argument("--notices", required=True); stage.add_argument("--git-commit", required=True)
-    stage.add_argument("--repository-root"); stage.add_argument("--paddle-config")
+    stage.add_argument("--repository-root"); stage.add_argument("--paddle-config"); stage.add_argument("--msvc-runtime-dir")
     args = parser.parse_args()
     if args.command == "stage":
-        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), repository_root=Path(args.repository_root) if args.repository_root else None, guide=Path(args.guide), notices=Path(args.notices), git_commit=args.git_commit, paddle_config=Path(args.paddle_config) if args.paddle_config else None); print(result.root)
+        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), repository_root=Path(args.repository_root) if args.repository_root else None, guide=Path(args.guide), notices=Path(args.notices), git_commit=args.git_commit, paddle_config=Path(args.paddle_config) if args.paddle_config else None, msvc_runtime_dir=Path(args.msvc_runtime_dir) if args.msvc_runtime_dir else None); print(result.root)
 
 
 if __name__ == "__main__": main()
 
-__all__ = ["PackageAuditError", "PackageLayout", "audit_package", "audit_zip_archive", "build_release_config", "collect_licenses", "run_dumpbin", "stage_package", "write_manifest", "write_sha256", "zip_package"]
+__all__ = ["PackageAuditError", "PackageLayout", "audit_package", "audit_zip_archive", "build_release_config", "collect_licenses", "locate_msvc_runtime_dlls", "run_dumpbin", "stage_package", "write_manifest", "write_sha256", "zip_package"]

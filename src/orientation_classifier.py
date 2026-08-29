@@ -350,18 +350,26 @@ class OrientationClassifier:
         install_optional_sklearn_stubs()
         from paddleclas.deploy.python.predict_rec import RecPredictor
         from paddleclas.deploy.utils import config as paddle_config
+        from src.paddleclas_inference_compat import prepare_paddle_model_path
 
         selected_compute_device = _select_paddle_device(paddle, compute_device)
         config_path = paddle_config_path or (
             project_root / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml"
         )
         config = paddle_config.get_config(str(config_path), show=False)
-        config.Global.rec_inference_model_dir = str(model_dir)
+        try:
+            paddle_model_dir = prepare_paddle_model_path(model_dir)
+        except Exception as exc:
+            raise ComputeDeviceError(
+                "MODEL_PATH_UNSUPPORTED",
+                "Paddle 无法处理模型路径；请将程序解压到纯 ASCII 路径后重试",
+            ) from exc
+        config.Global.rec_inference_model_dir = str(paddle_model_dir)
         config.Global.use_gpu = compute_device == "gpu"
         config.Global.enable_mkldnn = compute_device == "cpu"
         config.Global.enable_benchmark = False
         config.Global.gpu_mem = 1024
-        global_predictor = create_rec_predictor(RecPredictor, config, paddle, model_dir)
+        global_predictor = create_rec_predictor(RecPredictor, config, paddle, paddle_model_dir)
         try:
             embeddings = list(global_predictor.predict([np.zeros((512, 512, 3), dtype=np.uint8)]))
             embedding = np.asarray(embeddings[0], dtype=np.float32) if len(embeddings) == 1 else None

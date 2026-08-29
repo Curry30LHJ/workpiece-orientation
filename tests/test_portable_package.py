@@ -4,6 +4,7 @@ from zipfile import ZipFile
 
 import pytest
 
+import release_tools.portable_package as portable_package
 from release_tools.portable_package import (
     PackageAuditError, audit_package, audit_zip_archive, build_release_config,
     stage_package, write_manifest, write_sha256, zip_package,
@@ -31,6 +32,8 @@ def minimal_stage(root: Path, edition: str = "gpu") -> Path:
         json.dumps({"layout_version": 1}), encoding="utf-8"
     )
     (root / "WorkpieceOrientation.exe").write_bytes(b"MZ-qt")
+    for name in ("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"):
+        (root / name).write_bytes(b"MZ-msvc-runtime")
     (root / "Qt5Core.dll").write_bytes(b"MZ-qtcore")
     (root / "platforms").mkdir()
     (root / "platforms" / "qwindows.dll").write_bytes(b"MZ-platform")
@@ -103,6 +106,13 @@ def test_cpu_audit_rejects_cuda_runtime(tmp_path: Path):
     (root / "backend" / "cudnn64_8.dll").write_bytes(b"MZ")
     with pytest.raises(PackageAuditError, match="CUDA"):
         audit_synthetic(root, edition="cpu")
+
+
+def test_audit_requires_msvc_runtime_for_qt_executable(tmp_path: Path):
+    root = minimal_stage(tmp_path / "package")
+    (root / "VCRUNTIME140_1.dll").unlink()
+    with pytest.raises(PackageAuditError, match="MSVC runtime missing"):
+        audit_synthetic(root)
 
 
 def test_manifest_and_zip_use_one_versioned_root(tmp_path: Path):
@@ -205,6 +215,8 @@ def _minimal_stage_inputs(root: Path):
     backend.mkdir(parents=True)
     model.mkdir(parents=True)
     (qt / "WorkpieceOrientation.exe").write_bytes(b"MZ-qt")
+    for name in ("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"):
+        (qt / name).write_bytes(b"MZ-msvc-runtime")
     (qt / "platforms").mkdir()
     (qt / "platforms" / "qwindows.dll").write_bytes(b"MZ")
     (qt / "Makefile.Debug").write_text("dev", encoding="utf-8")
@@ -236,6 +248,80 @@ def test_stage_filters_build_sources_and_requires_inference_config(tmp_path: Pat
     assert not (layout.root / "backend" / "headers.h").exists()
     assert not (layout.root / "Makefile.Debug").exists()
     assert not (layout.root / "unused.h").exists()
+    assert all((layout.root / name).is_file() for name in (
+        "MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"
+    ))
+
+
+def test_stage_copies_msvc_runtime_from_backend_when_windeployqt_omits_it(tmp_path: Path):
+    qt, backend, model, guide, notices, config = _minimal_stage_inputs(tmp_path / "inputs")
+    for name in ("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"):
+        (qt / name).unlink()
+        (backend / "_internal" / name).parent.mkdir(parents=True, exist_ok=True)
+        (backend / "_internal" / name).write_bytes(b"MZ-msvc-runtime")
+    layout = stage_package(
+        edition="gpu", version="1.0.0", qt_release_dir=qt, backend_dir=backend,
+        model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+        git_commit="0" * 40, paddle_config=config,
+    )
+    assert all((layout.root / name).is_file() for name in (
+        "MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"
+    ))
+
+
+def test_stage_rejects_missing_msvc_runtime(tmp_path: Path):
+    qt, backend, model, guide, notices, config = _minimal_stage_inputs(tmp_path / "inputs")
+    for name in ("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"):
+        (qt / name).unlink()
+    with pytest.raises(PackageAuditError, match="explicit MSVC runtime directory"):
+        stage_package(
+            edition="gpu", version="1.0.0", qt_release_dir=qt, backend_dir=backend,
+            model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+            git_commit="0" * 40, paddle_config=config,
+            msvc_runtime_dir=tmp_path / "missing-runtime",
+        )
+
+
+def test_stage_filters_generated_resource_file(tmp_path: Path):
+    qt, backend, model, guide, notices, config = _minimal_stage_inputs(tmp_path / "inputs")
+    (qt / "WorkpieceOrientation_resource.res").write_bytes(b"generated")
+    layout = stage_package(
+        edition="gpu", version="1.0.0", qt_release_dir=qt, backend_dir=backend,
+        model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+        git_commit="0" * 40, paddle_config=config,
+    )
+    assert not (layout.root / "WorkpieceOrientation_resource.res").exists()
+
+
+def test_stage_rejects_reparse_component_before_copy(tmp_path: Path, monkeypatch):
+    qt, backend, model, guide, notices, config = _minimal_stage_inputs(tmp_path / "inputs")
+    poisoned = qt / "poison"
+    poisoned.mkdir()
+    (poisoned / "not-runtime.dll").write_bytes(b"bad")
+    real_detector = portable_package._is_reparse_point
+    monkeypatch.setattr(
+        portable_package,
+        "_is_reparse_point",
+        lambda path: Path(path).name == "poison" or real_detector(path),
+    )
+    with pytest.raises(PackageAuditError, match="reparse point"):
+        stage_package(
+            edition="gpu", version="1.0.0", qt_release_dir=qt, backend_dir=backend,
+            model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+            git_commit="0" * 40, paddle_config=config,
+        )
+
+
+def test_audit_rejects_reparse_component(tmp_path: Path, monkeypatch):
+    root = minimal_stage(tmp_path / "package")
+    real_detector = portable_package._is_reparse_point
+    monkeypatch.setattr(
+        portable_package,
+        "_is_reparse_point",
+        lambda path: Path(path).name == "backend" or real_detector(path),
+    )
+    with pytest.raises(PackageAuditError, match="reparse point"):
+        audit_synthetic(root)
 
 
 def test_stage_fails_when_inference_config_is_unavailable(tmp_path: Path):

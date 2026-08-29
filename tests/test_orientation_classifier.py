@@ -1176,6 +1176,36 @@ def test_load_configures_requested_paddle_device(
     assert loaded.compute_device == device
 
 
+def test_load_uses_ascii_model_path_for_windows_unicode_package_root(tmp_path, monkeypatch):
+    import src.paddleclas_inference_compat as compat
+
+    captured = _install_fake_paddleclas(monkeypatch)
+    _install_fake_paddle_runtime(monkeypatch)
+    model_dir = tmp_path / "模型目录"
+    model_dir.mkdir()
+    for name, payload in (
+        ("inference.pdmodel", b"model"),
+        ("inference.pdiparams", b"params"),
+        ("inference.pdiparams.info", b"info"),
+    ):
+        (model_dir / name).write_bytes(payload)
+    monkeypatch.setattr(compat, "_windows_short_path", lambda _path: None)
+
+    loaded = OrientationClassifier.load(
+        tmp_path, model_dir, compute_device="cpu", inference_mode="fast_geometry"
+    )
+    try:
+        configured = captured["config"].Global.rec_inference_model_dir
+        if compat.os.name == "nt":
+            assert configured != str(model_dir)
+            assert all(ord(character) < 128 for character in configured)
+        else:
+            assert configured == str(model_dir)
+        assert loaded.compute_device == "cpu"
+    finally:
+        compat.cleanup_paddle_model_paths()
+
+
 def test_gpu_load_refuses_missing_cuda_without_cpu_fallback(tmp_path, monkeypatch):
     _install_fake_paddleclas(monkeypatch)
     _install_fake_paddle_runtime(monkeypatch, compiled=False, gpu_count=0)

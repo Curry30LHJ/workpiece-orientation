@@ -13,6 +13,7 @@ param(
     [int]$SmokeSeed = 20260813,
     [string]$ModelPath = '',
     [string]$PaddleConfig = '',
+    [string]$MsvcRuntimeDir = '',
     [string]$OutputRoot = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'release_staging')
 )
 $ErrorActionPreference = 'Stop'
@@ -68,7 +69,9 @@ foreach ($ed in $editions) {
         $configArg = Join-Path $repo 'third_party\PaddleClas\deploy\configs\inference_general.yaml'
     }
     if (-not (Test-Path -LiteralPath $configArg)) { throw "Paddle inference config not found: $configArg" }
-    & $py -m release_tools.portable_package stage --edition $ed --version $Version --qt-release-dir $qtRelease --backend-dir $backend --model-dir $model --output-root $stagingRoot --guide (Join-Path $repo 'deploy\使用说明.txt') --notices (Join-Path $repo 'deploy\THIRD_PARTY-NOTICES.txt') --git-commit $gitCommit --repository-root $repo --paddle-config $configArg
+    $stageArgs = @('stage', '--edition', $ed, '--version', $Version, '--qt-release-dir', $qtRelease, '--backend-dir', $backend, '--model-dir', $model, '--output-root', $stagingRoot, '--guide', (Join-Path $repo 'deploy\使用说明.txt'), '--notices', (Join-Path $repo 'deploy\THIRD_PARTY-NOTICES.txt'), '--git-commit', $gitCommit, '--repository-root', $repo, '--paddle-config', $configArg)
+    if ($MsvcRuntimeDir) { $stageArgs += @('--msvc-runtime-dir', $MsvcRuntimeDir) }
+    & $py -m release_tools.portable_package @stageArgs
     if ($LASTEXITCODE -ne 0) { throw "Portable package staging failed for $ed with exit code $LASTEXITCODE" }
     $package = Join-Path $target "WorkpieceOrientation-$($ed.ToUpper())"
     $paddleDist = if ($ed -eq 'gpu') { 'paddlepaddle-gpu' } else { 'paddlepaddle' }
