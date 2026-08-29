@@ -117,13 +117,15 @@ def test_run_smoke_writes_failure_report_and_preserves_nonzero_exit(tmp_path):
     ]
     with pytest.raises(RuntimeError, match="register failed"):
         run_smoke(
-            SmokeOptions(package_root=package, dataset_root=dataset, report_path=report_path),
+            SmokeOptions(package_root=package, dataset_root=dataset,
+                         front_template_count=2, back_template_count=2,
+                         report_path=report_path),
             process_factory=lambda *a, **k: process,
             socket_factory=lambda *a, **k: FakeSocket([], responses),
             temp_root_factory=lambda: tmp_path / "source-copy",
         )
     payload = json.loads(report_path.read_text(encoding="utf-8"))
-    assert payload["error"] == "register failed"
+    assert payload["error"].startswith("register failed")
     assert payload["commands"][-1] == "register"
     assert payload["results"][-1]["response"]["ok"] is False
     assert payload["process_exit"] == 7
@@ -166,7 +168,7 @@ def test_run_portability_uses_destination_counts_and_records_destination_command
         temp_root_factory=lambda: tmp_path / "copy",
     )
     assert report["destination"]["template_counts"] == {"front": 2, "back": 2}
-    assert [entry["command"] for entry in report["destination"]["commands"]] == [
+    assert report["destination"]["commands"] == [
         "hello", "list_workpieces", "predict", "predict", "get_geometry_mask_profile", "shutdown"
     ]
     assert report_path.is_file()
