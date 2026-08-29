@@ -60,7 +60,11 @@ def _process_exit_code(process: Any) -> int | None:
 
 def _collect_backend_log(report: dict[str, Any], process: Any) -> None:
     """Best-effort capture of backend output after process shutdown."""
-    stream = getattr(process, "stdout", None)
+    try:
+        stream = getattr(process, "stdout", None)
+    except Exception as exc:
+        report["backend_log_error"] = str(exc)
+        return
     if stream is None:
         return
     try:
