@@ -9,9 +9,11 @@ from release_tools.portable_smoke import SmokeOptions, run_portability, run_smok
 class FakeSocket:
     def __init__(self, events, responses):
         self.events, self.responses = events, iter(responses)
+        self.requests = []
 
     def request(self, command, **fields):
         self.events.append(command)
+        self.requests.append((command, fields))
         response = next(self.responses)
         return response(command, fields) if callable(response) else response
 
@@ -21,6 +23,7 @@ class FakeSocket:
 
 class FakeProcess:
     returncode = None
+    stdout = None
     def poll(self): return self.returncode
     def wait(self, timeout=None): self.returncode = 0; return 0
     def terminate(self): self.returncode = 0
@@ -109,6 +112,7 @@ def test_run_smoke_writes_failure_report_and_preserves_nonzero_exit(tmp_path):
     dataset = _dataset_fixture(tmp_path / "dataset")
     package = _package_fixture(tmp_path / "package")
     process = FailingWaitProcess()
+    process.stdout = type("FakeStdout", (), {"read": lambda self: "backend output"})()
     report_path = tmp_path / "failure.json"
     responses = [
         {"ok": True, "ready": True, "instance_token": "token"},
@@ -129,6 +133,7 @@ def test_run_smoke_writes_failure_report_and_preserves_nonzero_exit(tmp_path):
     assert payload["commands"][-1] == "register"
     assert payload["results"][-1]["response"]["ok"] is False
     assert payload["process_exit"] == 7
+    assert payload["backend_log"] == "backend output"
 
 
 def test_run_portability_uses_destination_counts_and_records_destination_commands(tmp_path):
@@ -171,6 +176,8 @@ def test_run_portability_uses_destination_counts_and_records_destination_command
     assert report["destination"]["commands"] == [
         "hello", "list_workpieces", "predict", "predict", "get_geometry_mask_profile", "shutdown"
     ]
+    shutdown_fields = [fields for command, fields in sockets[1].requests if command == "shutdown"][-1]
+    assert shutdown_fields["instance_token"] == "destination-token"
     assert report_path.is_file()
 
 
@@ -187,3 +194,96 @@ def test_run_portability_rejects_nonempty_destination_before_copy(tmp_path):
             socket_factory=lambda *a, **k: FakeSocket([], []),
             temp_root_factory=lambda: tmp_path / "copy",
         )
+
+
+def test_run_smoke_requires_explicit_empty_workpiece_list(tmp_path):
+    dataset = _dataset_fixture(tmp_path / "dataset")
+    package = _package_fixture(tmp_path / "package")
+    for index, malformed in enumerate(({}, {"workpieces": None})):
+        responses = [
+            {"ok": True, "ready": True, "instance_token": "hello-token"},
+            {"ok": True, **malformed},
+        ]
+        with pytest.raises(RuntimeError, match="workpieces"):
+            run_smoke(
+                SmokeOptions(package_root=package, dataset_root=dataset,
+                             front_template_count=2, back_template_count=2),
+                process_factory=lambda *a, **k: FakeProcess(),
+                socket_factory=lambda *a, responses=responses, **k: FakeSocket([], responses),
+                temp_root_factory=lambda index=index: tmp_path / f"copy-{index}",
+            )
+
+
+def test_run_smoke_rejects_missing_hello_instance_token(tmp_path):
+    dataset = _dataset_fixture(tmp_path / "dataset")
+    package = _package_fixture(tmp_path / "package")
+    with pytest.raises(RuntimeError, match="instance token"):
+        run_smoke(
+            SmokeOptions(package_root=package, dataset_root=dataset,
+                         front_template_count=2, back_template_count=2),
+            process_factory=lambda *a, **k: FakeProcess(),
+            socket_factory=lambda *a, **k: FakeSocket([], [{"ok": True, "ready": True}]),
+            temp_root_factory=lambda: tmp_path / "copy",
+        )
+
+
+def test_run_portability_rejects_extra_destination_workpiece(tmp_path):
+    dataset = _dataset_fixture(tmp_path / "dataset")
+    source = _package_fixture(tmp_path / "source")
+    destination = _package_fixture(tmp_path / "destination", edition="cpu")
+    source_responses = [
+        {"ok": True, "ready": True, "instance_token": "source-token"},
+        {"ok": True, "workpieces": []},
+        {"ok": True, "workpiece": {"id": "wp-1"}, "template_counts": {"front": 2, "back": 2}},
+        {"ok": True, "workpieces": [{"id": "wp-1"}]},
+        {"ok": True, "label": "front"}, {"ok": True, "label": "back"},
+        {"ok": True, "profile": {}}, {"ok": True},
+        {"ok": True, "workpieces": [{"id": "wp-1"}]},
+        {"ok": True, "workpiece": {"id": "wp-1"}},
+        {"ok": True, "workpieces": [{"id": "wp-1"}]}, {"ok": True},
+    ]
+    destination_responses = [
+        {"ok": True, "ready": True, "instance_token": "destination-token"},
+        {"ok": True, "workpieces": [
+            {"id": "wp-1", "template_counts": {"front": 2, "back": 2}},
+            {"id": "unexpected", "template_counts": {"front": 1, "back": 1}},
+        ]},
+    ]
+    sockets = []
+    def socket_factory(*args, **kwargs):
+        responses = source_responses if not sockets else destination_responses
+        sock = FakeSocket([], responses); sockets.append(sock); return sock
+    with pytest.raises(RuntimeError, match="destination workpiece set"):
+        run_portability(
+            SmokeOptions(source_package_root=source, destination_package_root=destination,
+                         dataset_root=dataset, front_template_count=2, back_template_count=2),
+            process_factory=lambda *a, **k: FakeProcess(), socket_factory=socket_factory,
+            temp_root_factory=lambda: tmp_path / "copy",
+        )
+
+
+def test_run_smoke_uses_hello_token_for_shutdown_and_predict_fields(tmp_path):
+    dataset = _dataset_fixture(tmp_path / "dataset")
+    package = _package_fixture(tmp_path / "package")
+    responses = [
+        {"ok": True, "ready": True, "instance_token": "hello-token"},
+        {"ok": True, "workpieces": []},
+        {"ok": True, "workpiece": {"id": "wp-1"}, "template_counts": {"front": 2, "back": 2}},
+        {"ok": True, "workpieces": [{"id": "wp-1"}]},
+        {"ok": True, "label": "front"}, {"ok": True, "label": "back"},
+        {"ok": True, "profile": {}}, {"ok": True},
+        {"ok": True, "workpieces": [{"id": "wp-1"}]},
+        {"ok": True, "workpiece": {"id": "wp-1"}},
+        {"ok": True, "workpieces": [{"id": "wp-1"}]}, {"ok": True},
+    ]
+    sock = FakeSocket([], responses)
+    process = FakeProcess(); process.token = "wrong-process-token"
+    run_smoke(
+        SmokeOptions(package_root=package, dataset_root=dataset, front_template_count=2, back_template_count=2),
+        process_factory=lambda *a, **k: process, socket_factory=lambda *a, **k: sock,
+        temp_root_factory=lambda: tmp_path / "copy",
+    )
+    predict_requests = [fields for command, fields in sock.requests if command == "predict"]
+    assert all({"workpiece_id", "image_path"} <= set(fields) for fields in predict_requests)
+    shutdown_fields = [fields for command, fields in sock.requests if command == "shutdown"][-1]
+    assert shutdown_fields["instance_token"] == "hello-token"

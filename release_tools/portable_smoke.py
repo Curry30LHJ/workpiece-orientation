@@ -58,6 +58,17 @@ def _process_exit_code(process: Any) -> int | None:
     return value
 
 
+def _collect_backend_log(report: dict[str, Any], process: Any) -> None:
+    """Best-effort capture of backend output after process shutdown."""
+    stream = getattr(process, "stdout", None)
+    if stream is None:
+        return
+    try:
+        report["backend_log"] = stream.read()
+    except Exception as exc:
+        report["backend_log_error"] = str(exc)
+
+
 class _JsonSocket:
     def __init__(self, sock: socket.socket):
         self.sock = sock
@@ -229,8 +240,13 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
             if time.monotonic() >= deadline:
                 raise TimeoutError("backend did not become ready")
             time.sleep(0.25)
+        instance_token = hello.get("instance_token")
+        if not isinstance(instance_token, str) or not instance_token.strip():
+            raise RuntimeError("backend hello omitted instance token")
         initial = request("list_workpieces")
-        if initial.get("workpieces"):
+        if not isinstance(initial.get("workpieces"), list):
+            raise RuntimeError("initial list_workpieces response omitted workpieces list")
+        if initial["workpieces"] != []:
             raise RuntimeError("packaged data is not empty before smoke")
         registered = request("register", name="portable-smoke", replace=False,
                              front_images=front, back_images=back, progress_events=True)
@@ -260,19 +276,13 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         restored_list = request("list_workpieces")
         if not any(item.get("id") == workpiece_id for item in restored_list.get("workpieces", [])):
             raise RuntimeError("restored workpiece missing from list")
-        request("shutdown", instance_token=getattr(process, "token", None) or hello.get("instance_token"))
+        request("shutdown", instance_token=instance_token)
         process.wait(timeout=10)
         if process.returncode != 0:
             raise RuntimeError(f"backend exited with code {process.returncode}")
         report.update(ok=True, workpiece_id=workpiece_id, template_counts=counts, process_exit=process.returncode,
                       temp_package=str(temp_package), front_query=front_query, back_query=back_query,
                       labels={"front": "front", "back": "back"})
-        stream = getattr(process, "stdout", None)
-        if stream is not None:
-            try:
-                report["backend_log"] = stream.read()
-            except Exception:
-                pass
     except Exception as exc:
         report["error"] = str(exc)
         setattr(exc, "smoke_report", report)
@@ -293,6 +303,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
             except Exception as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
+        _collect_backend_log(report, process)
         report["process_exit"] = _process_exit_code(process)
         if options.report_path:
             try:
@@ -385,6 +396,7 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         raise
     client = None
     hello: dict[str, Any] = {}
+    destination_instance_token: str | None = None
     destination_report: dict[str, Any] = {"commands": [], "results": []}
     primary_error: Exception | None = None
 
@@ -415,8 +427,17 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
             if hello.get("status") != "loading" or time.monotonic() >= deadline:
                 raise RuntimeError("destination did not become ready")
             time.sleep(0.25)
+        destination_instance_token = hello.get("instance_token")
+        if not isinstance(destination_instance_token, str) or not destination_instance_token.strip():
+            raise RuntimeError("destination hello omitted instance token")
         listed = request("list_workpieces")
-        item = next((x for x in listed.get("workpieces", []) if x.get("id") == source["workpiece_id"]), None)
+        workpieces = listed.get("workpieces")
+        if not isinstance(workpieces, list):
+            raise RuntimeError("destination list_workpieces response omitted workpieces list")
+        destination_ids = [item.get("id") for item in workpieces if isinstance(item, dict)]
+        if len(workpieces) != 1 or destination_ids != [source["workpiece_id"]]:
+            raise RuntimeError("destination workpiece set does not match source migration set")
+        item = workpieces[0]
         if item is None:
             raise RuntimeError("copied workpiece missing on destination")
         counts = item.get("template_counts")
@@ -440,9 +461,9 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         report["error"] = str(exc)
     finally:
         shutdown_error: Exception | None = None
-        if client is not None and hello.get("instance_token"):
+        if client is not None and isinstance(hello.get("instance_token"), str) and hello.get("instance_token").strip():
             try:
-                request("shutdown", instance_token=hello["instance_token"])
+                request("shutdown", instance_token=destination_instance_token)
             except Exception as exc:
                 shutdown_error = exc
         try:
