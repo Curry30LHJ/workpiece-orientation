@@ -84,6 +84,8 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
     root.mkdir(parents=True)
     qt_release_dir, backend_dir, model_dir = map(Path, (qt_release_dir, backend_dir, model_dir))
     for item in qt_release_dir.iterdir():
+        if item.suffix.lower() in {".obj", ".cpp", ".h", ".hpp", ".rc", ".exp", ".lib", ".pdb"} or item.name.lower().startswith(("makefile", "moc_", "ui_")):
+            continue
         if item.name.lower() == "app_config.json":
             continue
         target = root / item.name
@@ -125,11 +127,18 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
 
 
 def run_dumpbin(executable: Path, package_root: Path) -> list[str]:
+    dumpbin = shutil.which("dumpbin")
+    if not dumpbin:
+        candidates = sorted(Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2019").glob("*/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe"))
+        if candidates:
+            dumpbin = str(candidates[-1])
+    if not dumpbin:
+        raise PackageAuditError("dumpbin is required to audit executable dependencies (install VS C++ tools)")
     try:
-        headers = subprocess.run(["dumpbin", "/HEADERS", str(executable)], capture_output=True, text=True, check=False)
-        result = subprocess.run(["dumpbin", "/DEPENDENTS", str(executable)], capture_output=True, text=True, check=False)
+        headers = subprocess.run([dumpbin, "/HEADERS", str(executable)], capture_output=True, text=True, check=False)
+        result = subprocess.run([dumpbin, "/DEPENDENTS", str(executable)], capture_output=True, text=True, check=False)
     except OSError:
-        raise PackageAuditError("dumpbin is required to audit executable dependencies")
+        raise PackageAuditError(f"unable to execute dumpbin: {dumpbin}")
     if headers.returncode != 0 or result.returncode != 0:
         raise PackageAuditError(f"dumpbin failed for {executable.name}")
     machine = re.search(r"\b([0-9a-f]{3,4})\s+machine\b", headers.stdout, flags=re.IGNORECASE)
