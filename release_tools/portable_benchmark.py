@@ -196,6 +196,8 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
             raise ValueError(f"acceptance case {case} has no dataset fingerprint/path")
         if not isinstance(details.get("aggregate_sha256"), str) or len(str(details.get("aggregate_sha256"))) != 64:
             raise ValueError(f"acceptance case {case} has no aggregate fingerprint")
+        if not isinstance(details.get("overall_sha256"), str) or len(str(details.get("overall_sha256"))) != 64:
+            raise ValueError(f"acceptance case {case} has no overall fingerprint")
         for direction in ("front", "back"):
             section = details.get(direction)
             if not isinstance(section, Mapping):
