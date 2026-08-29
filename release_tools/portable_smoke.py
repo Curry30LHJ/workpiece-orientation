@@ -153,7 +153,9 @@ def _copy_to_long_temp(root: Path, factory: Callable[..., Path] | None) -> Path:
         # when copytree creates extracted children.
         base = None
         for _ in range(8):
-            candidate = root.parent / f".smoke-package-{uuid.uuid4().hex}"
+            # Keep the real portability probe meaningful: the copied package
+            # must exercise both Unicode and whitespace in its absolute path.
+            candidate = root.parent / f".便携 smoke package-{uuid.uuid4().hex}"
             try:
                 candidate.mkdir()
                 base = candidate

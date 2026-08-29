@@ -37,7 +37,9 @@ def test_copy_to_long_temp_does_not_depend_on_mkdtemp_acl(tmp_path: Path):
     target = smoke._copy_to_long_temp(source, None)
     try:
         assert target.is_dir()
-        assert target.parent.name.startswith(".smoke-package-")
+        assert target.parent.name.startswith(".便携 smoke package-")
+        assert " " in str(target)
+        assert any(ord(character) > 127 for character in str(target))
     finally:
         import shutil
         shutil.rmtree(target.parent)

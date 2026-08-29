@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import types
+import uuid
 from typing import Any
 from pathlib import Path
 
@@ -76,7 +77,19 @@ def _copy_model_to_ascii_path(source: Path) -> Path:
         raise RuntimeError(
             "Paddle model path contains non-ASCII characters and no ASCII temporary directory is available"
         )
-    destination = Path(tempfile.mkdtemp(prefix="workpiece-model-", dir=str(parent)))
+    destination: Path | None = None
+    for _ in range(16):
+        candidate = parent / f"workpiece-model-{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        except OSError:
+            continue
+        destination = candidate
+        break
+    if destination is None:
+        raise RuntimeError("unable to create an ASCII temporary directory for the Paddle model")
     if not _is_ascii_path(destination):
         shutil.rmtree(destination, ignore_errors=True)
         raise RuntimeError("temporary Paddle model path is not ASCII")
