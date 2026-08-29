@@ -401,6 +401,7 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         completed = True
         return report
     finally:
+        active_error = sys.exc_info()[1]
         shutdown_error = None
         if client is not None:
             try:
@@ -417,6 +418,16 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 process.wait(timeout=10)
             if completed and process.returncode not in (None, 0):
                 raise RuntimeError(f"backend exited with code {process.returncode}")
+            if process.stdout is not None:
+                try:
+                    backend_log = process.stdout.read()
+                except Exception as exc:
+                    backend_log = f"<backend log unavailable: {exc}>"
+            else:
+                backend_log = ""
+            if active_error is not None:
+                setattr(active_error, "process_exit", process.returncode)
+                setattr(active_error, "backend_log", backend_log)
         if shutdown_error is not None and completed:
             raise RuntimeError(f"backend shutdown failed: {shutdown_error}") from shutdown_error
         shutil.rmtree(temp_parent, ignore_errors=True)

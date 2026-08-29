@@ -31,7 +31,9 @@ def main() -> int:
     except Exception as exc:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({"passed": False, "error": {"type": type(exc).__name__, "message": str(exc)},
-                                          "process_exit": None, "backend_log": "", "lifecycle": {"shutdown": "not_confirmed"}},
+                                          "process_exit": getattr(exc, "process_exit", None),
+                                          "backend_log": getattr(exc, "backend_log", ""),
+                                          "lifecycle": {"shutdown": "not_confirmed"}},
                                           ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"benchmark failed: {exc}", file=sys.stderr)
         return 2
