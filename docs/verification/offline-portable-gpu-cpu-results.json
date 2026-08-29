@@ -2,13 +2,13 @@
   "version": "1.0.0",
   "verification_date": "2026-08-29",
   "branch": "feature/20260828/offline-portable-packages",
-  "source_head_commit": "1d3f185738b93a97b1994a842204cf76e98d481f",
-  "package_build_commit": "d918723261bf7d211b752e2f1022ba120b6ebe63",
+  "source_head_commit": "d3d1fa0834f11964919124359921c2ebc5db27cc",
+  "package_build_commit": "d3d1fa0834f11964919124359921c2ebc5db27cc",
   "packages": {
     "gpu": {
       "artifact": "release_artifacts/WorkpieceOrientation-GPU-x64-1.0.0.zip",
-      "size_bytes": 2537514980,
-      "zip_sha256": "8818e1c17725a92b4a2097b3c761fc86b174e1c224001aa7b129310d471f33f4",
+      "size_bytes": 2537515338,
+      "zip_sha256": "02d7e7fe1e958a50e8c6ceb7184559aa0893d8cdcff5655a59e9d1c850be1817",
       "content_audit": "passed",
       "zip_extraction_audit": "passed",
       "audited_file_count": 1192,
@@ -24,14 +24,21 @@
         "request_timeout_ms": 120000
       },
       "smoke": {
-        "report": "release_staging/final-1.0.0-final/reports/gpu-smoke.json",
+        "report": "release_staging/final-1.0.0-qtfix2/reports/gpu-smoke.json",
         "passed": true,
         "template_counts": {"front": 5, "back": 10},
         "labels": {"front": "front", "back": "back"},
         "process_exit": 0,
         "forced_termination": false,
         "temporary_package_cleaned": true,
-        "register_elapsed_ms": 276494.9554
+        "register_elapsed_ms": 5542.2078,
+        "qt_packaged_smoke": {
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_ms": 9856,
+          "command": "WorkpieceOrientation.exe --package-smoke-test",
+          "platform": "windows-default"
+        }
       },
       "benchmark": {
         "report": "release_staging/final-1.0.0-final/reports/gpu-portable-benchmark.json",
@@ -64,8 +71,8 @@
     },
     "cpu": {
       "artifact": "release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip",
-      "size_bytes": 254500483,
-      "zip_sha256": "e29b2a95bc927920f51e025039935947a81fac9cc4b42287f473bb4a2b7520ce",
+      "size_bytes": 254500024,
+      "zip_sha256": "4044820dcabbd1fcc8c517eb7d80b6b6b6a64478b4210640be0536052d51f2db",
       "content_audit": "passed",
       "zip_extraction_audit": "passed",
       "audited_file_count": 1171,
@@ -81,14 +88,21 @@
         "request_timeout_ms": 120000
       },
       "smoke": {
-        "report": "release_staging/final-1.0.0-final/reports/cpu-smoke.json",
+        "report": "release_staging/final-1.0.0-qtfix2/reports/cpu-smoke.json",
         "passed": true,
         "template_counts": {"front": 5, "back": 10},
         "labels": {"front": "front", "back": "back"},
         "process_exit": 0,
         "forced_termination": false,
         "temporary_package_cleaned": true,
-        "register_elapsed_ms": 41988.4119
+        "register_elapsed_ms": 36139.1158,
+        "qt_packaged_smoke": {
+          "passed": true,
+          "exit_code": 0,
+          "elapsed_ms": 5983,
+          "command": "WorkpieceOrientation.exe --package-smoke-test",
+          "platform": "windows-default"
+        }
       },
       "benchmark": {
         "report": "release_staging/final-1.0.0-final/reports/cpu-portable-benchmark.json",
@@ -156,7 +170,12 @@
       "failed_targets": 0,
       "command": "scripts/run_qt5_tests.ps1 (Qt 5.14.2, offscreen)"
     },
-    "focused_package_regression": {"passed": 61, "failed": 0}
+    "focused_package_regression": {"passed": 61, "failed": 0},
+    "qt_packaged_smoke": {
+      "passed_editions": 2,
+      "failed_editions": 0,
+      "note": "在重建后的 staging 包中直接启动 Qt EXE；使用默认 Windows 平台，不把缺少 qoffscreen.dll 的离屏探针当作用户启动路径。"
+    }
   },
   "template_count_performance_reference": {
     "source": "docs/verification/lightweight-geometry-fast-path-results.md",
@@ -177,6 +196,7 @@
     "package_build": "passed",
     "static_and_zip_audits": "passed",
     "functional_smoke": "passed",
+    "qt_packaged_smoke": "passed",
     "gpu_latency_gate": "passed",
     "accuracy_and_cross_edition_consistency": "passed",
     "clean_vm_acceptance": "pending"
