@@ -312,6 +312,12 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 if root_resolved not in target.parents and target != root_resolved:
                     raise ValueError(f"ZIP entry escapes extraction root: {member.filename}")
             archive.extractall(package_root)
+        if not (package_root / "app_config.json").is_file():
+            children = [p for p in package_root.iterdir() if p.is_dir()]
+            if len(children) == 1 and (children[0] / "app_config.json").is_file():
+                package_root = children[0]
+            else:
+                raise ValueError("ZIP must contain app_config.json at root or one top-level directory")
         config = json.loads((package_root / "app_config.json").read_text(encoding="utf-8"))
         _validate_config(package_root, config)
         environment = _environment(config)
