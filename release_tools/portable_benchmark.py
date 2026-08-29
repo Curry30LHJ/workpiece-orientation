@@ -106,11 +106,19 @@ def _free_port() -> int:
 
 
 class _Client:
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock: socket.socket, request_timeout: float | None = None):
         self.sock = sock
+        self.request_timeout = request_timeout
         self.file = sock.makefile("rwb")
 
-    def request(self, command: str, **fields: Any) -> dict[str, Any]:
+    def request(self, command: str, *, timeout: float | None = None, **fields: Any) -> dict[str, Any]:
+        # ``socket.create_connection`` uses a short connect timeout.  The
+        # resulting socket retains that timeout, so reset it for every
+        # protocol request; registration and CPU inference may legitimately
+        # take longer than the connection handshake.
+        request_timeout = self.request_timeout if timeout is None else timeout
+        if request_timeout is not None:
+            self.sock.settimeout(max(float(request_timeout), 0.001))
         request_id = str(uuid.uuid4())
         self.file.write((json.dumps({"version": 1, "request_id": request_id,
                                      "command": command, **fields}) + "\n").encode())
@@ -232,6 +240,44 @@ def _normalise_fingerprint_path(value: object, label: str) -> str:
     return "/".join(parts)
 
 
+def _is_reparse_point(path: Path) -> bool:
+    """Detect symlinks and Windows junctions/reparse points."""
+
+    if path.is_symlink():
+        return True
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+    except (AttributeError, OSError):
+        return False
+
+
+def _assert_no_reparse_components(path: Path, floor: Path) -> None:
+    """Reject a symlink/junction in any component below ``floor``.
+
+    Calling ``resolve`` before this check would hide a junction that points to
+    another directory inside the corpus.  The lexical walk therefore happens
+    first and is intentionally limited to the corpus subtree, not the drive
+    root (which may itself be a mount point on Windows).
+    """
+
+    path = Path(path)
+    floor = Path(floor)
+    try:
+        relative = path.relative_to(floor)
+    except ValueError as exc:
+        raise ValueError(f"path is outside corpus root: {path}") from exc
+    current = floor
+    for component in relative.parts:
+        current = current / component
+        if _is_reparse_point(current):
+            raise ValueError(f"reparse point is not allowed in acceptance corpus: {current}")
+
+
 def _source_for_fingerprint(project_root: Path, relative: str, *, case: str,
                             direction: str) -> Path:
     """Resolve a fingerprint path and enforce its dataset/direction partition."""
@@ -243,7 +289,9 @@ def _source_for_fingerprint(project_root: Path, relative: str, *, case: str,
             raise ValueError(f"fingerprint path is outside {case}/{direction} dataset: {relative}")
     elif len(parts) < 3 or parts[-2] != orientation_dir:
         raise ValueError(f"fingerprint path has invalid direction partition: {relative}")
-    source = (project_root / Path(*parts)).resolve()
+    lexical_source = project_root / Path(*parts)
+    _assert_no_reparse_components(lexical_source, project_root)
+    source = lexical_source.resolve()
     if project_root.resolve() not in source.parents:
         raise ValueError(f"fingerprint path escapes corpus root: {relative}")
     return source
@@ -284,8 +332,8 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
         dataset_root = Path(dataset_text)
         if not dataset_root.is_absolute() or dataset_root.name != expected_dataset or not dataset_root.is_dir():
             raise ValueError(f"acceptance case {case} dataset_path is invalid")
-        if dataset_root.is_symlink():
-            raise ValueError(f"acceptance case {case} dataset_path must not be a symlink")
+        project_root = dataset_root.parent.parent
+        _assert_no_reparse_components(dataset_root, project_root.parent)
         dataset_root = dataset_root.resolve()
         if dataset_root.parent.name.lower() != "data":
             raise ValueError(f"acceptance case {case} dataset_path must be under data/")
@@ -338,8 +386,9 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                     width = _strict_int(row.get("width"), f"{label} width", positive=True)
                     height = _strict_int(row.get("height"), f"{label} height", positive=True)
                     source_input = Path(row["image_path"])
-                    if not source_input.is_absolute() or source_input.is_symlink() or not source_input.is_file():
+                    if not source_input.is_absolute() or not source_input.is_file():
                         raise FileNotFoundError(source_input)
+                    _assert_no_reparse_components(source_input, project_root)
                     source = source_input.resolve()
                     # Resolve the source to the fingerprint path, rather than
                     # trusting a suffix/filename heuristic.  This binds the
@@ -455,9 +504,29 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 raise ValueError("ZIP must contain app_config.json at root or one top-level directory")
         config = json.loads((package_root / "app_config.json").read_text(encoding="utf-8"))
         _validate_config(package_root, config)
+        configured_request_timeout = config.get("request_timeout_ms", 120000)
+        if isinstance(configured_request_timeout, bool) or not isinstance(configured_request_timeout, (int, float)) or configured_request_timeout <= 0:
+            raise ValueError("package config request_timeout_ms must be a positive number")
+        request_timeout_seconds = float(configured_request_timeout) / 1000.0
         environment = _environment(config)
+        version_metadata: dict[str, Any] = {}
+        version_path = package_root / "version.json"
+        if version_path.is_file():
+            try:
+                metadata = json.loads(version_path.read_text(encoding="utf-8"))
+                if isinstance(metadata, Mapping):
+                    version_metadata = {str(key): value for key, value in metadata.items()}
+            except (OSError, ValueError):
+                # Package audit reports malformed metadata.  Keep benchmark
+                # reports backward-compatible for older packages that lack it.
+                version_metadata = {}
         report.update({"edition": config.get("edition"), "version": config.get("package_version"),
-                       "versions": {"package": config.get("package_version")},
+                       "versions": {"package": config.get("package_version"), **{
+                           key: version_metadata[key] for key in
+                           ("python", "paddle", "paddleclas", "pyinstaller", "qt")
+                           if key in version_metadata
+                       }},
+                       "package_metadata": version_metadata,
                        "manifest_hashes": _manifest_hashes(package_root), "environment": environment,
                        "hardware": environment})
         templates, queries = _acceptance_rows(Path(acceptance_spec), package_root)
@@ -486,7 +555,11 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
-                client = _Client(socket.create_connection(("127.0.0.1", port), timeout=5))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("backend did not accept a connection")
+                client = _Client(socket.create_connection(("127.0.0.1", port), timeout=min(5.0, remaining)),
+                                 request_timeout=request_timeout_seconds)
                 lifecycle["connection_established"] = True
                 break
             except OSError:
@@ -498,13 +571,16 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         report["startup"]["connection_ms"] = (perf_counter() - started) * 1000.0
         phases: list[dict[str, Any]] = []
         while time.monotonic() < deadline:
-            hello = client.request("hello")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("backend did not become ready")
+            hello = client.request("hello", timeout=min(request_timeout_seconds, remaining))
             phases.append({"phase": hello.get("phase"), "status": hello.get("status"), "elapsed_ms": (perf_counter() - started) * 1000.0})
             if hello.get("ready") is True:
                 break
             if hello.get("status") != "loading":
                 raise RuntimeError(f"backend startup failed: {hello}")
-            time.sleep(0.1)
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         else:
             raise TimeoutError("backend did not become ready")
         report["startup"]["phases"] = phases
@@ -520,12 +596,18 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
             raise RuntimeError("backend hello instance token mismatch")
         report["environment"]["paddle_device_actual"] = hello.get("compute_device")
         report["hardware"] = report["environment"]
+        def request_with_deadline(command: str, **fields: Any) -> dict[str, Any]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"benchmark overall timeout exceeded before {command}")
+            return client.request(command, timeout=min(request_timeout_seconds, remaining), **fields)
+
         workpieces: dict[str, str] = {}
         for case in sorted({str(row["case"]) for row in queries}):
             front = templates.get(f"{case}:front", [])
             back = templates.get(f"{case}:back", [])
-            response = client.request("register", name=f"benchmark-{case}", replace=False,
-                                      front_images=[str(p) for p in front], back_images=[str(p) for p in back])
+            response = request_with_deadline("register", name=f"benchmark-{case}", replace=False,
+                                            front_images=[str(p) for p in front], back_images=[str(p) for p in back])
             counts = response.get("template_counts")
             if counts != {"front": len(front), "back": len(back)} or not front or not back:
                 raise RuntimeError(f"register template counts mismatch for {case}: {counts}")
@@ -535,8 +617,10 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 raise RuntimeError(f"register returned invalid workpiece id for {case}")
             workpieces[case] = workpiece_id
         for index in range(warmup):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("benchmark overall timeout exceeded during warmup")
             row = queries[index % len(queries)]
-            client.request("predict", workpiece_id=workpieces[str(row["case"])], image_path=row["image_path"])
+            request_with_deadline("predict", workpiece_id=workpieces[str(row["case"])], image_path=row["image_path"])
         samples: list[dict[str, Any]] = []
         predictions: dict[str, str] = {}
         correct_samples = 0
@@ -548,7 +632,7 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
             if expected_label not in {"front", "back"}:
                 raise ValueError("acceptance query expected_orientation must be front or back")
             t0 = perf_counter()
-            response = client.request("predict", workpiece_id=workpieces[str(row["case"])], image_path=row["image_path"])
+            response = request_with_deadline("predict", workpiece_id=workpieces[str(row["case"])], image_path=row["image_path"])
             round_trip_ms = (perf_counter() - t0) * 1000.0
             label = response.get("label")
             if label not in {"front", "back"}:
@@ -610,7 +694,8 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
             try:
                 if process is not None and process.poll() is None:
                     lifecycle["shutdown_requested"] = True
-                    client.request("shutdown", instance_token=(hello or {}).get("instance_token", ""))
+                    client.request("shutdown", timeout=5.0,
+                                   instance_token=(hello or {}).get("instance_token", ""))
                     lifecycle["shutdown_confirmed"] = True
             except Exception as exc:
                 shutdown_error = exc

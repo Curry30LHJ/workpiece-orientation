@@ -191,6 +191,50 @@ def test_acceptance_rows_rejects_inventory_size_and_dimension_corruption(tmp_pat
         _acceptance_rows(spec, tmp_path / "extract")
 
 
+def test_acceptance_rows_rejects_nested_reparse_component(tmp_path: Path, monkeypatch):
+    root = tmp_path / "corpus"
+    spec = _acceptance_fixture(root)
+    # Simulate a junction/reparse point without requiring elevated Windows
+    # privileges to create one in the test workspace.
+    monkeypatch.setattr(benchmark, "_is_reparse_point", lambda path: path.name == "0")
+    with pytest.raises(ValueError, match="reparse point"):
+        _acceptance_rows(spec, tmp_path / "extract")
+
+
+def test_client_resets_connect_timeout_for_long_requests():
+    class FakeFile:
+        def __init__(self):
+            self.payload = b'{"request_id":"ignored","ok":true}\n'
+        def write(self, data):
+            return len(data)
+        def flush(self):
+            return None
+        def readline(self):
+            request = json.loads(self.payload.decode())
+            request["request_id"] = json.loads(self.last.decode())["request_id"]
+            self.payload = (json.dumps(request) + "\n").encode()
+            return self.payload
+
+    class FakeSocket:
+        def __init__(self):
+            self.timeouts = []
+            self.file = FakeFile()
+        def makefile(self, *_):
+            original = self.file.write
+            def write(data):
+                self.file.last = data
+                return original(data)
+            self.file.write = write
+            return self.file
+        def settimeout(self, value):
+            self.timeouts.append(value)
+
+    sock = FakeSocket()
+    client = benchmark._Client(sock, request_timeout=120.0)
+    assert client.request("register", timeout=45.0)["ok"] is True
+    assert sock.timeouts == [45.0]
+
+
 def test_run_benchmark_accepts_versioned_top_level_zip_and_reports_lifecycle(tmp_path: Path, monkeypatch):
     config = _minimal_config()
     package = tmp_path / "package.zip"
@@ -198,6 +242,7 @@ def test_run_benchmark_accepts_versioned_top_level_zip_and_reports_lifecycle(tmp
     _write_zip(package, {
         f"{root_name}/app_config.json": json.dumps(config).encode(),
         f"{root_name}/backend/config.yaml": b"Global: {}\n",
+        f"{root_name}/version.json": json.dumps({"version": "1.0.0", "python": "3.10", "paddle": "3.2.2", "paddleclas": "2.6.0", "pyinstaller": "6.22.2", "qt": "5.14.2"}).encode(),
     })
     template = tmp_path / "template.png"
     query = tmp_path / "query.png"
@@ -245,6 +290,7 @@ def test_run_benchmark_accepts_versioned_top_level_zip_and_reports_lifecycle(tmp
     assert report["lifecycle"]["shutdown_confirmed"] is True
     assert report["lifecycle"]["process_exit"] == 0
     assert "fake backend log" in report["backend_log"]
+    assert report["versions"] == {"package": "1.0.0", "python": "3.10", "paddle": "3.2.2", "paddleclas": "2.6.0", "pyinstaller": "6.22.2", "qt": "5.14.2"}
 
 
 def test_run_benchmark_timeout_preserves_process_exit_log_and_lifecycle(tmp_path: Path, monkeypatch):
