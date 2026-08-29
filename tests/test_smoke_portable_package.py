@@ -178,6 +178,8 @@ def test_run_portability_uses_destination_counts_and_records_destination_command
     ]
     shutdown_fields = [fields for command, fields in sockets[1].requests if command == "shutdown"][-1]
     assert shutdown_fields["instance_token"] == "destination-token"
+    assert all({"workpiece_id", "image_path"} <= set(fields)
+               for command, fields in sockets[1].requests if command == "predict")
     assert report_path.is_file()
 
 
@@ -258,6 +260,28 @@ def test_run_portability_rejects_extra_destination_workpiece(tmp_path):
             SmokeOptions(source_package_root=source, destination_package_root=destination,
                          dataset_root=dataset, front_template_count=2, back_template_count=2),
             process_factory=lambda *a, **k: FakeProcess(), socket_factory=socket_factory,
+            temp_root_factory=lambda: tmp_path / "copy",
+        )
+
+
+def test_run_portability_rejects_missing_destination_hello_token(tmp_path, monkeypatch):
+    import release_tools.portable_smoke as portable_smoke
+
+    source = _package_fixture(tmp_path / "source")
+    destination = _package_fixture(tmp_path / "destination", edition="cpu")
+    source_report = {
+        "workpiece_id": "wp-1", "template_counts": {"front": 2, "back": 2},
+        "temp_package": str(source), "front_query": "front.png", "back_query": "back.png",
+        "commands": [], "results": [],
+    }
+    monkeypatch.setattr(portable_smoke, "run_smoke", lambda *args, **kwargs: source_report)
+    destination_responses = [{"ok": True, "ready": True}]
+    with pytest.raises(RuntimeError, match="destination hello omitted instance token"):
+        run_portability(
+            SmokeOptions(source_package_root=source, destination_package_root=destination,
+                         dataset_root=tmp_path),
+            process_factory=lambda *a, **k: FakeProcess(),
+            socket_factory=lambda *a, **k: FakeSocket([], destination_responses),
             temp_root_factory=lambda: tmp_path / "copy",
         )
 
