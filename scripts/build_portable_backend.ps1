@@ -39,12 +39,16 @@ try {
 $backend = Join-Path $editionRoot 'orientation_backend'
 $exe = Join-Path $backend 'orientation_backend.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "Frozen backend missing orientation_backend.exe: $exe" }
-$visibleSources = @(Get-ChildItem -LiteralPath $backend -Recurse -File -Include '*.py' | Where-Object {
+$visibleSources = @(Get-ChildItem -LiteralPath $backend -Recurse -File | Where-Object {
+    # Windows PowerShell 5.1 ignores -Include when -LiteralPath is used;
+    # filter on the extension explicitly so DLLs are never misreported as
+    # Python sources.
+    if ($_.Extension -ine '.py') { return $false }
     $relative = $_.FullName.Substring($backend.Length + 1).Replace('\','/').ToLowerInvariant()
-    -not $relative.StartsWith('_internal/cv2/')
+    return -not $relative.StartsWith('_internal/cv2/')
 })
 if ($visibleSources.Count -gt 0) {
     throw ("Frozen backend contains project Python source: " + (($visibleSources | ForEach-Object { $_.FullName }) -join ', '))
 }
-Write-Output ("Dependency loader sources retained (OpenCV only): " + ((Get-ChildItem -LiteralPath $backend -Recurse -File -Include '*.py' | Measure-Object).Count))
+Write-Output ("Dependency loader sources retained (OpenCV only): " + ((Get-ChildItem -LiteralPath $backend -Recurse -File | Where-Object { $_.Extension -ieq '.py' } | Measure-Object).Count))
 Write-Output ("Backend bundle ready: " + $backend)

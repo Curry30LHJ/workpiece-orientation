@@ -65,3 +65,9 @@ def test_release_script_allows_explicit_msvc_runtime_directory():
     script = (Path(__file__).parents[1] / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
     assert "MsvcRuntimeDir" in script
     assert "--msvc-runtime-dir" in script
+
+
+def test_backend_source_audit_filters_python_explicitly_for_windows_powershell():
+    script = (Path(__file__).parents[1] / "scripts" / "build_portable_backend.ps1").read_text(encoding="utf-8")
+    assert "Extension -ieq '.py'" in script
+    assert "-Include '*.py'" not in script
