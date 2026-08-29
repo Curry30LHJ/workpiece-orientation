@@ -19,7 +19,7 @@ foreach ($requiredPath in @($qmake, $Jom, $VcVars, $projectFile)) {
 
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 Set-Location -LiteralPath $buildDir
-$qmakeLine = 'call "' + $VcVars + '" && "' + $qmake + '" "' + $projectFile + '" CONFIG+=release'
+$qmakeLine = 'call "' + $VcVars + '" && "' + $qmake + '" "..\workpiece_orientation.pro" CONFIG+=release'
 cmd.exe /d /s /c $qmakeLine
 $buildExitCode = $LASTEXITCODE
 if ($buildExitCode -ne 0) {

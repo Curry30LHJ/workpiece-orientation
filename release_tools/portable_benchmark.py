@@ -12,7 +12,9 @@ from pathlib import Path
 import platform
 import shutil
 import socket
+import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -156,16 +158,44 @@ def _manifest_hashes(root: Path) -> dict[str, str]:
             if isinstance(row, Mapping) and "path" in row and "sha256" in row}
 
 
+def _validate_config(root: Path | str, config: Mapping[str, Any]) -> None:
+    """Validate all package paths before using them as subprocess arguments."""
+    root_path = Path(root).resolve()
+    for key in ("backend_executable", "project_root", "model_dir", "paddle_config", "data_root"):
+        value = config.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"package config path must be a non-empty string: {key}")
+        candidate = Path(value)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(f"package config path must be relative and contained: {key}")
+        resolved = (root_path / candidate).resolve()
+        if root_path not in resolved.parents and resolved != root_path:
+            raise ValueError(f"package config path escapes package root: {key}")
+        current = root_path
+        for part in candidate.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"package config path traverses symlink: {key}")
+
+
 def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[Path]], list[dict[str, Any]]]:
     payload = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     inventory = payload.get("selection_inventory")
     if not isinstance(inventory, Mapping):
         raise ValueError("acceptance spec has no selection_inventory")
+    if set(inventory) != {"M1", "M2", "M7"}:
+        raise ValueError("acceptance spec must contain exactly M1, M2, and M7")
     templates: dict[str, list[Path]] = {}
     queries: list[dict[str, Any]] = []
+    template_hashes: set[str] = set()
+    query_hashes: set[str] = set()
     for case, details in inventory.items():
         if not isinstance(details, Mapping):
             continue
+        if not isinstance(details.get("dataset_path"), str) or not str(details.get("dataset_path")).strip():
+            raise ValueError(f"acceptance case {case} has no dataset fingerprint/path")
+        if not isinstance(details.get("aggregate_sha256"), str) or len(str(details.get("aggregate_sha256"))) != 64:
+            raise ValueError(f"acceptance case {case} has no aggregate fingerprint")
         for direction in ("front", "back"):
             section = details.get(direction)
             if not isinstance(section, Mapping):
@@ -177,19 +207,33 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                 for index, row in enumerate(rows):
                     if not isinstance(row, Mapping) or not isinstance(row.get("image_path"), str):
                         continue
+                    if row.get("role") != ("template" if role == "templates" else "query"):
+                        raise ValueError("acceptance inventory row has invalid role")
                     source = Path(row["image_path"])
                     if not source.is_file():
                         raise FileNotFoundError(source)
                     destination = temp_root / "data" / "benchmark" / str(case) / direction / f"{index:04d}_{source.name}"
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, destination)
+                    if row.get("sha256") and _sha256(source) != str(row["sha256"]):
+                        raise ValueError(f"acceptance source hash mismatch: {source}")
+                    if int(row.get("width", 0)) <= 0 or int(row.get("height", 0)) <= 0:
+                        raise ValueError("acceptance inventory row has invalid dimensions")
                     if role == "templates":
                         templates.setdefault(f"{case}:{direction}", []).append(destination)
+                        if row.get("sha256"):
+                            template_hashes.add(str(row["sha256"]))
                     else:
+                        if row.get("expected_orientation") not in {"front", "back"}:
+                            raise ValueError("acceptance query expected_orientation must be front or back")
                         queries.append({**dict(row), "case": str(case), "direction": direction,
                                         "image_path": str(destination), "query_identity": str(row.get("query_identity", destination.name))})
+                        if row.get("sha256"):
+                            query_hashes.add(str(row["sha256"]))
     if not templates or not queries:
         raise ValueError("acceptance spec contains no usable templates and queries")
+    if template_hashes & query_hashes:
+        raise ValueError("acceptance template/query SHA-256 overlap")
     identities = [str(row["query_identity"]) for row in queries]
     if any(not identity.strip() for identity in identities) or len(set(identities)) != len(identities):
         raise ValueError("acceptance query identities must be unique and non-empty")
@@ -219,17 +263,25 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         with zipfile.ZipFile(package_zip) as archive:
             root_resolved = package_root.resolve()
             for member in archive.infolist():
+                if stat.S_ISLNK((member.external_attr >> 16) & 0xFFFF):
+                    raise ValueError(f"ZIP symlink entries are not allowed: {member.filename}")
                 target = (package_root / member.filename).resolve()
                 if root_resolved not in target.parents and target != root_resolved:
                     raise ValueError(f"ZIP entry escapes extraction root: {member.filename}")
             archive.extractall(package_root)
         config = json.loads((package_root / "app_config.json").read_text(encoding="utf-8"))
+        _validate_config(package_root, config)
         environment = _environment(config)
         report.update({"edition": config.get("edition"), "version": config.get("package_version"),
                        "versions": {"package": config.get("package_version")},
                        "manifest_hashes": _manifest_hashes(package_root), "environment": environment,
                        "hardware": environment})
         templates, queries = _acceptance_rows(Path(acceptance_spec), package_root)
+        report["acceptance_source_hashes"] = {
+            str(row["query_identity"]): str(row["sha256"])
+            for row in queries
+            if row.get("sha256")
+        }
         port = _free_port()
         executable = package_root / str(config["backend_executable"])
         token = str(uuid.uuid4())
@@ -271,12 +323,25 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
             raise TimeoutError("backend did not become ready")
         report["startup"]["phases"] = phases
         report["startup"]["ready_ms"] = (perf_counter() - started) * 1000.0
+        if hello.get("edition") != config.get("edition") or hello.get("compute_device") != config.get("compute_device"):
+            raise RuntimeError("backend hello edition/device does not match app_config")
+        if hello.get("package_version") != config.get("package_version"):
+            raise RuntimeError("backend hello package version does not match app_config")
+        if hello.get("model_fingerprint") != config.get("model_sha256"):
+            raise RuntimeError("backend hello model fingerprint does not match app_config")
+        if hello.get("instance_token") != token:
+            raise RuntimeError("backend hello instance token mismatch")
+        report["environment"]["paddle_device_actual"] = hello.get("compute_device")
+        report["hardware"] = report["environment"]
         workpieces: dict[str, str] = {}
         for case in sorted({str(row["case"]) for row in queries}):
             front = templates.get(f"{case}:front", [])
             back = templates.get(f"{case}:back", [])
             response = client.request("register", name=f"benchmark-{case}", replace=False,
                                       front_images=[str(p) for p in front], back_images=[str(p) for p in back])
+            counts = response.get("template_counts")
+            if counts != {"front": len(front), "back": len(back)} or not front or not back:
+                raise RuntimeError(f"register template counts mismatch for {case}: {counts}")
             workpiece = response.get("workpiece") or {}
             workpiece_id = workpiece.get("id")
             if not isinstance(workpiece_id, str) or not workpiece_id.strip():
@@ -289,12 +354,16 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         predictions: dict[str, str] = {}
         for index in range(iterations):
             row = queries[index % len(queries)]
+            expected_label = row.get("expected_orientation")
+            if expected_label not in {"front", "back"}:
+                raise ValueError("acceptance query expected_orientation must be front or back")
             t0 = perf_counter()
             response = client.request("predict", workpiece_id=workpieces[str(row["case"])], image_path=row["image_path"])
             round_trip_ms = (perf_counter() - t0) * 1000.0
             label = response.get("label")
-            if isinstance(label, str):
-                predictions[str(row["query_identity"])] = label
+            if label not in {"front", "back"}:
+                raise RuntimeError("predict response label must be front or back")
+            predictions[str(row["query_identity"])] = label
             backend_timings = response.get("timings_ms") if isinstance(response.get("timings_ms"), Mapping) else {}
             backend_total = response.get("elapsed_ms", backend_timings.get("total"))
             if backend_total is None:
@@ -309,30 +378,47 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                                    "backend_elapsed_ms": summarize([r["backend_elapsed_ms"] for r in samples])}})
         expected = {str(row["query_identity"]): str(row.get("expected_orientation")) for row in queries}
         correct = sum(predictions.get(k) == v for k, v in expected.items())
-        report["accuracy"] = {"queries": len(expected), "correct": int(correct), "accuracy": float(correct / len(expected)) if expected else 0.0}
+        review_by_identity = {row["image"]: bool(row["needs_review"]) for row in samples}
+        report["needs_review"] = {"count": sum(review_by_identity.values()), "by_image": review_by_identity}
+        accuracy_value = float(correct / len(expected)) if expected else 0.0
+        review_rate = float(sum(review_by_identity.values()) / len(expected)) if expected else 1.0
+        report["accuracy"] = {"queries": len(expected), "correct": int(correct), "accuracy": accuracy_value,
+                                "review_count": sum(review_by_identity.values()), "review_rate": review_rate}
         backend_summary = report["timings"]["backend_elapsed_ms"]
         report["gates"] = {"gpu_backend_p95_ms": {"actual": backend_summary["p95"], "limit": 25.0,
-                                                      "passed": report["edition"] != "gpu" or backend_summary["p95"] <= 25.0}}
+                                                      "passed": report["edition"] != "gpu" or backend_summary["p95"] <= 25.0},
+                         "accuracy_complete": {"actual": len(predictions), "limit": len(expected), "passed": len(predictions) == len(expected)},
+                         "review_rate": {"actual": review_rate, "limit": 0.05, "passed": review_rate <= 0.05}}
         if compare is not None:
             previous = json.loads(Path(compare).read_text(encoding="utf-8"))
             report["differences"] = compare_predictions(previous.get("predictions", {}), predictions)
+            previous_review = (previous.get("needs_review") or {}).get("by_image", {})
+            report["needs_review_differences"] = [
+                {"image": image, "gpu": previous_review.get(image), "cpu": value}
+                for image, value in sorted(review_by_identity.items())
+                if previous_review.get(image) != value
+            ]
         completed = True
         return report
     finally:
+        shutdown_error = None
         if client is not None:
             try:
                 if process is not None and process.poll() is None:
                     client.request("shutdown", instance_token=(hello or {}).get("instance_token", ""))
-            except Exception:
-                pass
+            except Exception as exc:
+                shutdown_error = exc
             client.close()
         if process is not None:
             try:
                 process.wait(timeout=10)
             except Exception:
                 process.kill()
+                process.wait(timeout=10)
             if completed and process.returncode not in (None, 0):
                 raise RuntimeError(f"backend exited with code {process.returncode}")
+        if shutdown_error is not None and completed:
+            raise RuntimeError(f"backend shutdown failed: {shutdown_error}") from shutdown_error
         shutil.rmtree(temp_parent, ignore_errors=True)
 
 

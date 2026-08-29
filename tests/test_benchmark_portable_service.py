@@ -1,6 +1,11 @@
 import pytest
 
-from release_tools.portable_benchmark import compare_predictions, run_benchmark, summarize
+from release_tools.portable_benchmark import (
+    _validate_config,
+    compare_predictions,
+    run_benchmark,
+    summarize,
+)
 
 
 def test_summarize_reports_required_percentiles():
@@ -44,3 +49,11 @@ def test_compare_predictions_is_sorted_and_reports_missing_entries():
 def test_run_benchmark_requires_at_least_1000_measured_requests():
     with pytest.raises(ValueError, match="at least 1000"):
         run_benchmark("missing.zip", "missing.json", iterations=999)
+
+
+def test_validate_config_rejects_absolute_and_parent_paths():
+    config = {key: "ok" for key in ("backend_executable", "project_root", "model_dir", "paddle_config", "data_root")}
+    with pytest.raises(ValueError):
+        _validate_config("C:/package", {**config, "model_dir": "C:/outside"})
+    with pytest.raises(ValueError):
+        _validate_config("C:/package", {**config, "data_root": "../outside"})
