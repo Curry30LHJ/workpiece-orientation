@@ -96,7 +96,44 @@ def test_release_python_boundaries_use_repo_relative_paths():
     assert "'--repository-root', '.'" in script
     assert "Path('.')" in script
     assert "CreateProcessW" in script
+    assert "$smokeReportArg = Join-Path (Join-Path $stagingRootArg 'reports')" in script
+    assert "--report $smokeReportArg" in script
     assert "finally {" in script and "Pop-Location" in script
+
+
+def test_smoke_report_path_join_executes_with_two_arguments():
+    """The smoke report path must not call Join-Path with three positional args.
+
+    PowerShell parses the old inline expression successfully, but fails only
+    when the smoke branch executes.  Extract the production assignment and
+    evaluate it with representative values so this regression catches that
+    runtime-only binding error without running the full release build.
+    """
+    powershell = shutil.which("powershell")
+    if powershell is None:
+        return
+    root = Path(__file__).parents[1]
+    script = (root / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
+    assignments = [line.strip() for line in script.splitlines() if line.strip().startswith("$smokeReportArg = Join-Path")]
+    assert len(assignments) == 1
+    assignment = assignments[0]
+    harness = root / f".smoke-report-join-{uuid.uuid4().hex}.ps1"
+    try:
+        harness.write_text(
+            "$stagingRootArg = 'release_staging\\final-1.0.0'\n"
+            "$ed = 'gpu'\n"
+            f"{assignment}\n"
+            "if ($smokeReportArg -ne 'release_staging\\final-1.0.0\\reports\\gpu-smoke.json') { exit 2 }\n",
+            encoding="utf-8-sig",
+        )
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+    finally:
+        harness.unlink(missing_ok=True)
 
 
 def test_windows_powershell_python_launch_preserves_unicode_argument():

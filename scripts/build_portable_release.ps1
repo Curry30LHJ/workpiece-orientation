@@ -112,7 +112,8 @@ try {
     & $py -c "from release_tools.portable_package import collect_licenses; from pathlib import Path; collect_licenses(Path(r'$packageArg')/'third_party_licenses', distributions=('pyinstaller','$paddleDist','paddleclas','numpy','opencv-python'), python_license=Path(r'$pythonLicense'))"
     if ($LASTEXITCODE -ne 0) { throw "License collection failed for $ed with exit code $LASTEXITCODE" }
     if (-not $SkipSmoke) {
-        & $py 'scripts\smoke_portable_package.py' --package-root $packageArg --dataset-root $SmokeDatasetRoot --front-template-count $SmokeFrontTemplateCount --back-template-count $SmokeBackTemplateCount --seed $SmokeSeed --report (Join-Path $stagingRootArg 'reports' "$ed-smoke.json")
+        $smokeReportArg = Join-Path (Join-Path $stagingRootArg 'reports') "$ed-smoke.json"
+        & $py 'scripts\smoke_portable_package.py' --package-root $packageArg --dataset-root $SmokeDatasetRoot --front-template-count $SmokeFrontTemplateCount --back-template-count $SmokeBackTemplateCount --seed $SmokeSeed --report $smokeReportArg
         if ($LASTEXITCODE -ne 0) { throw "Portable smoke failed for $ed" }
     }
     $label = $ed.ToUpper()
