@@ -235,6 +235,16 @@ def test_client_resets_connect_timeout_for_long_requests():
     assert sock.timeouts == [45.0]
 
 
+def test_benchmark_temp_root_uses_explicit_uuid_directory(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(benchmark.tempfile, "mkdtemp", lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("managed ACL")))
+    root = benchmark._explicit_temp_dir(tmp_path, "benchmark-test")
+    try:
+        assert root.parent == tmp_path
+        assert root.name.startswith(".benchmark-test-")
+    finally:
+        root.rmdir()
+
+
 def test_run_benchmark_accepts_versioned_top_level_zip_and_reports_lifecycle(tmp_path: Path, monkeypatch):
     config = _minimal_config()
     package = tmp_path / "package.zip"

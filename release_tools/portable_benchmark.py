@@ -106,6 +106,27 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _explicit_temp_dir(parent: Path, prefix: str) -> Path:
+    """Create a private UUID directory without inheriting tempfile ACLs."""
+
+    candidates = [Path(parent), Path.cwd()]
+    try:
+        candidates.append(Path(tempfile.gettempdir()))
+    except OSError:
+        pass
+    for base in candidates:
+        for _ in range(8):
+            target = base / f".{prefix}-{uuid.uuid4().hex}"
+            try:
+                target.mkdir(parents=False)
+                return target
+            except FileExistsError:
+                continue
+            except OSError:
+                break
+    raise OSError("unable to create a writable benchmark temporary directory")
+
+
 class _Client:
     def __init__(self, sock: socket.socket, request_timeout: float | None = None):
         self.sock = sock
@@ -472,7 +493,7 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
     if not package_zip.is_file():
         raise FileNotFoundError(package_zip)
     started = perf_counter()
-    temp_parent = Path(tempfile.mkdtemp(prefix="portable-benchmark-"))
+    temp_parent = _explicit_temp_dir(package_zip.parent, "portable-benchmark")
     process = None
     client = None
     log_handle = None

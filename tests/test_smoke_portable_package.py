@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import release_tools.portable_smoke as smoke
 from release_tools.portable_smoke import SmokeOptions, run_portability, run_smoke
 
 
@@ -27,6 +28,19 @@ class FakeProcess:
     def poll(self): return self.returncode
     def wait(self, timeout=None): self.returncode = 0; return 0
     def terminate(self): self.returncode = 0
+
+
+def test_copy_to_long_temp_does_not_depend_on_mkdtemp_acl(tmp_path: Path):
+    source = tmp_path / "package"
+    source.mkdir()
+    (source / "app_config.json").write_text("{}", encoding="utf-8")
+    target = smoke._copy_to_long_temp(source, None)
+    try:
+        assert target.is_dir()
+        assert target.parent.name.startswith(".smoke-package-")
+    finally:
+        import shutil
+        shutil.rmtree(target.parent)
 
 
 class FailingWaitProcess(FakeProcess):

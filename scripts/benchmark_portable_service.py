@@ -19,12 +19,15 @@ def main() -> int:
     parser.add_argument("--acceptance-spec", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--timeout-seconds", type=float, default=600.0,
+                        help="overall startup and benchmark timeout (default: 600s)")
     parser.add_argument("--compare", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
         report = run_benchmark(args.package_zip, args.acceptance_spec, warmup=args.warmup,
-                               iterations=args.iterations, compare=args.compare)
+                               iterations=args.iterations, compare=args.compare,
+                               timeout_seconds=args.timeout_seconds)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return 0 if report.get("passed") is True else 2

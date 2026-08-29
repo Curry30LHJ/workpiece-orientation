@@ -7,7 +7,6 @@ import os
 import shutil
 import socket
 import subprocess
-import tempfile
 import time
 import uuid
 import hashlib
@@ -149,7 +148,22 @@ def _copy_to_long_temp(root: Path, factory: Callable[..., Path] | None) -> Path:
         target = Path(factory())
         target.parent.mkdir(parents=True, exist_ok=True)
     else:
-        base = Path(tempfile.mkdtemp(prefix="离线 smoke portable package "))
+        # Use an explicit UUID directory beside the package.  ``mkdtemp`` may
+        # inherit a restrictive ACL on managed Windows hosts and then fail
+        # when copytree creates extracted children.
+        base = None
+        for _ in range(8):
+            candidate = root.parent / f".smoke-package-{uuid.uuid4().hex}"
+            try:
+                candidate.mkdir()
+                base = candidate
+                break
+            except FileExistsError:
+                continue
+            except OSError:
+                break
+        if base is None:
+            raise OSError("unable to create a writable smoke temporary directory")
         target = base / ("x" * max(1, 190 - len(str(base))))
     # A factory is allowed to choose the location, but an existing location is
     # never safe to reuse: doing so could overwrite another smoke run or the
