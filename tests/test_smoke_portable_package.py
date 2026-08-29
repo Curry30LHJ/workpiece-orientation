@@ -75,6 +75,29 @@ def test_copy_to_long_temp_does_not_depend_on_mkdtemp_acl(tmp_path: Path):
         shutil.rmtree(target.parent)
 
 
+@pytest.mark.parametrize("factory", ["default", "provided"])
+def test_copy_to_long_temp_removes_partial_copy_on_failure(tmp_path: Path, monkeypatch, factory):
+    source = tmp_path / "package"
+    source.mkdir()
+    (source / "app_config.json").write_text("{}", encoding="utf-8")
+    target = (tmp_path / "provided-copy") if factory == "provided" else None
+
+    def fail_copytree(_source, destination):
+        destination = Path(destination)
+        destination.mkdir(parents=True)
+        (destination / "partial.bin").write_bytes(b"partial")
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(smoke.shutil, "copytree", fail_copytree)
+    root_factory = (lambda: target) if target is not None else None
+    with pytest.raises(OSError, match="copy failed"):
+        smoke._copy_to_long_temp(source, root_factory)
+
+    assert target is None or not target.exists()
+    if target is None:
+        assert not list(tmp_path.glob(".便携 smoke package-*"))
+
+
 class FailingWaitProcess(FakeProcess):
     def wait(self, timeout=None):
         self.returncode = 7
@@ -152,6 +175,7 @@ def test_smoke_runs_protocol_in_order_and_reports_portable_result(tmp_path):
     assert report["template_counts"] == {"front": 2, "back": 2}
     assert process.returncode == 0
     assert options.report_path.is_file()
+    assert not (tmp_path / "tmp copy").exists()
 
 
 def test_run_smoke_writes_failure_report_and_preserves_nonzero_exit(tmp_path):
@@ -180,6 +204,7 @@ def test_run_smoke_writes_failure_report_and_preserves_nonzero_exit(tmp_path):
     assert payload["results"][-1]["response"]["ok"] is False
     assert payload["process_exit"] == 7
     assert payload["backend_log"] == "backend output"
+    assert not (tmp_path / "source-copy").exists()
 
 
 def test_run_portability_uses_destination_counts_and_records_destination_commands(tmp_path):
@@ -230,6 +255,8 @@ def test_run_portability_uses_destination_counts_and_records_destination_command
     assert all({"workpiece_id", "image_path"} <= set(fields)
                for command, fields in sockets[1].requests if command == "predict")
     assert report_path.is_file()
+    assert not (tmp_path / "copy").exists()
+    assert not (tmp_path / "copy-destination").exists()
 
 
 def test_run_portability_rejects_nonempty_destination_before_copy(tmp_path):
@@ -357,6 +384,8 @@ def test_run_portability_rejects_extra_destination_workpiece(tmp_path):
         )
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["destination"]["backend_log"] == "destination failure output"
+    assert not (tmp_path / "copy").exists()
+    assert not (tmp_path / "copy-destination").exists()
 
 
 def test_run_portability_rejects_missing_destination_hello_token(tmp_path, monkeypatch):

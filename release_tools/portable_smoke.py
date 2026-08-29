@@ -145,6 +145,7 @@ def _package_config(root: Path) -> dict[str, Any]:
 
 
 def _copy_to_long_temp(root: Path, factory: Callable[..., Path] | None) -> Path:
+    base: Path | None = None
     if factory is not None:
         target = Path(factory())
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -173,10 +174,42 @@ def _copy_to_long_temp(root: Path, factory: Callable[..., Path] | None) -> Path:
     # caller's package data.
     if target.exists():
         raise FileExistsError(f"temporary package target already exists: {target}")
-    shutil.copytree(root, target)
+    try:
+        shutil.copytree(root, target)
+    except Exception:
+        # ``copytree`` can leave a partially populated target when a file
+        # cannot be copied.  Remove only the target created by this call; a
+        # caller-provided parent directory must remain untouched.
+        try:
+            if target.exists():
+                shutil.rmtree(target)
+        finally:
+            if factory is None and base is not None and base.exists():
+                shutil.rmtree(base)
+        raise
     if factory is None and len(str(target.resolve())) < 180:
+        # The portability guard runs after the copy, so clean that copy before
+        # rejecting it; otherwise every short-path probe leaks a full package.
+        try:
+            if target.exists():
+                shutil.rmtree(target)
+        finally:
+            if base is not None and base.exists():
+                shutil.rmtree(base)
         raise RuntimeError("temporary package path is shorter than portability requirement")
     return target
+
+
+def _cleanup_temp_package(path: Path | None, *, remove_parent: bool = True) -> None:
+    """Remove a smoke copy and its private default parent, if applicable."""
+    if path is None:
+        return
+    target = Path(path)
+    if target.exists():
+        shutil.rmtree(target)
+    parent = target.parent
+    if remove_parent and parent.name.startswith(".便携 smoke package-") and parent.exists():
+        shutil.rmtree(parent)
 
 
 def _start_backend(root: Path, config: dict[str, Any], port: int,
@@ -208,7 +241,8 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
               socket_factory: Callable[..., Any] | None = None,
               temp_root_factory: Callable[..., Path] | None = None,
               free_port_factory: Callable[[], int] | None = None,
-              port_factory: Callable[[], int] | None = None) -> dict[str, Any]:
+              port_factory: Callable[[], int] | None = None,
+              _retain_temp_package: bool = False) -> dict[str, Any]:
     """Run a packaged protocol smoke test. Factories make the workflow unit-testable."""
     if options.package_root is None:
         raise ValueError("package_root is required")
@@ -234,11 +268,19 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         raise
     process_factory = process_factory or _real_process_factory
     port = (free_port_factory or port_factory or _free_port)()
+    temp_package: Path | None = None
+    temp_parent_owned = temp_root_factory is None
     try:
         temp_package = _copy_to_long_temp(package, temp_root_factory)
+        report["temp_package"] = str(temp_package)
+        report["_temp_parent_owned"] = temp_parent_owned
         config = _package_config(temp_package)
         process = _start_backend(temp_package, config, port, process_factory)
     except Exception as exc:
+        try:
+            _cleanup_temp_package(temp_package)
+        except Exception:
+            pass
         report["error"] = str(exc)
         report["process_exit"] = None
         setattr(exc, "smoke_report", report)
@@ -351,6 +393,12 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
                     cleanup_error = exc
         _collect_backend_log(report, process)
         report["process_exit"] = _process_exit_code(process)
+        if not _retain_temp_package:
+            try:
+                _cleanup_temp_package(temp_package, remove_parent=temp_parent_owned)
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if options.report_path:
             persist_error = _persist_report_safely(Path(options.report_path), report)
             if persist_error is not None and not primary_error and cleanup_error is None:
@@ -395,6 +443,10 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         _persist_report_safely(options.report_path, report)
         raise
     source_factories = dict(factories)
+    source_temp: Path | None = None
+    source_parent_owned = source_factories.get("temp_root_factory") is None
+    dest_copy: Path | None = None
+    destination_parent_owned = False
     try:
         source = run_smoke(
             SmokeOptions(package_root=options.source_package_root, dataset_root=options.dataset_root,
@@ -405,6 +457,7 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
             temp_root_factory=source_factories.get("temp_root_factory"),
             free_port_factory=source_factories.get("free_port_factory"),
             port_factory=source_factories.get("port_factory"),
+            _retain_temp_package=True,
         )
     except Exception as exc:
         report["error"] = str(exc)
@@ -413,12 +466,22 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
             report["source"] = partial
             report["commands"] = list(partial.get("commands", []))
             report["results"] = list(partial.get("results", []))
+            try:
+                _cleanup_temp_package(
+                    Path(partial["temp_package"]),
+                    remove_parent=bool(partial.get("_temp_parent_owned", source_parent_owned)),
+                )
+            except (KeyError, OSError):
+                pass
         setattr(exc, "smoke_report", report)
         _persist_report_safely(options.report_path, report)
         raise
     report["source"] = source
-    src_data = Path(source["temp_package"]) / "data"
+    source_temp = Path(source["temp_package"])
+    source_parent_owned = bool(source.get("_temp_parent_owned", source_parent_owned))
+    src_data = source_temp / "data"
     destination_factory = factories.get("destination_temp_root_factory") or factories.get("temp_root_factory")
+    destination_parent_owned = destination_factory is None
     if destination_factory is not None:
         candidate = Path(destination_factory())
         source_temp = Path(source["temp_package"]).resolve()
@@ -437,6 +500,14 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         port = (factories.get("free_port_factory") or factories.get("port_factory") or _free_port)()
         process = _start_backend(dest_copy, cfg, port, process_factory)
     except Exception as exc:
+        for temporary in (dest_copy, source_temp):
+            try:
+                _cleanup_temp_package(
+                    temporary,
+                    remove_parent=(source_parent_owned if temporary == source_temp else destination_parent_owned),
+                )
+            except OSError:
+                pass
         report["error"] = str(exc)
         setattr(exc, "smoke_report", report)
         _persist_report_safely(options.report_path, report)
@@ -540,6 +611,15 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
                     shutdown_error = exc
         _collect_backend_log(destination_report, process)
         destination_report["process_exit"] = _process_exit_code(process)
+        for temporary in (dest_copy, source_temp):
+            try:
+                _cleanup_temp_package(
+                    temporary,
+                    remove_parent=(source_parent_owned if temporary == source_temp else destination_parent_owned),
+                )
+            except OSError as exc:
+                if shutdown_error is None:
+                    shutdown_error = exc
         if primary_error is None and shutdown_error is not None:
             primary_error = shutdown_error
             report["error"] = str(shutdown_error)
