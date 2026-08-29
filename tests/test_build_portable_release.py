@@ -47,5 +47,14 @@ def test_release_scripts_create_and_resolve_nested_output_root():
         assert "New-Item -ItemType Directory -Force -Path $OutputRoot" in script
         assert "Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop" in script
         assert ".ProviderPath" in script
+        assert "DirectoryInfo" in script and ".FullName" in script
     assert "OutputRoot is not a directory" in backend
     assert "OutputRoot is not a directory" in release
+
+
+def test_release_script_audits_the_extracted_zip_and_cleans_a_private_temp_root():
+    script = (Path(__file__).parents[1] / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
+    assert "audit_zip_archive" in script
+    assert "ExtractToDirectory" not in script  # extraction is centralized and hardened in Python
+    assert "Extracted ZIP audit failed" in script
+    assert "release_artifacts" in script

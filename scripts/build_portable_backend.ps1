@@ -12,10 +12,10 @@ if (-not (Test-Path -LiteralPath $OutputRoot -PathType Container)) {
     if (Test-Path -LiteralPath $OutputRoot) { throw "OutputRoot is not a directory: $OutputRoot" }
     New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 }
-# Resolve after creation.  DirectoryInfo does not reliably expose a `.Path`
-# property in all PowerShell/provider combinations; ProviderPath is stable and
-# also gives us the canonical path used by the containment checks below.
-$stagingRoot = (Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).ProviderPath
+# Resolve after creation and normalize through DirectoryInfo.FullName.  Some
+# PowerShell providers return a DirectoryInfo without a usable `.Path`; using
+# the provider path as input and FullName as output is stable for nested roots.
+$stagingRoot = ([IO.DirectoryInfo]::new((Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).ProviderPath)).FullName
 $editionRoot = Join-Path $stagingRoot ("backend-" + $Edition)
 $distPath = $editionRoot
 $workPath = Join-Path $project ("deploy\pyinstaller-work\" + $Edition)

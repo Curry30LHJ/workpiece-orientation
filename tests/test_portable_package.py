@@ -5,7 +5,7 @@ from zipfile import ZipFile
 import pytest
 
 from release_tools.portable_package import (
-    PackageAuditError, audit_package, build_release_config,
+    PackageAuditError, audit_package, audit_zip_archive, build_release_config,
     stage_package, write_manifest, write_sha256, zip_package,
 )
 from src.model_fingerprint import model_directory_sha256
@@ -116,10 +116,49 @@ def test_manifest_and_zip_use_one_versioned_root(tmp_path: Path):
         assert {Path(name).parts[0] for name in zipped.namelist()} == {
             "WorkpieceOrientation-GPU"
         }
+        assert "WorkpieceOrientation-GPU/data/workpieces/" in zipped.namelist()
     checksum = write_sha256(archive)
     digest, filename = checksum.read_text(encoding="ascii").strip().split("  ", 1)
     assert len(digest) == 64
     assert filename == archive.name
+
+
+def test_audit_zip_reopens_versioned_root_and_cleans_temp_directory(tmp_path: Path):
+    root = minimal_stage(tmp_path / "WorkpieceOrientation-GPU")
+    archive = zip_package(root, tmp_path / "package.zip")
+    result = audit_zip_archive(
+        archive, edition="gpu", version="1.0.0",
+        dependency_checker=lambda executable, package_root: [],
+    )
+    assert result["edition"] == "gpu"
+    assert not list(tmp_path.glob(".zip-audit-*"))
+
+
+def test_audit_zip_creates_extract_root_without_tempfile_acl_dependency(tmp_path: Path, monkeypatch):
+    root = minimal_stage(tmp_path / "WorkpieceOrientation-GPU")
+    archive = zip_package(root, tmp_path / "package.zip")
+    # If the implementation regresses to tempfile.mkdtemp, this deliberately
+    # fails; explicit UUID mkdir is required for the Windows packaging host.
+    import tempfile
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("managed ACL")))
+    audit_zip_archive(
+        archive, edition="gpu", version="1.0.0",
+        dependency_checker=lambda executable, package_root: [],
+    )
+    assert not list(tmp_path.glob(".zip-audit-*"))
+
+
+def test_audit_zip_rejects_path_traversal_and_cleans_temp_directory(tmp_path: Path):
+    archive = tmp_path / "malicious.zip"
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("../outside.txt", b"must not extract")
+    with pytest.raises(PackageAuditError, match="escapes extraction root"):
+        audit_zip_archive(
+            archive, edition="gpu", version="1.0.0",
+            dependency_checker=lambda executable, package_root: [],
+        )
+    assert not (tmp_path.parent / "outside.txt").exists()
+    assert not list(tmp_path.glob(".zip-audit-*"))
 
 
 def test_audit_allows_pyinstaller_internal_pyi_but_rejects_visible_source(tmp_path: Path):

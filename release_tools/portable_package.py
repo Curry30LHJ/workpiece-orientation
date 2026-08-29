@@ -8,8 +8,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import zipfile
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -326,8 +328,76 @@ def collect_licenses(destination: Path, distributions: Iterable[str] = ("pyinsta
 def zip_package(root: Path, archive: Path) -> Path:
     root, archive = Path(root), Path(archive); archive.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in sorted(x for x in root.rglob("*") if x.is_file()): z.write(p, root.name + "/" + p.relative_to(root).as_posix())
+        for p in sorted(root.rglob("*")):
+            if p.is_symlink():
+                raise PackageAuditError(f"cannot archive symlink: {p.relative_to(root).as_posix()}")
+            arcname = root.name + "/" + p.relative_to(root).as_posix()
+            if p.is_dir():
+                z.writestr(arcname.rstrip("/") + "/", "")
+            elif p.is_file():
+                z.write(p, arcname)
     return archive
+
+
+def audit_zip_archive(archive: Path, *, edition: str, version: str,
+                      forbidden_roots: Iterable[Path] = (),
+                      runtime_roots: Iterable[Path] = (),
+                      dependency_checker: Callable[[Path, Path], list[str]] = run_dumpbin) -> dict[str, object]:
+    """Safely extract a generated archive, audit its actual top-level package.
+
+    Extraction is intentionally performed in a new temporary directory beside
+    the archive and is always removed on return.  ZIP entries are checked for
+    traversal and symlink metadata before writing, so this verification step
+    cannot escape its disposable root even if an archive is replaced.
+    """
+    archive = Path(archive)
+    if not archive.is_file():
+        raise PackageAuditError(f"ZIP archive is missing: {archive}")
+    parent = archive.parent.resolve()
+    temp_root: Path | None = None
+    # Avoid tempfile.mkdtemp on Windows: on some managed hosts it creates a
+    # directory with an ACL that prevents the current process from creating
+    # extracted children.  Explicit mkdir inherits the archive directory's
+    # normal permissions and the UUID makes collisions negligible.
+    for _ in range(8):
+        candidate = parent / f".zip-audit-{uuid.uuid4().hex}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        temp_root = candidate
+        break
+    if temp_root is None:
+        raise PackageAuditError("unable to create a unique ZIP audit directory")
+    try:
+        with zipfile.ZipFile(archive) as zipped:
+            root = temp_root.resolve()
+            for info in zipped.infolist():
+                name = info.filename.replace("\\", "/")
+                destination = (temp_root / name).resolve()
+                if destination != root and root not in destination.parents:
+                    raise PackageAuditError(f"ZIP entry escapes extraction root: {name}")
+                mode = (info.external_attr >> 16) & 0o170000
+                if stat.S_ISLNK(mode):
+                    raise PackageAuditError(f"ZIP symlink is not allowed: {name}")
+                if info.is_dir() or name.endswith("/"):
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with zipped.open(info) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+        top_entries = list(temp_root.iterdir())
+        top_dirs = [item for item in top_entries if item.is_dir()]
+        if len(top_dirs) != 1 or len(top_entries) != 1:
+            raise PackageAuditError("ZIP must contain exactly one top-level package directory")
+        return audit_package(top_dirs[0], edition=edition, version=version,
+                             forbidden_roots=forbidden_roots,
+                             runtime_roots=runtime_roots,
+                             dependency_checker=dependency_checker)
+    except zipfile.BadZipFile as exc:
+        raise PackageAuditError(f"invalid ZIP archive: {exc}") from exc
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=False)
 
 
 def write_sha256(archive: Path) -> Path:
@@ -346,4 +416,4 @@ def main() -> None:
 
 if __name__ == "__main__": main()
 
-__all__ = ["PackageAuditError", "PackageLayout", "audit_package", "build_release_config", "collect_licenses", "run_dumpbin", "stage_package", "write_manifest", "write_sha256", "zip_package"]
+__all__ = ["PackageAuditError", "PackageLayout", "audit_package", "audit_zip_archive", "build_release_config", "collect_licenses", "run_dumpbin", "stage_package", "write_manifest", "write_sha256", "zip_package"]

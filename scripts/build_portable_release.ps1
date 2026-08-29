@@ -23,7 +23,7 @@ if (-not (Test-Path -LiteralPath $OutputRoot -PathType Container)) {
     if (Test-Path -LiteralPath $OutputRoot) { throw "OutputRoot is not a directory: $OutputRoot" }
     New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 }
-$stagingRoot = (Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).ProviderPath
+$stagingRoot = ([IO.DirectoryInfo]::new((Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).ProviderPath)).FullName
 $ownedRootPath = [IO.Path]::GetFullPath((Join-Path $repo 'release_staging')).TrimEnd('\')
 $ownedRoot = $ownedRootPath + '\'
 if ($stagingRoot -ne $ownedRootPath -and -not $stagingRoot.StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputRoot must remain under release_staging' }
@@ -82,6 +82,12 @@ foreach ($ed in $editions) {
         if ($LASTEXITCODE -ne 0) { throw "Portable smoke failed for $ed" }
     }
     $label = $ed.ToUpper()
-    & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$package'); roots=[Path(r'$repo'),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); a=zip_package(p,Path(r'$repo')/'release_artifacts'/f'WorkpieceOrientation-$label-x64-$Version.zip'); write_sha256(a)"
+    $archive = Join-Path $repo "release_artifacts\WorkpieceOrientation-$label-x64-$Version.zip"
+    & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$package'); roots=[Path(r'$repo'),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); a=zip_package(p,Path(r'$archive')); write_sha256(a)"
     if ($LASTEXITCODE -ne 0) { throw "Package audit/archive failed for $ed with exit code $LASTEXITCODE" }
+    # Re-open the exact ZIP artifact in a fresh, disposable directory and run
+    # the same audit against the extracted layout. This catches archive root,
+    # path, and omission errors that a source-directory audit cannot detect.
+    & $py -c "from release_tools.portable_package import audit_zip_archive; from pathlib import Path; roots=[Path(r'$repo'),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_zip_archive(Path(r'$archive'),edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots)"
+    if ($LASTEXITCODE -ne 0) { throw "Extracted ZIP audit failed for $ed with exit code $LASTEXITCODE" }
 }
