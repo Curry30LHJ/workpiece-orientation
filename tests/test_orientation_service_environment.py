@@ -24,8 +24,11 @@ def test_prepare_windows_torch_dll_path(monkeypatch, tmp_path: Path):
 def test_prepare_windows_numpy_dll_path_adds_frozen_runtime_dirs(monkeypatch, tmp_path: Path):
     runtime_root = tmp_path / "backend"
     internal = runtime_root / "_internal"
-    numpy_libs = internal / "numpy.libs"
-    paddle_libs = internal / "paddle.libs"
+    # PyInstaller's onedir collector nests package-owned native libraries
+    # under the package directories (the layout emitted by the release
+    # builder), rather than flattening them beside ``_internal``.
+    numpy_libs = internal / "numpy" / ".libs"
+    paddle_libs = internal / "paddle" / "libs"
     cv2_dir = internal / "cv2"
     for path in (runtime_root, internal, numpy_libs, paddle_libs, cv2_dir):
         path.mkdir(parents=True, exist_ok=True)
@@ -34,8 +37,17 @@ def test_prepare_windows_numpy_dll_path_adds_frozen_runtime_dirs(monkeypatch, tm
     monkeypatch.setattr(service.os, "name", "nt")
     monkeypatch.setenv("PATH", "original-path")
     added = []
-    monkeypatch.setattr(service.os, "add_dll_directory", lambda path: added.append(path))
+    handles = []
+
+    def add_dll_directory(path):
+        added.append(path)
+        handle = object()
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(service.os, "add_dll_directory", add_dll_directory)
     monkeypatch.setattr(service, "_windows_short_path", lambda path: None)
+    monkeypatch.setattr(service, "_WINDOWS_DLL_DIRECTORY_HANDLES", [])
 
     service._prepare_windows_numpy_dll_path()
 
@@ -47,6 +59,7 @@ def test_prepare_windows_numpy_dll_path_adds_frozen_runtime_dirs(monkeypatch, tm
         str(cv2_dir),
     ]
     assert service.os.environ["PATH"].startswith(str(cv2_dir))
+    assert service._WINDOWS_DLL_DIRECTORY_HANDLES == handles
 
 
 def _required_service_args(tmp_path: Path) -> list[str]:

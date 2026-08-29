@@ -17,6 +17,9 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+_WINDOWS_DLL_DIRECTORY_HANDLES: list[Any] = []
+
+
 def _windows_short_path(path: Path) -> Path | None:
     if os.name != "nt":
         return None
@@ -42,7 +45,11 @@ def _add_windows_dll_directory(path: Path, seen: set[str]) -> None:
     key = str(selected).casefold()
     if key in seen:
         return
-    os.add_dll_directory(str(selected))
+    handle = os.add_dll_directory(str(selected))
+    # ``os.add_dll_directory`` unregisters the path when its handle is
+    # garbage-collected.  Keep the handles alive for the lifetime of the
+    # frozen service so extension modules can resolve their dependencies.
+    _WINDOWS_DLL_DIRECTORY_HANDLES.append(handle)
     os.environ["PATH"] = str(selected) + os.pathsep + os.environ.get("PATH", "")
     seen.add(key)
 
@@ -64,6 +71,10 @@ def _prepare_windows_numpy_dll_path() -> None:
     for candidate in (
         runtime_root,
         runtime_root / "_internal",
+        runtime_root / "_internal" / "numpy" / ".libs",
+        runtime_root / "_internal" / "paddle" / "libs",
+        # Keep compatibility with older/custom collectors that flatten these
+        # directories beside the package trees.
         runtime_root / "_internal" / "numpy.libs",
         runtime_root / "_internal" / "paddle.libs",
         runtime_root / "_internal" / "cv2",
