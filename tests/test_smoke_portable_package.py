@@ -360,3 +360,61 @@ def test_run_smoke_uses_hello_token_for_shutdown_and_predict_fields(tmp_path):
     assert all({"workpiece_id", "image_path"} <= set(fields) for fields in predict_requests)
     shutdown_fields = [fields for command, fields in sock.requests if command == "shutdown"][-1]
     assert shutdown_fields["instance_token"] == "hello-token"
+
+
+def test_run_smoke_rejects_non_string_registered_workpiece_id(tmp_path):
+    dataset = _dataset_fixture(tmp_path / "dataset")
+    package = _package_fixture(tmp_path / "package")
+    responses = [
+        {"ok": True, "ready": True, "instance_token": "token"},
+        {"ok": True, "workpieces": []},
+        {"ok": True, "workpiece": {"id": 7}, "template_counts": {"front": 2, "back": 2}},
+    ]
+    with pytest.raises(RuntimeError, match="register did not return workpiece id"):
+        run_smoke(
+            SmokeOptions(package_root=package, dataset_root=dataset,
+                         front_template_count=2, back_template_count=2),
+            process_factory=lambda *a, **k: FakeProcess(),
+            socket_factory=lambda *a, **k: FakeSocket([], responses),
+            temp_root_factory=lambda: tmp_path / "copy",
+        )
+
+
+@pytest.mark.parametrize(
+    ("malformed_list", "expected_error"),
+    [
+        ([{"id": "wp-1"}, {"id": "extra"}], "registered workpiece missing from list"),
+        ([{"id": "wp-1"}, {"id": "wp-1"}], "recycled workpiece missing from recycle list"),
+        ([{"id": "wp-1"}, {"id": 7}], "restored workpiece missing from list"),
+    ],
+)
+def test_run_smoke_rejects_non_unique_or_invalid_lifecycle_workpiece_lists(
+    tmp_path, malformed_list, expected_error
+):
+    dataset = _dataset_fixture(tmp_path / "dataset")
+    package = _package_fixture(tmp_path / "package")
+    responses = [
+        {"ok": True, "ready": True, "instance_token": "token"},
+        {"ok": True, "workpieces": []},
+        {"ok": True, "workpiece": {"id": "wp-1"}, "template_counts": {"front": 2, "back": 2}},
+        {"ok": True, "workpieces": malformed_list}
+        if expected_error == "registered workpiece missing from list"
+        else {"ok": True, "workpieces": [{"id": "wp-1"}]},
+        {"ok": True, "label": "front"}, {"ok": True, "label": "back"},
+        {"ok": True, "profile": {}}, {"ok": True},
+        {"ok": True, "workpieces": malformed_list}
+        if expected_error == "recycled workpiece missing from recycle list"
+        else {"ok": True, "workpieces": [{"id": "wp-1"}]},
+        {"ok": True, "workpiece": {"id": "wp-1"}},
+        {"ok": True, "workpieces": malformed_list}
+        if expected_error == "restored workpiece missing from list"
+        else {"ok": True, "workpieces": [{"id": "wp-1"}]},
+    ]
+    with pytest.raises(RuntimeError, match=expected_error):
+        run_smoke(
+            SmokeOptions(package_root=package, dataset_root=dataset,
+                         front_template_count=2, back_template_count=2),
+            process_factory=lambda *a, **k: FakeProcess(),
+            socket_factory=lambda *a, **k: FakeSocket([], responses),
+            temp_root_factory=lambda: tmp_path / "copy",
+        )

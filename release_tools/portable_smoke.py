@@ -121,6 +121,19 @@ def _ok(response: dict[str, Any], command: str) -> dict[str, Any]:
     return response
 
 
+def _require_single_workpiece(response: dict[str, Any], workpiece_id: str,
+                              error_message: str) -> None:
+    workpieces = response.get("workpieces")
+    if not isinstance(workpieces, list) or len(workpieces) != 1:
+        raise RuntimeError(error_message)
+    item = workpieces[0]
+    if not isinstance(item, dict):
+        raise RuntimeError(error_message)
+    listed_id = item.get("id")
+    if not isinstance(listed_id, str) or not listed_id.strip() or listed_id != workpiece_id:
+        raise RuntimeError(error_message)
+
+
 def _package_config(root: Path) -> dict[str, Any]:
     path = root / "app_config.json"
     config = json.loads(path.read_text(encoding="utf-8"))
@@ -268,12 +281,13 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         expected_counts = {"front": len(front), "back": len(back)}
         if counts != expected_counts:
             raise RuntimeError(f"template count mismatch: {counts} != {expected_counts}")
-        workpiece_id = registered.get("workpiece", {}).get("id")
-        if not workpiece_id:
+        registered_workpiece = registered.get("workpiece")
+        workpiece_id = (registered_workpiece.get("id")
+                        if isinstance(registered_workpiece, dict) else None)
+        if not isinstance(workpiece_id, str) or not workpiece_id.strip():
             raise RuntimeError("register did not return workpiece id")
         listed = request("list_workpieces")
-        if not any(item.get("id") == workpiece_id for item in listed.get("workpieces", [])):
-            raise RuntimeError("registered workpiece missing from list")
+        _require_single_workpiece(listed, workpiece_id, "registered workpiece missing from list")
         if request("predict", workpiece_id=workpiece_id, image_path=front_query).get("label") != "front":
             raise RuntimeError("front prediction mismatch")
         if request("predict", workpiece_id=workpiece_id, image_path=back_query).get("label") != "back":
@@ -281,15 +295,13 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         request("get_geometry_mask_profile", workpiece_id=workpiece_id)
         request("recycle_workpiece", workpiece_id=workpiece_id, operation_id="portable-smoke-recycle")
         recycled = request("list_recycled_workpieces")
-        if not any(item.get("id") == workpiece_id for item in recycled.get("workpieces", [])):
-            raise RuntimeError("recycled workpiece missing from recycle list")
+        _require_single_workpiece(recycled, workpiece_id, "recycled workpiece missing from recycle list")
         restored = request("restore_workpiece", workpiece_id=workpiece_id, operation_id="portable-smoke-restore")
-        restored_item = restored.get("workpiece", {})
-        if restored_item.get("id") != workpiece_id:
+        restored_item = restored.get("workpiece")
+        if not isinstance(restored_item, dict) or restored_item.get("id") != workpiece_id:
             raise RuntimeError("restored workpiece missing from restore response")
         restored_list = request("list_workpieces")
-        if not any(item.get("id") == workpiece_id for item in restored_list.get("workpieces", [])):
-            raise RuntimeError("restored workpiece missing from list")
+        _require_single_workpiece(restored_list, workpiece_id, "restored workpiece missing from list")
         request("shutdown", instance_token=instance_token)
         process.wait(timeout=10)
         if process.returncode != 0:
