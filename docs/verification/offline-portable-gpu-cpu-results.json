@@ -1,0 +1,23 @@
+{
+  "version": "1.0.0",
+  "git_commit": "61264e4d310a7a01ea70323efef5d986cb6b2597",
+  "packages": {
+    "gpu": {"zip_sha256": null, "size_bytes": null, "content_audit": "not_run", "status": "blocked"},
+    "cpu": {"zip_sha256": null, "size_bytes": null, "content_audit": "not_run", "status": "blocked"}
+  },
+  "tests": {
+    "benchmark_portable_service": {"passed": 12, "failed": 0},
+    "related_tests": {"passed": 32, "failed": 0, "setup_errors": 38, "error": "pytest temporary-directory lock PermissionError"},
+    "qt_tests": "not_run"
+  },
+  "build": {
+    "command": "scripts/build_portable_release.ps1 -Edition all -Version 1.0.0 -GpuPython ...workpiece-package-gpu... -CpuPython ...workpiece-package-cpu... -ModelPath E:/Project/wang/pp_813/third_party/models/shiru_rec/general_PPLCNetV2_base_pretrained_v1.0_infer -SkipSmoke",
+    "gpu_backend": "PyInstaller completed; staging reached portable_package after PYTHONPATH fix, then failed because Qt release directory was absent",
+    "cpu_backend": "PyInstaller completed; first all-edition attempt reached portable_package after PYTHONPATH fix, then failed because Qt release directory was absent",
+    "exit_status": "failed"
+  },
+  "gpu": {"status": "not_run", "gate": "not_run", "reason": "no ZIP produced"},
+  "cpu": {"status": "not_run", "reason": "no ZIP produced"},
+  "cpu_gpu_differences": [],
+  "clean_machine": {"status": "not_run", "reason": "no ZIP produced; no clean Windows VM available"}
+}

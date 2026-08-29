@@ -16,6 +16,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$env:PYTHONPATH = if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) { $repo } else { "$repo;$env:PYTHONPATH" }
 $gitCommit = (& git -C $repo rev-parse HEAD 2>$null); if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitCommit)) { throw 'Unable to determine git commit' }
 $stagingRoot = [IO.Path]::GetFullPath($OutputRoot)
 $ownedRootPath = [IO.Path]::GetFullPath((Join-Path $repo 'release_staging')).TrimEnd('\')
