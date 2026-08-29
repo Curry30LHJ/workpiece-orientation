@@ -74,8 +74,8 @@ def test_generated_configs_are_relative_fast_and_device_specific():
     assert cpu["compute_device"] == cpu["edition"] == "cpu"
     assert gpu["inference_mode"] == cpu["inference_mode"] == "fast_geometry"
     assert gpu["model_sha256"] == cpu["model_sha256"] == model_sha
-    assert gpu["startup_timeout_ms"] == 30000
-    assert cpu["startup_timeout_ms"] == 60000
+    assert gpu["startup_timeout_ms"] == 600000
+    assert cpu["startup_timeout_ms"] == 600000
     assert all("E:/" not in str(value) for value in gpu.values())
 
 

@@ -361,7 +361,10 @@ def build_release_config(*, edition: str, version: str, model_sha256: str) -> di
         "model_dir": "models/shitu_rec", "data_root": "data", "model_sha256": model_sha256,
         "compute_device": edition, "edition": edition, "package_version": version,
         "local_search_mode": "adaptive", "inference_mode": "fast_geometry", "host": "127.0.0.1",
-        "port": 37651, "startup_timeout_ms": 30000 if edition == "gpu" else 60000,
+        # Initial Paddle model loading can exceed one minute on a clean
+        # offline machine; keep the Qt startup watchdog aligned with the
+        # documented five-minute allowance for both editions.
+        "port": 37651, "startup_timeout_ms": 600000,
         "request_timeout_ms": 120000,
     }
 

@@ -17,6 +17,63 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+def _windows_short_path(path: Path) -> Path | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
+        if length <= 0 or length >= len(buffer):
+            return None
+        value = buffer.value
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError:
+            return None
+        return Path(value)
+    except (AttributeError, OSError):
+        return None
+
+
+def _add_windows_dll_directory(path: Path, seen: set[str]) -> None:
+    selected = _windows_short_path(path) or path
+    key = str(selected).casefold()
+    if key in seen:
+        return
+    os.add_dll_directory(str(selected))
+    os.environ["PATH"] = str(selected) + os.pathsep + os.environ.get("PATH", "")
+    seen.add(key)
+
+
+def _prepare_windows_numpy_dll_path() -> None:
+    """Expose the frozen backend runtime directories before importing NumPy.
+
+    When the packaged service is launched from a long or non-ASCII install
+    path, the Windows loader can fail to resolve NumPy's extension DLLs unless
+    the frozen runtime directories are visible ahead of the first ``numpy``
+    import.  Keep this narrow to the bundled runtime trees used by the frozen
+    backend.
+    """
+
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    runtime_root = Path(sys.executable).resolve().parent
+    seen: set[str] = set()
+    for candidate in (
+        runtime_root,
+        runtime_root / "_internal",
+        runtime_root / "_internal" / "numpy.libs",
+        runtime_root / "_internal" / "paddle.libs",
+        runtime_root / "_internal" / "cv2",
+    ):
+        if candidate.is_dir():
+            _add_windows_dll_directory(candidate, seen)
+
+
+_prepare_windows_numpy_dll_path()
+
 # Qt launches this file by path. Add the repository root for that entrypoint
 # so absolute ``src.*`` imports work both by file path and by ``python -m``.
 if __package__ in (None, ""):

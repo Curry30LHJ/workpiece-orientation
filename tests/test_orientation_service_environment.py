@@ -21,6 +21,34 @@ def test_prepare_windows_torch_dll_path(monkeypatch, tmp_path: Path):
     assert service.os.environ["PATH"].startswith(str(torch_lib))
 
 
+def test_prepare_windows_numpy_dll_path_adds_frozen_runtime_dirs(monkeypatch, tmp_path: Path):
+    runtime_root = tmp_path / "backend"
+    internal = runtime_root / "_internal"
+    numpy_libs = internal / "numpy.libs"
+    paddle_libs = internal / "paddle.libs"
+    cv2_dir = internal / "cv2"
+    for path in (runtime_root, internal, numpy_libs, paddle_libs, cv2_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(service.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(service.sys, "executable", str(runtime_root / "orientation_backend.exe"))
+    monkeypatch.setattr(service.os, "name", "nt")
+    monkeypatch.setenv("PATH", "original-path")
+    added = []
+    monkeypatch.setattr(service.os, "add_dll_directory", lambda path: added.append(path))
+    monkeypatch.setattr(service, "_windows_short_path", lambda path: None)
+
+    service._prepare_windows_numpy_dll_path()
+
+    assert added == [
+        str(runtime_root),
+        str(internal),
+        str(numpy_libs),
+        str(paddle_libs),
+        str(cv2_dir),
+    ]
+    assert service.os.environ["PATH"].startswith(str(cv2_dir))
+
+
 def _required_service_args(tmp_path: Path) -> list[str]:
     return [
         "--project-root", str(tmp_path),
@@ -165,6 +193,7 @@ def test_packaged_main_creates_only_logs_before_binding(monkeypatch, tmp_path):
         lambda: SimpleNamespace(parse_args=lambda: args),
     )
     monkeypatch.setattr(service, "configure_diagnostic_logging", configure_logs)
+    monkeypatch.setattr(service, "_prepare_windows_numpy_dll_path", lambda: None)
     monkeypatch.setattr(service, "_prepare_windows_torch_dll_path", lambda: None)
     monkeypatch.setattr(service, "OrientationTcpServer", bind_listener)
 
