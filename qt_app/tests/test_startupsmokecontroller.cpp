@@ -12,6 +12,7 @@ public:
     bool start(const QString &, const QStringList &, const QString &) override { return true; }
     void terminate() override {}
     void kill() override {}
+    void release() override {}
     bool isRunning() const override { return false; }
 };
 
