@@ -217,7 +217,7 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
         for direction in ("front", "back"):
             section = details.get(direction)
             if not isinstance(section, Mapping):
-                continue
+                raise ValueError(f"acceptance case {case} missing {direction} section")
             fp_section = selections_fp[case].get(direction) if isinstance(selections_fp[case], Mapping) else None
             if not isinstance(fp_section, Mapping):
                 raise ValueError(f"acceptance fingerprint missing {case}/{direction}")
@@ -225,7 +225,7 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
             for role in ("templates", "queries"):
                 rows = section.get(role, [])
                 if not isinstance(rows, list):
-                    continue
+                    raise ValueError(f"acceptance case {case}/{direction} {role} must be a list")
                 for index, row in enumerate(rows):
                     if not isinstance(row, Mapping) or not isinstance(row.get("image_path"), str):
                         continue
