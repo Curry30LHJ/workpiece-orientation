@@ -24,6 +24,7 @@ from typing import Any
 import zipfile
 
 import numpy as np
+import cv2
 from scripts.benchmark_adaptive_local_search import _canonical_sha256
 
 
@@ -221,8 +222,8 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
             fp_section = selections_fp[case].get(direction) if isinstance(selections_fp[case], Mapping) else None
             if not isinstance(fp_section, Mapping):
                 raise ValueError(f"acceptance fingerprint missing {case}/{direction}")
-            fp_used: set[int] = set()
             for role in ("templates", "queries"):
+                fp_used: set[int] = set()
                 rows = section.get(role, [])
                 if not isinstance(rows, list):
                     raise ValueError(f"acceptance case {case}/{direction} {role} must be a list")
@@ -249,6 +250,8 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                     if row.get("sha256") and _sha256(source) != str(row["sha256"]):
                         raise ValueError(f"acceptance source hash mismatch: {source}")
                     fp_rows = fp_section.get(role, [])
+                    if not isinstance(fp_rows, list):
+                        raise ValueError(f"acceptance fingerprint rows must be a list: {case}/{direction}/{role}")
                     normalized = source.as_posix().lower()
                     anchor = "/data/" if "/data/" in normalized else "/runtime_library/"
                     rel = normalized.split(anchor, 1)[1] if anchor in normalized else source.name.lower()
@@ -257,6 +260,9 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                     if match_index is None:
                         raise ValueError(f"acceptance inventory/fingerprint mismatch: {source}")
                     fp_used.add(match_index)
+                    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+                    if image is None or image.shape[1] != int(row["width"]) or image.shape[0] != int(row["height"]):
+                        raise ValueError(f"acceptance image dimensions mismatch: {source}")
                     if int(row.get("width", 0)) <= 0 or int(row.get("height", 0)) <= 0:
                         raise ValueError("acceptance inventory row has invalid dimensions")
                     if role == "templates":
@@ -272,6 +278,8 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                         if row.get("sha256"):
                             query_hashes.add(str(row["sha256"]))
                             query_by_case[str(case)].add(str(row["sha256"]))
+                if len(fp_used) != len(fp_rows):
+                    raise ValueError(f"acceptance fingerprint row count mismatch: {case}/{direction}/{role}")
         overlap_by_case[str(case)] = len(template_by_case[str(case)] & query_by_case[str(case)])
     if not templates or not queries:
         raise ValueError("acceptance spec contains no usable templates and queries")
@@ -380,6 +388,7 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
             raise TimeoutError("backend did not become ready")
         report["startup"]["phases"] = phases
         report["startup"]["ready_ms"] = (perf_counter() - started) * 1000.0
+        deadline = time.monotonic() + timeout_seconds
         if hello.get("edition") != config.get("edition") or hello.get("compute_device") != config.get("compute_device"):
             raise RuntimeError("backend hello edition/device does not match app_config")
         if hello.get("package_version") != config.get("package_version"):
@@ -492,6 +501,7 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 raise RuntimeError(f"backend exited with code {process.returncode}")
             try:
                 log_handle.flush()
+                log_handle.seek(0)
                 backend_log = log_handle.read()
                 log_handle.close()
             except Exception as exc:
