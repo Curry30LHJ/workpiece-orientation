@@ -237,15 +237,15 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                     expected_dataset = f"1_{case}"
                     if row.get("dataset") != expected_dataset or Path(str(details["dataset_path"])).name != expected_dataset:
                         raise ValueError("acceptance inventory dataset mismatch")
-                    if not isinstance(row.get("sha256"), str) or len(str(row["sha256"])) != 64 or int(row.get("size", 0)) <= 0:
-                        raise ValueError("acceptance inventory row requires sha256 and size")
+                    if not isinstance(row.get("sha256"), str) or len(str(row["sha256"])) != 64:
+                        raise ValueError("acceptance inventory row requires sha256")
                     source = Path(row["image_path"])
                     if not source.is_file():
                         raise FileNotFoundError(source)
                     destination = temp_root / "data" / "benchmark" / str(case) / direction / f"{index:04d}_{source.name}"
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, destination)
-                    if int(row["size"]) != source.stat().st_size:
+                    if row.get("size") is not None and int(row["size"]) != source.stat().st_size:
                         raise ValueError(f"acceptance source size mismatch: {source}")
                     if row.get("sha256") and _sha256(source) != str(row["sha256"]):
                         raise ValueError(f"acceptance source hash mismatch: {source}")
