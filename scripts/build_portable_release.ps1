@@ -19,7 +19,11 @@ $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $env:PYTHONPATH = if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) { $repo } else { "$repo;$env:PYTHONPATH" }
 $gitCommit = (& git -C $repo rev-parse HEAD 2>$null); if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitCommit)) { throw 'Unable to determine git commit' }
-$stagingRoot = [IO.Path]::GetFullPath($OutputRoot)
+if (-not (Test-Path -LiteralPath $OutputRoot -PathType Container)) {
+    if (Test-Path -LiteralPath $OutputRoot) { throw "OutputRoot is not a directory: $OutputRoot" }
+    New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+}
+$stagingRoot = (Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).ProviderPath
 $ownedRootPath = [IO.Path]::GetFullPath((Join-Path $repo 'release_staging')).TrimEnd('\')
 $ownedRoot = $ownedRootPath + '\'
 if ($stagingRoot -ne $ownedRootPath -and -not $stagingRoot.StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutputRoot must remain under release_staging' }

@@ -8,9 +8,14 @@ param(
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($Python)) { throw 'Python must point to the edition packaging environment interpreter' }
 $project = (Resolve-Path -LiteralPath $ProjectRoot).Path
-$stagingRoot = (Resolve-Path -LiteralPath $OutputRoot -ErrorAction SilentlyContinue)
-if ($null -eq $stagingRoot) { $stagingRoot = New-Item -ItemType Directory -Force -Path $OutputRoot }
-$stagingRoot = $stagingRoot.Path
+if (-not (Test-Path -LiteralPath $OutputRoot -PathType Container)) {
+    if (Test-Path -LiteralPath $OutputRoot) { throw "OutputRoot is not a directory: $OutputRoot" }
+    New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+}
+# Resolve after creation.  DirectoryInfo does not reliably expose a `.Path`
+# property in all PowerShell/provider combinations; ProviderPath is stable and
+# also gives us the canonical path used by the containment checks below.
+$stagingRoot = (Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).ProviderPath
 $editionRoot = Join-Path $stagingRoot ("backend-" + $Edition)
 $distPath = $editionRoot
 $workPath = Join-Path $project ("deploy\pyinstaller-work\" + $Edition)

@@ -36,3 +36,16 @@ def test_release_script_checks_each_external_build_step_and_passes_paddle_config
     ):
         assert marker in script
     assert "--paddle-config $configArg" in script
+
+
+def test_release_scripts_create_and_resolve_nested_output_root():
+    root = Path(__file__).parents[1]
+    backend = (root / "scripts" / "build_portable_backend.ps1").read_text(encoding="utf-8")
+    release = (root / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
+    for script in (backend, release):
+        assert "Test-Path -LiteralPath $OutputRoot -PathType Container" in script
+        assert "New-Item -ItemType Directory -Force -Path $OutputRoot" in script
+        assert "Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop" in script
+        assert ".ProviderPath" in script
+    assert "OutputRoot is not a directory" in backend
+    assert "OutputRoot is not a directory" in release
