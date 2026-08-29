@@ -62,6 +62,25 @@ def test_prepare_windows_numpy_dll_path_adds_frozen_runtime_dirs(monkeypatch, tm
     assert service._WINDOWS_DLL_DIRECTORY_HANDLES == handles
 
 
+def test_prepare_windows_frozen_import_path_uses_short_runtime_root(monkeypatch, tmp_path: Path):
+    runtime_root = tmp_path / ("中文安装路径" * 8) / "backend"
+    runtime_root.mkdir(parents=True)
+    short_root = tmp_path / "BACKEN~1"
+    short_root.mkdir()
+    monkeypatch.setattr(service.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(service.sys, "executable", str(runtime_root / "orientation_backend.exe"))
+    monkeypatch.setattr(service.sys, "_MEIPASS", str(runtime_root), raising=False)
+    monkeypatch.setattr(service.sys, "path", [str(runtime_root), "other"], raising=False)
+    monkeypatch.setattr(service.os, "name", "nt")
+    monkeypatch.setattr(service, "_windows_short_path", lambda path: short_root if path == runtime_root else None)
+
+    service._prepare_windows_frozen_import_path()
+
+    assert service.sys._MEIPASS == str(short_root)
+    assert service.sys.path[0] == str(short_root)
+    assert str(runtime_root) not in service.sys.path
+
+
 def _required_service_args(tmp_path: Path) -> list[str]:
     return [
         "--project-root", str(tmp_path),

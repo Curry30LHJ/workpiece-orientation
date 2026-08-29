@@ -85,8 +85,12 @@ def _persist_report_safely(path: Path | None, report: dict[str, Any]) -> Excepti
 class _JsonSocket:
     def __init__(self, sock: socket.socket, timeout_seconds: float):
         self.sock = sock
-        self.sock.settimeout(timeout_seconds)
+        self.set_timeout(timeout_seconds)
         self.file = sock.makefile("rwb")
+
+    def set_timeout(self, timeout_seconds: float) -> None:
+        """Update the underlying socket to the remaining smoke budget."""
+        self.sock.settimeout(max(0.001, float(timeout_seconds)))
 
     def request(self, command: str, **fields: Any) -> dict[str, Any]:
         request_id = str(uuid.uuid4())
@@ -119,6 +123,12 @@ def _ok(response: dict[str, Any], command: str) -> dict[str, Any]:
     if response.get("ok") is not True:
         raise RuntimeError(f"{command} failed: {response}")
     return response
+
+
+def _set_client_timeout(client: Any, timeout_seconds: float) -> None:
+    setter = getattr(client, "set_timeout", None)
+    if callable(setter):
+        setter(max(0.001, float(timeout_seconds)))
 
 
 def _require_single_workpiece(response: dict[str, Any], workpiece_id: str,
@@ -168,7 +178,11 @@ def _copy_to_long_temp(root: Path, factory: Callable[..., Path] | None) -> Path:
                 break
         if base is None:
             raise OSError("unable to create a writable smoke temporary directory")
-        target = base / ("x" * max(1, 190 - len(str(base))))
+        # Keep the copied package long enough to exercise Unicode/whitespace
+        # path handling, while leaving headroom for PyInstaller's deepest
+        # native extension path on the Windows loader (which still has a
+        # stricter limit than ordinary file APIs on some Windows 10 hosts).
+        target = base / ("x" * max(1, 180 - len(str(base))))
     # A factory is allowed to choose the location, but an existing location is
     # never safe to reuse: doing so could overwrite another smoke run or the
     # caller's package data.
@@ -289,28 +303,39 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
     client = None
     report["edition"] = config.get("edition")
     deadline = time.monotonic() + options.timeout_seconds
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("smoke deadline exceeded")
+        return remaining
+
     try:
         if socket_factory is None:
-            while time.monotonic() < deadline:
+            while True:
+                remaining = remaining_timeout()
                 try:
                     client = _JsonSocket(
-                        socket.create_connection(("127.0.0.1", port), timeout=options.timeout_seconds),
-                        options.timeout_seconds,
+                        socket.create_connection(("127.0.0.1", port), timeout=remaining),
+                        remaining,
                     )
                     break
                 except OSError:
                     if process.poll() is not None:
                         raise RuntimeError(f"backend exited with code {process.returncode}")
-                    time.sleep(0.2)
+                    time.sleep(min(0.2, remaining_timeout()))
             if client is None:
                 raise TimeoutError("backend did not accept a connection")
         else:
+            remaining = remaining_timeout()
             try:
-                client = socket_factory("127.0.0.1", port, timeout=options.timeout_seconds)
+                client = socket_factory("127.0.0.1", port, timeout=remaining)
             except TypeError:
                 client = socket_factory("127.0.0.1", port)
 
         def request(command: str, **fields: Any) -> dict[str, Any]:
+            remaining = remaining_timeout()
+            _set_client_timeout(client, remaining)
             report["commands"].append(command)
             try:
                 raw_response = client.request(command, **fields)
@@ -326,9 +351,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
                 break
             if hello.get("status") != "loading":
                 raise RuntimeError(f"backend hello failed: {hello}")
-            if time.monotonic() >= deadline:
-                raise TimeoutError("backend did not become ready")
-            time.sleep(0.25)
+            time.sleep(min(0.25, remaining_timeout()))
         instance_token = hello.get("instance_token")
         if not isinstance(instance_token, str) or not instance_token.strip():
             raise RuntimeError("backend hello omitted instance token")
@@ -365,7 +388,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         restored_list = request("list_workpieces")
         _require_single_workpiece(restored_list, workpiece_id, "restored workpiece missing from list")
         request("shutdown", instance_token=instance_token)
-        process.wait(timeout=10)
+        process.wait(timeout=min(10.0, remaining_timeout()))
         if process.returncode != 0:
             raise RuntimeError(f"backend exited with code {process.returncode}")
         report.update(ok=True, workpiece_id=workpiece_id, template_counts=counts, process_exit=process.returncode,
@@ -516,9 +539,18 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
     hello: dict[str, Any] = {}
     destination_instance_token: str | None = None
     destination_report: dict[str, Any] = {"commands": [], "results": []}
+    destination_deadline = time.monotonic() + options.timeout_seconds
     primary_error: Exception | None = None
 
+    def destination_remaining_timeout() -> float:
+        remaining = destination_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("destination smoke deadline exceeded")
+        return remaining
+
     def request(command: str, **fields: Any) -> dict[str, Any]:
+        remaining = destination_remaining_timeout()
+        _set_client_timeout(client, remaining)
         destination_report["commands"].append(command)
         try:
             raw = client.request(command, **fields)
@@ -531,23 +563,24 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
     try:
         sf = factories.get("socket_factory")
         if sf:
+            remaining = destination_remaining_timeout()
             try:
-                client = sf("127.0.0.1", port, timeout=options.timeout_seconds)
+                client = sf("127.0.0.1", port, timeout=remaining)
             except TypeError:
                 client = sf("127.0.0.1", port)
         else:
+            remaining = destination_remaining_timeout()
             client = _JsonSocket(
-                socket.create_connection(("127.0.0.1", port), timeout=options.timeout_seconds),
-                options.timeout_seconds,
+                socket.create_connection(("127.0.0.1", port), timeout=remaining),
+                remaining,
             )
-        deadline = time.monotonic() + options.timeout_seconds
         while True:
             hello = request("hello")
             if hello.get("ready") is True:
                 break
-            if hello.get("status") != "loading" or time.monotonic() >= deadline:
+            if hello.get("status") != "loading":
                 raise RuntimeError("destination did not become ready")
-            time.sleep(0.25)
+            time.sleep(min(0.25, destination_remaining_timeout()))
         destination_instance_token = hello.get("instance_token")
         if not isinstance(destination_instance_token, str) or not destination_instance_token.strip():
             raise RuntimeError("destination hello omitted instance token")

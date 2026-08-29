@@ -25,6 +25,41 @@ def test_json_socket_applies_configured_read_timeout():
     assert raw.timeout == 37.5
 
 
+def test_smoke_enforces_one_shared_deadline_across_protocol_requests(tmp_path, monkeypatch):
+    dataset = _dataset_fixture(tmp_path / "dataset")
+    package = _package_fixture(tmp_path / "package")
+    clock = [0.0]
+    budgets = []
+
+    class SlowSocket(FakeSocket):
+        def set_timeout(self, value):
+            budgets.append(value)
+
+        def request(self, command, **fields):
+            response = super().request(command, **fields)
+            clock[0] += 0.6
+            return response
+
+    responses = [
+        {"ok": True, "ready": True, "instance_token": "token"},
+        {"ok": True, "workpieces": []},
+        {"ok": True, "workpiece": {"id": "wp-1"}, "template_counts": {"front": 2, "back": 2}},
+    ]
+    monkeypatch.setattr(smoke.time, "monotonic", lambda: clock[0])
+    with pytest.raises(TimeoutError, match="deadline|timed out"):
+        run_smoke(
+            SmokeOptions(package_root=package, dataset_root=dataset,
+                         front_template_count=2, back_template_count=2,
+                         timeout_seconds=1.0),
+            process_factory=lambda *a, **k: FakeProcess(),
+            socket_factory=lambda *a, **k: SlowSocket([], responses),
+            temp_root_factory=lambda: tmp_path / "deadline-copy",
+        )
+    assert budgets
+    assert budgets == sorted(budgets, reverse=True)
+    assert budgets[-1] <= 1.0
+
+
 def test_smoke_wrapper_runs_directly_outside_repo_cwd():
     script = Path(__file__).parents[1] / "scripts" / "smoke_portable_package.py"
     result = subprocess.run(
@@ -70,6 +105,21 @@ def test_copy_to_long_temp_does_not_depend_on_mkdtemp_acl(tmp_path: Path):
         assert target.parent.name.startswith(".便携 smoke package-")
         assert " " in str(target)
         assert any(ord(character) > 127 for character in str(target))
+    finally:
+        import shutil
+        shutil.rmtree(target.parent)
+
+
+def test_copy_to_long_temp_leaves_headroom_for_frozen_native_extensions(tmp_path: Path):
+    source = tmp_path / "package"
+    nested = source / "backend" / "_internal" / "numpy" / "core"
+    nested.mkdir(parents=True)
+    (nested / "_multiarray_umath.cp310-win_amd64.pyd").write_bytes(b"x")
+    target = smoke._copy_to_long_temp(source, None)
+    try:
+        extension = target / "backend" / "_internal" / "numpy" / "core" / "_multiarray_umath.cp310-win_amd64.pyd"
+        assert len(str(target.resolve())) >= 180
+        assert len(str(extension.resolve())) < 260
     finally:
         import shutil
         shutil.rmtree(target.parent)

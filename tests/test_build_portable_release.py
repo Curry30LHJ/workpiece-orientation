@@ -94,11 +94,25 @@ def test_release_python_boundaries_use_repo_relative_paths():
     assert "'--backend-dir', $backendArg" in script
     assert "'--output-root', $stagingRootArg" in script
     assert "'--repository-root', '.'" in script
-    assert "Path('.')" in script
+    assert "Path.cwd().resolve()" in script
+    assert "roots=[Path('.')" not in script
     assert "CreateProcessW" in script
     assert "$smokeReportArg = Join-Path (Join-Path $stagingRootArg 'reports')" in script
     assert "--report $smokeReportArg" in script
     assert "finally {" in script and "Pop-Location" in script
+
+
+def test_release_audit_resolves_repository_root_inside_python():
+    script = (Path(__file__).parents[1] / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
+    assert "roots=[Path.cwd().resolve()," in script
+    assert "roots=[Path('.')," not in script
+
+
+def test_release_script_guards_pop_location_when_push_was_not_reached():
+    script = (Path(__file__).parents[1] / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
+    assert "$releaseLocationPushed = $false" in script
+    assert "$releaseLocationPushed = $true" in script
+    assert "if ($releaseLocationPushed) { Pop-Location }" in script
 
 
 def test_smoke_report_path_join_executes_with_two_arguments():

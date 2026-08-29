@@ -64,6 +64,7 @@ finally {
 $asciiInputRoot = Join-Path ([IO.Path]::GetPathRoot($repo)) ".portable-release-inputs-$PID"
 if (Test-Path -LiteralPath $asciiInputRoot) { throw "Temporary input directory already exists: $asciiInputRoot" }
 New-Item -ItemType Directory -Path $asciiInputRoot -Force | Out-Null
+$releaseLocationPushed = $false
 try {
     # PowerShell 5.1 marshals non-ASCII native arguments through the active
     # code page. Copy these two source files to an ASCII-only path first.
@@ -85,6 +86,7 @@ try {
     # owned by this repository are nevertheless passed relative to this
     # Push-Location; external user-supplied paths remain intentionally intact.
     Push-Location -LiteralPath $repo
+    $releaseLocationPushed = $true
     foreach ($ed in $editions) {
         $target = Join-Path $stagingRoot "$ed-$Version"
         if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
@@ -119,16 +121,19 @@ try {
     $label = $ed.ToUpper()
     $archive = Join-Path $repo "release_artifacts\WorkpieceOrientation-$label-x64-$Version.zip"
     $archiveArg = Join-Path 'release_artifacts' "WorkpieceOrientation-$label-x64-$Version.zip"
-    & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$packageArg'); roots=[Path('.'),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); a=zip_package(p,Path(r'$archiveArg')); write_sha256(a)"
+    & $py -c "from release_tools.portable_package import audit_package,write_manifest,zip_package,write_sha256; from pathlib import Path; p=Path(r'$packageArg'); roots=[Path.cwd().resolve(),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); write_manifest(p,edition='$ed',version='$Version'); audit_package(p,edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots); a=zip_package(p,Path(r'$archiveArg')); write_sha256(a)"
     if ($LASTEXITCODE -ne 0) { throw "Package audit/archive failed for $ed with exit code $LASTEXITCODE" }
     # Re-open the exact ZIP artifact in a fresh, disposable directory and run
     # the same audit against the extracted layout. This catches archive root,
     # path, and omission errors that a source-directory audit cannot detect.
-    & $py -c "from release_tools.portable_package import audit_zip_archive; from pathlib import Path; roots=[Path('.'),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_zip_archive(Path(r'$archiveArg'),edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots)"
+    & $py -c "from release_tools.portable_package import audit_zip_archive; from pathlib import Path; roots=[Path.cwd().resolve(),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_zip_archive(Path(r'$archiveArg'),edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots)"
     if ($LASTEXITCODE -ne 0) { throw "Extracted ZIP audit failed for $ed with exit code $LASTEXITCODE" }
 }
 }
 finally {
-    Pop-Location
-    if (Test-Path -LiteralPath $asciiInputRoot) { Remove-Item -LiteralPath $asciiInputRoot -Recurse -Force }
+    try {
+        if ($releaseLocationPushed) { Pop-Location }
+    } finally {
+        if (Test-Path -LiteralPath $asciiInputRoot) { Remove-Item -LiteralPath $asciiInputRoot -Recurse -Force }
+    }
 }
