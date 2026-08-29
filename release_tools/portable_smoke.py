@@ -317,7 +317,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         report["process_exit"] = _process_exit_code(process)
         if options.report_path:
             persist_error = _persist_report_safely(Path(options.report_path), report)
-            if persist_error is not None and not primary_error:
+            if persist_error is not None and not primary_error and cleanup_error is None:
                 raise persist_error
         if cleanup_error is not None and not primary_error:
             raise cleanup_error
