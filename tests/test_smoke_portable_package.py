@@ -1,10 +1,24 @@
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 import release_tools.portable_smoke as smoke
 from release_tools.portable_smoke import SmokeOptions, run_portability, run_smoke
+
+
+def test_smoke_wrapper_runs_directly_outside_repo_cwd():
+    script = Path(__file__).parents[1] / "scripts" / "smoke_portable_package.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=script.parents[1].parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "usage:" in result.stdout.lower()
 
 
 class FakeSocket:
