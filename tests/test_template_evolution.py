@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import threading
 
 import cv2
 import numpy as np
@@ -43,8 +44,83 @@ class FakeClassifier:
         return dict(region)
 
 
-def setup_catalog(tmp_path, front_count=1):
-    classifier = FakeClassifier()
+class BlockingProgressClassifier(FakeClassifier):
+    def __init__(self):
+        super().__init__()
+        self.block_appends = False
+        self.feature_started = threading.Event()
+        self.release_feature = threading.Event()
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.block_appends:
+            if progress_callback is not None:
+                progress_callback("front", 0, len(front))
+            self.feature_started.set()
+            assert self.release_feature.wait(2.0)
+        return super().build_template_cache(front, back, progress_callback)
+
+
+class FailingProgressClassifier(FakeClassifier):
+    def __init__(self):
+        super().__init__()
+        self.fail_appends = False
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.fail_appends:
+            if progress_callback is not None:
+                progress_callback("front", 0, len(front))
+            raise RuntimeError("synthetic feature failure")
+        return super().build_template_cache(front, back, progress_callback)
+
+
+class TimedBlockingProgressClassifier(BlockingProgressClassifier):
+    def __init__(self, now):
+        super().__init__()
+        self.now = now
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.block_appends:
+            self.now[0] += 1.25
+        return super().build_template_cache(front, back, progress_callback)
+
+
+class TimedFailingProgressClassifier(FailingProgressClassifier):
+    def __init__(self, now):
+        super().__init__()
+        self.now = now
+
+    def build_template_cache(self, front, back, progress_callback=None):
+        if self.fail_appends:
+            self.now[0] += 1.25
+        return super().build_template_cache(front, back, progress_callback)
+
+
+class BlockingGeometryProfiles:
+    def __init__(self):
+        self.validation_started = threading.Event()
+        self.release_validation = threading.Event()
+
+    def validate_new_template(self, workpiece_id, orientation, image_path):
+        self.validation_started.set()
+        assert self.release_validation.wait(2.0)
+        return {"status": "active", "needs_review": False}
+
+
+class TimedReviewProfiles:
+    def __init__(self, now):
+        self.now = now
+
+    def validate_new_template(self, workpiece_id, orientation, image_path):
+        self.now[0] += 1.25
+        return {
+            "status": "low_confidence",
+            "needs_review": True,
+            "reason": "synthetic timed review",
+        }
+
+
+def setup_catalog(tmp_path, front_count=1, classifier=None):
+    classifier = classifier or FakeClassifier()
     library = WorkpieceLibrary(tmp_path / "library")
     catalog = WorkpieceCatalog(library, classifier)
     front = [image(tmp_path / f"front-{index}.png", 10 + index) for index in range(front_count)]
@@ -75,6 +151,508 @@ def test_confirmations_for_same_workpiece_coalesce_and_append(tmp_path):
     assert evolution.get_job(job1["job_id"])["state"] == "completed"
 
 
+def test_submitted_job_reports_queued_progress_for_all_coalesced_items(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "queued-progress", start_worker=False)
+
+    first = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "queued-front.png", 31),
+        operation_id="queued-progress-front",
+    )
+    second = evolution.submit_confirmation(
+        record.id,
+        "back",
+        image(tmp_path / "queued-back.png", 41),
+        operation_id="queued-progress-back",
+    )
+
+    assert second["job_id"] == first["job_id"]
+    assert second["state"] == "queued"
+    assert second["phase"] == "queued"
+    assert second["completed"] == 0
+    assert second["total"] == 2
+    assert second["progress"] == 0
+    assert second["started_at"] is None
+    assert second["finished_at"] is None
+    assert second["elapsed_ms"] is None
+
+
+def test_elapsed_time_updates_during_progress_and_freezes_after_completion(tmp_path):
+    now = [100.0]
+    classifier = TimedBlockingProgressClassifier(now)
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / "timed-progress",
+        clock=lambda: now[0],
+        duration_clock=lambda: now[0],
+        start_worker=False,
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "timed-confirmed.png", 39),
+        operation_id="timed-progress",
+    )
+    classifier.block_appends = True
+    worker = threading.Thread(target=lambda: evolution.run_next(force=True))
+
+    worker.start()
+    assert classifier.feature_started.wait(1.0)
+    try:
+        progress = evolution.get_job(job["job_id"])
+        assert progress["state"] == "building"
+        assert progress["started_at"] == 100.0
+        assert progress["finished_at"] is None
+        assert progress["elapsed_ms"] == 1250
+        persisted = json.loads(evolution.jobs_path.read_text(encoding="utf-8"))
+        persisted_job = next(item for item in persisted["jobs"] if item["job_id"] == job["job_id"])
+        assert persisted_job["started_at"] == 100.0
+        assert persisted_job["finished_at"] is None
+        assert persisted_job["elapsed_ms"] == 1250
+    finally:
+        classifier.release_feature.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    completed = evolution.get_job(job["job_id"])
+    assert completed["state"] == "completed"
+    assert completed["started_at"] == 100.0
+    assert completed["finished_at"] == 101.25
+    assert completed["elapsed_ms"] == 1250
+    now[0] = 110.0
+    restarted = TemplateEvolution(
+        catalog, tmp_path / "timed-progress", clock=lambda: now[0], start_worker=False
+    )
+    persisted_completed = restarted.get_job(job["job_id"])
+    assert persisted_completed["finished_at"] == 101.25
+    assert persisted_completed["elapsed_ms"] == 1250
+
+
+def test_get_and_list_jobs_report_live_elapsed_while_validating(tmp_path):
+    wall_now = [100.0]
+    duration_now = [10.0]
+    catalog, record = setup_catalog(tmp_path)
+    profiles = BlockingGeometryProfiles()
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / "live-validating",
+        clock=lambda: wall_now[0],
+        duration_clock=lambda: duration_now[0],
+        start_worker=False,
+        geometry_profiles=profiles,
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "live-validating.png", 43),
+        operation_id="live-validating",
+    )
+    worker = threading.Thread(target=lambda: evolution.run_next(force=True))
+
+    worker.start()
+    assert profiles.validation_started.wait(1.0)
+    try:
+        duration_now[0] = 11.25
+        assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+        listed = next(item for item in evolution.list_jobs() if item["job_id"] == job["job_id"])
+        assert listed["elapsed_ms"] == 1250
+    finally:
+        profiles.release_validation.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+    duration_now[0] = 20.0
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+
+
+@pytest.mark.parametrize(
+    "finish_wall,expected_finished",
+    [(1100.0, 1100.0), (90.0, 100.0)],
+)
+def test_feature_elapsed_uses_duration_clock_when_wall_clock_jumps(
+    tmp_path, finish_wall, expected_finished
+):
+    wall_now = [100.0]
+    duration_now = [20.0]
+    classifier = BlockingProgressClassifier()
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / f"wall-jump-{finish_wall}",
+        clock=lambda: wall_now[0],
+        duration_clock=lambda: duration_now[0],
+        start_worker=False,
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / f"wall-jump-{finish_wall}.png", 44),
+        operation_id=f"wall-jump-{finish_wall}",
+    )
+    classifier.block_appends = True
+    worker = threading.Thread(target=lambda: evolution.run_next(force=True))
+
+    worker.start()
+    assert classifier.feature_started.wait(1.0)
+    try:
+        wall_now[0] = finish_wall
+        duration_now[0] = 21.25
+        assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+        listed = next(item for item in evolution.list_jobs() if item["job_id"] == job["job_id"])
+        assert listed["elapsed_ms"] == 1250
+    finally:
+        classifier.release_feature.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    completed = evolution.get_job(job["job_id"])
+    assert completed["started_at"] == 100.0
+    assert completed["finished_at"] == expected_finished
+    assert completed["elapsed_ms"] == 1250
+    wall_now[0] = 5000.0
+    duration_now[0] = 200.0
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+
+
+def test_build_reports_features_without_publishing_candidate_early(tmp_path):
+    classifier = BlockingProgressClassifier()
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    original = catalog.capture_snapshot(record.id)
+    evolution = TemplateEvolution(catalog, tmp_path / "blocking-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "blocking-confirmed.png", 32),
+        operation_id="blocking-progress",
+    )
+    classifier.block_appends = True
+    results = []
+    worker = threading.Thread(target=lambda: results.append(evolution.run_next(force=True)))
+
+    worker.start()
+    assert classifier.feature_started.wait(1.0)
+    try:
+        active = catalog.capture_snapshot(record.id)
+        progress = evolution.get_job(job["job_id"])
+        assert progress["state"] == "building"
+        assert progress["phase"] == "features"
+        assert active.record.revision == original.record.revision
+        assert active.cache is original.cache
+        persisted = json.loads(evolution.jobs_path.read_text(encoding="utf-8"))
+        persisted_job = next(item for item in persisted["jobs"] if item["job_id"] == job["job_id"])
+        assert persisted_job["phase"] == "features"
+    finally:
+        classifier.release_feature.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert results[0]["state"] == "completed"
+    assert results[0]["phase"] == "active"
+    assert results[0]["progress"] == 100
+    assert catalog.capture_snapshot(record.id).record.revision == original.record.revision + 1
+
+
+def test_feature_failure_keeps_previous_active_snapshot(tmp_path):
+    classifier = FailingProgressClassifier()
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    original = catalog.capture_snapshot(record.id)
+    evolution = TemplateEvolution(catalog, tmp_path / "failing-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "failing-confirmed.png", 33),
+        operation_id="failing-progress",
+    )
+    classifier.fail_appends = True
+
+    result = evolution.run_next(force=True)
+
+    active = catalog.capture_snapshot(record.id)
+    assert result["job_id"] == job["job_id"]
+    assert result["state"] == "failed"
+    assert result["phase"] == "features"
+    assert "synthetic feature failure" in result["error"]
+    assert active.record.revision == original.record.revision
+    assert active.cache is original.cache
+
+
+def test_failed_job_freezes_elapsed_time(tmp_path):
+    now = [200.0]
+    classifier = TimedFailingProgressClassifier(now)
+    catalog, record = setup_catalog(tmp_path, classifier=classifier)
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / "timed-failure",
+        clock=lambda: now[0],
+        duration_clock=lambda: now[0],
+        start_worker=False,
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "timed-failure.png", 40),
+        operation_id="timed-failure",
+    )
+    classifier.fail_appends = True
+
+    failed = evolution.run_next(force=True)
+
+    assert failed["state"] == "failed"
+    assert failed["started_at"] == 200.0
+    assert failed["finished_at"] == 201.25
+    assert failed["elapsed_ms"] == 1250
+    now[0] = 205.0
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+
+
+def test_needs_review_job_freezes_elapsed_time(tmp_path):
+    now = [300.0]
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / "timed-review",
+        clock=lambda: now[0],
+        duration_clock=lambda: now[0],
+        start_worker=False,
+        geometry_profiles=TimedReviewProfiles(now),
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "timed-review.png", 41),
+        operation_id="timed-review",
+    )
+
+    review = evolution.run_next(force=True)
+
+    assert review["state"] == "needs_review"
+    assert review["started_at"] == 300.0
+    assert review["finished_at"] == 301.25
+    assert review["elapsed_ms"] == 1250
+    now[0] = 305.0
+    assert evolution.get_job(job["job_id"])["elapsed_ms"] == 1250
+
+
+def test_build_reports_validating_while_geometry_check_is_running(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    profiles = BlockingGeometryProfiles()
+    evolution = TemplateEvolution(
+        catalog,
+        tmp_path / "validating-progress",
+        start_worker=False,
+        geometry_profiles=profiles,
+    )
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "validating-confirmed.png", 38),
+        operation_id="validating-progress",
+    )
+    worker = threading.Thread(target=lambda: evolution.run_next(force=True))
+
+    worker.start()
+    assert profiles.validation_started.wait(1.0)
+    try:
+        progress = evolution.get_job(job["job_id"])
+        assert progress["state"] == "building"
+        assert progress["phase"] == "validating"
+    finally:
+        profiles.release_validation.set()
+        worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+
+
+def test_restart_requeues_interrupted_build_with_recovery_detail(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    storage = tmp_path / "interrupted-progress"
+    evolution = TemplateEvolution(catalog, storage, start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "interrupted-confirmed.png", 34),
+        operation_id="interrupted-progress",
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            state="building",
+            phase="features",
+            completed=1,
+            total=3,
+            progress=33,
+            started_at=100.0,
+            finished_at=None,
+            elapsed_ms=1250,
+        )
+        evolution._persist()
+
+    restarted = TemplateEvolution(catalog, storage, start_worker=False)
+    recovered = restarted.get_job(job["job_id"])
+
+    assert recovered["job_id"] == job["job_id"]
+    assert recovered["state"] == "queued"
+    assert recovered["phase"] == "queued"
+    assert recovered["recovery_detail"]
+    assert recovered["started_at"] is None
+    assert recovered["finished_at"] is None
+    assert recovered["elapsed_ms"] is None
+
+
+def test_retry_requeues_same_job_and_clears_failure_detail(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "retry-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id, "front", image(tmp_path / "retry.png", 35), operation_id="retry-progress"
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            state="failed",
+            phase="features",
+            completed=2,
+            total=4,
+            progress=50,
+            error="failed",
+            recovery_detail="old recovery",
+            started_at=100.0,
+            finished_at=101.25,
+            elapsed_ms=1250,
+        )
+
+    retried = evolution.action(job["job_id"], "retry")
+
+    assert retried["job_id"] == job["job_id"]
+    assert retried["state"] == "queued"
+    assert retried["phase"] == "queued"
+    assert retried["completed"] == 0
+    assert retried["total"] == 1
+    assert retried["progress"] == 0
+    assert retried["error"] is None
+    assert not retried.get("recovery_detail")
+    assert retried["started_at"] is None
+    assert retried["finished_at"] is None
+    assert retried["elapsed_ms"] is None
+
+
+def test_resolve_review_requeues_same_job_and_clears_review_detail(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "review-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id, "front", image(tmp_path / "review.png", 36), operation_id="review-progress"
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            state="needs_review",
+            phase="validating",
+            completed=1,
+            total=3,
+            progress=33,
+            error="review required",
+            recovery_detail="old recovery",
+            started_at=200.0,
+            finished_at=201.25,
+            elapsed_ms=1250,
+        )
+
+    resolved = evolution.action(job["job_id"], "resolve-review")
+
+    assert resolved["job_id"] == job["job_id"]
+    assert resolved["state"] == "queued"
+    assert resolved["phase"] == "queued"
+    assert resolved["completed"] == 0
+    assert resolved["total"] == 1
+    assert resolved["progress"] == 0
+    assert resolved["error"] is None
+    assert not resolved.get("recovery_detail")
+    assert resolved["started_at"] is None
+    assert resolved["finished_at"] is None
+    assert resolved["elapsed_ms"] is None
+
+
+def test_cancel_preserves_last_phase_and_incomplete_progress(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "cancel-progress", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id, "front", image(tmp_path / "cancel.png", 37), operation_id="cancel-progress"
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            phase="copying", completed=1, total=4, progress=25
+        )
+
+    cancelled = evolution.action(job["job_id"], "cancel")
+
+    assert cancelled["job_id"] == job["job_id"]
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["phase"] == "copying"
+    assert cancelled["completed"] == 1
+    assert cancelled["total"] == 4
+    assert cancelled["progress"] == 25
+    assert cancelled["started_at"] is None
+    assert cancelled["finished_at"] is None
+    assert cancelled["elapsed_ms"] is None
+
+
+def test_cancel_preserves_existing_terminal_elapsed_time(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    evolution = TemplateEvolution(catalog, tmp_path / "cancel-terminal", start_worker=False)
+    job = evolution.submit_confirmation(
+        record.id,
+        "front",
+        image(tmp_path / "cancel-terminal.png", 42),
+        operation_id="cancel-terminal",
+    )
+    with evolution._condition:
+        evolution._jobs[job["job_id"]].update(
+            state="failed",
+            started_at=400.0,
+            finished_at=401.25,
+            elapsed_ms=1250,
+        )
+
+    cancelled = evolution.action(job["job_id"], "cancel")
+
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["started_at"] == 400.0
+    assert cancelled["finished_at"] == 401.25
+    assert cancelled["elapsed_ms"] == 1250
+
+
+def test_legacy_queued_job_loads_with_unknown_elapsed_time(tmp_path):
+    catalog, record = setup_catalog(tmp_path)
+    storage = tmp_path / "legacy-timing"
+    storage.mkdir()
+    (storage / "jobs.json").write_text(
+        json.dumps({
+            "jobs": [{
+                "job_id": "legacy-queued",
+                "workpiece_id": record.id,
+                "base_revision": record.revision,
+                "state": "queued",
+                "phase": "queued",
+                "completed": 0,
+                "total": 0,
+                "progress": 0,
+                "warnings": [],
+                "error": None,
+                "last_submitted_at": 0.0,
+                "items": [],
+            }],
+            "operations": {},
+        }),
+        encoding="utf-8",
+    )
+
+    legacy = TemplateEvolution(catalog, storage, start_worker=False).get_job("legacy-queued")
+
+    assert legacy["started_at"] is None
+    assert legacy["finished_at"] is None
+    assert legacy["elapsed_ms"] is None
+
+
 def test_restart_reconciles_manifest_commit_without_appending_twice(tmp_path):
     catalog, record = setup_catalog(tmp_path)
     storage = tmp_path / "restart-jobs"
@@ -96,11 +674,22 @@ def test_restart_reconciles_manifest_commit_without_appending_twice(tmp_path):
         evolution._jobs[job["job_id"]]["state"] = "building"
         evolution._persist()
 
-    restarted = TemplateEvolution(catalog, storage, start_worker=False)
+    wall_ticks = iter((500.0, 501.25))
+    duration_ticks = iter((50.0, 51.25))
+    restarted = TemplateEvolution(
+        catalog,
+        storage,
+        clock=lambda: next(wall_ticks),
+        duration_clock=lambda: next(duration_ticks),
+        start_worker=False,
+    )
     result = restarted.run_next(force=True)
 
     assert result["state"] == "completed"
     assert result["revision"] == committed.revision
+    assert result["started_at"] == 500.0
+    assert result["finished_at"] == 501.25
+    assert result["elapsed_ms"] == 1250
     assert len(catalog.get(record.id).front_images) == 2
     assert not staged.exists()
 
@@ -167,6 +756,7 @@ def test_completed_job_records_its_job_id_in_template_manifest(tmp_path):
     )
     assert result["state"] == "completed"
     assert manifest["last_template_update"]["operation_id"] == job["job_id"]
+    assert manifest["template_inventory"][-1]["source"] == "confirmed_inspection"
 
 
 class LowConfidenceGeometryProfiles:

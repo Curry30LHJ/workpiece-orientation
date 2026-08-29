@@ -6,13 +6,14 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import logging
 from pathlib import Path
 import os
 import shutil
 import uuid
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from src.image_io import read_color_image
 from src.orientation_classifier import TEMPLATE_CACHE_FILE_NAME, TemplateCache
@@ -72,11 +73,66 @@ class PreparedTemplateUpdate:
     consumed: bool = False
 
 
-CacheProgressCallback = Callable[[str, int, int], None]
+CacheProgressCallback = Callable[..., None]
 CacheBuilder = Callable[[Sequence[Path], Sequence[Path], CacheProgressCallback | None], TemplateCache]
 CacheLoader = Callable[[WorkpieceRecord], TemplateCache | None]
 CacheSaver = Callable[[WorkpieceRecord, TemplateCache], None]
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _adapt_cache_progress(
+    report: ProgressCallback,
+    *,
+    front_count: int,
+    total: int,
+) -> CacheProgressCallback:
+    """Normalize legacy and structured cache-builder progress."""
+
+    def cache_progress(*args: Any) -> None:
+        if len(args) == 1 and isinstance(args[0], Mapping):
+            event = dict(args[0])
+            if (
+                not isinstance(event.get("phase"), str)
+                or type(event.get("completed")) is not int
+                or type(event.get("total")) is not int
+            ):
+                raise TypeError("Structured progress requires phase, completed, and total")
+            report(event)
+            return
+        if len(args) == 3:
+            label, completed, _side_total = args
+            offset = front_count if label == "back" else 0
+            report({"phase": "features", "completed": offset + completed, "total": total})
+            return
+        raise TypeError("Progress callback expects an event dictionary or label, completed, total")
+
+    return cache_progress
+
+
+def _call_cache_builder(
+    build_cache: CacheBuilder,
+    front_images: Sequence[Path],
+    back_images: Sequence[Path],
+    progress_callback: CacheProgressCallback | None,
+    *,
+    library_revision: int,
+) -> TemplateCache:
+    """Pass a known revision when supported without breaking legacy builders."""
+    try:
+        inspect.signature(build_cache).bind(
+            front_images,
+            back_images,
+            progress_callback,
+            library_revision=library_revision,
+        )
+    except (TypeError, ValueError):
+        return build_cache(front_images, back_images, progress_callback)
+    return build_cache(
+        front_images,
+        back_images,
+        progress_callback,
+        library_revision=library_revision,
+    )
 
 
 def _validate_name(name: str) -> str:
@@ -148,6 +204,63 @@ class WorkpieceLibrary:
         return next((record for record in self._records.values() if record.name.casefold() == key), None)
 
     @staticmethod
+    def _validated_template_inventory(
+        manifest_path: Path,
+        manifest: dict[str, Any],
+        front_paths: Sequence[Path],
+        back_paths: Sequence[Path],
+    ) -> tuple[list[dict[str, Any]], tuple[Path, ...], tuple[Path, ...]] | None:
+        if "template_inventory" not in manifest:
+            return None
+        inventory = manifest["template_inventory"]
+        if not isinstance(inventory, list):
+            raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+        paths_by_direction = {
+            "front": {path.name: path for path in front_paths},
+            "back": {path.name: path for path in back_paths},
+        }
+        expected = {
+            (direction, filename)
+            for direction, paths in paths_by_direction.items()
+            for filename in paths
+        }
+        seen: set[tuple[str, str]] = set()
+        ordered_paths: dict[str, list[Path]] = {"front": [], "back": []}
+        validated: list[dict[str, Any]] = []
+        required = {"template_id", "direction", "filename", "source", "added_at"}
+        for item in inventory:
+            if not isinstance(item, dict) or not required.issubset(item):
+                raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+            template_id = item["template_id"]
+            direction = item["direction"]
+            filename = item["filename"]
+            source = item["source"]
+            added_at = item["added_at"]
+            if (
+                not isinstance(direction, str)
+                or direction not in {"front", "back"}
+                or not isinstance(filename, str)
+                or not filename
+                or Path(filename).name != filename
+                or any(separator in filename for separator in ("/", "\\"))
+                or not isinstance(template_id, str)
+                or template_id != f"{direction}:{filename}"
+                or not isinstance(source, str)
+                or not source
+                or (added_at is not None and (not isinstance(added_at, str) or not added_at))
+            ):
+                raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+            key = (direction, filename)
+            if key in seen or key not in expected:
+                raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+            seen.add(key)
+            ordered_paths[direction].append(paths_by_direction[direction][filename])
+            validated.append(deepcopy(item))
+        if seen != expected:
+            raise InvalidTemplateSetError(f"Invalid template_inventory: {manifest_path}")
+        return validated, tuple(ordered_paths["front"]), tuple(ordered_paths["back"])
+
+    @staticmethod
     def _record_from_root(root: Path) -> WorkpieceRecord:
         manifest_path = root / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -155,14 +268,24 @@ class WorkpieceLibrary:
         name = _validate_name(manifest["name"])
         if record_id != root.name or manifest.get("labels") != {"0": "front", "1": "back"}:
             raise InvalidTemplateSetError(f"Invalid manifest: {manifest_path}")
+        front_paths = tuple(sorted((root / "0").iterdir(), key=lambda path: path.name.casefold()))
+        back_paths = tuple(sorted((root / "1").iterdir(), key=lambda path: path.name.casefold()))
+        inventory = WorkpieceLibrary._validated_template_inventory(
+            manifest_path,
+            manifest,
+            front_paths,
+            back_paths,
+        )
+        if inventory is not None:
+            _, front_paths, back_paths = inventory
         seen_images: dict[str, Path] = {}
         front = _validate_images(
-            sorted((root / "0").iterdir(), key=lambda path: path.name.casefold()),
+            front_paths,
             "front",
             seen_images,
         )
         back = _validate_images(
-            sorted((root / "1").iterdir(), key=lambda path: path.name.casefold()),
+            back_paths,
             "back",
             seen_images,
         )
@@ -206,6 +329,46 @@ class WorkpieceLibrary:
             copied.append(destination)
             if on_image is not None:
                 on_image(index + 1, len(paths))
+        return tuple(copied)
+
+    @staticmethod
+    def _inventory_entries(
+        front_images: Sequence[Path],
+        back_images: Sequence[Path],
+        *,
+        source: str,
+        added_at: str | None,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "template_id": f"{direction}:{path.name}",
+                "direction": direction,
+                "filename": path.name,
+                "source": source,
+                "added_at": added_at,
+            }
+            for direction, paths in (("front", front_images), ("back", back_images))
+            for path in paths
+        ]
+
+    @staticmethod
+    def _copy_appended_templates(
+        paths: Sequence[Path],
+        target: Path,
+        *,
+        start_index: int,
+    ) -> tuple[Path, ...]:
+        copied: list[Path] = []
+        candidate_index = start_index
+        for source in paths:
+            while True:
+                width = max(2, len(str(candidate_index)))
+                destination = target / f"{candidate_index:0{width}d}{source.suffix.lower()}"
+                candidate_index += 1
+                if not destination.exists():
+                    break
+            shutil.copy2(source, destination)
+            copied.append(destination)
         return tuple(copied)
 
     def register(
@@ -301,13 +464,20 @@ class WorkpieceLibrary:
                     }
                 ),
             )
+            created_at = datetime.now(timezone.utc).isoformat()
             manifest = {
                 "schema_version": 1,
                 "id": new_id,
                 "name": display_name,
                 "labels": {"0": "front", "1": "back"},
                 "template_counts": {"front": len(front), "back": len(back)},
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": created_at,
+                "template_inventory": self._inventory_entries(
+                    staged_front,
+                    staged_back,
+                    source="initial_registration",
+                    added_at=created_at,
+                ),
                 "revision": 1,
                 "state": "active",
             }
@@ -316,11 +486,13 @@ class WorkpieceLibrary:
             )
             report({"phase": "features", "completed": 0, "total": total})
 
-            def cache_progress(label: str, completed: int, side_total: int) -> None:
-                offset = len(front) if label == "back" else 0
-                report({"phase": "features", "completed": offset + completed, "total": total})
-
-            cache = build_cache(staged_front, staged_back, cache_progress)
+            cache = _call_cache_builder(
+                build_cache,
+                staged_front,
+                staged_back,
+                _adapt_cache_progress(report, front_count=len(front), total=total),
+                library_revision=1,
+            )
             report({"phase": "committing", "completed": total, "total": total})
             if existing is not None:
                 backup_root = self.library_dir / f".backup-{uuid.uuid4().hex}"
@@ -359,6 +531,7 @@ class WorkpieceLibrary:
         *,
         operation_id: str,
         progress_callback: ProgressCallback | None = None,
+        source: str = "manual_append",
     ) -> PreparedTemplateUpdate:
         """Build a complete append candidate without mutating the active record."""
         if not isinstance(operation_id, str) or not operation_id:
@@ -405,16 +578,28 @@ class WorkpieceLibrary:
             _image_fingerprint(read_color_image(path))
             for path in (*new_front, *new_back)
         )
+        old_inventory = self.get_template_inventory(base_record.id)
         staging = self.library_dir / f".staging-{uuid.uuid4().hex}"
         try:
             report({"phase": "copying", "completed": 0, "total": total})
             shutil.copytree(base_record.root, staging)
-            shutil.rmtree(staging / "0")
-            shutil.rmtree(staging / "1")
             (staging / TEMPLATE_CACHE_FILE_NAME).unlink(missing_ok=True)
-            staged_front = self._copy_templates(all_front, staging / "0")
-            staged_back = self._copy_templates(all_back, staging / "1")
+            staged_existing_front = tuple(staging / "0" / path.name for path in base_record.front_images)
+            staged_existing_back = tuple(staging / "1" / path.name for path in base_record.back_images)
+            staged_new_front = self._copy_appended_templates(
+                new_front,
+                staging / "0",
+                start_index=len(base_record.front_images),
+            )
+            staged_new_back = self._copy_appended_templates(
+                new_back,
+                staging / "1",
+                start_index=len(base_record.back_images),
+            )
+            staged_front = staged_existing_front + staged_new_front
+            staged_back = staged_existing_back + staged_new_back
             manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
+            updated_at = datetime.now(timezone.utc).isoformat()
             manifest.update(
                 {
                     "schema_version": max(3, int(manifest.get("schema_version", 1))),
@@ -424,7 +609,13 @@ class WorkpieceLibrary:
                     "template_counts": {"front": len(all_front), "back": len(all_back)},
                     "revision": base_record.revision + 1,
                     "state": "active",
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": updated_at,
+                    "template_inventory": old_inventory + self._inventory_entries(
+                        staged_new_front,
+                        staged_new_back,
+                        source=source,
+                        added_at=updated_at,
+                    ),
                     "last_template_update": {
                         "operation_id": operation_id,
                         "base_revision": base_record.revision,
@@ -438,11 +629,13 @@ class WorkpieceLibrary:
             )
             report({"phase": "features", "completed": 0, "total": total})
 
-            def cache_progress(label: str, completed: int, side_total: int) -> None:
-                offset = len(all_front) if label == "back" else 0
-                report({"phase": "features", "completed": offset + completed, "total": total})
-
-            cache = build_cache(staged_front, staged_back, cache_progress)
+            cache = _call_cache_builder(
+                build_cache,
+                staged_front,
+                staged_back,
+                _adapt_cache_progress(report, front_count=len(all_front), total=total),
+                library_revision=base_record.revision + 1,
+            )
             staged_record = WorkpieceRecord(
                 base_record.id,
                 base_record.name,
@@ -539,6 +732,7 @@ class WorkpieceLibrary:
         *,
         operation_id: str | None = None,
         progress_callback: ProgressCallback | None = None,
+        source: str = "manual_append",
     ) -> tuple[WorkpieceRecord, TemplateCache]:
         """Compatibility wrapper around prepare, commit, and retired cleanup."""
         prepared = self.prepare_append(
@@ -548,6 +742,7 @@ class WorkpieceLibrary:
             build_cache,
             operation_id=operation_id or uuid.uuid4().hex,
             progress_callback=progress_callback,
+            source=source,
         )
         try:
             record, retired = self.commit_prepared(prepared)
@@ -598,7 +793,13 @@ class WorkpieceLibrary:
                     except Exception as exc:
                         LOGGER.warning("Ignoring invalid template cache for %s: %s", root, exc)
                 if cache is None:
-                    cache = build_cache(record.front_images, record.back_images, None)
+                    cache = _call_cache_builder(
+                        build_cache,
+                        record.front_images,
+                        record.back_images,
+                        None,
+                        library_revision=record.revision,
+                    )
                     if cache_saver is not None:
                         try:
                             cache_saver(record, cache)
@@ -628,6 +829,30 @@ class WorkpieceLibrary:
             {"id": record.id, "name": record.name}
             for record in sorted(self._records.values(), key=lambda item: item.name.casefold())
         ]
+
+    def get_workpiece_metadata(self, workpiece_id: str) -> dict[str, Any]:
+        record = self._records[workpiece_id]
+        manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
+        return {"updated_at": manifest.get("updated_at") or manifest.get("created_at")}
+
+    def get_template_inventory(self, workpiece_id: str) -> list[dict[str, Any]]:
+        record = self._records[workpiece_id]
+        manifest_path = record.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        inventory = self._validated_template_inventory(
+            manifest_path,
+            manifest,
+            tuple((record.root / "0").iterdir()),
+            tuple((record.root / "1").iterdir()),
+        )
+        if inventory is not None:
+            return inventory[0]
+        return self._inventory_entries(
+            record.front_images,
+            record.back_images,
+            source="initial_registration",
+            added_at=manifest.get("created_at"),
+        )
 
     def get(self, workpiece_id: str) -> WorkpieceRecord:
         return self._records[workpiece_id]

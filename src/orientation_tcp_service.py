@@ -3,18 +3,126 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 import math
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 import threading
 import time
 from typing import Any, Callable, Mapping
+
+_WINDOWS_DLL_DIRECTORY_HANDLES: list[Any] = []
+
+
+def _windows_short_path(path: Path) -> Path | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
+        if length <= 0 or length >= len(buffer):
+            return None
+        value = buffer.value
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError:
+            return None
+        return Path(value)
+    except (AttributeError, OSError):
+        return None
+
+
+def _prepare_windows_frozen_import_path() -> None:
+    """Prefer the 8.3 runtime root when a frozen app is deeply installed.
+
+    NumPy extension imports are resolved from ``sys._MEIPASS``.  Even with a
+    long-path-aware manifest, some Windows extension loaders still reject a
+    fully-qualified ``.pyd`` path longer than ``MAX_PATH``.  A short 8.3 alias
+    points at the same onedir tree and lets the loader open the extension
+    without copying or changing the package layout.
+    """
+
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    runtime_root = Path(sys.executable).resolve().parent
+    short_root = _windows_short_path(runtime_root)
+    if short_root is None:
+        return
+    # Do not call ``Path.resolve`` on the short alias here: Windows resolves
+    # an 8.3 spelling back to its long canonical spelling, which would make a
+    # useful alias look identical and silently disable the workaround.
+    if os.path.normcase(os.path.abspath(str(short_root))) == os.path.normcase(
+        os.path.abspath(str(runtime_root))
+    ):
+        return
+    short_value = str(short_root)
+    setattr(sys, "_MEIPASS", short_value)
+    runtime_value = os.path.normcase(os.path.abspath(str(runtime_root)))
+    rewritten: list[str] = []
+    for entry in sys.path:
+        try:
+            value = os.path.normcase(os.path.abspath(str(entry)))
+        except (OSError, TypeError, ValueError):
+            value = ""
+        if value == runtime_value:
+            continue
+        rewritten.append(entry)
+    sys.path[:] = [short_value, *rewritten]
+
+
+def _add_windows_dll_directory(path: Path, seen: set[str]) -> None:
+    selected = _windows_short_path(path) or path
+    key = str(selected).casefold()
+    if key in seen:
+        return
+    handle = os.add_dll_directory(str(selected))
+    # ``os.add_dll_directory`` unregisters the path when its handle is
+    # garbage-collected.  Keep the handles alive for the lifetime of the
+    # frozen service so extension modules can resolve their dependencies.
+    _WINDOWS_DLL_DIRECTORY_HANDLES.append(handle)
+    os.environ["PATH"] = str(selected) + os.pathsep + os.environ.get("PATH", "")
+    seen.add(key)
+
+
+def _prepare_windows_numpy_dll_path() -> None:
+    """Expose the frozen backend runtime directories before importing NumPy.
+
+    When the packaged service is launched from a long or non-ASCII install
+    path, the Windows loader can fail to resolve NumPy's extension DLLs unless
+    the frozen runtime directories are visible ahead of the first ``numpy``
+    import.  Keep this narrow to the bundled runtime trees used by the frozen
+    backend.
+    """
+
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    runtime_root = Path(sys.executable).resolve().parent
+    seen: set[str] = set()
+    for candidate in (
+        runtime_root,
+        runtime_root / "_internal",
+        runtime_root / "_internal" / "numpy" / ".libs",
+        runtime_root / "_internal" / "paddle" / "libs",
+        # Keep compatibility with older/custom collectors that flatten these
+        # directories beside the package trees.
+        runtime_root / "_internal" / "numpy.libs",
+        runtime_root / "_internal" / "paddle.libs",
+        runtime_root / "_internal" / "cv2",
+    ):
+        if candidate.is_dir():
+            _add_windows_dll_directory(candidate, seen)
+
+
+_prepare_windows_frozen_import_path()
+_prepare_windows_numpy_dll_path()
 
 # Qt launches this file by path. Add the repository root for that entrypoint
 # so absolute ``src.*`` imports work both by file path and by ``python -m``.
@@ -22,14 +130,22 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.orientation_classifier import (
+    COMPUTE_DEVICES,
+    DEFAULT_COMPUTE_DEVICE,
+    DEFAULT_INFERENCE_MODE,
     DEFAULT_LOCAL_SEARCH_MODE,
+    ComputeDeviceError,
     ImageUnreadableError,
+    INFERENCE_MODES,
     LOCAL_SEARCH_MODES,
+    ModelFingerprintError,
     OrientationClassifier,
     OrientationClassifierError,
     PropagationModelError,
     WorkpieceNotFoundError,
 )
+from src.runtime_data import RuntimeDataError, legacy_runtime_data, prepare_runtime_data
+from src.windows_parent_watchdog import start_parent_watchdog
 from src.workpiece_library import (
     FeatureBuildError,
     InvalidTemplateSetError,
@@ -78,17 +194,90 @@ GEOMETRY_ERROR_CODES = {
     GeometryContextMismatchError: "GEOMETRY_CONTEXT_MISMATCH",
     GeometryCacheRevisionMismatchError: "PROFILE_CACHE_REVISION_MISMATCH",
 }
+FAST_HARD_ERROR_CODES = {
+    "FAST_CACHE_NOT_READY",
+    "FAST_CACHE_REVISION_MISMATCH",
+    "FAST_CACHE_BUILD_FAILED",
+    "FAST_FEATURE_INVALID",
+    "FAST_CACHE_CAPABILITY_UNAVAILABLE",
+}
+STARTUP_PHASE_ORDER = {
+    "loading_runtime": 0,
+    "preparing_data": 1,
+    "loading_model": 2,
+    "restoring_library": 3,
+    "ready": 4,
+}
+STARTUP_ERROR_ACTIONS = {
+    "MODEL_LOAD_FAILED": "检查模型文件和后端依赖是否完整，然后重启程序",
+    "MODEL_FINGERPRINT_MISMATCH": "恢复本版本随附的完整模型目录，然后重启程序",
+    "GPU_UNAVAILABLE": "确认 NVIDIA 显卡和兼容驱动可用；无 NVIDIA GPU 时请改用 CPU 版",
+    "DEVICE_MISMATCH": "关闭程序，确认安装包版本与计算设备一致后重新启动",
+    "RUNTIME_SELF_CHECK_FAILED": "检查对应版本运行库和驱动，保留日志并联系技术支持",
+    "DATA_DIRECTORY_NOT_WRITABLE": "将程序解压到当前用户可写目录，确认 data 未被占用后重启",
+    "DATA_VERSION_UNSUPPORTED": "使用支持该 data 版本的软件，或恢复兼容备份",
+    "DATA_LAYOUT_AMBIGUOUS": "备份 data 后移除无法识别的文件，禁止合并两个非空 data",
+    "DATA_MIGRATION_FAILED": "保留现有 data 和自动备份，查看日志后重试或联系技术支持",
+    "FAST_CACHE_BUILD_FAILED": "保留工件库并重启；仍失败时查看日志并重新建立该工件缓存",
+}
+DEFAULT_STARTUP_ERROR_ACTION = "查看后端日志并联系技术支持"
 
 
-def configure_diagnostic_logging(library_dir: Path) -> logging.Handler:
-    """Persist backend diagnostics next to the workpiece library.
+def _prefixed_fast_error_code(error: object) -> str | None:
+    code = str(error).partition(":")[0].strip()
+    return code if code in FAST_HARD_ERROR_CODES else None
+
+
+def _diagnostic_log_series(handler: TimedRotatingFileHandler) -> list[Path]:
+    log_path = Path(handler.baseFilename)
+    backup_prefix = f"{log_path.name}."
+    files = []
+    for child in log_path.parent.iterdir():
+        if child.is_symlink() or not child.is_file():
+            continue
+        if child.name == log_path.name:
+            files.append(child)
+            continue
+        if not child.name.startswith(backup_prefix):
+            continue
+        suffix = child.name[len(backup_prefix):]
+        if handler.extMatch.fullmatch(suffix):
+            files.append(child)
+    return files
+
+
+def _prune_diagnostic_logs(
+    handler: TimedRotatingFileHandler,
+    maximum_bytes: int = 30 * 1024 * 1024,
+) -> None:
+    log_path = Path(handler.baseFilename)
+    backups = sorted(path for path in _diagnostic_log_series(handler) if path != log_path)
+    excess = max(0, len(backups) - handler.backupCount)
+    for path in backups[:excess]:
+        path.unlink()
+
+    files = []
+    total = 0
+    for path in _diagnostic_log_series(handler):
+        stat = path.stat()
+        files.append((stat.st_mtime_ns, path, stat.st_size))
+        total += stat.st_size
+    for _modified, path, size in sorted(files):
+        if total <= maximum_bytes:
+            break
+        path.unlink()
+        total -= size
+
+
+def configure_diagnostic_logging(logs_dir: Path) -> logging.Handler:
+    """Persist rotating backend diagnostics in the exact supplied log directory.
 
     The handler is marked so repeated startup/configuration calls replace only
     this service's handler and leave application/test handlers untouched.
     """
-    diagnostics_dir = Path(library_dir) / "diagnostics"
-    diagnostics_dir.mkdir(parents=True, exist_ok=True)
-    log_path = (diagnostics_dir / "orientation-service.log").resolve()
+    logs_dir = Path(logs_dir).resolve()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "orientation-service.log"
     root_logger = logging.getLogger()
     for existing in list(root_logger.handlers):
         if not getattr(existing, "_workpiece_orientation_diagnostic", False):
@@ -99,11 +288,26 @@ def configure_diagnostic_logging(library_dir: Path) -> logging.Handler:
         root_logger.removeHandler(existing)
         existing.close()
 
-    handler = RotatingFileHandler(
+    retention_probe = TimedRotatingFileHandler(
         log_path,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=3,
+        when="midnight",
+        interval=1,
+        backupCount=14,
         encoding="utf-8",
+        utc=False,
+        delay=True,
+    )
+    try:
+        _prune_diagnostic_logs(retention_probe)
+    finally:
+        retention_probe.close()
+    handler = TimedRotatingFileHandler(
+        log_path,
+        when="midnight",
+        interval=1,
+        backupCount=14,
+        encoding="utf-8",
+        utc=False,
     )
     handler._workpiece_orientation_diagnostic = True
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
@@ -141,6 +345,16 @@ class ProtocolError(RuntimeError):
 @dataclass(frozen=True)
 class RuntimeSnapshot:
     status: str
+    phase: str = "loading_runtime"
+    message: str = "正在加载运行环境"
+    progress: int = 5
+    package_version: str = "dev"
+    edition: str = "dev"
+    compute_device: str = "gpu"
+    model_fingerprint: str = ""
+    instance_token: str = "external"
+    error_action: str = ""
+    log_path: str = ""
     classifier: Any | None = None
     library: Any | None = None
     error_code: str | None = None
@@ -150,55 +364,153 @@ class RuntimeSnapshot:
     geometry_profiles: Any | None = None
 
 
+def _shutdown_runtime_components(
+    catalog: Any | None,
+    evolution: Any | None,
+    geometry_profiles: Any | None,
+) -> None:
+    for name, component in (
+        ("fast cache jobs", catalog),
+        ("template evolution", evolution),
+        ("geometry profiles", geometry_profiles),
+    ):
+        shutdown = getattr(component, "shutdown", None)
+        if not callable(shutdown):
+            continue
+        try:
+            shutdown()
+        except Exception:
+            LOGGER.exception("Unable to shut down %s", name)
+
+
 class ServiceRuntime:
     """Thread-safe model lifecycle state shared by the TCP dispatcher and loader."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        package_version: str = "dev",
+        edition: str = "dev",
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        model_fingerprint: str = "",
+        instance_token: str = "external",
+        log_path: str = "",
+    ) -> None:
         self._lock = threading.RLock()
-        self._snapshot = RuntimeSnapshot(status="loading")
+        self._snapshot = RuntimeSnapshot(
+            status="loading",
+            package_version=package_version,
+            edition=edition,
+            compute_device=compute_device,
+            model_fingerprint=model_fingerprint,
+            instance_token=instance_token,
+            log_path=log_path,
+        )
+        self._shutdown_requested = False
 
     def snapshot(self) -> RuntimeSnapshot:
         with self._lock:
             return self._snapshot
 
-    def set_ready(self, classifier: Any, library: Any, catalog: Any | None = None) -> None:
-        resolved_catalog = catalog or WorkpieceCatalog(library, classifier)
-        evolution = None
-        library_dir = getattr(library, "library_dir", None)
-        geometry_profiles = getattr(resolved_catalog, "geometry_profiles", None)
-        if geometry_profiles is None and library_dir is not None:
-            geometry_profiles = GeometryMaskProfiles(
-                resolved_catalog,
-                getattr(classifier, "geometry_calibrator", None),
-                storage_dir=Path(library_dir) / ".geometry-mask-jobs",
-                start_worker=False,
-            )
-            setter = getattr(resolved_catalog, "set_geometry_profiles", None)
-            if callable(setter):
-                setter(geometry_profiles)
-        if library_dir is not None:
-            evolution = TemplateEvolution(
-                resolved_catalog,
-                Path(library_dir) / ".evolution",
-                geometry_profiles=geometry_profiles,
-                start_worker=False,
-            )
+    def request_shutdown(self) -> RuntimeSnapshot:
         with self._lock:
-            self._snapshot = RuntimeSnapshot(
-                status="ready", classifier=classifier, library=library,
-                catalog=resolved_catalog, evolution=evolution, geometry_profiles=geometry_profiles,
+            self._shutdown_requested = True
+            return self._snapshot
+
+    def update_loading(self, phase: str, message: str, progress: int) -> None:
+        if phase not in STARTUP_PHASE_ORDER:
+            raise ValueError(f"unknown loading phase: {phase}")
+        if not 0 <= progress < 100:
+            raise ValueError("loading progress must be between 0 and 99")
+        with self._lock:
+            if self._snapshot.status != "loading" or self._shutdown_requested:
+                return
+            if STARTUP_PHASE_ORDER[phase] < STARTUP_PHASE_ORDER[self._snapshot.phase]:
+                return
+            if progress < self._snapshot.progress:
+                return
+            self._snapshot = replace(
+                self._snapshot,
+                phase=phase,
+                message=message,
+                progress=progress,
             )
-        for worker in (geometry_profiles, evolution):
-            start = getattr(worker, "start", None)
-            if callable(start):
-                start()
+
+    def set_ready(self, classifier: Any, library: Any, catalog: Any | None = None) -> bool:
+        owns_catalog = catalog is None
+        resolved_catalog = None
+        owns_geometry_profiles = False
+        evolution = None
+        geometry_profiles = None
+        transferred = False
+        try:
+            resolved_catalog = catalog if catalog is not None else WorkpieceCatalog(library, classifier)
+            library_dir = getattr(library, "library_dir", None)
+            geometry_profiles = getattr(resolved_catalog, "geometry_profiles", None)
+            if geometry_profiles is None and library_dir is not None:
+                geometry_profiles = GeometryMaskProfiles(
+                    resolved_catalog,
+                    getattr(classifier, "geometry_calibrator", None),
+                    storage_dir=Path(library_dir) / ".geometry-mask-jobs",
+                    start_worker=False,
+                )
+                owns_geometry_profiles = True
+                setter = getattr(resolved_catalog, "set_geometry_profiles", None)
+                if callable(setter):
+                    setter(geometry_profiles)
+            with self._lock:
+                if self._shutdown_requested:
+                    return False
+            if library_dir is not None:
+                evolution = TemplateEvolution(
+                    resolved_catalog,
+                    Path(library_dir) / ".evolution",
+                    geometry_profiles=geometry_profiles,
+                    start_worker=False,
+                )
+            with self._lock:
+                if self._shutdown_requested:
+                    return False
+                previous_snapshot = self._snapshot
+                self._snapshot = replace(
+                    self._snapshot,
+                    status="ready",
+                    phase="ready",
+                    message="后端已就绪",
+                    progress=100,
+                    compute_device=getattr(classifier, "compute_device", self._snapshot.compute_device),
+                    model_fingerprint=getattr(classifier, "model_fingerprint", self._snapshot.model_fingerprint),
+                    classifier=classifier,
+                    library=library,
+                    catalog=resolved_catalog, evolution=evolution, geometry_profiles=geometry_profiles,
+                )
+                try:
+                    for worker in (geometry_profiles, evolution):
+                        start = getattr(worker, "start", None)
+                        if callable(start):
+                            start()
+                except Exception:
+                    self._snapshot = previous_snapshot
+                    raise
+                transferred = True
+            return True
+        finally:
+            if not transferred:
+                _shutdown_runtime_components(
+                    resolved_catalog if owns_catalog else None,
+                    evolution,
+                    geometry_profiles if owns_geometry_profiles else None,
+                )
 
     def set_failed(self, code: str, message: str) -> None:
         with self._lock:
-            self._snapshot = RuntimeSnapshot(
+            self._snapshot = replace(
+                self._snapshot,
                 status="failed",
+                message=message or "模型加载失败",
                 error_code=code,
                 error_message=message or "模型加载失败",
+                error_action=STARTUP_ERROR_ACTIONS.get(code, DEFAULT_STARTUP_ERROR_ACTION),
             )
 
 
@@ -260,6 +572,38 @@ class OrientationCommandDispatcher:
     def _error(cls, request_id: object, code: str, message: str) -> dict[str, object]:
         return cls._response(request_id, ok=False, error={"code": code, "message": message})
 
+    @classmethod
+    def _fast_prediction_error(
+        cls,
+        request_id: object,
+        catalog: Any,
+        workpiece_id: str,
+        exc: BaseException,
+    ) -> dict[str, object] | None:
+        code = _prefixed_fast_error_code(exc)
+        if code != "FAST_CACHE_NOT_READY":
+            return None if code is None else cls._error(request_id, code, str(exc))
+
+        status = None
+        status_reader = getattr(catalog, "fast_cache_status", None)
+        if callable(status_reader):
+            try:
+                status = status_reader(workpiece_id)
+            except Exception:
+                LOGGER.debug("Unable to read fast cache status after prediction failure", exc_info=True)
+        if isinstance(status, Mapping):
+            status_error = status.get("error")
+            status_code = _prefixed_fast_error_code(status_error) if status_error else None
+            if status_code == "FAST_CACHE_CAPABILITY_UNAVAILABLE":
+                return cls._error(request_id, status_code, str(status_error))
+            if status.get("state") == "failed":
+                return cls._error(
+                    request_id,
+                    "FAST_CACHE_BUILD_FAILED",
+                    str(status_error or exc),
+                )
+        return cls._error(request_id, code, str(exc))
+
     def dispatch(
         self,
         request: Mapping[str, object],
@@ -278,38 +622,55 @@ class OrientationCommandDispatcher:
         runtime = self.runtime.snapshot()
         try:
             if command == "hello":
+                hello = {
+                    "service": SERVICE_NAME,
+                    "ready": runtime.status == "ready",
+                    "status": runtime.status,
+                    "phase": runtime.phase,
+                    "message": runtime.message,
+                    "progress": runtime.progress,
+                    "package_version": runtime.package_version,
+                    "edition": runtime.edition,
+                    "compute_device": runtime.compute_device,
+                    "model_fingerprint": runtime.model_fingerprint,
+                    "instance_token": runtime.instance_token,
+                    "error_action": runtime.error_action,
+                    "log_path": runtime.log_path,
+                }
                 if runtime.status == "loading":
-                    return self._response(
-                        request_id,
-                        ok=True,
-                        service=SERVICE_NAME,
-                        ready=False,
-                        status="loading",
-                        message="模型加载中",
-                    )
+                    return self._response(request_id, ok=True, **hello)
                 if runtime.status == "failed":
                     return self._response(
                         request_id,
                         ok=False,
-                        service=SERVICE_NAME,
-                        ready=False,
-                        status="failed",
+                        **hello,
                         error={
                             "code": runtime.error_code or "MODEL_LOAD_FAILED",
                             "message": runtime.error_message or "模型加载失败",
                         },
                     )
-                return self._response(
-                    request_id,
-                    ok=True,
-                    service=SERVICE_NAME,
-                    ready=True,
-                )
+                return self._response(request_id, ok=True, **hello)
             if command == "list_workpieces":
                 if runtime.status != "ready":
                     return self._runtime_error(request_id, runtime)
                 catalog = runtime.catalog or WorkpieceCatalog(runtime.library, runtime.classifier)
-                return self._response(request_id, ok=True, workpieces=catalog.list_workpieces())
+                return self._response(request_id, ok=True, workpieces=catalog.list_workpiece_summaries())
+            if command == "get_workpiece_details":
+                if runtime.status != "ready":
+                    return self._runtime_error(request_id, runtime)
+                workpiece_id = request.get("workpiece_id")
+                if not isinstance(workpiece_id, str) or not workpiece_id.strip():
+                    return self._error(
+                        request_id,
+                        "INVALID_REQUEST",
+                        "workpiece_id must be a non-empty string",
+                    )
+                catalog = runtime.catalog or WorkpieceCatalog(runtime.library, runtime.classifier)
+                return self._response(
+                    request_id,
+                    ok=True,
+                    workpiece=catalog.get_workpiece_details(workpiece_id),
+                )
             if command == "list_recycled_workpieces":
                 if runtime.status != "ready":
                     return self._runtime_error(request_id, runtime)
@@ -623,6 +984,23 @@ class OrientationCommandDispatcher:
                     replace,
                     progress_callback=progress_callback if progress_events else None,
                 )
+                fast_status_reader = getattr(catalog, "fast_cache_status", None)
+                fast_status = fast_status_reader(record.id) if callable(fast_status_reader) else {}
+                response_cache = cache
+                if isinstance(fast_status, Mapping) and fast_status.get("state") == "ready":
+                    capture_snapshot = getattr(catalog, "capture_snapshot", None)
+                    if callable(capture_snapshot):
+                        current = capture_snapshot(record.id)
+                        if getattr(current.record, "revision", None) == record.revision:
+                            response_cache = current.cache
+                fast_runtime = getattr(response_cache, "fast_runtime", None)
+                if isinstance(response_cache, Mapping):
+                    fast_runtime = response_cache.get("fast_runtime")
+                fast_cache_revision = getattr(fast_runtime, "cache_revision", None)
+                training_summary = getattr(fast_runtime, "training_summary", None)
+                if isinstance(fast_runtime, Mapping):
+                    fast_cache_revision = fast_runtime.get("cache_revision")
+                    training_summary = fast_runtime.get("training_summary")
                 return self._response(
                     request_id,
                     ok=True,
@@ -631,6 +1009,9 @@ class OrientationCommandDispatcher:
                         "front": len(record.front_images),
                         "back": len(record.back_images),
                     },
+                    fast_cache_state=fast_status.get("state") if isinstance(fast_status, Mapping) else None,
+                    fast_cache_revision=fast_cache_revision,
+                    training_summary=training_summary,
                     elapsed_ms=(time.perf_counter() - started) * 1000.0,
                 )
             if command == "predict":
@@ -643,13 +1024,30 @@ class OrientationCommandDispatcher:
                 try:
                     catalog = runtime.catalog or WorkpieceCatalog(runtime.library, runtime.classifier)
                     prediction = catalog.predict(workpiece_id, Path(image_path))
-                except OrientationClassifierError:
-                    raise
                 except Exception as exc:
+                    fast_error = self._fast_prediction_error(
+                        request_id,
+                        catalog,
+                        workpiece_id,
+                        exc,
+                    )
+                    if fast_error is not None:
+                        return fast_error
+                    if isinstance(exc, OrientationClassifierError):
+                        raise
                     LOGGER.exception("Orientation classifier failed")
                     return self._error(request_id, "MODEL_ERROR", str(exc))
                 return self._response(request_id, ok=True, **prediction)
             if command == "shutdown":
+                if (
+                    runtime.instance_token != "external"
+                    and request.get("instance_token") != runtime.instance_token
+                ):
+                    return self._error(
+                        request_id,
+                        "INSTANCE_TOKEN_MISMATCH",
+                        "instance_token does not match this backend instance",
+                    )
                 return self._response(request_id, ok=True)
             return self._error(request_id, "INVALID_REQUEST", f"Unknown command: {command}")
         except WorkpieceExistsError as exc:
@@ -743,6 +1141,12 @@ class OrientationTcpServer:
         self.dispatcher = dispatcher
         self.handshake_timeout_seconds = float(handshake_timeout_seconds)
         self._stop_event = threading.Event()
+        self._shutdown_started = threading.Event()
+        self._shutdown_complete = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._listener_close_lock = threading.Lock()
+        self._listener_closed = False
         self._client_state_lock = threading.Lock()
         self._handshake_in_progress = False
         self._active_client = False
@@ -754,6 +1158,16 @@ class OrientationTcpServer:
             self._listener.close()
             raise ServiceStartupError("PORT_IN_USE", f"cannot bind {host}:{port}: {exc}") from exc
         self.address = self._listener.getsockname()
+
+    def _close_listener_once(self) -> None:
+        with self._listener_close_lock:
+            if self._listener_closed:
+                return
+            self._listener_closed = True
+        try:
+            self._listener.close()
+        except OSError:
+            pass
 
     def _claim_handshake(self) -> bool:
         with self._client_state_lock:
@@ -770,6 +1184,27 @@ class OrientationTcpServer:
     def _release_client(self) -> None:
         with self._client_state_lock:
             self._active_client = False
+
+    def _start_client_handler(self, client: socket.socket) -> bool:
+        try:
+            handler = threading.Thread(
+                target=self._handle_client,
+                args=(client,),
+                daemon=True,
+            )
+        except Exception:
+            client.close()
+            raise
+        try:
+            with self._lifecycle_lock:
+                if not self._shutdown_requested:
+                    handler.start()
+                    return True
+        except Exception:
+            client.close()
+            raise
+        client.close()
+        return False
 
     def _handle_client(self, sock: socket.socket) -> None:
         connection = JsonLineConnection(sock)
@@ -880,60 +1315,104 @@ class OrientationTcpServer:
         }
 
     def serve_forever(self) -> None:
-        self._listener.settimeout(0.2)
-        while not self._stop_event.is_set():
-            try:
-                client, _ = self._listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                if self._stop_event.is_set():
+        try:
+            self._listener.settimeout(0.2)
+            while not self._stop_event.is_set():
+                if self._shutdown_started.is_set():
                     break
-                raise
-            threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
-        self._listener.close()
+                try:
+                    client, _ = self._listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._shutdown_started.is_set():
+                        break
+                    raise
+                if not self._start_client_handler(client):
+                    break
+        finally:
+            self.request_shutdown()
 
     def request_shutdown(self) -> None:
-        self._stop_event.set()
-        runtime = self.dispatcher.runtime.snapshot()
-        if runtime.evolution is not None and hasattr(runtime.evolution, "shutdown"):
-            runtime.evolution.shutdown()
-        profiles = getattr(runtime.catalog, "geometry_profiles", None)
-        if profiles is not None and hasattr(profiles, "shutdown"):
-            profiles.shutdown()
+        with self._lifecycle_lock:
+            if self._shutdown_requested:
+                owns_shutdown = False
+                runtime = None
+            else:
+                runtime = self.dispatcher.runtime.request_shutdown()
+                self._shutdown_requested = True
+                self._shutdown_started.set()
+                owns_shutdown = True
+        if not owns_shutdown:
+            self._shutdown_complete.wait()
+            return
+        assert runtime is not None
         try:
-            self._listener.close()
-        except OSError:
-            pass
+            profiles = runtime.geometry_profiles or getattr(runtime.catalog, "geometry_profiles", None)
+            _shutdown_runtime_components(runtime.catalog, runtime.evolution, profiles)
+        finally:
+            self._stop_event.set()
+            try:
+                self._close_listener_once()
+            finally:
+                self._shutdown_complete.set()
 
 
 def _load_runtime(
     runtime: ServiceRuntime,
     project_root: Path,
     model_dir: Path,
-    library_dir: Path,
+    library_dir: Path | None,
     local_search_mode: str = DEFAULT_LOCAL_SEARCH_MODE,
+    inference_mode: str = DEFAULT_INFERENCE_MODE,
+    *,
+    data_root: Path | None = None,
+    paddle_config_path: Path | None = None,
+    compute_device: str = DEFAULT_COMPUTE_DEVICE,
+    model_sha256: str | None = None,
 ) -> None:
+    catalog = None
+    profiles = None
+    transferred = False
     try:
+        runtime.update_loading("preparing_data", "正在检查数据目录", 15)
+        if data_root is not None:
+            paths = prepare_runtime_data(data_root)
+        elif library_dir is not None:
+            paths = legacy_runtime_data(library_dir)
+        else:
+            raise RuntimeDataError("DATA_LAYOUT_AMBIGUOUS", "No runtime data path was provided")
+        runtime.update_loading("loading_model", "正在加载 PP-ShiTu 模型", 35)
         classifier = OrientationClassifier.load(
             project_root,
             model_dir,
+            paddle_config_path=paddle_config_path,
+            compute_device=compute_device,
+            expected_model_fingerprint=model_sha256,
             local_search_mode=local_search_mode,
+            inference_mode=inference_mode,
         )
-        library = WorkpieceLibrary(library_dir)
+        runtime.update_loading("restoring_library", "正在恢复工件库和快速缓存", 80)
+        library = WorkpieceLibrary(paths.workpieces)
         catalog = WorkpieceCatalog(library, classifier)
         profiles = GeometryMaskProfiles(
             catalog,
             getattr(classifier, "geometry_calibrator", None),
-            storage_dir=Path(library_dir) / ".geometry-mask-jobs",
+            storage_dir=paths.workpieces / ".geometry-mask-jobs",
             start_worker=False,
         )
         catalog.set_geometry_profiles(profiles)
         catalog.recover()
-        runtime.set_ready(classifier, library, catalog)
+        transferred = runtime.set_ready(classifier, library, catalog)
+    except (RuntimeDataError, ComputeDeviceError, ModelFingerprintError) as exc:
+        LOGGER.exception("Orientation service startup failed with code %s", exc.code)
+        runtime.set_failed(exc.code, str(exc) or type(exc).__name__)
     except Exception as exc:
         LOGGER.exception("Orientation service model loading failed")
         runtime.set_failed("MODEL_LOAD_FAILED", str(exc) or type(exc).__name__)
+    finally:
+        if not transferred:
+            _shutdown_runtime_components(catalog, None, profiles)
 
 
 def _build_argument_parser() -> argparse.ArgumentParser:
@@ -942,40 +1421,92 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=37651)
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--library-dir", type=Path, required=True)
+    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group.add_argument("--data-root", type=Path)
+    data_group.add_argument("--library-dir", type=Path)
+    parser.add_argument("--paddle-config", type=Path)
+    parser.add_argument("--compute-device", choices=COMPUTE_DEVICES, default=DEFAULT_COMPUTE_DEVICE)
+    parser.add_argument("--model-sha256")
+    parser.add_argument("--package-version", default="dev")
+    parser.add_argument("--edition", default="dev")
+    parser.add_argument("--instance-token", default="external")
+    parser.add_argument("--parent-pid", type=int)
     parser.add_argument(
         "--local-search-mode",
         choices=LOCAL_SEARCH_MODES,
         default=DEFAULT_LOCAL_SEARCH_MODE,
     )
+    parser.add_argument(
+        "--inference-mode",
+        choices=INFERENCE_MODES,
+        default=DEFAULT_INFERENCE_MODE,
+    )
     return parser
+
+
+def _validate_packaged_arguments(args: argparse.Namespace) -> None:
+    if getattr(args, "data_root", None) is None:
+        return
+    instance_token = str(getattr(args, "instance_token", "")).strip()
+    if not instance_token or instance_token == "external":
+        raise SystemExit("INVALID_INSTANCE_TOKEN: packaged startup requires a non-empty instance token")
+    model_sha256 = str(getattr(args, "model_sha256", "") or "")
+    if re.fullmatch(r"[0-9a-f]{64}", model_sha256) is None:
+        raise SystemExit("INVALID_MODEL_SHA256: packaged startup requires a lowercase SHA-256")
 
 
 def main() -> None:
     args = _build_argument_parser().parse_args()
     if args.host != "127.0.0.1":
         raise SystemExit("INVALID_BIND_ADDRESS: only 127.0.0.1 is allowed")
-    configure_diagnostic_logging(args.library_dir)
+    _validate_packaged_arguments(args)
+    data_root = getattr(args, "data_root", None)
+    library_dir = getattr(args, "library_dir", None)
+    if data_root is not None:
+        logs_dir = Path(data_root).resolve() / "logs"
+    else:
+        logs_dir = legacy_runtime_data(library_dir).logs
+    configure_diagnostic_logging(logs_dir)
+    log_path = str((logs_dir / "orientation-service.log").resolve())
     _prepare_windows_torch_dll_path()
-    runtime = ServiceRuntime()
+    runtime = ServiceRuntime(
+        package_version=getattr(args, "package_version", "dev"),
+        edition=getattr(args, "edition", "dev"),
+        compute_device=getattr(args, "compute_device", DEFAULT_COMPUTE_DEVICE),
+        model_fingerprint=getattr(args, "model_sha256", None) or "",
+        instance_token=getattr(args, "instance_token", "external"),
+        log_path=log_path,
+    )
     try:
         server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host=args.host, port=args.port)
     except ServiceStartupError as exc:
         raise SystemExit(f"{exc.code}: {exc.message}") from exc
+    start_parent_watchdog(getattr(args, "parent_pid", None), server.request_shutdown)
     loader = threading.Thread(
         target=_load_runtime,
         args=(
             runtime,
             args.project_root,
             args.model_dir,
-            args.library_dir,
-            args.local_search_mode,
+            library_dir,
         ),
+        kwargs={
+            "data_root": data_root,
+            "paddle_config_path": getattr(args, "paddle_config", None),
+            "compute_device": getattr(args, "compute_device", DEFAULT_COMPUTE_DEVICE),
+            "model_sha256": getattr(args, "model_sha256", None),
+            "local_search_mode": args.local_search_mode,
+            "inference_mode": args.inference_mode,
+        },
         name="orientation-model-loader",
         daemon=True,
     )
     loader.start()
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.request_shutdown()
+        loader.join()
 
 
 if __name__ == "__main__":

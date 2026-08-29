@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>InspectionPage</class>
+ <widget class="QWidget" name="InspectionPage">
+  <property name="pageRoot" stdset="0"><bool>true</bool></property>
+  <layout class="QVBoxLayout" name="inspectionPageLayout">
+   <property name="leftMargin"><number>24</number></property>
+   <property name="topMargin"><number>24</number></property>
+   <property name="rightMargin"><number>24</number></property>
+   <property name="bottomMargin"><number>24</number></property>
+   <property name="spacing"><number>16</number></property>
+   <item>
+    <widget class="QWidget" name="inspectionModeBar">
+     <property name="sizePolicy"><sizepolicy hsizetype="Preferred" vsizetype="Maximum"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy></property>
+     <layout class="QHBoxLayout" name="inspectionModeLayout">
+      <property name="leftMargin"><number>0</number></property>
+      <property name="topMargin"><number>0</number></property>
+      <property name="rightMargin"><number>0</number></property>
+      <property name="bottomMargin"><number>0</number></property>
+      <property name="spacing"><number>8</number></property>
+      <item><widget class="QLabel" name="inspectionModeLabel"><property name="text"><string>检测方式</string></property><property name="sectionHeading" stdset="0"><bool>true</bool></property></widget></item>
+      <item><widget class="QPushButton" name="singleModeButton"><property name="text"><string>单张检测</string></property><property name="checkable"><bool>true</bool></property><property name="checked"><bool>true</bool></property><property name="role" stdset="0"><string>segment</string></property></widget></item>
+      <item><widget class="QPushButton" name="batchModeButton"><property name="text"><string>批量检测</string></property><property name="checkable"><bool>true</bool></property><property name="role" stdset="0"><string>segment</string></property></widget></item>
+      <item><spacer name="inspectionModeSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QSplitter" name="inspectionSplitter">
+     <property name="orientation"><enum>Qt::Horizontal</enum></property>
+     <widget class="QWidget" name="imagePane">
+      <property name="panel" stdset="0"><bool>true</bool></property>
+      <layout class="QVBoxLayout" name="imagePaneLayout">
+       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>16</number></property><property name="spacing"><number>8</number></property>
+       <item><widget class="InspectionImageView" name="inspectionImageView"><property name="minimumSize"><size><width>320</width><height>240</height></size></property></widget></item>
+       <item><widget class="QLabel" name="currentImageLabel"><property name="alignment"><set>Qt::AlignCenter</set></property><property name="text"><string>请选择待测图片或拖放图片到此处</string></property></widget></item>
+       <item>
+        <layout class="QHBoxLayout" name="imageActionsLayout">
+         <item><widget class="QPushButton" name="chooseImageButton"><property name="text"><string>选择待测图片</string></property></widget></item>
+         <item><widget class="QPushButton" name="predictButton"><property name="text"><string>开始检测</string></property></widget></item>
+         <item><widget class="QPushButton" name="zoomOutButton"><property name="text"><string>缩小</string></property></widget></item>
+         <item><widget class="QPushButton" name="zoomInButton"><property name="text"><string>放大</string></property></widget></item>
+         <item><widget class="QPushButton" name="resetViewButton"><property name="text"><string>适应窗口</string></property></widget></item>
+        </layout>
+       </item>
+       <item>
+       <layout class="QHBoxLayout" name="batchButtonLayout">
+         <item><widget class="QPushButton" name="chooseBatchImagesButton"><property name="text"><string>选择批量图片</string></property></widget></item>
+         <item><widget class="QPushButton" name="batchPredictButton"><property name="text"><string>批量检测</string></property></widget></item>
+         <item><widget class="QPushButton" name="stopBatchButton"><property name="text"><string>停止批量检测</string></property></widget></item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="resultPane">
+      <property name="panel" stdset="0"><bool>true</bool></property>
+      <property name="minimumSize"><size><width>440</width><height>0</height></size></property>
+      <layout class="QVBoxLayout" name="resultPaneLayout">
+       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>16</number></property><property name="spacing"><number>8</number></property>
+       <item><widget class="QLabel" name="batchSummaryLabel"><property name="text"><string/></property></widget></item>
+       <item><widget class="QProgressBar" name="batchProgressBar"><property name="value"><number>0</number></property><property name="textVisible"><bool>true</bool></property></widget></item>
+       <item>
+        <layout class="QGridLayout" name="batchFilterLayout">
+         <property name="horizontalSpacing"><number>8</number></property>
+         <property name="verticalSpacing"><number>8</number></property>
+         <item row="0" column="0"><widget class="QPushButton" name="allBatchFilterButton"><property name="text"><string>全部</string></property><property name="checkable"><bool>true</bool></property><property name="checked"><bool>true</bool></property></widget></item>
+         <item row="0" column="1"><widget class="QPushButton" name="needsReviewBatchFilterButton"><property name="text"><string>需复检</string></property><property name="checkable"><bool>true</bool></property></widget></item>
+         <item row="1" column="0"><widget class="QPushButton" name="unprocessedBatchFilterButton"><property name="text"><string>未处理</string></property><property name="checkable"><bool>true</bool></property></widget></item>
+         <item row="1" column="1"><widget class="QPushButton" name="failedBatchFilterButton"><property name="text"><string>失败</string></property><property name="checkable"><bool>true</bool></property></widget></item>
+         </layout>
+       </item>
+       <item>
+        <widget class="QSplitter" name="batchReviewSplitter">
+         <property name="orientation"><enum>Qt::Vertical</enum></property>
+         <property name="childrenCollapsible"><bool>false</bool></property>
+         <widget class="QTableWidget" name="batchResultsTableWidget">
+          <property name="minimumSize"><size><width>0</width><height>140</height></size></property>
+         </widget>
+         <widget class="QWidget" name="resultDetailPane">
+          <layout class="QVBoxLayout" name="resultDetailLayout">
+           <item><widget class="QLabel" name="resultLabel"><property name="text"><string>尚未检测</string></property></widget></item>
+           <item><widget class="QLabel" name="resultMessageLabel"><property name="wordWrap"><bool>true</bool></property><property name="text"><string/></property></widget></item>
+           <item><widget class="QLabel" name="reviewLabel"><property name="messageKind" stdset="0"><string>warning</string></property><property name="text"><string/></property></widget></item>
+           <item>
+            <layout class="QHBoxLayout" name="confirmationActionsLayout">
+             <item><widget class="QPushButton" name="confirmFrontButton"><property name="text"><string>确认正面</string></property></widget></item>
+             <item><widget class="QPushButton" name="confirmBackButton"><property name="text"><string>修正为反面</string></property></widget></item>
+             <item><widget class="QPushButton" name="rejectConfirmationButton"><property name="text"><string>不入库</string></property></widget></item>
+            </layout>
+           </item>
+           <item><widget class="QTextEdit" name="evidenceTextEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumHeight"><number>130</number></property></widget></item>
+           <item>
+            <widget class="QGroupBox" name="rawEvidenceContainer">
+             <property name="title"><string>原始证据详情</string></property>
+             <property name="checkable"><bool>true</bool></property>
+             <property name="checked"><bool>false</bool></property>
+             <layout class="QVBoxLayout" name="rawEvidenceLayout">
+              <item><widget class="QTextEdit" name="rawEvidenceTextEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumHeight"><number>110</number></property></widget></item>
+             </layout>
+            </widget>
+           </item>
+           <item><widget class="QLabel" name="currentResultTargetLabel"><property name="wordWrap"><bool>false</bool></property><property name="text"><string/></property></widget></item>
+          </layout>
+         </widget>
+        </widget>
+       </item>
+       <item><widget class="QLabel" name="recentInspectionTitleLabel"><property name="text"><string>最近检测</string></property><property name="sectionHeading" stdset="0"><bool>true</bool></property></widget></item>
+       <item><widget class="QListWidget" name="recentInspectionList"><property name="maximumHeight"><number>180</number></property><property name="iconSize"><size><width>64</width><height>48</height></size></property></widget></item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>InspectionImageView</class>
+   <extends>QGraphicsView</extends>
+   <header>inspectionimageview.h</header>
+  </customwidget>
+ </customwidgets>
+ <resources/>
+ <connections/>
+</ui>

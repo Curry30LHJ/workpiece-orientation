@@ -12,6 +12,9 @@ QProcessLauncher::QProcessLauncher(QObject *parent)
 }
 
 bool QProcessLauncher::start(const QString &program, const QStringList &arguments, const QString &workingDirectory) {
+    if (process_ == nullptr) return false;
+    process_->setStandardOutputFile(QProcess::nullDevice());
+    process_->setStandardErrorFile(QProcess::nullDevice());
     process_->setProgram(program);
     process_->setArguments(arguments);
     process_->setWorkingDirectory(workingDirectory);
@@ -20,13 +23,28 @@ bool QProcessLauncher::start(const QString &program, const QStringList &argument
 }
 
 void QProcessLauncher::terminate() {
-    process_->terminate();
+    if (process_ != nullptr) process_->terminate();
 }
 
 void QProcessLauncher::kill() {
-    process_->kill();
+    if (process_ != nullptr) process_->kill();
+}
+
+void QProcessLauncher::release() {
+    if (process_ == nullptr) return;
+    QProcess *releasedProcess = process_;
+    process_ = nullptr;
+    QObject::disconnect(releasedProcess, nullptr, this, nullptr);
+    releasedProcess->setParent(nullptr);
+    if (releasedProcess->state() == QProcess::NotRunning) {
+        releasedProcess->deleteLater();
+        return;
+    }
+    connect(releasedProcess,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            releasedProcess, &QObject::deleteLater);
 }
 
 bool QProcessLauncher::isRunning() const {
-    return process_->state() != QProcess::NotRunning;
+    return process_ != nullptr && process_->state() != QProcess::NotRunning;
 }

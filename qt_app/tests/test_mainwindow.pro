@@ -5,24 +5,40 @@ QMAKE_CXXFLAGS += /utf-8
 
 TARGET = test_mainwindow
 SOURCES += test_mainwindow.cpp \
+           ../appheader.cpp \
+           ../apptheme.cpp \
            ../appconfig.cpp \
            ../backendclient.cpp \
            ../backendprocessmanager.cpp \
            ../processlauncher.cpp \
            ../mainwindow.cpp \
+           ../inspectionimageview.cpp \
+           ../inspectionpage.cpp \
+           ../workpiecelibrarypage.cpp \
            ../geometryrulecanvas.cpp \
-           ../geometrymaskmanager.cpp \
+           ../geometryrulespage.cpp \
            ../annotationcanvas.cpp \
            ../annotationmanager.cpp \
-           ../annotationeditor.cpp
-HEADERS += ../appconfig.h \
+           ../annotationeditor.cpp \
+           ../taskstatuswidget.cpp
+HEADERS += ../appheader.h \
+           ../apptheme.h \
+           ../appconfig.h \
            ../backendclient.h \
            ../backendprocessmanager.h \
            ../processlauncher.h \
            ../mainwindow.h \
+           ../inspectiontypes.h \
+           ../inspectionimageview.h \
+           ../inspectionpage.h \
+           ../workpiecelibrarypage.h \
            ../geometryrulecanvas.h \
-           ../geometrymaskmanager.h \
+           ../geometryrulespage.h \
            ../annotationcanvas.h \
            ../annotationmanager.h \
-           ../annotationeditor.h
-FORMS += ../mainwindow.ui
+           ../annotationeditor.h \
+           ../taskstatuswidget.h
+FORMS += ../mainwindow.ui \
+         ../inspectionpage.ui \
+         ../workpiecelibrarypage.ui
+RESOURCES += ../resources.qrc

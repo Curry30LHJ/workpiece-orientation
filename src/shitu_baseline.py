@@ -11,8 +11,28 @@ import numpy as np
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png"}
 
 
-def split_labels(data_dir: Path, template_count: int, seed: int):
-    """Return independently shuffled template and held-out paths for labels 0 and 1."""
+def split_labels(
+    data_dir: Path,
+    template_count: int,
+    seed: int,
+    *,
+    back_template_count: int | None = None,
+):
+    """Return independently shuffled template and held-out paths for labels 0 and 1.
+
+    ``template_count`` remains the shared count used by the original evaluation
+    helpers.  Packaging/smoke callers may provide ``back_template_count`` to
+    exercise an intentionally asymmetric template set without changing the
+    existing positional API.
+    """
+    if int(template_count) <= 0:
+        raise ValueError("template_count must be positive")
+    if back_template_count is not None and int(back_template_count) <= 0:
+        raise ValueError("back_template_count must be positive")
+    counts = {
+        "0": int(template_count),
+        "1": int(template_count if back_template_count is None else back_template_count),
+    }
     templates = {}
     tests = {}
     for label in ("0", "1"):
@@ -20,11 +40,12 @@ def split_labels(data_dir: Path, template_count: int, seed: int):
         if not label_dir.is_dir():
             raise ValueError(f"Missing label directory: {label_dir}")
         paths = sorted(path for path in label_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS)
-        if len(paths) <= template_count:
-            raise ValueError(f"Label {label} needs more than {template_count} images; found {len(paths)}")
+        count = counts[label]
+        if len(paths) <= count:
+            raise ValueError(f"Label {label} needs more than {count} images; found {len(paths)}")
         random.Random(seed).shuffle(paths)
-        templates[label] = paths[:template_count]
-        tests[label] = paths[template_count:]
+        templates[label] = paths[:count]
+        tests[label] = paths[count:]
     return templates, tests
 
 

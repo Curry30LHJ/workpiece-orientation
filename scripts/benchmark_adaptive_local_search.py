@@ -1226,6 +1226,21 @@ def _number(value: Any, digits: int = 2) -> str:
     return f"{float(value):.{digits}f}"
 
 
+def _reproduction_command(args: argparse.Namespace) -> str:
+    command = [
+        str(Path(sys.executable).resolve()),
+        str(Path(__file__).resolve()),
+        "--project-root", str(Path(args.project_root).resolve()),
+        "--model-dir", str(Path(args.model_dir).resolve()),
+        "--library-dir", str(Path(args.library_dir).resolve()),
+        "--m1-workpiece-id", str(args.m1_workpiece_id),
+        "--warmup", str(args.warmup),
+        "--output-json", str(Path(args.output_json).resolve()),
+        "--output-markdown", str(Path(args.output_markdown).resolve()),
+    ]
+    return subprocess.list2cmdline(command)
+
+
 def _render_markdown(report: dict) -> str:
     environment = report.get("environment", {})
     benchmark = report.get("benchmark", {})
@@ -1280,6 +1295,17 @@ def _render_markdown(report: dict) -> str:
         "| 模式 | PID | 端口 | 传输 | 总耗时（ms） |",
         "| --- | ---: | --- | --- | ---: |",
     ]
+    reproduction_command = report.get("reproduction_command")
+    if reproduction_command:
+        environment_index = lines.index("## 环境与可复现信息")
+        lines[environment_index:environment_index] = [
+            "## 精确复现命令",
+            "",
+            "```powershell",
+            str(reproduction_command),
+            "```",
+            "",
+        ]
     for mode in ("exhaustive", "adaptive"):
         worker = report.get("workers", {}).get(mode, {})
         port = worker.get("worker_port")
@@ -1428,6 +1454,7 @@ def _run_parent(args: argparse.Namespace) -> int:
             "workers": {},
             "error": {"type": type(exc).__name__, "message": str(exc)},
         }
+    report["reproduction_command"] = _reproduction_command(args)
     _write_json(output_json, report)
     output_markdown.parent.mkdir(parents=True, exist_ok=True)
     markdown = _render_markdown(report)

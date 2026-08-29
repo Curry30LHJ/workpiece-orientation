@@ -1,12 +1,13 @@
 #pragma once
 
-#include <QDialog>
+#include <QWidget>
 #include <QList>
 #include <QJsonArray>
 #include <QJsonObject>
 
 class QComboBox;
 class QDoubleSpinBox;
+class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -17,22 +18,37 @@ class QTableWidget;
 class QTextEdit;
 class GeometryRuleCanvas;
 
-class GeometryMaskManagerDialog : public QDialog {
+class GeometryRulesPage : public QWidget {
     Q_OBJECT
 
 public:
-    explicit GeometryMaskManagerDialog(QWidget *parent = nullptr);
+    enum ValidationIssueRole {
+        DirectionRole = Qt::UserRole + 1,
+        TemplateIdRole,
+        RuleIdRole,
+        ReasonCodeRole,
+    };
+
+    explicit GeometryRulesPage(QWidget *parent = nullptr);
 
     void setSnapshot(const QJsonObject &snapshot);
+    void reconcileSnapshotKeepingDraft(const QJsonObject &snapshot);
     void setValidationJob(const QJsonObject &job);
     void setBusy(bool busy);
+    void setEditingLocked(bool locked);
+    void setBackendAvailable(bool available, const QString &reason);
     void setPreviewBusy(bool busy);
     void setRulePreview(const QJsonObject &preview);
     void setOperationError(const QString &message);
+    void clearPublishContinuation();
     QJsonObject draft() const { return draft_; }
     QJsonObject snapshot() const { return snapshot_; }
+    bool hasUnsavedChanges() const { return dirty_; }
+    void discardUnsavedChanges();
+    void requestSaveDraft();
 
 signals:
+    void unsavedChangesChanged(bool dirty);
     void snapshotRequested(const QString &workpieceId);
     void saveDraftRequested(const QJsonObject &draft, int libraryRevision, int draftRevision);
     void publishWorkflowRequested(const QJsonObject &draft, int libraryRevision, int draftRevision,
@@ -88,6 +104,7 @@ private:
     void setCurrentCalibration(const QJsonObject &calibration);
     QString calibrationState(const QString &side, const QString &ruleId) const;
     void ensureDirectionObject(const QString &name);
+    void restoreSnapshotDraft();
     void setCurrentRuleFromEditor();
     void loadCurrentRuleIntoEditor();
     QJsonObject currentRule() const;
@@ -96,6 +113,8 @@ private:
     QJsonObject canvasShapeForRule(const QJsonObject &rule) const;
     QJsonObject anchorFromCanvasShape(const QJsonObject &shape) const;
     QJsonObject ruleGeometryFromCanvasShape(const QJsonObject &shape) const;
+    void setDirty(bool dirty);
+    void updateEditingControls();
     void markDraftDirty();
     void applyDraftMutation(const QJsonObject &next);
     void refreshEditor();
@@ -109,11 +128,16 @@ private:
     void selectRuleById(const QString &ruleId);
     void refreshMigrationPanel();
     QJsonObject selectedMigrationConflict() const;
+    void invalidatePublishContinuation(bool clearReason = true);
 
     QJsonObject snapshot_;
     QJsonObject draft_;
     QJsonObject job_;
+    bool warningContinuationAvailable_ = false;
     bool busy_ = false;
+    bool editingLocked_ = false;
+    bool backendAvailable_ = true;
+    QString backendUnavailableReason_;
     bool previewBusy_ = false;
     bool dirty_ = false;
     bool manualAnchorCapture_ = false;
@@ -142,12 +166,12 @@ private:
     QTableWidget *validationTable_ = nullptr;
     QTextEdit *diagnostics_ = nullptr;
     QLabel *validationHintLabel_ = nullptr;
+    QLabel *publishDisabledReasonLabel_ = nullptr;
     QPushButton *saveButton_ = nullptr;
     QPushButton *validateButton_ = nullptr;
     QPushButton *publishButton_ = nullptr;
     QPushButton *publishWorkflowButton_ = nullptr;
     QPushButton *rollbackButton_ = nullptr;
-    QPushButton *cancelButton_ = nullptr;
     QPushButton *setAnchorButton_ = nullptr;
     QPushButton *manualAnchorButton_ = nullptr;
     QPushButton *undoButton_ = nullptr;
@@ -158,6 +182,9 @@ private:
     QPushButton *resolveMigrationButton_ = nullptr;
     QLabel *dirtyLabel_ = nullptr;
     GeometryRuleCanvas *canvas_ = nullptr;
+    QGroupBox *advancedGeometryGroup_ = nullptr;
+    QWidget *advancedGeometryContent_ = nullptr;
+    QWidget *migrationPanel_ = nullptr;
     QList<QJsonObject> undoHistory_;
     QList<QJsonObject> redoHistory_;
     QString editorDirection_;

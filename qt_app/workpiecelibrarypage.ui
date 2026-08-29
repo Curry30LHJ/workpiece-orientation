@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>WorkpieceLibraryPage</class>
+ <widget class="QWidget" name="WorkpieceLibraryPage">
+  <property name="pageRoot" stdset="0"><bool>true</bool></property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <property name="leftMargin"><number>24</number></property>
+   <property name="topMargin"><number>24</number></property>
+   <property name="rightMargin"><number>24</number></property>
+   <property name="bottomMargin"><number>24</number></property>
+   <property name="spacing"><number>16</number></property>
+   <item>
+    <widget class="QSplitter" name="librarySplitter">
+     <property name="orientation"><enum>Qt::Horizontal</enum></property>
+     <widget class="QWidget" name="browserPanel">
+      <property name="panel" stdset="0"><bool>true</bool></property>
+      <layout class="QVBoxLayout" name="browserLayout">
+       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>16</number></property><property name="spacing"><number>8</number></property>
+       <item><widget class="QLabel" name="browserTitleLabel"><property name="text"><string>工件浏览</string></property><property name="sectionHeading" stdset="0"><bool>true</bool></property></widget></item>
+       <item><widget class="QLineEdit" name="librarySearchEdit"><property name="placeholderText"><string>搜索工件名称或编号</string></property></widget></item>
+       <item><widget class="QListWidget" name="libraryWorkpieceList"/></item>
+       <item><widget class="QPushButton" name="setCurrentWorkpieceButton"><property name="text"><string>设为当前检测工件</string></property></widget></item>
+       <item><widget class="QPushButton" name="refreshWorkpiecesButton"><property name="text"><string>刷新工件列表</string></property></widget></item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="contentPanel">
+      <property name="panel" stdset="0"><bool>true</bool></property>
+      <layout class="QVBoxLayout" name="contentLayout">
+       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>16</number></property>
+       <item>
+        <widget class="QTabWidget" name="libraryTabWidget">
+         <widget class="QWidget" name="detailsTab">
+          <attribute name="title"><string>工件详情</string></attribute>
+          <layout class="QVBoxLayout" name="detailsLayout">
+           <item><widget class="QLabel" name="workpieceDetailsSummaryLabel"><property name="text"><string>请选择工件查看详情</string></property></widget></item>
+           <item><widget class="QTableWidget" name="templateDetailsTable">
+            <property name="columnCount"><number>5</number></property>
+            <property name="rowCount"><number>0</number></property>
+            <property name="selectionBehavior"><enum>QAbstractItemView::SelectRows</enum></property>
+            <property name="editTriggers"><set>QAbstractItemView::NoEditTriggers</set></property>
+            <column><property name="text"><string>模板</string></property></column>
+            <column><property name="text"><string>方向</string></property></column>
+            <column><property name="text"><string>来源</string></property></column>
+            <column><property name="text"><string>加入时间</string></property></column>
+            <column><property name="text"><string>状态</string></property></column>
+           </widget></item>
+          </layout>
+         </widget>
+         <widget class="QWidget" name="registrationTab">
+          <attribute name="title"><string>新建 / 覆盖</string></attribute>
+          <layout class="QGridLayout" name="registrationLayout">
+           <item row="0" column="0"><widget class="QLabel" name="nameLabel"><property name="text"><string>工件名称</string></property></widget></item>
+           <item row="0" column="1" colspan="2"><widget class="QLineEdit" name="workpieceNameEdit"/></item>
+           <item row="1" column="0"><widget class="QLabel" name="frontTemplatesLabel"><property name="text"><string>正面已选择 0 张</string></property></widget></item>
+           <item row="1" column="1"><widget class="QPushButton" name="chooseFrontTemplatesButton"><property name="text"><string>选择正面模板</string></property></widget></item>
+           <item row="1" column="2"><widget class="QLabel" name="frontTemplatesFilesLabel"><property name="text"><string/></property></widget></item>
+           <item row="2" column="0"><widget class="QLabel" name="backTemplatesLabel"><property name="text"><string>反面已选择 0 张</string></property></widget></item>
+           <item row="2" column="1"><widget class="QPushButton" name="chooseBackTemplatesButton"><property name="text"><string>选择反面模板</string></property></widget></item>
+           <item row="2" column="2"><widget class="QLabel" name="backTemplatesFilesLabel"><property name="text"><string/></property></widget></item>
+           <item row="3" column="0" colspan="3"><widget class="QLabel" name="templateWarningLabel"><property name="text"><string/></property></widget></item>
+           <item row="4" column="0"><widget class="QLabel" name="registrationProgressLabel"><property name="text"><string>建库进度：未开始</string></property></widget></item>
+           <item row="4" column="1"><widget class="QProgressBar" name="registrationProgressBar"><property name="value"><number>0</number></property></widget></item>
+           <item row="4" column="2"><widget class="QLabel" name="registrationElapsedLabel"><property name="text"><string>耗时：0 ms</string></property></widget></item>
+           <item row="5" column="1" colspan="2"><widget class="QPushButton" name="registerButton"><property name="text"><string>建立工件库</string></property></widget></item>
+           <item row="6" column="0" colspan="3"><widget class="QLabel" name="latestRegistrationResultLabel"><property name="text"><string>尚无建库结果</string></property></widget></item>
+           <item row="7" column="0" colspan="3"><widget class="QLabel" name="libraryMessageLabel"><property name="text"><string/></property></widget></item>
+          </layout>
+         </widget>
+         <widget class="QWidget" name="tasksTab">
+          <attribute name="title"><string>后台任务</string></attribute>
+          <layout class="QVBoxLayout" name="tasksLayout">
+           <item><widget class="QTableWidget" name="evolutionJobsTable">
+            <property name="columnCount"><number>6</number></property>
+            <property name="rowCount"><number>0</number></property>
+            <property name="selectionBehavior"><enum>QAbstractItemView::SelectRows</enum></property>
+            <property name="editTriggers"><set>QAbstractItemView::NoEditTriggers</set></property>
+            <column><property name="text"><string>任务 ID</string></property></column>
+            <column><property name="text"><string>工件</string></property></column>
+            <column><property name="text"><string>状态</string></property></column>
+            <column><property name="text"><string>阶段</string></property></column>
+            <column><property name="text"><string>进度</string></property></column>
+            <column><property name="text"><string>错误</string></property></column>
+           </widget></item>
+          </layout>
+         </widget>
+         <widget class="QWidget" name="dangerTab">
+          <attribute name="title"><string>管理</string></attribute>
+          <layout class="QVBoxLayout" name="dangerLayout">
+           <item><widget class="QLabel" name="recycleHelpLabel"><property name="text"><string>将工件移入可恢复回收区前，请准确输入当前浏览工件名称。</string></property></widget></item>
+           <item><widget class="QLineEdit" name="recycleNameConfirmationEdit"><property name="placeholderText"><string>输入工件名称确认</string></property></widget></item>
+           <item><widget class="QPushButton" name="deleteWorkpieceButton"><property name="text"><string>移入回收区</string></property></widget></item>
+           <item><spacer name="dangerSpacer"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>40</height></size></property></spacer></item>
+          </layout>
+         </widget>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

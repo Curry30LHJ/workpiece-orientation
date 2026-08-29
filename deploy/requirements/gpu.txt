@@ -1,0 +1,2 @@
+-r common.txt
+paddlepaddle-gpu==3.2.2

@@ -29,6 +29,10 @@ public:
     void setTool(Tool tool);
     void setCoarseShape(const QJsonObject &shape);
     void setFitOverlay(const QJsonObject &fit, const QImage &maskOverlay = QImage());
+    void setGuideVisible(bool visible);
+    void setFittedBoundaryVisible(bool visible);
+    void setEffectiveBoundaryVisible(bool visible);
+    void setMaskOverlayVisible(bool visible);
     void setRotationDegrees(qreal degrees);
     void resetView();
     void cancelGesture();
@@ -36,7 +40,13 @@ public:
 
     QImage image() const { return image_; }
     QJsonObject coarseShape() const { return coarseShape_; }
-    QJsonObject fitShape() const { return fitShape_; }
+    QJsonObject fitShape() const;
+    QJsonObject fittedShape() const { return fittedShape_; }
+    QJsonObject effectiveShape() const { return effectiveShape_; }
+    bool guideVisible() const { return guideVisible_; }
+    bool fittedBoundaryVisible() const { return fittedBoundaryVisible_; }
+    bool effectiveBoundaryVisible() const { return effectiveBoundaryVisible_; }
+    bool maskOverlayVisible() const { return maskOverlayVisible_; }
     QRectF imageTarget() const;
 
 signals:
@@ -61,7 +71,12 @@ private:
     QImage image_;
     QImage maskOverlay_;
     QJsonObject coarseShape_;
-    QJsonObject fitShape_;
+    QJsonObject fittedShape_;
+    QJsonObject effectiveShape_;
+    bool guideVisible_ = true;
+    bool fittedBoundaryVisible_ = true;
+    bool effectiveBoundaryVisible_ = true;
+    bool maskOverlayVisible_ = true;
     Tool tool_ = None;
     qreal rotationDegrees_ = 0.0;
     QPointF dragStart_;

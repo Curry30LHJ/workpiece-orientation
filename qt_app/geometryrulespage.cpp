@@ -1,11 +1,15 @@
-#include "geometrymaskmanager.h"
+#include "geometryrulespage.h"
 
 #include "geometryrulecanvas.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QColor>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
+#include <QFrame>
+#include <QGroupBox>
+#include <QHeaderView>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -15,8 +19,10 @@
 #include <QMessageBox>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSpinBox>
 #include <QSplitter>
+#include <QStyle>
 #include <QTableWidget>
 #include <QAbstractItemView>
 #include <QSignalBlocker>
@@ -28,6 +34,13 @@
 #include <QtMath>
 
 namespace {
+void setSemanticMessage(QLabel *label, const QString &kind) {
+    if (label == nullptr) return;
+    label->setProperty("messageKind", kind);
+    label->style()->unpolish(label);
+    label->style()->polish(label);
+}
+
 QJsonObject emptyDirection() {
     return QJsonObject{{QStringLiteral("anchor"), QJsonValue()},
                        {QStringLiteral("rules"), QJsonArray()}};
@@ -59,30 +72,73 @@ QString orientationName(const QString &value) {
     if (value == QStringLiteral("uncertain")) return QStringLiteral("不确定");
     return value.isEmpty() ? QStringLiteral("未知") : value;
 }
+
+QString validationStatusText(const QString &state) {
+    if (state == QStringLiteral("active")) return QStringLiteral("通过");
+    if (state == QStringLiteral("warning")) return QStringLiteral("告警");
+    if (state == QStringLiteral("blocking_issue")) return QStringLiteral("阻断");
+    if (state == QStringLiteral("low_confidence")) return QStringLiteral("低置信度");
+    if (state == QStringLiteral("not_configured")) return QStringLiteral("未配置");
+    if (state == QStringLiteral("needs_reseed") || state == QStringLiteral("failed")) {
+        return QStringLiteral("拟合失败");
+    }
+    if (state == QStringLiteral("excluded")) return QStringLiteral("已排除");
+    return state.isEmpty() ? QStringLiteral("需处理") : state;
 }
 
-GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(parent) {
-    setWindowTitle(QStringLiteral("几何干扰规则管理"));
-    resize(1100, 700);
+QString validationReasonText(const QString &code) {
+    if (code.isEmpty()) return QString();
+    if (code == QStringLiteral("edge_support_low")) return QStringLiteral("边缘支持不足");
+    if (code == QStringLiteral("source_disagreement")) return QStringLiteral("来源投票不一致");
+    if (code == QStringLiteral("effective_area_low")) return QStringLiteral("有效区域过小");
+    if (code == QStringLiteral("keypoint_retention_low")) return QStringLiteral("关键点保留率偏低");
+    if (code == QStringLiteral("fit_not_active")) return QStringLiteral("拟合结果未生效");
+    if (code == QStringLiteral("geometry_mask_too_large")) return QStringLiteral("忽略区域过大");
+    if (code == QStringLiteral("keypoint_retention_critical")) return QStringLiteral("关键点保留率过低");
+    if (code == QStringLiteral("leave_one_out_incomplete")) return QStringLiteral("留一验证未完成");
+    if (code == QStringLiteral("leave_one_out_failed")) return QStringLiteral("留一验证失败");
+    if (code == QStringLiteral("geometry_regression")) return QStringLiteral("识别结果回归");
+    if (code == QStringLiteral("geometry_fusion_regression")) return QStringLiteral("融合结果回归");
+    if (code == QStringLiteral("missing_direction_calibration")) return QStringLiteral("方向标定缺失");
+    if (code == QStringLiteral("MISSING_DIRECTION_CALIBRATION")) return QStringLiteral("方向标定缺失");
+    if (code == QStringLiteral("FITTED_GEOMETRY_MISSING")) return QStringLiteral("拟合边界缺失");
+    if (code == QStringLiteral("MIGRATION_CONFLICT")) return QStringLiteral("存在迁移冲突");
+    if (code == QStringLiteral("PROFILE_CACHE_REVISION_MISMATCH")) return QStringLiteral("规则缓存修订不一致");
+    if (code == QStringLiteral("template_needs_review")) return QStringLiteral("模板需要人工复核");
+    if (code == QStringLiteral("template_excluded")) return QStringLiteral("模板已人工排除");
+    for (const QChar character : code) {
+        if (character.unicode() > 0x7f) return code;
+    }
+    return QStringLiteral("未识别问题（%1）").arg(code);
+}
+}
+
+GeometryRulesPage::GeometryRulesPage(QWidget *parent) : QWidget(parent) {
+    setProperty("pageRoot", true);
     auto *root = new QVBoxLayout(this);
+    root->setContentsMargins(24, 24, 24, 24);
+    root->setSpacing(16);
     auto *splitter = new QSplitter(Qt::Horizontal, this);
+    splitter->setObjectName(QStringLiteral("geometryWorkspaceSplitter"));
+    splitter->setChildrenCollapsible(false);
     root->addWidget(splitter);
 
     auto *left = new QWidget(splitter);
+    left->setObjectName(QStringLiteral("geometryRulePanel"));
+    left->setProperty("panel", true);
     auto *leftLayout = new QVBoxLayout(left);
+    leftLayout->setContentsMargins(16, 16, 16, 16);
+    leftLayout->setSpacing(8);
     revisionLabel_ = new QLabel(left);
     statusLabel_ = new QLabel(left);
     statusLabel_->setObjectName(QStringLiteral("geometryStatusLabel"));
     leftLayout->addWidget(revisionLabel_);
-    leftLayout->addWidget(statusLabel_);
     directionCombo_ = new QComboBox(left);
     directionCombo_->setObjectName(QStringLiteral("directionCombo"));
     directionCombo_->addItem(QStringLiteral("正面"), QStringLiteral("front"));
     directionCombo_->addItem(QStringLiteral("反面"), QStringLiteral("back"));
-    leftLayout->addWidget(directionCombo_);
     templateCombo_ = new QComboBox(left);
     templateCombo_->setObjectName(QStringLiteral("templatePreviewCombo"));
-    leftLayout->addWidget(templateCombo_);
     ruleList_ = new QListWidget(left);
     ruleList_->setObjectName(QStringLiteral("ruleList"));
     leftLayout->addWidget(ruleList_, 1);
@@ -114,10 +170,8 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     ruleForm->addRow(QStringLiteral("旋转角度"), rotationSpin_);
     anchorCandidateCombo_ = new QComboBox(left);
     anchorCandidateCombo_->setObjectName(QStringLiteral("anchorCandidateCombo"));
-    ruleForm->addRow(QStringLiteral("基准候选"), anchorCandidateCombo_);
     ruleCandidateCombo_ = new QComboBox(left);
     ruleCandidateCombo_->setObjectName(QStringLiteral("ruleCandidateCombo"));
-    ruleForm->addRow(QStringLiteral("规则候选"), ruleCandidateCombo_);
     reviewStateCombo_ = new QComboBox(left);
     reviewStateCombo_->setObjectName(QStringLiteral("reviewStateCombo"));
     reviewStateCombo_->addItem(QStringLiteral("纳入"), QStringLiteral("included"));
@@ -125,8 +179,6 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     reviewStateCombo_->addItem(QStringLiteral("排除"), QStringLiteral("excluded"));
     reviewReasonEdit_ = new QLineEdit(left);
     reviewReasonEdit_->setObjectName(QStringLiteral("reviewReasonEdit"));
-    ruleForm->addRow(QStringLiteral("模板复核"), reviewStateCombo_);
-    ruleForm->addRow(QStringLiteral("复核原因"), reviewReasonEdit_);
     leftLayout->addLayout(ruleForm);
     auto *ruleButtons = new QHBoxLayout();
     auto *addButton = new QPushButton(QStringLiteral("新增规则"), left);
@@ -139,69 +191,134 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     setAnchorButton_ = new QPushButton(QStringLiteral("将画布设为基准边界"), left);
     setAnchorButton_->setVisible(false);
     setAnchorButton_->setObjectName(QStringLiteral("setAnchorButton"));
-    leftLayout->addWidget(setAnchorButton_);
     manualAnchorButton_ = new QPushButton(QStringLiteral("手动指定基准边界"), left);
     manualAnchorButton_->setObjectName(QStringLiteral("manualAnchorButton"));
     manualAnchorButton_->setVisible(false);
-    leftLayout->addWidget(manualAnchorButton_);
 
     auto *center = new QWidget(splitter);
+    center->setObjectName(QStringLiteral("geometryCanvasPanel"));
+    center->setProperty("panel", true);
     auto *centerLayout = new QVBoxLayout(center);
+    centerLayout->setContentsMargins(16, 16, 16, 16);
+    centerLayout->setSpacing(8);
+    auto *previewSelectors = new QFormLayout();
+    previewSelectors->addRow(QStringLiteral("方向"), directionCombo_);
+    previewSelectors->addRow(QStringLiteral("模板"), templateCombo_);
+    centerLayout->addLayout(previewSelectors);
     canvas_ = new GeometryRuleCanvas(center);
     canvas_->setObjectName(QStringLiteral("geometryRuleCanvas"));
+    canvas_->setGuideVisible(false);
     centerLayout->addWidget(canvas_, 1);
+    auto *layerToggles = new QHBoxLayout();
+    auto *guideLayerToggle = new QCheckBox(QStringLiteral("手绘引导"), center);
+    auto *fittedLayerToggle = new QCheckBox(QStringLiteral("拟合边界"), center);
+    auto *effectiveLayerToggle = new QCheckBox(QStringLiteral("有效边界"), center);
+    auto *maskLayerToggle = new QCheckBox(QStringLiteral("忽略区域"), center);
+    guideLayerToggle->setObjectName(QStringLiteral("guideLayerToggle"));
+    fittedLayerToggle->setObjectName(QStringLiteral("fittedLayerToggle"));
+    effectiveLayerToggle->setObjectName(QStringLiteral("effectiveLayerToggle"));
+    maskLayerToggle->setObjectName(QStringLiteral("maskLayerToggle"));
+    guideLayerToggle->setChecked(false);
+    fittedLayerToggle->setChecked(true);
+    effectiveLayerToggle->setChecked(true);
+    maskLayerToggle->setChecked(true);
+    layerToggles->addWidget(guideLayerToggle);
+    layerToggles->addWidget(fittedLayerToggle);
+    layerToggles->addWidget(effectiveLayerToggle);
+    layerToggles->addWidget(maskLayerToggle);
+    layerToggles->addStretch(1);
+    centerLayout->addLayout(layerToggles);
     auto *help = new QLabel(QStringLiteral("先选择方向和规则，再在画布中粗画；坐标按原图保存。"), center);
     help->setWordWrap(true);
     centerLayout->addWidget(help);
 
     auto *right = new QWidget(splitter);
+    right->setObjectName(QStringLiteral("geometryValidationPanel"));
+    right->setProperty("panel", true);
     auto *rightLayout = new QVBoxLayout(right);
+    rightLayout->setContentsMargins(16, 16, 16, 16);
+    rightLayout->setSpacing(8);
+    rightLayout->addWidget(statusLabel_);
     progressBar_ = new QProgressBar(right);
     progressBar_->setRange(0, 1);
     diagnostics_ = new QTextEdit(right);
     diagnostics_->setReadOnly(true);
-    rightLayout->addWidget(new QLabel(QStringLiteral("验证进度/诊断"), right));
+    rightLayout->addWidget(new QLabel(QStringLiteral("验证进度"), right));
     rightLayout->addWidget(progressBar_);
-    rightLayout->addWidget(diagnostics_, 1);
     validationHintLabel_ = new QLabel(QStringLiteral("点击表格中的模板行可定位预览；低置信度/未配置模板请在左侧选择“排除”并填写原因，再重新验证。"), right);
     validationHintLabel_->setObjectName(QStringLiteral("validationHintLabel"));
     validationHintLabel_->setWordWrap(true);
-    validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
+    validationHintLabel_->setProperty("messageKind", QStringLiteral("warning"));
     rightLayout->addWidget(validationHintLabel_);
     validationTable_ = new QTableWidget(right);
     validationTable_->setObjectName(QStringLiteral("validationTable"));
     validationTable_->setColumnCount(4);
     validationTable_->setHorizontalHeaderLabels({QStringLiteral("方向"), QStringLiteral("模板"),
-                                                  QStringLiteral("状态"), QStringLiteral("待处理规则")});
+                                                  QStringLiteral("状态"), QStringLiteral("原因/规则")});
     validationTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     validationTable_->setSelectionMode(QAbstractItemView::SingleSelection);
     validationTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     validationTable_->setCursor(Qt::PointingHandCursor);
+    validationTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    validationTable_->horizontalHeader()->setMinimumSectionSize(48);
     rightLayout->addWidget(validationTable_, 1);
 
+    advancedGeometryGroup_ = new QGroupBox(QStringLiteral("高级选项"), right);
+    advancedGeometryGroup_->setObjectName(QStringLiteral("advancedGeometryGroup"));
+    advancedGeometryGroup_->setCheckable(true);
+    advancedGeometryGroup_->setChecked(false);
+    auto *advancedLayout = new QVBoxLayout(advancedGeometryGroup_);
+    advancedGeometryContent_ = new QWidget(advancedGeometryGroup_);
+    advancedGeometryContent_->setObjectName(QStringLiteral("advancedGeometryContent"));
+    auto *advancedContentLayout = new QVBoxLayout(advancedGeometryContent_);
+    auto *advancedFields = new QFormLayout();
+    advancedFields->addRow(QStringLiteral("基准候选"), anchorCandidateCombo_);
+    advancedFields->addRow(QStringLiteral("规则候选"), ruleCandidateCombo_);
+    advancedFields->addRow(QStringLiteral("模板复核"), reviewStateCombo_);
+    advancedFields->addRow(QStringLiteral("复核原因"), reviewReasonEdit_);
+    advancedContentLayout->addLayout(advancedFields);
+    advancedContentLayout->addWidget(setAnchorButton_);
+    advancedContentLayout->addWidget(manualAnchorButton_);
+    advancedContentLayout->addWidget(new QLabel(QStringLiteral("原始诊断"), advancedGeometryContent_));
+    advancedContentLayout->addWidget(diagnostics_);
+
+    migrationPanel_ = new QWidget(advancedGeometryContent_);
+    migrationPanel_->setObjectName(QStringLiteral("migrationPanel"));
+    auto *migrationPanelLayout = new QVBoxLayout(migrationPanel_);
     auto *migrationForm = new QFormLayout();
-    migrationConflictCombo_ = new QComboBox(right);
+    migrationConflictCombo_ = new QComboBox(migrationPanel_);
     migrationConflictCombo_->setObjectName(QStringLiteral("migrationConflictCombo"));
-    migrationActionCombo_ = new QComboBox(right);
+    migrationActionCombo_ = new QComboBox(migrationPanel_);
     migrationActionCombo_->setObjectName(QStringLiteral("migrationActionCombo"));
     migrationActionCombo_->addItem(QStringLiteral("仅保留所选来源"), QStringLiteral("keep_only"));
     migrationActionCombo_->addItem(QStringLiteral("正反来源配成一条规则"), QStringLiteral("pair"));
     migrationActionCombo_->addItem(QStringLiteral("分别保留"), QStringLiteral("keep_separate"));
-    migrationSurvivorCombo_ = new QComboBox(right);
+    migrationSurvivorCombo_ = new QComboBox(migrationPanel_);
     migrationSurvivorCombo_->setObjectName(QStringLiteral("migrationSurvivorCombo"));
-    migrationFrontCombo_ = new QComboBox(right);
+    migrationFrontCombo_ = new QComboBox(migrationPanel_);
     migrationFrontCombo_->setObjectName(QStringLiteral("migrationFrontCombo"));
-    migrationBackCombo_ = new QComboBox(right);
+    migrationBackCombo_ = new QComboBox(migrationPanel_);
     migrationBackCombo_->setObjectName(QStringLiteral("migrationBackCombo"));
-    resolveMigrationButton_ = new QPushButton(QStringLiteral("应用迁移处置"), right);
+    resolveMigrationButton_ = new QPushButton(QStringLiteral("应用迁移处置"), migrationPanel_);
     resolveMigrationButton_->setObjectName(QStringLiteral("resolveMigrationButton"));
     migrationForm->addRow(QStringLiteral("迁移冲突"), migrationConflictCombo_);
     migrationForm->addRow(QStringLiteral("处置方式"), migrationActionCombo_);
     migrationForm->addRow(QStringLiteral("保留来源"), migrationSurvivorCombo_);
     migrationForm->addRow(QStringLiteral("正面来源"), migrationFrontCombo_);
     migrationForm->addRow(QStringLiteral("反面来源"), migrationBackCombo_);
-    rightLayout->addLayout(migrationForm);
-    rightLayout->addWidget(resolveMigrationButton_);
+    migrationPanelLayout->addLayout(migrationForm);
+    migrationPanelLayout->addWidget(resolveMigrationButton_);
+    advancedContentLayout->addWidget(migrationPanel_);
+    auto *advancedScroll = new QScrollArea(advancedGeometryGroup_);
+    advancedScroll->setObjectName(QStringLiteral("advancedGeometryScrollArea"));
+    advancedScroll->setWidgetResizable(true);
+    advancedScroll->setFrameShape(QFrame::NoFrame);
+    advancedScroll->setWidget(advancedGeometryContent_);
+    advancedScroll->setVisible(false);
+    advancedLayout->addWidget(advancedScroll);
+    connect(advancedGeometryGroup_, &QGroupBox::toggled,
+            advancedScroll, &QWidget::setVisible);
+    rightLayout->addWidget(advancedGeometryGroup_);
     auto *overrideReasonLabel = new QLabel(QStringLiteral("发布覆盖原因（有告警或回归时必填）"), right);
     overrideReasonLabel->setObjectName(QStringLiteral("overrideReasonLabel"));
     rightLayout->addWidget(overrideReasonLabel);
@@ -210,26 +327,29 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     overrideReasonEdit_->setPlaceholderText(QStringLiteral("请说明已检查告警/回归并确认发布"));
     rightLayout->addWidget(overrideReasonEdit_);
 
-    auto *buttons = new QHBoxLayout();
     saveButton_ = new QPushButton(QStringLiteral("保存草稿"), this);
     validateButton_ = new QPushButton(QStringLiteral("验证草稿"), this);
     publishButton_ = new QPushButton(QStringLiteral("发布规则"), this);
     publishWorkflowButton_ = new QPushButton(QStringLiteral("保存、验证并发布"), this);
     rollbackButton_ = new QPushButton(QStringLiteral("回退上一版本"), this);
-    cancelButton_ = new QPushButton(QStringLiteral("关闭"), this);
     saveButton_->setObjectName(QStringLiteral("saveButton"));
     validateButton_->setObjectName(QStringLiteral("validateButton"));
     publishButton_->setObjectName(QStringLiteral("publishButton"));
     publishButton_->setVisible(false);
     publishWorkflowButton_->setObjectName(QStringLiteral("publishWorkflowButton"));
+    publishWorkflowButton_->setProperty("role", QStringLiteral("primary"));
     rollbackButton_->setObjectName(QStringLiteral("rollbackButton"));
-    buttons->addWidget(saveButton_);
-    buttons->addWidget(validateButton_);
-    buttons->addWidget(publishButton_);
-    buttons->addWidget(publishWorkflowButton_);
-    buttons->addWidget(rollbackButton_);
-    buttons->addWidget(cancelButton_);
-    root->addLayout(buttons);
+    auto *advancedWorkflowButtons = new QHBoxLayout();
+    advancedWorkflowButtons->addWidget(saveButton_);
+    advancedWorkflowButtons->addWidget(validateButton_);
+    advancedWorkflowButtons->addWidget(rollbackButton_);
+    advancedContentLayout->addLayout(advancedWorkflowButtons);
+    publishDisabledReasonLabel_ = new QLabel(this);
+    publishDisabledReasonLabel_->setObjectName(QStringLiteral("publishDisabledReasonLabel"));
+    publishDisabledReasonLabel_->setWordWrap(true);
+    publishDisabledReasonLabel_->setProperty("messageKind", QStringLiteral("error"));
+    rightLayout->addWidget(publishDisabledReasonLabel_);
+    rightLayout->addWidget(publishWorkflowButton_);
 
     auto *editButtons = new QHBoxLayout();
     undoButton_ = new QPushButton(QStringLiteral("撤销"), left);
@@ -254,29 +374,33 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     versionCombo_->addItem(QStringLiteral("活动版本（只读）"), QStringLiteral("active"));
     copyActiveToDraftButton_ = new QPushButton(QStringLiteral("复制活动版本到草稿"), left);
     copyActiveToDraftButton_->setObjectName(QStringLiteral("copyActiveToDraftButton"));
-    leftLayout->addWidget(versionCombo_);
-    leftLayout->addWidget(copyActiveToDraftButton_);
+    advancedContentLayout->addWidget(versionCombo_);
+    advancedContentLayout->addWidget(copyActiveToDraftButton_);
 
-    connect(addButton, &QPushButton::clicked, this, &GeometryMaskManagerDialog::addRule);
-    connect(deleteButton, &QPushButton::clicked, this, &GeometryMaskManagerDialog::deleteRule);
-    connect(setAnchorButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::setAnchorFromCanvas);
-    connect(saveButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::saveDraft);
-    connect(validateButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::validateDraft);
-    connect(publishButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::publishDraft);
-    connect(publishWorkflowButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::publishWorkflow);
+    splitter->setStretchFactor(0, 24);
+    splitter->setStretchFactor(1, 52);
+    splitter->setStretchFactor(2, 24);
+    splitter->setSizes({240, 520, 240});
+
+    connect(addButton, &QPushButton::clicked, this, &GeometryRulesPage::addRule);
+    connect(deleteButton, &QPushButton::clicked, this, &GeometryRulesPage::deleteRule);
+    connect(setAnchorButton_, &QPushButton::clicked, this, &GeometryRulesPage::setAnchorFromCanvas);
+    connect(saveButton_, &QPushButton::clicked, this, &GeometryRulesPage::saveDraft);
+    connect(validateButton_, &QPushButton::clicked, this, &GeometryRulesPage::validateDraft);
+    connect(publishButton_, &QPushButton::clicked, this, &GeometryRulesPage::publishDraft);
+    connect(publishWorkflowButton_, &QPushButton::clicked, this, &GeometryRulesPage::publishWorkflow);
     connect(resolveMigrationButton_, &QPushButton::clicked, this,
-            &GeometryMaskManagerDialog::resolveMigrationConflict);
+            &GeometryRulesPage::resolveMigrationConflict);
     connect(migrationConflictCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) { refreshMigrationPanel(); });
     connect(migrationActionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) { refreshMigrationPanel(); });
-    connect(rollbackButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::rollbackDraft);
-    connect(cancelButton_, &QPushButton::clicked, this, &QDialog::reject);
-    connect(undoButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::undoDraft);
-    connect(redoButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::redoDraft);
-    connect(resetRuleButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::resetCurrentRule);
-    connect(reloadDraftButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::reloadDraft);
-    connect(copyActiveToDraftButton_, &QPushButton::clicked, this, &GeometryMaskManagerDialog::copyActiveToDraft);
+    connect(rollbackButton_, &QPushButton::clicked, this, &GeometryRulesPage::rollbackDraft);
+    connect(undoButton_, &QPushButton::clicked, this, &GeometryRulesPage::undoDraft);
+    connect(redoButton_, &QPushButton::clicked, this, &GeometryRulesPage::redoDraft);
+    connect(resetRuleButton_, &QPushButton::clicked, this, &GeometryRulesPage::resetCurrentRule);
+    connect(reloadDraftButton_, &QPushButton::clicked, this, &GeometryRulesPage::reloadDraft);
+    connect(copyActiveToDraftButton_, &QPushButton::clicked, this, &GeometryRulesPage::copyActiveToDraft);
     connect(directionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) {
                 refreshRuleList();
@@ -288,6 +412,14 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
                 refreshTemplatePreview();
                 if (!suppressPreviewRequests_) requestPreviewFromShape(canvasShapeForRule(currentRule()));
             });
+    connect(guideLayerToggle, &QCheckBox::toggled,
+            canvas_, &GeometryRuleCanvas::setGuideVisible);
+    connect(fittedLayerToggle, &QCheckBox::toggled,
+            canvas_, &GeometryRuleCanvas::setFittedBoundaryVisible);
+    connect(effectiveLayerToggle, &QCheckBox::toggled,
+            canvas_, &GeometryRuleCanvas::setEffectiveBoundaryVisible);
+    connect(maskLayerToggle, &QCheckBox::toggled,
+            canvas_, &GeometryRuleCanvas::setMaskOverlayVisible);
     connect(ruleList_, &QListWidget::currentRowChanged, this, [this](int) { loadCurrentRuleIntoEditor(); });
     connect(validationTable_, &QTableWidget::cellClicked, this,
             [this](int row, int) { selectValidationTemplate(row); });
@@ -301,9 +433,16 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
                 canvas_->setTool(shape == QStringLiteral("circle") ? GeometryRuleCanvas::Circle
                                    : shape == QStringLiteral("ellipse") ? GeometryRuleCanvas::Ellipse
                                                                           : shape == QStringLiteral("rotated_rectangle")
-                                                                                ? GeometryRuleCanvas::RotatedRectangle
-                                                                                : GeometryRuleCanvas::None);
+                                                                                 ? GeometryRuleCanvas::RotatedRectangle
+                                                                                 : GeometryRuleCanvas::None);
+                setCurrentRuleFromEditor();
             });
+    connect(ruleNameEdit_, &QLineEdit::textChanged, this,
+            [this](const QString &) { setCurrentRuleFromEditor(); });
+    connect(modeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int) { setCurrentRuleFromEditor(); });
+    connect(marginSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this](int) { setCurrentRuleFromEditor(); });
     connect(anchorCandidateCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int index) { Q_UNUSED(index); candidateChanged(anchorCandidateCombo_->currentIndex()); });
     connect(ruleCandidateCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -313,18 +452,8 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     connect(reviewReasonEdit_, &QLineEdit::textChanged, this,
             [this](const QString &text) { setTemplateReview(reviewStateCombo_->currentData().toString(), text); });
     connect(versionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-            [this, addButton, deleteButton](int index) {
-                const bool readOnly = index == 1;
-                for (QWidget *widget : {static_cast<QWidget *>(shapeCombo_), static_cast<QWidget *>(modeCombo_),
-                                        static_cast<QWidget *>(ruleNameEdit_), static_cast<QWidget *>(marginSpin_),
-                                        static_cast<QWidget *>(rotationSpin_), static_cast<QWidget *>(addButton),
-                                        static_cast<QWidget *>(deleteButton),
-                                        static_cast<QWidget *>(canvas_)}) {
-                    if (widget) widget->setEnabled(!readOnly);
-                }
-                copyActiveToDraftButton_->setEnabled(readOnly);
-            });
-    connect(overrideReasonEdit_, &QLineEdit::textChanged, this, &GeometryMaskManagerDialog::updatePublishState);
+            [this](int) { updateEditingControls(); });
+    connect(overrideReasonEdit_, &QLineEdit::textChanged, this, &GeometryRulesPage::updatePublishState);
     connect(rotationSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             [this](double value) { canvas_->setRotationDegrees(value); });
     connect(canvas_, &GeometryRuleCanvas::shapeChanged, this, [this](const QJsonObject &shape) {
@@ -352,7 +481,7 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
         markDraftDirty();
     });
     connect(canvas_, &GeometryRuleCanvas::shapeCommitted, this,
-            &GeometryMaskManagerDialog::requestPreviewFromShape);
+            &GeometryRulesPage::requestPreviewFromShape);
     connect(manualAnchorButton_, &QPushButton::clicked, this, [this]() {
         manualAnchorCapture_ = true;
         manualAnchorButton_->setText(QStringLiteral("请在画布中绘制基准边界"));
@@ -360,39 +489,40 @@ GeometryMaskManagerDialog::GeometryMaskManagerDialog(QWidget *parent) : QDialog(
     });
     refreshRuleList();
     refreshTemplatePreview();
+    updateEditingControls();
     updatePublishState();
 }
 
-QString GeometryMaskManagerDialog::direction() const {
+QString GeometryRulesPage::direction() const {
     return directionCombo_ ? directionCombo_->currentData().toString() : QStringLiteral("front");
 }
 
-QString GeometryMaskManagerDialog::currentTemplateId() const {
+QString GeometryRulesPage::currentTemplateId() const {
     return templateCombo_ ? templateCombo_->currentData(Qt::UserRole + 1).toString() : QString();
 }
 
-QString GeometryMaskManagerDialog::currentEditContextKey() const {
+QString GeometryRulesPage::currentEditContextKey() const {
     return QStringLiteral("%1|%2|%3|%4")
         .arg(currentRuleId(), direction(), currentTemplateId())
         .arg(snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
-QJsonObject GeometryMaskManagerDialog::directionObject() const {
+QJsonObject GeometryRulesPage::directionObject() const {
     const QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
     return directions.value(direction()).toObject();
 }
 
-bool GeometryMaskManagerDialog::usesLogicalRuleSchema() const {
+bool GeometryRulesPage::usesLogicalRuleSchema() const {
     return draft_.value(QStringLiteral("schema_version")).toInt(1) == 2;
 }
 
-QJsonArray GeometryMaskManagerDialog::logicalRules() const {
+QJsonArray GeometryRulesPage::logicalRules() const {
     return usesLogicalRuleSchema()
         ? draft_.value(QStringLiteral("rules")).toArray()
         : rulesFor(directionObject());
 }
 
-QString GeometryMaskManagerDialog::currentRuleId() const {
+QString GeometryRulesPage::currentRuleId() const {
     if (ruleList_ != nullptr && ruleList_->currentItem() != nullptr) {
         const QString stored = ruleList_->currentItem()->data(Qt::UserRole).toString();
         if (!stored.isEmpty()) return stored;
@@ -404,13 +534,13 @@ QString GeometryMaskManagerDialog::currentRuleId() const {
         : QString();
 }
 
-QJsonObject GeometryMaskManagerDialog::currentCalibration() const {
+QJsonObject GeometryRulesPage::currentCalibration() const {
     if (!usesLogicalRuleSchema()) return {};
     return directionObject().value(QStringLiteral("calibrations")).toObject()
         .value(currentRuleId()).toObject();
 }
 
-void GeometryMaskManagerDialog::setCurrentCalibration(const QJsonObject &calibration) {
+void GeometryRulesPage::setCurrentCalibration(const QJsonObject &calibration) {
     if (!usesLogicalRuleSchema()) return;
     const QString ruleId = currentRuleId();
     if (ruleId.isEmpty()) return;
@@ -427,7 +557,7 @@ void GeometryMaskManagerDialog::setCurrentCalibration(const QJsonObject &calibra
     markDraftDirty();
 }
 
-QString GeometryMaskManagerDialog::calibrationState(const QString &sideName, const QString &ruleId) const {
+QString GeometryRulesPage::calibrationState(const QString &sideName, const QString &ruleId) const {
     const QJsonObject side = draft_.value(QStringLiteral("directions")).toObject()
         .value(sideName).toObject();
     const QJsonObject calibration = side.value(QStringLiteral("calibrations")).toObject()
@@ -439,8 +569,8 @@ QString GeometryMaskManagerDialog::calibrationState(const QString &sideName, con
     return QStringLiteral("缺失");
 }
 
-GeometryMaskManagerDialog::MissingCalibration
-GeometryMaskManagerDialog::firstMissingEnabledCalibration() const {
+GeometryRulesPage::MissingCalibration
+GeometryRulesPage::firstMissingEnabledCalibration() const {
     if (!usesLogicalRuleSchema()) return {};
     const QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
     for (const QJsonValue &value : logicalRules()) {
@@ -459,7 +589,7 @@ GeometryMaskManagerDialog::firstMissingEnabledCalibration() const {
     return {};
 }
 
-void GeometryMaskManagerDialog::selectRuleById(const QString &ruleId) {
+void GeometryRulesPage::selectRuleById(const QString &ruleId) {
     if (ruleList_ == nullptr) return;
     for (int row = 0; row < ruleList_->count(); ++row) {
         if (ruleList_->item(row)->data(Qt::UserRole).toString() == ruleId) {
@@ -469,7 +599,7 @@ void GeometryMaskManagerDialog::selectRuleById(const QString &ruleId) {
     }
 }
 
-QJsonObject GeometryMaskManagerDialog::selectedMigrationConflict() const {
+QJsonObject GeometryRulesPage::selectedMigrationConflict() const {
     if (migrationConflictCombo_ == nullptr) return {};
     const QString conflictId = migrationConflictCombo_->currentData().toString();
     for (const QJsonValue &value : draft_.value(QStringLiteral("migration")).toObject()
@@ -480,7 +610,7 @@ QJsonObject GeometryMaskManagerDialog::selectedMigrationConflict() const {
     return {};
 }
 
-void GeometryMaskManagerDialog::refreshMigrationPanel() {
+void GeometryRulesPage::refreshMigrationPanel() {
     if (migrationConflictCombo_ == nullptr || migrationActionCombo_ == nullptr) return;
     const QString previousConflict = migrationConflictCombo_->currentData().toString();
     const QString previousAction = migrationActionCombo_->currentData().toString();
@@ -525,11 +655,16 @@ void GeometryMaskManagerDialog::refreshMigrationPanel() {
     migrationFrontCombo_->setVisible(action == QStringLiteral("pair"));
     migrationBackCombo_->setVisible(action == QStringLiteral("pair"));
     const bool hasConflict = !conflict.isEmpty();
+    if (migrationPanel_ != nullptr) migrationPanel_->setVisible(hasConflict);
+    if (hasConflict && advancedGeometryGroup_ != nullptr) {
+        advancedGeometryGroup_->setChecked(true);
+    }
     migrationActionCombo_->setEnabled(hasConflict);
     resolveMigrationButton_->setEnabled(hasConflict);
+    updateEditingControls();
 }
 
-void GeometryMaskManagerDialog::resolveMigrationConflict() {
+void GeometryRulesPage::resolveMigrationConflict() {
     const QJsonObject conflict = selectedMigrationConflict();
     if (conflict.isEmpty()) return;
     const QString action = migrationActionCombo_->currentData().toString();
@@ -551,7 +686,7 @@ void GeometryMaskManagerDialog::resolveMigrationConflict() {
         snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
-void GeometryMaskManagerDialog::ensureDirectionObject(const QString &name) {
+void GeometryRulesPage::ensureDirectionObject(const QString &name) {
     QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
     if (!directions.contains(name)) {
         directions.insert(name, usesLogicalRuleSchema() ? emptyLogicalDirection() : emptyDirection());
@@ -559,11 +694,11 @@ void GeometryMaskManagerDialog::ensureDirectionObject(const QString &name) {
     draft_.insert(QStringLiteral("directions"), directions);
 }
 
-int GeometryMaskManagerDialog::currentRuleIndex() const {
+int GeometryRulesPage::currentRuleIndex() const {
     return ruleList_ ? ruleList_->currentRow() : -1;
 }
 
-QJsonObject GeometryMaskManagerDialog::currentRule() const {
+QJsonObject GeometryRulesPage::currentRule() const {
     const QJsonArray rules = logicalRules();
     const int index = currentRuleIndex();
     if (index < 0 || index >= rules.size()) return {};
@@ -583,11 +718,11 @@ QJsonObject GeometryMaskManagerDialog::currentRule() const {
     return rule;
 }
 
-QJsonObject GeometryMaskManagerDialog::currentDirectionAnchor() const {
+QJsonObject GeometryRulesPage::currentDirectionAnchor() const {
     return directionObject().value(QStringLiteral("anchor")).toObject();
 }
 
-QJsonObject GeometryMaskManagerDialog::anchorFromCanvasShape(const QJsonObject &shape) const {
+QJsonObject GeometryRulesPage::anchorFromCanvasShape(const QJsonObject &shape) const {
     if (canvas_ == nullptr || canvas_->image().isNull()) return {};
     const qreal width = canvas_->image().width();
     const qreal height = canvas_->image().height();
@@ -609,7 +744,7 @@ QJsonObject GeometryMaskManagerDialog::anchorFromCanvasShape(const QJsonObject &
     return QJsonObject{{QStringLiteral("shape"), type}, {QStringLiteral("coarse"), coarse}};
 }
 
-QJsonObject GeometryMaskManagerDialog::ruleGeometryFromCanvasShape(const QJsonObject &shape) const {
+QJsonObject GeometryRulesPage::ruleGeometryFromCanvasShape(const QJsonObject &shape) const {
     if (canvas_ == nullptr || canvas_->image().isNull()) return {};
     const QJsonObject anchor = currentDirectionAnchor();
     const QJsonObject coarse = anchor.value(QStringLiteral("coarse")).toObject();
@@ -654,7 +789,7 @@ QJsonObject GeometryMaskManagerDialog::ruleGeometryFromCanvasShape(const QJsonOb
     return geometry;
 }
 
-QJsonObject GeometryMaskManagerDialog::canvasShapeForRule(const QJsonObject &rule) const {
+QJsonObject GeometryRulesPage::canvasShapeForRule(const QJsonObject &rule) const {
     if (canvas_ == nullptr || canvas_->image().isNull()) return {};
     const QJsonObject anchor = currentDirectionAnchor();
     const QJsonObject coarse = anchor.value(QStringLiteral("coarse")).toObject();
@@ -690,9 +825,10 @@ QJsonObject GeometryMaskManagerDialog::canvasShapeForRule(const QJsonObject &rul
     return shape;
 }
 
-void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
+void GeometryRulesPage::setSnapshot(const QJsonObject &snapshot) {
     const QString nextWorkpieceId = snapshot.value(QStringLiteral("workpiece_id")).toString();
     Q_UNUSED(nextWorkpieceId);
+    invalidatePublishContinuation();
     lastRulePreview_ = QJsonObject();
     lastPreviewRuleSignature_ = QJsonObject();
     lastPreviewWorkpieceId_.clear();
@@ -704,17 +840,10 @@ void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
     manualEditContextKey_.clear();
     pendingPreviewContextKey_.clear();
     snapshot_ = snapshot;
-    draft_ = snapshot.value(QStringLiteral("draft")).toObject();
-    if (draft_.isEmpty()) {
-        draft_ = QJsonObject{{QStringLiteral("schema_version"), 1},
-                             {QStringLiteral("directions"), QJsonObject{{QStringLiteral("front"), emptyDirection()},
-                                                                           {QStringLiteral("back"), emptyDirection()}}}};
-    }
-    ensureDirectionObject(QStringLiteral("front"));
-    ensureDirectionObject(QStringLiteral("back"));
+    restoreSnapshotDraft();
     job_ = QJsonObject();
     editorDirection_.clear();
-    dirty_ = false;
+    setDirty(false);
     undoHistory_.clear();
     redoHistory_.clear();
     if (versionCombo_ != nullptr) versionCombo_->setCurrentIndex(0);
@@ -725,7 +854,7 @@ void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
     refreshDiagnostics();
     if (validationHintLabel_ != nullptr) {
         validationHintLabel_->setText(QStringLiteral("点击表格中的模板行可定位预览；低置信度/未配置模板请在左侧选择“排除”并填写原因，再重新验证。"));
-        validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
+        setSemanticMessage(validationHintLabel_, QStringLiteral("warning"));
     }
     revisionLabel_->setText(QStringLiteral("库修订 %1，草稿修订 %2，活动 %3")
                                 .arg(snapshot.value(QStringLiteral("library_revision")).toInt())
@@ -734,7 +863,7 @@ void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
     statusLabel_->setText(snapshot.value(QStringLiteral("legacy_archived")).toBool()
                               ? QStringLiteral("旧位置标注已归档，请使用几何规则重新标定")
                               : QString());
-    statusLabel_->setStyleSheet(QString());
+    setSemanticMessage(statusLabel_, QStringLiteral("neutral"));
     refreshMigrationPanel();
     refreshRuleList();
     refreshTemplatePreview();
@@ -742,19 +871,84 @@ void GeometryMaskManagerDialog::setSnapshot(const QJsonObject &snapshot) {
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::setValidationJob(const QJsonObject &job) {
+void GeometryRulesPage::reconcileSnapshotKeepingDraft(const QJsonObject &snapshot) {
+    const QJsonObject localDraft = draft_;
+    const bool localDirty = dirty_;
+    const QList<QJsonObject> localUndoHistory = undoHistory_;
+    const QList<QJsonObject> localRedoHistory = redoHistory_;
+    const QString selectedDirection = direction();
+    const QString selectedTemplate = currentTemplateId();
+    const QString selectedRule = currentRuleId();
+    const bool previousSuppressPreview = suppressPreviewRequests_;
+
+    const QSignalBlocker pageBlocker(this);
+    suppressPreviewRequests_ = true;
+    setSnapshot(snapshot);
+    draft_ = localDraft;
+    dirty_ = localDirty;
+    undoHistory_ = localUndoHistory;
+    redoHistory_ = localRedoHistory;
+    editorDirection_.clear();
+    if (!selectedDirection.isEmpty() && directionCombo_ != nullptr) {
+        const int index = directionCombo_->findData(selectedDirection);
+        if (index >= 0) directionCombo_->setCurrentIndex(index);
+    }
+    refreshEditor();
+    if (!selectedRule.isEmpty()) selectRuleById(selectedRule);
+    if (!selectedTemplate.isEmpty() && templateCombo_ != nullptr) {
+        const int index = templateCombo_->findData(selectedTemplate,
+                                                    Qt::UserRole + 1);
+        if (index >= 0) templateCombo_->setCurrentIndex(index);
+    }
+    refreshTemplatePreview();
+    suppressPreviewRequests_ = previousSuppressPreview;
+}
+
+void GeometryRulesPage::restoreSnapshotDraft() {
+    draft_ = snapshot_.value(QStringLiteral("draft")).toObject();
+    if (draft_.isEmpty()) {
+        draft_ = QJsonObject{{QStringLiteral("schema_version"), 1},
+                             {QStringLiteral("directions"), QJsonObject{{QStringLiteral("front"), emptyDirection()},
+                                                                            {QStringLiteral("back"), emptyDirection()}}}};
+    }
+    ensureDirectionObject(QStringLiteral("front"));
+    ensureDirectionObject(QStringLiteral("back"));
+}
+
+void GeometryRulesPage::setValidationJob(const QJsonObject &job) {
     if (dirty_) return;
+    const bool sameCompletedContinuation = warningContinuationAvailable_
+        && job_.value(QStringLiteral("state")).toString() == QStringLiteral("completed")
+        && job.value(QStringLiteral("state")).toString() == QStringLiteral("completed")
+        && !job.value(QStringLiteral("job_id")).toString().isEmpty()
+        && job_.value(QStringLiteral("job_id")).toString()
+            == job.value(QStringLiteral("job_id")).toString()
+        && job_.value(QStringLiteral("base_library_revision")).toInt(-1)
+            == job.value(QStringLiteral("base_library_revision")).toInt(-1)
+        && job_.value(QStringLiteral("base_draft_revision")).toInt(-1)
+            == job.value(QStringLiteral("base_draft_revision")).toInt(-1)
+        && job.value(QStringLiteral("base_library_revision")).toInt(-1)
+            == snapshot_.value(QStringLiteral("library_revision")).toInt()
+        && job.value(QStringLiteral("base_draft_revision")).toInt(-1)
+            == snapshot_.value(QStringLiteral("draft_revision")).toInt();
+    if (!sameCompletedContinuation) invalidatePublishContinuation();
     job_ = job;
+    warningContinuationAvailable_ = !job.value(QStringLiteral("job_id")).toString().isEmpty()
+        && job.value(QStringLiteral("state")).toString() == QStringLiteral("completed")
+        && job.value(QStringLiteral("blocking_issues")).toArray().isEmpty()
+        && (!job.value(QStringLiteral("warnings")).toArray().isEmpty()
+            || job.value(QStringLiteral("regression")).toObject()
+                   .value(QStringLiteral("correct_to_wrong")).toInt() > 0);
     if (validationHintLabel_ != nullptr) {
         validationHintLabel_->setText(QStringLiteral("点击表格中的模板行可定位预览；低置信度/未配置模板请在左侧选择“排除”并填写原因，再重新验证。"));
-        validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
+        setSemanticMessage(validationHintLabel_, QStringLiteral("warning"));
     }
     const QJsonObject progress = job.value(QStringLiteral("progress")).toObject();
     const int total = qMax(1, progress.value(QStringLiteral("total")).toInt(1));
     progressBar_->setRange(0, total);
     progressBar_->setValue(qBound(0, progress.value(QStringLiteral("completed")).toInt(), total));
     statusLabel_->setText(QStringLiteral("验证任务：%1").arg(job.value(QStringLiteral("state")).toString()));
-    statusLabel_->setStyleSheet(QString());
+    setSemanticMessage(statusLabel_, QStringLiteral("neutral"));
     const QJsonArray warnings = job.value(QStringLiteral("warnings")).toArray();
     const QJsonArray blocking = job.value(QStringLiteral("blocking_issues")).toArray();
     QStringList validationLines;
@@ -779,7 +973,8 @@ void GeometryMaskManagerDialog::setValidationJob(const QJsonObject &job) {
                          change.value(QStringLiteral("candidate_decision_source")).toString()));
             }
         } else {
-            validationLines.append(QStringLiteral("发布阻断：%1").arg(code));
+            validationLines.append(QStringLiteral("发布阻断：%1")
+                .arg(validationReasonText(code)));
         }
     }
     if (validationLines.isEmpty()) validationLines.append(QStringLiteral("暂无告警"));
@@ -806,114 +1001,295 @@ void GeometryMaskManagerDialog::setValidationJob(const QJsonObject &job) {
         const QString templateId = issue.value(QStringLiteral("template_id")).toString();
         if (!templateId.isEmpty()) blockedTemplateIds.insert(templateId);
     }
+
+    const auto issueDirection = [](const QJsonObject &issue) {
+        for (const QString &key : {QStringLiteral("direction"),
+                                   QStringLiteral("orientation"),
+                                   QStringLiteral("expected")}) {
+            const QString value = issue.value(key).toString();
+            if (value == QStringLiteral("front") || value == QStringLiteral("back")) {
+                return value;
+            }
+        }
+        return QString();
+    };
+    const auto templateIdAt = [this](const QString &side, int index) {
+        if (side.isEmpty() || index < 0) return QString();
+        int current = 0;
+        for (const QJsonValue &value : snapshot_.value(QStringLiteral("templates")).toArray()) {
+            const QJsonObject item = value.toObject();
+            if (item.value(QStringLiteral("direction")).toString() != side) continue;
+            if (current == index) return item.value(QStringLiteral("template_id")).toString();
+            ++current;
+        }
+        return QString();
+    };
+    const auto issueTemplateId = [&issueDirection, &templateIdAt](const QJsonObject &issue) {
+        const QString direct = issue.value(QStringLiteral("template_id")).toString();
+        if (!direct.isEmpty()) return direct;
+        if (!issue.contains(QStringLiteral("index"))
+            || !issue.value(QStringLiteral("index")).isDouble()) {
+            return QString();
+        }
+        return templateIdAt(issueDirection(issue), issue.value(QStringLiteral("index")).toInt(-1));
+    };
+    const auto templateDirection = [this](const QString &templateId) {
+        if (templateId.isEmpty()) return QString();
+        for (const QJsonValue &value : snapshot_.value(QStringLiteral("templates")).toArray()) {
+            const QJsonObject item = value.toObject();
+            if (item.value(QStringLiteral("template_id")).toString() != templateId) continue;
+            const QString side = item.value(QStringLiteral("direction")).toString();
+            return side == QStringLiteral("front") || side == QStringLiteral("back")
+                ? side : QString();
+        }
+        return QString();
+    };
+    QSet<QString> insertedIssues;
+    const auto appendIssue = [this, &insertedIssues](const QString &side,
+                                                     const QString &templateId,
+                                                     const QString &ruleId,
+                                                     const QString &state,
+                                                     const QString &reasonCode,
+                                                     bool blocked,
+                                                     bool fusionRegression) {
+        const QString key = QStringLiteral("%1|%2|%3|%4|%5")
+                                .arg(side, templateId, ruleId, state, reasonCode);
+        if (insertedIssues.contains(key)) return;
+        insertedIssues.insert(key);
+        const int target = validationTable_->rowCount();
+        validationTable_->insertRow(target);
+        const QString reasonText = validationReasonText(reasonCode);
+        QList<QTableWidgetItem *> items{
+            new QTableWidgetItem(side), new QTableWidgetItem(templateId),
+            new QTableWidgetItem(validationStatusText(state)),
+            new QTableWidgetItem(ruleId.isEmpty() ? reasonText
+                                                   : reasonText.isEmpty() ? ruleId
+                                                                          : QStringLiteral("%1 · %2").arg(ruleId, reasonText))};
+        for (QTableWidgetItem *item : items) {
+            item->setData(DirectionRole, side);
+            item->setData(TemplateIdRole, templateId);
+            item->setData(RuleIdRole, ruleId);
+            item->setData(ReasonCodeRole, reasonCode);
+        }
+        if (blocked) {
+            items.at(2)->setBackground(QColor(QStringLiteral("#f8d7da")));
+            items.at(2)->setToolTip(fusionRegression
+                ? QStringLiteral("融合结果回归：请检查全局与局部结论后重新验证")
+                : QStringLiteral("验证阻断：请定位并修正后重新验证"));
+        } else if (state != QStringLiteral("active")
+                   && state != QStringLiteral("not_configured")
+                   && state != QStringLiteral("excluded")) {
+            items.at(2)->setBackground(QColor(QStringLiteral("#fff3cd")));
+        }
+        if (!reasonText.isEmpty()) items.at(2)->setToolTip(reasonText);
+        for (int column = 0; column < items.size(); ++column) {
+            validationTable_->setItem(target, column, items.at(column));
+        }
+    };
+
     const QJsonObject report = job.value(QStringLiteral("report")).toObject();
     for (const QString &label : {QStringLiteral("front"), QStringLiteral("back")}) {
         const QJsonArray rows = report.value(label).toArray();
         for (const QJsonValue &value : rows) {
             const QJsonObject row = value.toObject();
-            const int target = validationTable_->rowCount();
-            validationTable_->insertRow(target);
-            const QString templateId = row.value(QStringLiteral("template_id")).toString();
-            auto *directionItem = new QTableWidgetItem(label);
-            directionItem->setData(Qt::UserRole, label);
-            auto *templateItem = new QTableWidgetItem(templateId);
-            templateItem->setData(Qt::UserRole, templateId);
-            validationTable_->setItem(target, 0, directionItem);
-            validationTable_->setItem(target, 1, templateItem);
-            auto *statusItem = new QTableWidgetItem(row.value(QStringLiteral("status")).toString());
-            const QString status = row.value(QStringLiteral("status")).toString();
-            const QString reason = row.value(QStringLiteral("reason_code")).toString();
-            const QString statusText = status == QStringLiteral("active") ? QStringLiteral("已通过")
-                : status == QStringLiteral("low_confidence") ? QStringLiteral("低置信度")
-                : status == QStringLiteral("not_configured") ? QStringLiteral("未配置")
-                : status == QStringLiteral("needs_reseed") ? QStringLiteral("需重新标定")
-                : status == QStringLiteral("excluded") ? QStringLiteral("已排除")
-                : status;
-            statusItem->setText(statusText);
-            statusItem->setToolTip(reason.isEmpty() ? QStringLiteral("点击此行定位模板，再在左侧完成复核") : reason);
-            if (blockedTemplateIds.contains(templateId)) {
-                statusItem->setBackground(QColor(QStringLiteral("#f8d7da")));
-                statusItem->setToolTip(fusionRegressionTemplateIds.contains(templateId)
-                    ? QStringLiteral("融合结果回归：候选全局与局部结论冲突，局部覆盖后造成误判；请查看右侧证据并重新验证")
-                    : QStringLiteral("验证阻断：请定位此模板并明确排除或修正后重新验证"));
-            } else if (status != QStringLiteral("active") && status != QStringLiteral("not_configured")) {
-                statusItem->setBackground(QColor(QStringLiteral("#fff3cd")));
+            QString templateId = row.value(QStringLiteral("template_id")).toString();
+            if (templateId.isEmpty() && row.contains(QStringLiteral("index"))
+                && row.value(QStringLiteral("index")).isDouble()) {
+                templateId = templateIdAt(label, row.value(QStringLiteral("index")).toInt(-1));
             }
-            validationTable_->setItem(target, 2, statusItem);
-            int pendingRules = 0;
+            bool hasRuleIssue = false;
             for (const QJsonValue &ruleValue : row.value(QStringLiteral("rules")).toArray()) {
-                const QString ruleStatus = ruleValue.toObject().value(QStringLiteral("status")).toString();
-                if (ruleStatus != QStringLiteral("active") && ruleStatus != QStringLiteral("excluded")) {
-                    ++pendingRules;
-                }
+                const QJsonObject rule = ruleValue.toObject();
+                const QString ruleStatus = rule.value(QStringLiteral("status")).toString();
+                if (ruleStatus == QStringLiteral("active") || ruleStatus == QStringLiteral("excluded")) continue;
+                hasRuleIssue = true;
+                appendIssue(label, templateId,
+                            rule.value(QStringLiteral("rule_id")).toString(), ruleStatus,
+                            rule.value(QStringLiteral("reason_code")).toString(),
+                            blockedTemplateIds.contains(templateId),
+                            fusionRegressionTemplateIds.contains(templateId));
             }
-            validationTable_->setItem(target, 3, new QTableWidgetItem(QString::number(pendingRules)));
+            if (!hasRuleIssue) {
+                QString reasonCode = row.value(QStringLiteral("reason_code")).toString();
+                if (reasonCode.isEmpty()) {
+                    reasonCode = row.value(QStringLiteral("review_reason")).toString();
+                }
+                appendIssue(label, templateId, QString(),
+                            row.value(QStringLiteral("status")).toString(),
+                            reasonCode,
+                            blockedTemplateIds.contains(templateId),
+                            fusionRegressionTemplateIds.contains(templateId));
+            }
         }
     }
-    if (!dirty_ && canvas_ != nullptr) {
-        const QSignalBlocker canvasBlocker(canvas_);
-        canvas_->setCoarseShape(QJsonObject());
+    const auto appendStandaloneIssue = [&appendIssue, &issueDirection, &issueTemplateId,
+                                        &templateDirection](
+                                           const QJsonObject &issue, bool blocked) {
+        const QString code = issue.value(QStringLiteral("code")).toString();
+        const QString templateId = issueTemplateId(issue);
+        QString side = issueDirection(issue);
+        if (side.isEmpty()) side = templateDirection(templateId);
+        const QString ruleId = issue.value(QStringLiteral("rule_id")).toString();
+        appendIssue(side, templateId, ruleId,
+                    blocked ? QStringLiteral("blocking_issue") : QStringLiteral("warning"), code,
+                    blocked, code == QStringLiteral("geometry_fusion_regression"));
+    };
+    const auto appendStandaloneTemplates = [&appendStandaloneIssue, &issueDirection,
+                                            &templateDirection](const QJsonObject &issue,
+                                                                bool blocked) {
+        bool appended = false;
+        for (const QJsonValue &templateValue : issue.value(QStringLiteral("templates")).toArray()) {
+            if (!templateValue.isString()) continue;
+            const QString templateId = templateValue.toString();
+            if (templateId.isEmpty()) continue;
+            QJsonObject templateIssue = issue;
+            templateIssue.remove(QStringLiteral("templates"));
+            templateIssue.insert(QStringLiteral("template_id"), templateId);
+            if (issueDirection(templateIssue).isEmpty()) {
+                const QString side = templateDirection(templateId);
+                if (!side.isEmpty()) templateIssue.insert(QStringLiteral("direction"), side);
+            }
+            appendStandaloneIssue(templateIssue, blocked);
+            appended = true;
+        }
+        if (!appended) appendStandaloneIssue(issue, blocked);
+    };
+    for (const QJsonValue &value : warnings) {
+        appendStandaloneTemplates(value.toObject(), false);
+    }
+    for (const QJsonValue &value : blocking) {
+        const QJsonObject issue = value.toObject();
+        const QJsonArray changed = issue.value(QStringLiteral("changed_predictions")).toArray();
+        if (changed.isEmpty()) {
+            appendStandaloneTemplates(issue, true);
+            continue;
+        }
+        for (const QJsonValue &changeValue : changed) {
+            QJsonObject change = changeValue.toObject();
+            change.insert(QStringLiteral("code"), issue.value(QStringLiteral("code")));
+            appendStandaloneIssue(change, true);
+        }
     }
     applyFittedBoundaryForCurrentTemplate();
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::selectValidationTemplate(int row) {
+void GeometryRulesPage::selectValidationTemplate(int row) {
     if (validationTable_ == nullptr || templateCombo_ == nullptr || directionCombo_ == nullptr
         || row < 0 || row >= validationTable_->rowCount()) {
         return;
     }
-    const QTableWidgetItem *directionItem = validationTable_->item(row, 0);
-    const QTableWidgetItem *templateItem = validationTable_->item(row, 1);
-    if (directionItem == nullptr || templateItem == nullptr) return;
-    const QString selectedDirection = directionItem->data(Qt::UserRole).toString();
-    const QString selectedTemplate = templateItem->data(Qt::UserRole).toString();
-    if (selectedDirection.isEmpty() || selectedTemplate.isEmpty()) return;
-    const int directionIndex = directionCombo_->findData(selectedDirection);
-    if (directionIndex < 0) return;
+    const QTableWidgetItem *identityItem = validationTable_->item(row, 0);
+    if (identityItem == nullptr) return;
+    const QString selectedDirection = identityItem->data(DirectionRole).toString();
+    const QString selectedTemplate = identityItem->data(TemplateIdRole).toString();
+    const QString selectedRule = identityItem->data(RuleIdRole).toString();
+    const int directionIndex = selectedDirection.isEmpty()
+        ? -1 : directionCombo_->findData(selectedDirection);
+    if (!selectedDirection.isEmpty() && directionIndex < 0) return;
     const QSignalBlocker directionBlocker(directionCombo_);
     const QSignalBlocker templateBlocker(templateCombo_);
     suppressPreviewRequests_ = true;
-    if (directionCombo_->currentIndex() != directionIndex) directionCombo_->setCurrentIndex(directionIndex);
-    refreshRuleList();
-    refreshTemplatePreview();
-    const int templateIndex = templateCombo_->findData(selectedTemplate, Qt::UserRole + 1);
-    if (templateIndex < 0) {
-        suppressPreviewRequests_ = false;
-        return;
+    if (directionIndex >= 0 && directionCombo_->currentIndex() != directionIndex) {
+        directionCombo_->setCurrentIndex(directionIndex);
     }
-    if (templateCombo_->currentIndex() != templateIndex) templateCombo_->setCurrentIndex(templateIndex);
     refreshRuleList();
     refreshTemplatePreview();
-    const int finalTemplateIndex = templateCombo_->findData(selectedTemplate, Qt::UserRole + 1);
-    if (finalTemplateIndex >= 0) templateCombo_->setCurrentIndex(finalTemplateIndex);
+    if (!selectedTemplate.isEmpty()) {
+        const int templateIndex = templateCombo_->findData(selectedTemplate, Qt::UserRole + 1);
+        if (templateIndex < 0) {
+            suppressPreviewRequests_ = false;
+            return;
+        }
+        if (templateCombo_->currentIndex() != templateIndex) templateCombo_->setCurrentIndex(templateIndex);
+        refreshRuleList();
+        refreshTemplatePreview();
+        const int finalTemplateIndex = templateCombo_->findData(selectedTemplate, Qt::UserRole + 1);
+        if (finalTemplateIndex >= 0) templateCombo_->setCurrentIndex(finalTemplateIndex);
+    }
+    if (selectedRule.isEmpty()) ruleList_->setCurrentRow(-1);
+    else selectRuleById(selectedRule);
     refreshTemplateReview();
     suppressPreviewRequests_ = false;
-    if (!dirty_) {
-        const QSignalBlocker canvasBlocker(canvas_);
-        canvas_->setCoarseShape(QJsonObject());
+    if (!selectedTemplate.isEmpty() && !selectedRule.isEmpty()) {
+        applyFittedBoundaryForCurrentTemplate();
     }
-    applyFittedBoundaryForCurrentTemplate();
 }
 
-void GeometryMaskManagerDialog::setBusy(bool busy) {
+void GeometryRulesPage::setBusy(bool busy) {
     busy_ = busy;
-    saveButton_->setEnabled(!busy);
-    validateButton_->setEnabled(!busy);
-    rollbackButton_->setEnabled(!busy && snapshot_.value(QStringLiteral("previous_active_revision")).toInt(0) > 0);
+    saveButton_->setEnabled(backendAvailable_ && !busy && !editingLocked_);
+    validateButton_->setEnabled(backendAvailable_ && !busy && !editingLocked_);
+    rollbackButton_->setEnabled(backendAvailable_ && !busy && !editingLocked_
+                                && snapshot_.value(QStringLiteral("previous_active_revision")).toInt(0) > 0);
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::setPreviewBusy(bool busy) {
-    previewBusy_ = busy;
-    if (directionCombo_) directionCombo_->setEnabled(!busy);
-    if (templateCombo_) templateCombo_->setEnabled(!busy);
-    if (anchorCandidateCombo_) anchorCandidateCombo_->setEnabled(!busy);
-    if (ruleCandidateCombo_) ruleCandidateCombo_->setEnabled(!busy);
-    if (shapeCombo_) shapeCombo_->setEnabled(!busy);
+void GeometryRulesPage::setEditingLocked(bool locked) {
+    if (editingLocked_ == locked) return;
+    editingLocked_ = locked;
+    updateEditingControls();
+    setBusy(busy_);
 }
 
-void GeometryMaskManagerDialog::markDraftDirty() {
+void GeometryRulesPage::setBackendAvailable(bool available, const QString &reason) {
+    backendAvailable_ = available;
+    backendUnavailableReason_ = available ? QString() : reason.trimmed();
+    if (!available) setPreviewBusy(false);
+    setBusy(busy_);
+}
+
+void GeometryRulesPage::setPreviewBusy(bool busy) {
+    previewBusy_ = busy;
+    updateEditingControls();
+}
+
+void GeometryRulesPage::updateEditingControls() {
+    const bool readOnly = versionCombo_ != nullptr
+        && versionCombo_->currentData().toString() == QStringLiteral("active");
+    const bool editable = !editingLocked_ && !readOnly;
+    const bool previewEditable = editable && !previewBusy_;
+    if (directionCombo_) directionCombo_->setEnabled(!previewBusy_);
+    if (templateCombo_) templateCombo_->setEnabled(!previewBusy_);
+    if (shapeCombo_) shapeCombo_->setEnabled(previewEditable);
+    if (modeCombo_) modeCombo_->setEnabled(editable);
+    if (ruleNameEdit_) ruleNameEdit_->setEnabled(editable);
+    if (marginSpin_) marginSpin_->setEnabled(editable);
+    if (rotationSpin_) rotationSpin_->setEnabled(editable);
+    if (anchorCandidateCombo_) anchorCandidateCombo_->setEnabled(previewEditable);
+    if (ruleCandidateCombo_) ruleCandidateCombo_->setEnabled(previewEditable);
+    if (reviewStateCombo_) reviewStateCombo_->setEnabled(previewEditable);
+    if (reviewReasonEdit_) reviewReasonEdit_->setEnabled(previewEditable);
+    if (canvas_) canvas_->setEnabled(editable);
+    if (setAnchorButton_) setAnchorButton_->setEnabled(editable);
+    if (manualAnchorButton_) manualAnchorButton_->setEnabled(editable);
+    if (undoButton_) undoButton_->setEnabled(editable);
+    if (redoButton_) redoButton_->setEnabled(editable);
+    if (resetRuleButton_) resetRuleButton_->setEnabled(editable);
+    if (reloadDraftButton_) reloadDraftButton_->setEnabled(editable);
+    if (copyActiveToDraftButton_) copyActiveToDraftButton_->setEnabled(!editingLocked_ && readOnly);
+    if (QPushButton *button = findChild<QPushButton *>(QStringLiteral("addRuleButton"))) {
+        button->setEnabled(editable);
+    }
+    if (QPushButton *button = findChild<QPushButton *>(QStringLiteral("deleteRuleButton"))) {
+        button->setEnabled(editable);
+    }
+    const bool hasConflict = !selectedMigrationConflict().isEmpty();
+    for (QComboBox *combo : {migrationActionCombo_, migrationSurvivorCombo_,
+                             migrationFrontCombo_, migrationBackCombo_}) {
+        if (combo) combo->setEnabled(editable && hasConflict);
+    }
+    if (resolveMigrationButton_) resolveMigrationButton_->setEnabled(editable && hasConflict);
+}
+
+void GeometryRulesPage::setDirty(bool dirty) {
+    if (dirty_ == dirty) return;
+    dirty_ = dirty;
+    emit unsavedChangesChanged(dirty_);
+}
+
+void GeometryRulesPage::markDraftDirty() {
+    invalidatePublishContinuation();
     if (!dirty_) {
         job_ = QJsonObject();
         if (validationTable_ != nullptr) validationTable_->setRowCount(0);
@@ -927,19 +1303,19 @@ void GeometryMaskManagerDialog::markDraftDirty() {
         if (validationHintLabel_ != nullptr) {
             validationHintLabel_->setText(
                 QStringLiteral("草稿已修改：旧验证结果已失效，保存后请重新验证。"));
-            validationHintLabel_->setStyleSheet(QStringLiteral("color: #b35c00; font-weight: 600;"));
+            setSemanticMessage(validationHintLabel_, QStringLiteral("warning"));
         }
         if (statusLabel_ != nullptr) {
             statusLabel_->setText(QStringLiteral("草稿已修改：请先保存，再重新验证"));
-            statusLabel_->setStyleSheet(QStringLiteral("color: #b35c00;"));
+            setSemanticMessage(statusLabel_, QStringLiteral("warning"));
         }
     }
-    dirty_ = true;
+    setDirty(true);
     if (dirtyLabel_ != nullptr) dirtyLabel_->setText(QStringLiteral("草稿有未保存修改"));
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::applyDraftMutation(const QJsonObject &next) {
+void GeometryRulesPage::applyDraftMutation(const QJsonObject &next) {
     if (next == draft_) return;
     undoHistory_.append(draft_);
     if (undoHistory_.size() > 100) undoHistory_.removeFirst();
@@ -949,7 +1325,7 @@ void GeometryMaskManagerDialog::applyDraftMutation(const QJsonObject &next) {
     refreshEditor();
 }
 
-void GeometryMaskManagerDialog::refreshEditor() {
+void GeometryRulesPage::refreshEditor() {
     refreshRuleList();
     refreshTemplatePreview();
     dirtyLabel_->setText(dirty_ ? QStringLiteral("草稿有未保存修改") : QStringLiteral("草稿已保存"));
@@ -958,12 +1334,12 @@ void GeometryMaskManagerDialog::refreshEditor() {
     updatePublishState();
 }
 
-void GeometryMaskManagerDialog::setOperationError(const QString &message) {
+void GeometryRulesPage::setOperationError(const QString &message) {
     statusLabel_->setText(message);
-    statusLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
+    setSemanticMessage(statusLabel_, QStringLiteral("error"));
 }
 
-void GeometryMaskManagerDialog::refreshRuleList() {
+void GeometryRulesPage::refreshRuleList() {
     if (!ruleList_) return;
     if (editorDirection_ == direction()) setCurrentRuleFromEditor();
     const QString previousId = currentRuleId();
@@ -1006,7 +1382,7 @@ void GeometryMaskManagerDialog::refreshRuleList() {
     loadCurrentRuleIntoEditor();
 }
 
-void GeometryMaskManagerDialog::refreshTemplatePreview() {
+void GeometryRulesPage::refreshTemplatePreview() {
     if (!templateCombo_ || !canvas_) return;
     const QSignalBlocker canvasBlocker(canvas_);
     const QString side = direction();
@@ -1021,6 +1397,8 @@ void GeometryMaskManagerDialog::refreshTemplatePreview() {
                                 item.value(QStringLiteral("path")).toString());
         templateCombo_->setItemData(templateCombo_->count() - 1,
                                      item.value(QStringLiteral("template_id")).toString(), Qt::UserRole + 1);
+        templateCombo_->setItemData(templateCombo_->count() - 1,
+                                     item.value(QStringLiteral("path")).toString(), Qt::ToolTipRole);
     }
     int index = templateCombo_->findData(previous);
     if (index < 0) index = 0;
@@ -1034,8 +1412,7 @@ void GeometryMaskManagerDialog::refreshTemplatePreview() {
     const QJsonObject rule = currentRule();
     if (!rule.isEmpty()) {
         const QJsonObject guideShape = canvasShapeForRule(rule);
-        canvas_->setCoarseShape(manualEditContextKey_ == currentEditContextKey()
-                                    ? guideShape : QJsonObject());
+        canvas_->setCoarseShape(guideShape);
         const QString shape = rule.value(QStringLiteral("shape")).toString();
         canvas_->setTool(shape == QStringLiteral("ellipse") ? GeometryRuleCanvas::Ellipse
                            : shape == QStringLiteral("rotated_rectangle") ? GeometryRuleCanvas::RotatedRectangle
@@ -1052,7 +1429,7 @@ void GeometryMaskManagerDialog::refreshTemplatePreview() {
     refreshTemplateReview();
 }
 
-bool GeometryMaskManagerDialog::applyFittedBoundaryForCurrentTemplate() {
+bool GeometryRulesPage::applyFittedBoundaryForCurrentTemplate() {
     if (canvas_ == nullptr || templateCombo_ == nullptr) return false;
     canvas_->setFitOverlay(QJsonObject());
     const QString side = direction();
@@ -1153,12 +1530,12 @@ bool GeometryMaskManagerDialog::applyFittedBoundaryForCurrentTemplate() {
     return false;
 }
 
-void GeometryMaskManagerDialog::setTemplateDiagnostics(const QString &text) {
+void GeometryRulesPage::setTemplateDiagnostics(const QString &text) {
     templateDiagnostics_ = text;
     refreshDiagnostics();
 }
 
-void GeometryMaskManagerDialog::refreshDiagnostics() {
+void GeometryRulesPage::refreshDiagnostics() {
     if (diagnostics_ == nullptr) return;
     QStringList sections;
     if (!validationDiagnostics_.isEmpty()) sections.append(validationDiagnostics_);
@@ -1166,7 +1543,7 @@ void GeometryMaskManagerDialog::refreshDiagnostics() {
     diagnostics_->setPlainText(sections.join(QStringLiteral("\n\n----------------\n\n")));
 }
 
-void GeometryMaskManagerDialog::refreshTemplateReview() {
+void GeometryRulesPage::refreshTemplateReview() {
     if (templateCombo_ == nullptr || reviewStateCombo_ == nullptr || reviewReasonEdit_ == nullptr) return;
     const QString templateId = templateCombo_->currentData(Qt::UserRole + 1).toString();
     const QJsonObject reviews = directionObject().value(QStringLiteral("template_reviews")).toObject();
@@ -1178,7 +1555,7 @@ void GeometryMaskManagerDialog::refreshTemplateReview() {
     reviewReasonEdit_->setText(review.value(QStringLiteral("reason")).toString());
 }
 
-void GeometryMaskManagerDialog::setAnchorFromCanvas() {
+void GeometryRulesPage::setAnchorFromCanvas() {
     QJsonObject anchor = anchorFromCanvasShape(canvas_->coarseShape());
     if (anchor.isEmpty()) return;
     ensureDirectionObject(direction());
@@ -1192,7 +1569,7 @@ void GeometryMaskManagerDialog::setAnchorFromCanvas() {
     refreshRuleList();
 }
 
-void GeometryMaskManagerDialog::setCurrentRuleFromEditor() {
+void GeometryRulesPage::setCurrentRuleFromEditor() {
     if (!editorDirection_.isEmpty() && editorDirection_ != direction()) return;
     const int index = currentRuleIndex();
     if (index < 0) return;
@@ -1204,9 +1581,10 @@ void GeometryMaskManagerDialog::setCurrentRuleFromEditor() {
     const QString selectedShape = shapeCombo_->currentData().toString();
     const QString selectedMode = modeCombo_->currentData().toString();
     const int selectedMarginPercent = marginSpin_->value();
+    const bool shapeChanged = !selectedShape.isEmpty()
+        && selectedShape != rule.value(QStringLiteral("shape")).toString();
     const bool editorChanged = editedName != rule.value(QStringLiteral("name")).toString()
-        || (!selectedShape.isEmpty()
-            && selectedShape != rule.value(QStringLiteral("shape")).toString())
+        || shapeChanged
         || selectedMode != rule.value(QStringLiteral("mode")).toString()
         || selectedMarginPercent
             != qRound(rule.value(QStringLiteral("margin_ratio")).toDouble(0.0) * 100.0);
@@ -1220,6 +1598,18 @@ void GeometryMaskManagerDialog::setCurrentRuleFromEditor() {
     QJsonObject next = draft_;
     if (usesLogicalRuleSchema()) {
         next.insert(QStringLiteral("rules"), rules);
+        if (shapeChanged) {
+            QJsonObject directions = next.value(QStringLiteral("directions")).toObject();
+            const QString ruleId = rule.value(QStringLiteral("rule_id")).toString();
+            for (const QString &sideName : {QStringLiteral("front"), QStringLiteral("back")}) {
+                QJsonObject side = directions.value(sideName).toObject();
+                QJsonObject calibrations = side.value(QStringLiteral("calibrations")).toObject();
+                calibrations.remove(ruleId);
+                side.insert(QStringLiteral("calibrations"), calibrations);
+                directions.insert(sideName, side);
+            }
+            next.insert(QStringLiteral("directions"), directions);
+        }
     } else {
         if (!rule.contains(QStringLiteral("seed_geometry"))) {
             rule.insert(QStringLiteral("seed_geometry"), rule.value(QStringLiteral("geometry")));
@@ -1234,11 +1624,15 @@ void GeometryMaskManagerDialog::setCurrentRuleFromEditor() {
         next.insert(QStringLiteral("directions"), directions);
     }
     if (next == draft_) return;
+    if (shapeChanged && usesLogicalRuleSchema()) {
+        applyDraftMutation(next);
+        return;
+    }
     draft_ = next;
     markDraftDirty();
 }
 
-void GeometryMaskManagerDialog::loadCurrentRuleIntoEditor() {
+void GeometryRulesPage::loadCurrentRuleIntoEditor() {
     editorDirection_ = direction();
     const QJsonObject rule = currentRule();
     if (rule.isEmpty()) return;
@@ -1259,7 +1653,7 @@ void GeometryMaskManagerDialog::loadCurrentRuleIntoEditor() {
     refreshTemplatePreview();
 }
 
-void GeometryMaskManagerDialog::addRule() {
+void GeometryRulesPage::addRule() {
     ensureDirectionObject(direction());
     if (usesLogicalRuleSchema()) {
         QJsonArray rules = logicalRules();
@@ -1302,7 +1696,7 @@ void GeometryMaskManagerDialog::addRule() {
     ruleList_->setCurrentRow(rules.size() - 1);
 }
 
-void GeometryMaskManagerDialog::deleteRule() {
+void GeometryRulesPage::deleteRule() {
     setCurrentRuleFromEditor();
     const int index = currentRuleIndex();
     if (index < 0) return;
@@ -1339,8 +1733,8 @@ void GeometryMaskManagerDialog::deleteRule() {
     refreshRuleList();
 }
 
-void GeometryMaskManagerDialog::requestPreviewFromShape(const QJsonObject &shape) {
-    if (shape.isEmpty() || previewBusy_) return;
+void GeometryRulesPage::requestPreviewFromShape(const QJsonObject &shape) {
+    if (!backendAvailable_ || editingLocked_ || shape.isEmpty() || previewBusy_) return;
     if (manualAnchorCapture_) {
         const QJsonObject anchor = anchorFromCanvasShape(shape);
         if (anchor.isEmpty()) return;
@@ -1364,7 +1758,7 @@ void GeometryMaskManagerDialog::requestPreviewFromShape(const QJsonObject &shape
     emit previewRequested(request);
 }
 
-QJsonObject GeometryMaskManagerDialog::previewRequest(int anchorCandidateIndex, int ruleCandidateIndex,
+QJsonObject GeometryRulesPage::previewRequest(int anchorCandidateIndex, int ruleCandidateIndex,
                                                       const QJsonObject &seedShape) const {
     const QString templateId = templateCombo_->currentData(Qt::UserRole + 1).toString().isEmpty()
         ? templateCombo_->currentText() : templateCombo_->currentData(Qt::UserRole + 1).toString();
@@ -1386,9 +1780,9 @@ QJsonObject GeometryMaskManagerDialog::previewRequest(int anchorCandidateIndex, 
     return request;
 }
 
-void GeometryMaskManagerDialog::candidateChanged(int index) {
+void GeometryRulesPage::candidateChanged(int index) {
     Q_UNUSED(index);
-    if (previewBusy_) return;
+    if (!backendAvailable_ || previewBusy_) return;
     const QJsonObject request = previewRequest(anchorCandidateCombo_->currentIndex(), ruleCandidateCombo_->currentIndex());
     if (request.isEmpty()) return;
     pendingPreviewContextKey_ = currentEditContextKey();
@@ -1396,7 +1790,7 @@ void GeometryMaskManagerDialog::candidateChanged(int index) {
     emit previewRequested(request);
 }
 
-void GeometryMaskManagerDialog::setRulePreview(const QJsonObject &preview) {
+void GeometryRulesPage::setRulePreview(const QJsonObject &preview) {
     if (preview.value(QStringLiteral("direction")).toString() != direction()) return;
     const QString expectedTemplate = templateCombo_->currentData(Qt::UserRole + 1).toString();
     if (!expectedTemplate.isEmpty() && preview.value(QStringLiteral("template_id")).toString() != expectedTemplate) return;
@@ -1493,16 +1887,16 @@ void GeometryMaskManagerDialog::setRulePreview(const QJsonObject &preview) {
     const bool active = previewStatus == QStringLiteral("active");
     if (active) {
         statusLabel_->setText(QStringLiteral("当前模板拟合成功，请检查绿色边界"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #008000;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("success"));
     } else if (previewStatus == QStringLiteral("low_confidence")) {
         statusLabel_->setText(QStringLiteral("当前模板未拟合出有效边界，请在当前方向重新粗画；必要时重设基准边界"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #b35c00;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("warning"));
     }
     manualAnchorButton_->setVisible(!active);
     setPreviewBusy(false);
 }
 
-void GeometryMaskManagerDialog::setTemplateReview(const QString &state, const QString &reason) {
+void GeometryRulesPage::setTemplateReview(const QString &state, const QString &reason) {
     const QString templateId = templateCombo_->currentData(Qt::UserRole + 1).toString();
     if (templateId.isEmpty() || state.isEmpty()) return;
     QJsonObject directions = draft_.value(QStringLiteral("directions")).toObject();
@@ -1523,34 +1917,82 @@ void GeometryMaskManagerDialog::setTemplateReview(const QString &state, const QS
     markDraftDirty();
 }
 
-void GeometryMaskManagerDialog::saveDraft() {
+void GeometryRulesPage::saveDraft() {
+    if (!backendAvailable_ || busy_) return;
     setCurrentRuleFromEditor();
     emit saveDraftRequested(draft_, snapshot_.value(QStringLiteral("library_revision")).toInt(),
                              snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
-void GeometryMaskManagerDialog::validateDraft() {
+void GeometryRulesPage::requestSaveDraft() {
+    saveDraft();
+}
+
+void GeometryRulesPage::discardUnsavedChanges() {
+    reloadDraft();
+}
+
+void GeometryRulesPage::validateDraft() {
+    if (!backendAvailable_ || busy_) return;
+    invalidatePublishContinuation();
     setCurrentRuleFromEditor();
     emit validateRequested(snapshot_.value(QStringLiteral("library_revision")).toInt(),
                           snapshot_.value(QStringLiteral("draft_revision")).toInt());
 }
 
-void GeometryMaskManagerDialog::publishDraft() {
-    if (!publishButton_->isEnabled()) return;
+void GeometryRulesPage::publishDraft() {
+    if (!backendAvailable_ || !publishButton_->isEnabled()) return;
     emit publishRequested(job_.value(QStringLiteral("job_id")).toString(),
                           snapshot_.value(QStringLiteral("library_revision")).toInt(),
                           snapshot_.value(QStringLiteral("draft_revision")).toInt(),
                           overrideReasonEdit_->text().trimmed());
 }
 
-void GeometryMaskManagerDialog::publishWorkflow() {
+void GeometryRulesPage::clearPublishContinuation() {
+    invalidatePublishContinuation();
+    updatePublishState();
+}
+
+void GeometryRulesPage::invalidatePublishContinuation(bool clearReason) {
+    warningContinuationAvailable_ = false;
+    if (clearReason && overrideReasonEdit_ != nullptr
+        && !overrideReasonEdit_->text().isEmpty()) {
+        const QSignalBlocker blocker(overrideReasonEdit_);
+        overrideReasonEdit_->clear();
+    }
+}
+
+void GeometryRulesPage::publishWorkflow() {
     if (publishWorkflowButton_ == nullptr || !publishWorkflowButton_->isEnabled()) return;
+    const bool completedCurrentValidation = job_.value(QStringLiteral("state")).toString()
+            == QStringLiteral("completed")
+        && job_.value(QStringLiteral("base_library_revision")).toInt(-1)
+            == snapshot_.value(QStringLiteral("library_revision")).toInt()
+        && job_.value(QStringLiteral("base_draft_revision")).toInt(-1)
+            == snapshot_.value(QStringLiteral("draft_revision")).toInt();
+    const bool hasWarning = !job_.value(QStringLiteral("warnings")).toArray().isEmpty()
+        || job_.value(QStringLiteral("regression")).toObject()
+               .value(QStringLiteral("correct_to_wrong")).toInt() > 0;
+    const bool hasBlocking = !job_.value(QStringLiteral("blocking_issues")).toArray().isEmpty();
+    if (warningContinuationAvailable_ && completedCurrentValidation
+        && hasWarning && !hasBlocking) {
+        const QString reason = overrideReasonEdit_->text().trimmed();
+        if (reason.isEmpty()) {
+            updatePublishState();
+            return;
+        }
+        emit publishRequested(job_.value(QStringLiteral("job_id")).toString(),
+                              snapshot_.value(QStringLiteral("library_revision")).toInt(),
+                              snapshot_.value(QStringLiteral("draft_revision")).toInt(), reason);
+        return;
+    }
+    invalidatePublishContinuation();
     setCurrentRuleFromEditor();
     const QJsonArray conflicts = draft_.value(QStringLiteral("migration")).toObject()
                                      .value(QStringLiteral("conflicts")).toArray();
     if (!conflicts.isEmpty()) {
         statusLabel_->setText(QStringLiteral("请先在右侧处理迁移冲突，再保存、验证并发布"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("error"));
         return;
     }
     const MissingCalibration missing = firstMissingEnabledCalibration();
@@ -1560,21 +2002,21 @@ void GeometryMaskManagerDialog::publishWorkflow() {
         selectRuleById(missing.ruleId);
         statusLabel_->setText(missing.direction == QStringLiteral("front")
             ? QStringLiteral("请先完成正面标定") : QStringLiteral("请先完成反面标定"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #b00020;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("error"));
         return;
     }
     emit publishWorkflowRequested(draft_,
                                   snapshot_.value(QStringLiteral("library_revision")).toInt(),
                                   snapshot_.value(QStringLiteral("draft_revision")).toInt(),
-                                  overrideReasonEdit_->text().trimmed());
+                                  QString());
 }
 
-void GeometryMaskManagerDialog::rollbackDraft() {
-    if (busy_) return;
+void GeometryRulesPage::rollbackDraft() {
+    if (!backendAvailable_ || busy_) return;
     emit rollbackRequested(snapshot_.value(QStringLiteral("library_revision")).toInt());
 }
 
-void GeometryMaskManagerDialog::updatePublishState() {
+void GeometryRulesPage::updatePublishState() {
     const QString state = job_.value(QStringLiteral("state")).toString();
     const bool completed = state == QStringLiteral("completed")
         && job_.value(QStringLiteral("base_library_revision")).toInt() == snapshot_.value(QStringLiteral("library_revision")).toInt()
@@ -1584,53 +2026,85 @@ void GeometryMaskManagerDialog::updatePublishState() {
     const bool hasBlocking = !job_.value(QStringLiteral("blocking_issues")).toArray().isEmpty();
     const bool readOnly = versionCombo_ != nullptr && versionCombo_->currentData().toString() == QStringLiteral("active");
     const bool hasOverrideReason = !overrideReasonEdit_->text().trimmed().isEmpty();
-    const bool needsOverrideReason = completed && hasWarning && !hasBlocking && !hasOverrideReason;
-    publishButton_->setEnabled(!busy_ && !readOnly && completed && !hasBlocking
+    const bool needsOverrideReason = warningContinuationAvailable_ && completed
+        && hasWarning && !hasBlocking && !hasOverrideReason;
+    const bool warningContinuationReady = warningContinuationAvailable_ && completed
+        && hasWarning && !hasBlocking && hasOverrideReason;
+    publishButton_->setEnabled(backendAvailable_ && !busy_ && !editingLocked_
+                               && !readOnly && completed && !hasBlocking
                                && (!hasWarning || hasOverrideReason));
     if (validateButton_ != nullptr) {
-        validateButton_->setEnabled(!busy_ && !readOnly && !dirty_);
+        validateButton_->setEnabled(backendAvailable_ && !busy_ && !editingLocked_
+                                    && !readOnly && !dirty_);
         validateButton_->setToolTip(dirty_
             ? QStringLiteral("请先保存当前草稿，再重新验证") : QString());
     }
     if (publishWorkflowButton_ != nullptr) {
-        publishWorkflowButton_->setEnabled(!busy_ && !readOnly);
-        publishWorkflowButton_->setToolTip(QStringLiteral("自动保存当前草稿并验证；无阻断项时继续发布"));
+        const bool workflowBlocked = completed && hasBlocking;
+        publishWorkflowButton_->setEnabled(backendAvailable_ && !busy_
+                                           && (!editingLocked_ || warningContinuationReady) && !readOnly
+                                           && !workflowBlocked && !needsOverrideReason);
+        publishWorkflowButton_->setToolTip(needsOverrideReason
+            ? QStringLiteral("请先填写发布覆盖原因")
+            : workflowBlocked ? QStringLiteral("存在阻断项，请先处理后重新验证")
+                              : QStringLiteral("自动保存当前草稿并验证；无阻断项时继续发布"));
+    }
+    if (publishDisabledReasonLabel_ != nullptr) {
+        QString disabledReason;
+        if (!backendAvailable_) {
+            disabledReason = backendUnavailableReason_.isEmpty()
+                ? QStringLiteral("后端不可用") : backendUnavailableReason_;
+        } else if (busy_) {
+            disabledReason = QStringLiteral("操作进行中，请稍候");
+        } else if (readOnly) {
+            disabledReason = QStringLiteral("活动版本为只读，请切换到编辑草稿");
+        } else if (completed && hasBlocking) {
+            disabledReason = QStringLiteral("验证存在阻断项，请先处理问题后重新验证");
+        } else if (needsOverrideReason) {
+            disabledReason = QStringLiteral("存在可覆盖告警，请先填写发布覆盖原因");
+        } else if (editingLocked_ && !warningContinuationReady) {
+            disabledReason = QStringLiteral("发布流程进行中，请等待当前步骤完成");
+        }
+        publishDisabledReasonLabel_->setText(disabledReason);
+        publishDisabledReasonLabel_->setVisible(!disabledReason.isEmpty());
     }
     if (needsOverrideReason) {
         statusLabel_->setText(QStringLiteral("验证完成：存在可覆盖告警，请填写发布覆盖原因"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #b35c00;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("warning"));
         publishButton_->setToolTip(QStringLiteral("请先填写“发布覆盖原因（有告警或回归时必填）”"));
         overrideReasonEdit_->setToolTip(QStringLiteral("告警允许覆盖，但必须记录人工确认原因"));
     } else if (completed && hasBlocking) {
         statusLabel_->setText(QStringLiteral("验证完成：存在阻断项，处理后才能发布"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #c00000;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("error"));
         publishButton_->setToolTip(QStringLiteral("存在阻断项，当前不能发布"));
     } else if (completed && hasWarning && hasOverrideReason) {
         statusLabel_->setText(QStringLiteral("验证完成：覆盖原因已填写，可以发布"));
-        statusLabel_->setStyleSheet(QStringLiteral("color: #008000;"));
+        setSemanticMessage(statusLabel_, QStringLiteral("success"));
         publishButton_->setToolTip(QString());
     } else {
         publishButton_->setToolTip(QString());
     }
 }
 
-void GeometryMaskManagerDialog::undoDraft() {
+void GeometryRulesPage::undoDraft() {
     if (undoHistory_.isEmpty()) return;
     redoHistory_.append(draft_);
     draft_ = undoHistory_.takeLast();
+    editorDirection_.clear();
     markDraftDirty();
     refreshEditor();
 }
 
-void GeometryMaskManagerDialog::redoDraft() {
+void GeometryRulesPage::redoDraft() {
     if (redoHistory_.isEmpty()) return;
     undoHistory_.append(draft_);
     draft_ = redoHistory_.takeLast();
+    editorDirection_.clear();
     markDraftDirty();
     refreshEditor();
 }
 
-void GeometryMaskManagerDialog::resetCurrentRule() {
+void GeometryRulesPage::resetCurrentRule() {
     const int index = currentRuleIndex();
     if (index < 0) return;
     if (usesLogicalRuleSchema()) {
@@ -1664,12 +2138,14 @@ void GeometryMaskManagerDialog::resetCurrentRule() {
     applyDraftMutation(next);
 }
 
-void GeometryMaskManagerDialog::reloadDraft() {
-    draft_ = snapshot_.value(QStringLiteral("draft")).toObject();
+void GeometryRulesPage::reloadDraft() {
+    restoreSnapshotDraft();
+    editorDirection_.clear();
     undoHistory_.clear();
     redoHistory_.clear();
-    dirty_ = false;
+    setDirty(false);
     job_ = QJsonObject();
+    invalidatePublishContinuation();
     if (validationTable_ != nullptr) validationTable_->setRowCount(0);
     if (progressBar_ != nullptr) {
         progressBar_->setRange(0, 1);
@@ -1680,16 +2156,16 @@ void GeometryMaskManagerDialog::reloadDraft() {
     refreshDiagnostics();
     if (validationHintLabel_ != nullptr) {
         validationHintLabel_->setText(QStringLiteral("已恢复保存的草稿；请重新验证以生成最新结果。"));
-        validationHintLabel_->setStyleSheet(QStringLiteral("color: #7a4b00;"));
+        setSemanticMessage(validationHintLabel_, QStringLiteral("warning"));
     }
     if (statusLabel_ != nullptr) {
         statusLabel_->setText(QStringLiteral("已重新载入已保存草稿，请重新验证"));
-        statusLabel_->setStyleSheet(QString());
+        setSemanticMessage(statusLabel_, QStringLiteral("neutral"));
     }
     refreshEditor();
 }
 
-void GeometryMaskManagerDialog::copyActiveToDraft() {
+void GeometryRulesPage::copyActiveToDraft() {
     const QJsonObject active = snapshot_.value(QStringLiteral("active")).toObject();
     if (active.isEmpty()) return;
     applyDraftMutation(active);
