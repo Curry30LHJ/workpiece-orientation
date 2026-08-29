@@ -197,6 +197,8 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
     template_hashes: set[str] = set()
     query_hashes: set[str] = set()
     overlap_by_case: dict[str, int] = {}
+    template_by_case: dict[str, set[str]] = {}
+    query_by_case: dict[str, set[str]] = {}
     for case, details in inventory.items():
         if not isinstance(details, Mapping):
             continue
@@ -208,10 +210,15 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
         case_body = {k: v for k, v in case_fp.items() if k != "aggregate_sha256"}
         if _canonical_sha256(case_body) != case_fp.get("aggregate_sha256"):
             raise ValueError(f"acceptance case {case} aggregate fingerprint mismatch")
+        template_by_case[str(case)] = set()
+        query_by_case[str(case)] = set()
         for direction in ("front", "back"):
             section = details.get(direction)
             if not isinstance(section, Mapping):
                 continue
+            fp_section = selections_fp[case].get(direction) if isinstance(selections_fp[case], Mapping) else None
+            if not isinstance(fp_section, Mapping):
+                raise ValueError(f"acceptance fingerprint missing {case}/{direction}")
             for role in ("templates", "queries"):
                 rows = section.get(role, [])
                 if not isinstance(rows, list):
@@ -221,6 +228,13 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                         continue
                     if row.get("role") != ("template" if role == "templates" else "query"):
                         raise ValueError("acceptance inventory row has invalid role")
+                    if row.get("case") != case or row.get("expected_orientation") != direction:
+                        raise ValueError("acceptance inventory row case/direction mismatch")
+                    expected_dataset = f"1_{case}"
+                    if row.get("dataset") != expected_dataset or Path(str(details["dataset_path"])).name != expected_dataset:
+                        raise ValueError("acceptance inventory dataset mismatch")
+                    if not isinstance(row.get("sha256"), str) or len(str(row["sha256"])) != 64 or int(row.get("size", 0)) <= 0:
+                        raise ValueError("acceptance inventory row requires sha256 and size")
                     source = Path(row["image_path"])
                     if not source.is_file():
                         raise FileNotFoundError(source)
@@ -229,12 +243,20 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                     shutil.copy2(source, destination)
                     if row.get("sha256") and _sha256(source) != str(row["sha256"]):
                         raise ValueError(f"acceptance source hash mismatch: {source}")
+                    fp_rows = fp_section.get(role, [])
+                    normalized = source.as_posix().lower()
+                    anchor = "/data/" if "/data/" in normalized else "/runtime_library/"
+                    rel = normalized.split(anchor, 1)[1] if anchor in normalized else source.name.lower()
+                    rel = (anchor.strip("/") + "/" + rel)
+                    if not any(str(item.get("path", "")).lower() == rel and int(item.get("size", -1)) == source.stat().st_size and str(item.get("sha256")) == str(row["sha256"]) for item in fp_rows if isinstance(item, Mapping)):
+                        raise ValueError(f"acceptance inventory/fingerprint mismatch: {source}")
                     if int(row.get("width", 0)) <= 0 or int(row.get("height", 0)) <= 0:
                         raise ValueError("acceptance inventory row has invalid dimensions")
                     if role == "templates":
                         templates.setdefault(f"{case}:{direction}", []).append(destination)
                         if row.get("sha256"):
                             template_hashes.add(str(row["sha256"]))
+                            template_by_case[str(case)].add(str(row["sha256"]))
                     else:
                         if row.get("expected_orientation") not in {"front", "back"}:
                             raise ValueError("acceptance query expected_orientation must be front or back")
@@ -242,7 +264,8 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                                         "image_path": str(destination), "query_identity": str(row.get("query_identity", destination.name))})
                         if row.get("sha256"):
                             query_hashes.add(str(row["sha256"]))
-        overlap_by_case[str(case)] = 0
+                            query_by_case[str(case)].add(str(row["sha256"]))
+        overlap_by_case[str(case)] = len(template_by_case[str(case)] & query_by_case[str(case)])
     if not templates or not queries:
         raise ValueError("acceptance spec contains no usable templates and queries")
     if template_hashes & query_hashes:
