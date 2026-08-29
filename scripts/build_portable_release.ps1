@@ -56,20 +56,37 @@ try {
 finally {
     $env:PATH = $previousPath
 }
-foreach ($ed in $editions) {
-    $target = Join-Path $stagingRoot "$ed-$Version"
-    if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
-    $py = if ($ed -eq 'gpu') { $GpuPython } else { $CpuPython }
-    & (Join-Path $repo 'scripts\build_portable_backend.ps1') -Edition $ed -Python $py -ProjectRoot $repo -OutputRoot $stagingRoot
-    if ($LASTEXITCODE -ne 0) { throw "Portable backend build failed for $ed with exit code $LASTEXITCODE" }
-    $backend = Join-Path $stagingRoot "backend-$ed\orientation_backend"
-    $model = if ($ModelPath) { $ModelPath } else { Join-Path $repo 'models\shitu_rec' }
-    $configArg = if ($PaddleConfig) { $PaddleConfig } else { Join-Path $repo 'deploy\configs\inference_general.yaml' }
-    if (-not (Test-Path -LiteralPath $configArg)) {
-        $configArg = Join-Path $repo 'third_party\PaddleClas\deploy\configs\inference_general.yaml'
-    }
-    if (-not (Test-Path -LiteralPath $configArg)) { throw "Paddle inference config not found: $configArg" }
-    $stageArgs = @('stage', '--edition', $ed, '--version', $Version, '--qt-release-dir', $qtRelease, '--backend-dir', $backend, '--model-dir', $model, '--output-root', $stagingRoot, '--guide', (Join-Path $repo 'deploy\使用说明.txt'), '--notices', (Join-Path $repo 'deploy\THIRD_PARTY-NOTICES.txt'), '--git-commit', $gitCommit, '--repository-root', $repo, '--paddle-config', $configArg)
+$asciiInputRoot = Join-Path ([IO.Path]::GetPathRoot($repo)) ".portable-release-inputs-$PID"
+if (Test-Path -LiteralPath $asciiInputRoot) { throw "Temporary input directory already exists: $asciiInputRoot" }
+New-Item -ItemType Directory -Path $asciiInputRoot -Force | Out-Null
+try {
+    # PowerShell 5.1 marshals non-ASCII native arguments through the active
+    # code page. Copy these two source files to an ASCII-only path first.
+    $asciiGuide = Join-Path $asciiInputRoot 'guide.txt'
+    $asciiNotices = Join-Path $asciiInputRoot 'notices.txt'
+    $deployDir = Join-Path $repo 'deploy'
+    $noticesSource = Join-Path $deployDir 'THIRD_PARTY-NOTICES.txt'
+    $guideCandidates = @(Get-ChildItem -LiteralPath $deployDir -File -Filter '*.txt' |
+        Where-Object { $_.Name -cne 'THIRD_PARTY-NOTICES.txt' })
+    if ($guideCandidates.Count -eq 0) { throw "Offline guide .txt file not found in $deployDir" }
+    if ($guideCandidates.Count -gt 1) { throw "Expected one offline guide .txt file in $deployDir; found $($guideCandidates.Count)" }
+    if (-not (Test-Path -LiteralPath $noticesSource -PathType Leaf)) { throw "Third-party notices file not found: $noticesSource" }
+    Copy-Item -LiteralPath $guideCandidates[0].FullName -Destination $asciiGuide -Force
+    Copy-Item -LiteralPath $noticesSource -Destination $asciiNotices -Force
+    foreach ($ed in $editions) {
+        $target = Join-Path $stagingRoot "$ed-$Version"
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+        $py = if ($ed -eq 'gpu') { $GpuPython } else { $CpuPython }
+        & (Join-Path $repo 'scripts\build_portable_backend.ps1') -Edition $ed -Python $py -ProjectRoot $repo -OutputRoot $stagingRoot
+        if ($LASTEXITCODE -ne 0) { throw "Portable backend build failed for $ed with exit code $LASTEXITCODE" }
+        $backend = Join-Path $stagingRoot "backend-$ed\orientation_backend"
+        $model = if ($ModelPath) { $ModelPath } else { Join-Path $repo 'models\shitu_rec' }
+        $configArg = if ($PaddleConfig) { $PaddleConfig } else { Join-Path $repo 'deploy\configs\inference_general.yaml' }
+        if (-not (Test-Path -LiteralPath $configArg)) {
+            $configArg = Join-Path $repo 'third_party\PaddleClas\deploy\configs\inference_general.yaml'
+        }
+        if (-not (Test-Path -LiteralPath $configArg)) { throw "Paddle inference config not found: $configArg" }
+        $stageArgs = @('stage', '--edition', $ed, '--version', $Version, '--qt-release-dir', $qtRelease, '--backend-dir', $backend, '--model-dir', $model, '--output-root', $stagingRoot, '--guide', $asciiGuide, '--notices', $asciiNotices, '--git-commit', $gitCommit, '--repository-root', $repo, '--paddle-config', $configArg)
     if ($MsvcRuntimeDir) { $stageArgs += @('--msvc-runtime-dir', $MsvcRuntimeDir) }
     & $py -m release_tools.portable_package @stageArgs
     if ($LASTEXITCODE -ne 0) { throw "Portable package staging failed for $ed with exit code $LASTEXITCODE" }
@@ -93,4 +110,8 @@ foreach ($ed in $editions) {
     # path, and omission errors that a source-directory audit cannot detect.
     & $py -c "from release_tools.portable_package import audit_zip_archive; from pathlib import Path; roots=[Path(r'$repo'),Path(r'$QtBin'),Path(r'$py').parent,Path.home()]; audit_zip_archive(Path(r'$archive'),edition='$ed',version='$Version',forbidden_roots=roots,runtime_roots=roots)"
     if ($LASTEXITCODE -ne 0) { throw "Extracted ZIP audit failed for $ed with exit code $LASTEXITCODE" }
+}
+}
+finally {
+    if (Test-Path -LiteralPath $asciiInputRoot) { Remove-Item -LiteralPath $asciiInputRoot -Recurse -Force }
 }

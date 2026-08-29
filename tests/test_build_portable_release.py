@@ -67,6 +67,21 @@ def test_release_script_allows_explicit_msvc_runtime_directory():
     assert "--msvc-runtime-dir" in script
 
 
+def test_release_script_uses_ascii_temp_copies_for_unicode_guide_and_notices():
+    script = (Path(__file__).parents[1] / "scripts" / "build_portable_release.ps1").read_text(encoding="utf-8")
+    assert "使用说明.txt" not in script
+    assert "$asciiInputRoot = Join-Path ([IO.Path]::GetPathRoot($repo))" in script
+    assert "$asciiGuide = Join-Path $asciiInputRoot 'guide.txt'" in script
+    assert "$asciiNotices = Join-Path $asciiInputRoot 'notices.txt'" in script
+    assert "Get-ChildItem -LiteralPath $deployDir -File -Filter '*.txt'" in script
+    assert "Where-Object { $_.Name -cne 'THIRD_PARTY-NOTICES.txt' }" in script
+    assert "guideCandidates.Count -eq 0" in script
+    assert "guideCandidates.Count -gt 1" in script
+    assert "'--guide', $asciiGuide, '--notices', $asciiNotices" in script
+    assert "finally {" in script
+    assert "Remove-Item -LiteralPath $asciiInputRoot -Recurse -Force" in script
+
+
 def test_backend_source_audit_filters_python_explicitly_for_windows_powershell():
     script = (Path(__file__).parents[1] / "scripts" / "build_portable_backend.ps1").read_text(encoding="utf-8")
     assert "Extension -ieq '.py'" in script
