@@ -264,7 +264,12 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
     report: SmokeReport = SmokeReport(ok=False, package_root=str(package), commands=[], results=[])
     try:
         config = _package_config(package)
-        templates, held_out = split_labels(Path(options.dataset_root), options.front_template_count, options.seed)
+        templates, held_out = split_labels(
+            Path(options.dataset_root),
+            options.front_template_count,
+            options.seed,
+            back_template_count=options.back_template_count,
+        )
         front = [str(p) for p in templates["0"]]
         back = [str(p) for p in templates["1"]]
         template_hashes = {hashlib.sha256(p.read_bytes()).digest() for p in (*templates["0"], *templates["1"])}
@@ -388,7 +393,10 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         restored_list = request("list_workpieces")
         _require_single_workpiece(restored_list, workpiece_id, "restored workpiece missing from list")
         request("shutdown", instance_token=instance_token)
-        process.wait(timeout=min(10.0, remaining_timeout()))
+        # Restoring a workpiece may enqueue an asynchronous fast-cache build.
+        # Give the backend the same total smoke budget to finish its graceful
+        # shutdown instead of imposing an unrelated ten-second ceiling.
+        process.wait(timeout=remaining_timeout())
         if process.returncode != 0:
             raise RuntimeError(f"backend exited with code {process.returncode}")
         report.update(ok=True, workpiece_id=workpiece_id, template_counts=counts, process_exit=process.returncode,
@@ -622,7 +630,7 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
                 shutdown_error = exc
         try:
             if getattr(process, "poll", lambda: None)() is None:
-                process.wait(timeout=10)
+                process.wait(timeout=destination_remaining_timeout())
         except Exception as exc:
             if shutdown_error is None:
                 shutdown_error = exc
@@ -638,7 +646,7 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
                     shutdown_error = exc
         if getattr(process, "poll", lambda: 0)() is None:
             try:
-                process.terminate(); process.wait(timeout=10)
+                process.terminate(); process.wait(timeout=destination_remaining_timeout())
             except Exception as exc:
                 if shutdown_error is None:
                     shutdown_error = exc

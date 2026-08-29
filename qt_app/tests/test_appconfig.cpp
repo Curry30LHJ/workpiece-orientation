@@ -70,8 +70,11 @@ private:
             {QStringLiteral("inference_mode"), QStringLiteral("fast_geometry")},
             {QStringLiteral("host"), QStringLiteral("127.0.0.1")},
             {QStringLiteral("port"), 37651},
-            {QStringLiteral("startup_timeout_ms"),
-             edition == QStringLiteral("gpu") ? 30000 : 60000},
+            // The frozen Paddle runtime can take well over one minute to
+            // initialize on an offline customer machine.  Packaged configs
+            // therefore use the same ten-minute watchdog as the release
+            // builder; this is a ceiling, not an intentional startup delay.
+            {QStringLiteral("startup_timeout_ms"), 600000},
             {QStringLiteral("request_timeout_ms"), 120000},
         };
     }

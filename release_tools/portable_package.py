@@ -363,7 +363,8 @@ def build_release_config(*, edition: str, version: str, model_sha256: str) -> di
         "local_search_mode": "adaptive", "inference_mode": "fast_geometry", "host": "127.0.0.1",
         # Initial Paddle model loading can exceed one minute on a clean
         # offline machine; keep the Qt startup watchdog aligned with the
-        # documented five-minute allowance for both editions.
+        # documented ten-minute allowance for both editions.  This is a
+        # watchdog ceiling, not an intentional startup delay.
         "port": 37651, "startup_timeout_ms": 600000,
         "request_timeout_ms": 120000,
     }

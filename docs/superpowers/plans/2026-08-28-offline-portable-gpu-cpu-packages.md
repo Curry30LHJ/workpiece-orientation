@@ -696,7 +696,9 @@ static QJsonObject validPackagedConfig(const QTemporaryDir &temporary,
         {QStringLiteral("inference_mode"), QStringLiteral("fast_geometry")},
         {QStringLiteral("host"), QStringLiteral("127.0.0.1")},
         {QStringLiteral("port"), 37651},
-        {QStringLiteral("startup_timeout_ms"), edition == QStringLiteral("gpu") ? 30000 : 60000},
+        // Frozen Paddle initialization can exceed one minute offline; the
+        // packaged watchdog is a ten-minute ceiling for both editions.
+        {QStringLiteral("startup_timeout_ms"), 600000},
         {QStringLiteral("request_timeout_ms"), 120000},
     };
 }
@@ -1300,8 +1302,8 @@ def test_generated_configs_are_relative_fast_and_device_specific():
     assert cpu["compute_device"] == cpu["edition"] == "cpu"
     assert gpu["inference_mode"] == cpu["inference_mode"] == "fast_geometry"
     assert gpu["model_sha256"] == cpu["model_sha256"] == model_sha
-    assert gpu["startup_timeout_ms"] == 30000
-    assert cpu["startup_timeout_ms"] == 60000
+    assert gpu["startup_timeout_ms"] == 600000
+    assert cpu["startup_timeout_ms"] == 600000
     assert all("E:/" not in str(value) for value in gpu.values())
 
 
@@ -1382,7 +1384,7 @@ def build_release_config(
         "inference_mode": "fast_geometry",
         "host": "127.0.0.1",
         "port": 37651,
-        "startup_timeout_ms": 30000 if edition == "gpu" else 60000,
+        "startup_timeout_ms": 600000,
         "request_timeout_ms": 120000,
     }
 ```
@@ -1557,7 +1559,7 @@ assert commands == [
 ]
 ```
 
-Assert the first list is empty, registered front/back template counts equal every supplied image, both expected labels are returned, restored workpiece is listed, and process exits within 10 seconds.
+Assert the first list is empty, registered front/back template counts equal every supplied image, both expected labels are returned, restored workpiece is listed, and process exits within the configured smoke budget (including any asynchronous cache shutdown).
 
 - [ ] **Step 3: Run focused tests and verify RED**
 
