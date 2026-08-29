@@ -229,7 +229,7 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                     raise ValueError(f"acceptance case {case}/{direction} {role} must be a list")
                 for index, row in enumerate(rows):
                     if not isinstance(row, Mapping) or not isinstance(row.get("image_path"), str):
-                        continue
+                        raise ValueError(f"acceptance inventory row is malformed: {case}/{direction}/{role}")
                     if row.get("role") != ("template" if role == "templates" else "query"):
                         raise ValueError("acceptance inventory row has invalid role")
                     if row.get("case") != case or row.get("expected_orientation") != direction:
