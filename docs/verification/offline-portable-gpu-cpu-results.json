@@ -1,23 +1,184 @@
 {
   "version": "1.0.0",
-  "git_commit": "61264e4d310a7a01ea70323efef5d986cb6b2597",
+  "verification_date": "2026-08-29",
+  "branch": "feature/20260828/offline-portable-packages",
+  "source_head_commit": "1d3f185738b93a97b1994a842204cf76e98d481f",
+  "package_build_commit": "d918723261bf7d211b752e2f1022ba120b6ebe63",
   "packages": {
-    "gpu": {"zip_sha256": null, "size_bytes": null, "content_audit": "not_run", "status": "blocked"},
-    "cpu": {"zip_sha256": null, "size_bytes": null, "content_audit": "not_run", "status": "blocked"}
+    "gpu": {
+      "artifact": "release_artifacts/WorkpieceOrientation-GPU-x64-1.0.0.zip",
+      "size_bytes": 2537514980,
+      "zip_sha256": "8818e1c17725a92b4a2097b3c761fc86b174e1c224001aa7b129310d471f33f4",
+      "content_audit": "passed",
+      "zip_extraction_audit": "passed",
+      "audited_file_count": 1192,
+      "manifest_file_count": 1191,
+      "shipped_workpieces": 0,
+      "shipped_geometry_rules": 0,
+      "config": {
+        "edition": "gpu",
+        "compute_device": "gpu",
+        "inference_mode": "fast_geometry",
+        "launch_mode": "packaged_executable",
+        "startup_timeout_ms": 600000,
+        "request_timeout_ms": 120000
+      },
+      "smoke": {
+        "report": "release_staging/final-1.0.0-final/reports/gpu-smoke.json",
+        "passed": true,
+        "template_counts": {"front": 5, "back": 10},
+        "labels": {"front": "front", "back": "back"},
+        "process_exit": 0,
+        "forced_termination": false,
+        "temporary_package_cleaned": true,
+        "register_elapsed_ms": 276494.9554
+      },
+      "benchmark": {
+        "report": "release_staging/final-1.0.0-final/reports/gpu-portable-benchmark.json",
+        "warmup_requests": 50,
+        "measured_requests": 1000,
+        "acceptance_queries": 120,
+        "startup_ready_ms": 76462.1608,
+        "backend_elapsed_ms": {
+          "mean": 11.1641,
+          "p50": 10.9926,
+          "p95": 14.5300,
+          "p99": 17.1548,
+          "max": 21.8226
+        },
+        "round_trip_ms": {
+          "mean": 11.9981,
+          "p50": 11.8330,
+          "p95": 15.5994,
+          "p99": 18.2341,
+          "max": 22.9122
+        },
+        "accuracy": 1.0,
+        "correct_queries": 120,
+        "correct_samples": 1000,
+        "review_rate": 0.0,
+        "gpu_p95_gate_ms": 25.0,
+        "gpu_p95_gate_passed": true,
+        "lifecycle": {"process_exit": 0, "forced_termination": false}
+      }
+    },
+    "cpu": {
+      "artifact": "release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip",
+      "size_bytes": 254500483,
+      "zip_sha256": "e29b2a95bc927920f51e025039935947a81fac9cc4b42287f473bb4a2b7520ce",
+      "content_audit": "passed",
+      "zip_extraction_audit": "passed",
+      "audited_file_count": 1171,
+      "manifest_file_count": 1170,
+      "shipped_workpieces": 0,
+      "shipped_geometry_rules": 0,
+      "config": {
+        "edition": "cpu",
+        "compute_device": "cpu",
+        "inference_mode": "fast_geometry",
+        "launch_mode": "packaged_executable",
+        "startup_timeout_ms": 600000,
+        "request_timeout_ms": 120000
+      },
+      "smoke": {
+        "report": "release_staging/final-1.0.0-final/reports/cpu-smoke.json",
+        "passed": true,
+        "template_counts": {"front": 5, "back": 10},
+        "labels": {"front": "front", "back": "back"},
+        "process_exit": 0,
+        "forced_termination": false,
+        "temporary_package_cleaned": true,
+        "register_elapsed_ms": 41988.4119
+      },
+      "benchmark": {
+        "report": "release_staging/final-1.0.0-final/reports/cpu-portable-benchmark.json",
+        "warmup_requests": 50,
+        "measured_requests": 1000,
+        "acceptance_queries": 120,
+        "startup_ready_ms": 15297.4499,
+        "backend_elapsed_ms": {
+          "mean": 176.5671,
+          "p50": 171.4005,
+          "p95": 222.4404,
+          "p99": 258.9467,
+          "max": 304.6554
+        },
+        "round_trip_ms": {
+          "mean": 177.5001,
+          "p50": 172.2885,
+          "p95": 223.7086,
+          "p99": 260.4761,
+          "max": 305.6201
+        },
+        "accuracy": 1.0,
+        "correct_queries": 120,
+        "correct_samples": 1000,
+        "review_rate": 0.0,
+        "gpu_p95_gate": "not_applicable",
+        "lifecycle": {"process_exit": 0, "forced_termination": false},
+        "gpu_label_differences": 0,
+        "gpu_review_differences": 0
+      }
+    }
+  },
+  "benchmark_corpus": {
+    "source": "external M1/M2/M7 fast-geometry acceptance specification",
+    "shipped_in_package": false,
+    "template_counts": {"front": 5, "back": 10},
+    "queries": 120,
+    "warmup": 50,
+    "measured": 1000,
+    "template_query_sha256_overlap": 0
   },
   "tests": {
-    "benchmark_portable_service": {"passed": 12, "failed": 0},
-    "related_tests": {"passed": 32, "failed": 0, "setup_errors": 38, "error": "pytest temporary-directory lock PermissionError"},
-    "qt_tests": "not_run"
+    "python_full": {
+      "passed": 726,
+      "skipped": 5,
+      "failed": 0,
+      "command": "python -m pytest -q -p no:cacheprovider",
+      "note": "运行时使用 ASCII 临时目录，避免 Windows 执行器转码中文工作路径。"
+    },
+    "qt5_offscreen": {
+      "targets": [
+        "test_appconfig",
+        "test_backendclient",
+        "test_backendprocessmanager",
+        "test_annotationmanager",
+        "test_appfoundation",
+        "test_inspectionpage",
+        "test_workpiecelibrarypage",
+        "test_geometryrulecanvas",
+        "test_geometryrulespage",
+        "test_mainwindow",
+        "test_startupsmokecontroller"
+      ],
+      "passed_targets": 11,
+      "failed_targets": 0,
+      "command": "scripts/run_qt5_tests.ps1 (Qt 5.14.2, offscreen)"
+    },
+    "focused_package_regression": {"passed": 61, "failed": 0}
   },
-  "build": {
-    "command": "scripts/build_portable_release.ps1 -Edition all -Version 1.0.0 -GpuPython ...workpiece-package-gpu... -CpuPython ...workpiece-package-cpu... -ModelPath E:/Project/wang/pp_813/third_party/models/shiru_rec/general_PPLCNetV2_base_pretrained_v1.0_infer -SkipSmoke",
-    "gpu_backend": "PyInstaller completed; staging reached portable_package after PYTHONPATH fix, then failed because Qt release directory was absent",
-    "cpu_backend": "PyInstaller completed; first all-edition attempt reached portable_package after PYTHONPATH fix, then failed because Qt release directory was absent",
-    "exit_status": "failed"
+  "template_count_performance_reference": {
+    "source": "docs/verification/lightweight-geometry-fast-path-results.md",
+    "scope": "同一 fast-cache 模型实验；不是本次 ZIP 的端到端启动时间",
+    "feature_build_ms": {
+      "1+1": 202.732,
+      "5+10": 2420.843,
+      "10+15": 5258.186,
+      "35+35": 2785.459
+    },
+    "interpretation": "模板数主要增加离线缓存构建量；少于每侧 20 张时旋转增强会使训练行数增加。缓存完成后在线 fast_geometry 查询使用固定维度特征与 Ridge 头，不按模板数线性增加。"
   },
-  "gpu": {"status": "not_run", "gate": "not_run", "reason": "no ZIP produced"},
-  "cpu": {"status": "not_run", "reason": "no ZIP produced"},
-  "cpu_gpu_differences": [],
-  "clean_machine": {"status": "not_run", "reason": "no ZIP produced; no clean Windows VM available"}
+  "clean_machine": {
+    "status": "not_run",
+    "reason": "当前没有可用的干净 Windows 10/11 虚拟机；本次为开发机上的离线式长路径解压、协议冒烟和基准。"
+  },
+  "overall": {
+    "package_build": "passed",
+    "static_and_zip_audits": "passed",
+    "functional_smoke": "passed",
+    "gpu_latency_gate": "passed",
+    "accuracy_and_cross_edition_consistency": "passed",
+    "clean_vm_acceptance": "pending"
+  }
 }
