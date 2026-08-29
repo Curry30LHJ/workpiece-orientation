@@ -181,6 +181,8 @@ def _validate_config(root: Path | str, config: Mapping[str, Any]) -> None:
 
 def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[Path]], list[dict[str, Any]]]:
     payload = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1 or payload.get("passed") is not True:
+        raise ValueError("acceptance spec schema/passed gate is invalid")
     inventory = payload.get("selection_inventory")
     if not isinstance(inventory, Mapping):
         raise ValueError("acceptance spec has no selection_inventory")
@@ -201,7 +203,7 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
     query_by_case: dict[str, set[str]] = {}
     for case, details in inventory.items():
         if not isinstance(details, Mapping):
-            continue
+            raise ValueError(f"acceptance case {case} details must be an object")
         if not isinstance(details.get("dataset_path"), str) or not str(details.get("dataset_path")).strip():
             raise ValueError(f"acceptance case {case} has no dataset fingerprint/path")
         case_fp = selections_fp.get(case)
@@ -219,6 +221,7 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
             fp_section = selections_fp[case].get(direction) if isinstance(selections_fp[case], Mapping) else None
             if not isinstance(fp_section, Mapping):
                 raise ValueError(f"acceptance fingerprint missing {case}/{direction}")
+            fp_used: set[int] = set()
             for role in ("templates", "queries"):
                 rows = section.get(role, [])
                 if not isinstance(rows, list):
@@ -241,6 +244,8 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                     destination = temp_root / "data" / "benchmark" / str(case) / direction / f"{index:04d}_{source.name}"
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, destination)
+                    if int(row["size"]) != source.stat().st_size:
+                        raise ValueError(f"acceptance source size mismatch: {source}")
                     if row.get("sha256") and _sha256(source) != str(row["sha256"]):
                         raise ValueError(f"acceptance source hash mismatch: {source}")
                     fp_rows = fp_section.get(role, [])
@@ -248,8 +253,10 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                     anchor = "/data/" if "/data/" in normalized else "/runtime_library/"
                     rel = normalized.split(anchor, 1)[1] if anchor in normalized else source.name.lower()
                     rel = (anchor.strip("/") + "/" + rel)
-                    if not any(str(item.get("path", "")).lower() == rel and int(item.get("size", -1)) == source.stat().st_size and str(item.get("sha256")) == str(row["sha256"]) for item in fp_rows if isinstance(item, Mapping)):
+                    match_index = next((i for i, item in enumerate(fp_rows) if i not in fp_used and isinstance(item, Mapping) and str(item.get("path", "")).lower() == rel and int(item.get("size", -1)) == source.stat().st_size and str(item.get("sha256")) == str(row["sha256"])), None)
+                    if match_index is None:
                         raise ValueError(f"acceptance inventory/fingerprint mismatch: {source}")
+                    fp_used.add(match_index)
                     if int(row.get("width", 0)) <= 0 or int(row.get("height", 0)) <= 0:
                         raise ValueError("acceptance inventory row has invalid dimensions")
                     if role == "templates":
@@ -343,7 +350,8 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 "--package-version", str(config["package_version"]), "--instance-token", token,
                 "--parent-pid", str(os.getpid()), "--local-search-mode", str(config.get("local_search_mode", "adaptive")),
                 "--inference-mode", str(config.get("inference_mode", "fast_geometry"))]
-        process = subprocess.Popen(args, cwd=str(package_root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        log_handle = (temp_parent / "backend.log").open("w+", encoding="utf-8")
+        process = subprocess.Popen(args, cwd=str(package_root), stdout=log_handle, stderr=subprocess.STDOUT,
                                    text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         report["startup"]["process_spawn_ms"] = (perf_counter() - started) * 1000.0
         deadline = time.monotonic() + timeout_seconds
@@ -403,6 +411,8 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         predictions: dict[str, str] = {}
         correct_samples = 0
         for index in range(iterations):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("benchmark overall timeout exceeded")
             row = queries[index % len(queries)]
             expected_label = row.get("expected_orientation")
             if expected_label not in {"front", "back"}:
@@ -480,13 +490,12 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 process.wait(timeout=10)
             if completed and process.returncode not in (None, 0):
                 raise RuntimeError(f"backend exited with code {process.returncode}")
-            if process.stdout is not None:
-                try:
-                    backend_log = process.stdout.read()
-                except Exception as exc:
-                    backend_log = f"<backend log unavailable: {exc}>"
-            else:
-                backend_log = ""
+            try:
+                log_handle.flush()
+                backend_log = log_handle.read()
+                log_handle.close()
+            except Exception as exc:
+                backend_log = f"<backend log unavailable: {exc}>"
             if active_error is not None:
                 setattr(active_error, "process_exit", process.returncode)
                 setattr(active_error, "backend_log", backend_log)
