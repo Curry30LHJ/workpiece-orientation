@@ -27,7 +27,7 @@ def main() -> int:
                                iterations=args.iterations, compare=args.compare)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        return 0
+        return 0 if report.get("passed") is True else 2
     except Exception as exc:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({"passed": False, "error": {"type": type(exc).__name__, "message": str(exc)},

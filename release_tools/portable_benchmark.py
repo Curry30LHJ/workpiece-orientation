@@ -380,17 +380,26 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                                    "backend_elapsed_ms": summarize([r["backend_elapsed_ms"] for r in samples])}})
         expected = {str(row["query_identity"]): str(row.get("expected_orientation")) for row in queries}
         correct = sum(predictions.get(k) == v for k, v in expected.items())
-        review_by_identity = {row["image"]: bool(row["needs_review"]) for row in samples}
-        report["needs_review"] = {"count": sum(review_by_identity.values()), "by_image": review_by_identity}
+        review_counts = {}
+        for row in samples:
+            review_counts[row["image"]] = review_counts.get(row["image"], 0) + int(row["needs_review"])
+        review_count = sum(int(row["needs_review"]) for row in samples)
+        review_rate = float(review_count / len(samples)) if samples else 1.0
+        review_by_identity = {image: count > 0 for image, count in review_counts.items()}
+        report["needs_review"] = {"count": review_count, "measured_rate": review_rate,
+                                   "by_image": review_by_identity, "counts_by_image": review_counts}
         accuracy_value = float(correct / len(expected)) if expected else 0.0
-        review_rate = float(sum(review_by_identity.values()) / len(expected)) if expected else 1.0
+        identity_review_rate = float(sum(review_by_identity.values()) / len(expected)) if expected else 1.0
         report["accuracy"] = {"queries": len(expected), "correct": int(correct), "accuracy": accuracy_value,
-                                "review_count": sum(review_by_identity.values()), "review_rate": review_rate}
+                                "review_count": review_count, "review_rate": review_rate,
+                                "per_query_review_rate": identity_review_rate}
         backend_summary = report["timings"]["backend_elapsed_ms"]
         report["gates"] = {"gpu_backend_p95_ms": {"actual": backend_summary["p95"], "limit": 25.0,
                                                       "passed": report["edition"] != "gpu" or backend_summary["p95"] <= 25.0},
                          "accuracy_complete": {"actual": len(predictions), "limit": len(expected), "passed": len(predictions) == len(expected)},
+                         "correctness": {"actual": int(correct), "limit": len(expected), "passed": correct == len(expected)},
                          "review_rate": {"actual": review_rate, "limit": 0.05, "passed": review_rate <= 0.05}}
+        report["passed"] = all(item["passed"] for item in report["gates"].values())
         if compare is not None:
             previous = json.loads(Path(compare).read_text(encoding="utf-8"))
             report["differences"] = compare_predictions(previous.get("predictions", {}), predictions)
