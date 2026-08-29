@@ -186,7 +186,10 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         report["error"] = str(exc)
         report["process_exit"] = None
         setattr(exc, "smoke_report", report)
-        _persist_report(options.report_path, report)
+        try:
+            _persist_report(options.report_path, report)
+        except Exception:
+            pass
         raise
     process_factory = process_factory or _real_process_factory
     port = (free_port_factory or port_factory or _free_port)()
@@ -198,7 +201,10 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         report["error"] = str(exc)
         report["process_exit"] = None
         setattr(exc, "smoke_report", report)
-        _persist_report(options.report_path, report)
+        try:
+            _persist_report(options.report_path, report)
+        except Exception:
+            pass
         raise
     client = None
     report["edition"] = config.get("edition")

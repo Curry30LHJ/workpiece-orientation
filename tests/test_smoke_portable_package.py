@@ -229,6 +229,24 @@ def test_run_smoke_rejects_missing_hello_instance_token(tmp_path):
         )
 
 
+def test_run_smoke_report_write_error_preserves_primary_error(tmp_path, monkeypatch):
+    import release_tools.portable_smoke as portable_smoke
+
+    dataset = _dataset_fixture(tmp_path / "dataset")
+    package = _package_fixture(tmp_path / "package")
+    config_path = package / "app_config.json"
+    config_path.write_text(config_path.read_text(encoding="utf-8").replace(
+        '"backend_executable":"backend/orientation_backend.exe"',
+        '"backend_executable":"../backend/orientation_backend.exe"'), encoding="utf-8")
+    def fail_persist(*args, **kwargs):
+        raise OSError("report failed")
+    monkeypatch.setattr(portable_smoke, "_persist_report", fail_persist)
+    with pytest.raises(ValueError, match="relative"):
+        run_smoke(
+            SmokeOptions(package_root=package, dataset_root=dataset, report_path=tmp_path / "report.json"),
+        )
+
+
 def test_run_portability_rejects_extra_destination_workpiece(tmp_path):
     dataset = _dataset_fixture(tmp_path / "dataset")
     source = _package_fixture(tmp_path / "source")
