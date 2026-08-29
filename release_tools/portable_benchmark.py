@@ -24,6 +24,7 @@ from typing import Any
 import zipfile
 
 import numpy as np
+from scripts.benchmark_adaptive_local_search import _canonical_sha256
 
 
 def summarize(values: Sequence[float]) -> dict[str, float | int]:
@@ -204,6 +205,9 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
         case_fp = selections_fp.get(case)
         if not isinstance(case_fp, Mapping) or not isinstance(case_fp.get("aggregate_sha256"), str) or len(str(case_fp.get("aggregate_sha256"))) != 64:
             raise ValueError(f"acceptance case {case} has no aggregate fingerprint")
+        case_body = {k: v for k, v in case_fp.items() if k != "aggregate_sha256"}
+        if _canonical_sha256(case_body) != case_fp.get("aggregate_sha256"):
+            raise ValueError(f"acceptance case {case} aggregate fingerprint mismatch")
         for direction in ("front", "back"):
             section = details.get(direction)
             if not isinstance(section, Mapping):
@@ -247,6 +251,9 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
         expected_overlap = selections_fp[case].get("template_query_overlap_count", 0)
         if int(expected_overlap) != count:
             raise ValueError(f"acceptance overlap count mismatch for {case}")
+    body = {k: v for k, v in fingerprints.items() if k != "overall_sha256"}
+    if _canonical_sha256(body) != overall_fp:
+        raise ValueError("acceptance overall fingerprint mismatch")
     identities = [str(row["query_identity"]) for row in queries]
     if any(not identity.strip() for identity in identities) or len(set(identities)) != len(identities):
         raise ValueError("acceptance query identities must be unique and non-empty")
@@ -365,6 +372,7 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
             client.request("predict", workpiece_id=workpieces[str(row["case"])], image_path=row["image_path"])
         samples: list[dict[str, Any]] = []
         predictions: dict[str, str] = {}
+        correct_samples = 0
         for index in range(iterations):
             row = queries[index % len(queries)]
             expected_label = row.get("expected_orientation")
@@ -377,6 +385,7 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
             if label not in {"front", "back"}:
                 raise RuntimeError("predict response label must be front or back")
             predictions[str(row["query_identity"])] = label
+            correct_samples += int(label == expected_label)
             backend_timings = response.get("timings_ms") if isinstance(response.get("timings_ms"), Mapping) else {}
             backend_total = response.get("elapsed_ms", backend_timings.get("total"))
             if backend_total is None:
@@ -391,6 +400,7 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                                    "backend_elapsed_ms": summarize([r["backend_elapsed_ms"] for r in samples])}})
         expected = {str(row["query_identity"]): str(row.get("expected_orientation")) for row in queries}
         correct = sum(predictions.get(k) == v for k, v in expected.items())
+        sample_accuracy = float(correct_samples / len(samples)) if samples else 0.0
         review_counts = {}
         for row in samples:
             review_counts[row["image"]] = review_counts.get(row["image"], 0) + int(row["needs_review"])
@@ -402,13 +412,14 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         accuracy_value = float(correct / len(expected)) if expected else 0.0
         identity_review_rate = float(sum(review_by_identity.values()) / len(expected)) if expected else 1.0
         report["accuracy"] = {"queries": len(expected), "correct": int(correct), "accuracy": accuracy_value,
+                                "correct_samples": correct_samples, "sample_accuracy": sample_accuracy,
                                 "review_count": review_count, "review_rate": review_rate,
                                 "per_query_review_rate": identity_review_rate}
         backend_summary = report["timings"]["backend_elapsed_ms"]
         report["gates"] = {"gpu_backend_p95_ms": {"actual": backend_summary["p95"], "limit": 25.0,
                                                       "passed": report["edition"] != "gpu" or backend_summary["p95"] <= 25.0},
                          "accuracy_complete": {"actual": len(predictions), "limit": len(expected), "passed": len(predictions) == len(expected)},
-                         "correctness": {"actual": int(correct), "limit": len(expected), "passed": correct == len(expected)},
+                         "correctness": {"actual": sample_accuracy, "limit": 1.0, "passed": sample_accuracy == 1.0},
                          "review_rate": {"actual": review_rate, "limit": 0.05, "passed": review_rate <= 0.05}}
         report["passed"] = all(item["passed"] for item in report["gates"].values())
         if compare is not None:
