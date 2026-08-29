@@ -14,11 +14,20 @@ int main(int argc, char *argv[]) {
     QApplication application(argc, argv);
     AppTheme::apply(&application);
     application.setApplicationName(QStringLiteral("工件正反面检测"));
+    const bool packageSmokeTest = application.arguments().contains(
+        QStringLiteral("--package-smoke-test"));
+    // The smoke entry point intentionally creates no visible window.  Keep
+    // the event loop alive until StartupSmokeController receives the backend
+    // result; otherwise QApplication may quit immediately because there is no
+    // last window to keep open.
+    if (packageSmokeTest) {
+        application.setQuitOnLastWindowClosed(false);
+    }
     const QString configPath = QCoreApplication::applicationDirPath() + QStringLiteral("/app_config.json");
     QString configError;
     const std::optional<AppConfig> config = AppConfig::load(configPath, &configError);
     if (!config.has_value()) {
-        if (application.arguments().contains(QStringLiteral("--package-smoke-test"))) {
+        if (packageSmokeTest) {
             return 2;
         }
         MainWindow window;
@@ -28,7 +37,7 @@ int main(int argc, char *argv[]) {
     }
     BackendClient client;
     BackendProcessManager manager(*config, &client, nullptr, &application);
-    if (application.arguments().contains(QStringLiteral("--package-smoke-test"))) {
+    if (packageSmokeTest) {
         StartupSmokeController controller(&manager, config->startupTimeoutMs + 5000, &application);
         QObject::connect(&controller, &StartupSmokeController::finished,
                          &application, [&application](int code) { application.exit(code); });
