@@ -185,19 +185,25 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
         raise ValueError("acceptance spec has no selection_inventory")
     if set(inventory) != {"M1", "M2", "M7"}:
         raise ValueError("acceptance spec must contain exactly M1, M2, and M7")
+    fingerprints = ((payload.get("fingerprints") or {}).get("fast_geometry")
+                    if isinstance(payload.get("fingerprints"), Mapping) else None)
+    selections_fp = fingerprints.get("selections") if isinstance(fingerprints, Mapping) else None
+    overall_fp = fingerprints.get("overall_sha256") if isinstance(fingerprints, Mapping) else None
+    if not isinstance(selections_fp, Mapping) or not isinstance(overall_fp, str) or len(overall_fp) != 64:
+        raise ValueError("acceptance spec is missing fast_geometry fingerprints")
     templates: dict[str, list[Path]] = {}
     queries: list[dict[str, Any]] = []
     template_hashes: set[str] = set()
     query_hashes: set[str] = set()
+    overlap_by_case: dict[str, int] = {}
     for case, details in inventory.items():
         if not isinstance(details, Mapping):
             continue
         if not isinstance(details.get("dataset_path"), str) or not str(details.get("dataset_path")).strip():
             raise ValueError(f"acceptance case {case} has no dataset fingerprint/path")
-        if not isinstance(details.get("aggregate_sha256"), str) or len(str(details.get("aggregate_sha256"))) != 64:
+        case_fp = selections_fp.get(case)
+        if not isinstance(case_fp, Mapping) or not isinstance(case_fp.get("aggregate_sha256"), str) or len(str(case_fp.get("aggregate_sha256"))) != 64:
             raise ValueError(f"acceptance case {case} has no aggregate fingerprint")
-        if not isinstance(details.get("overall_sha256"), str) or len(str(details.get("overall_sha256"))) != 64:
-            raise ValueError(f"acceptance case {case} has no overall fingerprint")
         for direction in ("front", "back"):
             section = details.get(direction)
             if not isinstance(section, Mapping):
@@ -232,10 +238,15 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
                                         "image_path": str(destination), "query_identity": str(row.get("query_identity", destination.name))})
                         if row.get("sha256"):
                             query_hashes.add(str(row["sha256"]))
+        overlap_by_case[str(case)] = 0
     if not templates or not queries:
         raise ValueError("acceptance spec contains no usable templates and queries")
     if template_hashes & query_hashes:
         raise ValueError("acceptance template/query SHA-256 overlap")
+    for case, count in overlap_by_case.items():
+        expected_overlap = selections_fp[case].get("template_query_overlap_count", 0)
+        if int(expected_overlap) != count:
+            raise ValueError(f"acceptance overlap count mismatch for {case}")
     identities = [str(row["query_identity"]) for row in queries]
     if any(not identity.strip() for identity in identities) or len(set(identities)) != len(identities):
         raise ValueError("acceptance query identities must be unique and non-empty")
