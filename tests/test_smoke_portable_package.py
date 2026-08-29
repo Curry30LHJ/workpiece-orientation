@@ -160,7 +160,9 @@ def test_run_portability_uses_destination_counts_and_records_destination_command
         {"ok": True, "profile": {}}, {"ok": True},
     ]
     def process_factory(*args, **kwargs):
-        process = FakeProcess(); processes.append(process); return process
+        process = FakeProcess()
+        process.stdout = type("FakeStdout", (), {"read": lambda self: "destination backend output"})()
+        processes.append(process); return process
     def socket_factory(*args, **kwargs):
         socket = FakeSocket([], source_responses if not sockets else destination_responses)
         sockets.append(socket); return socket
@@ -173,6 +175,7 @@ def test_run_portability_uses_destination_counts_and_records_destination_command
         temp_root_factory=lambda: tmp_path / "copy",
     )
     assert report["destination"]["template_counts"] == {"front": 2, "back": 2}
+    assert report["destination"]["backend_log"] == "destination backend output"
     assert report["destination"]["commands"] == [
         "hello", "list_workpieces", "predict", "predict", "get_geometry_mask_profile", "shutdown"
     ]
@@ -241,10 +244,11 @@ def test_run_smoke_report_write_error_preserves_primary_error(tmp_path, monkeypa
     def fail_persist(*args, **kwargs):
         raise OSError("report failed")
     monkeypatch.setattr(portable_smoke, "_persist_report", fail_persist)
-    with pytest.raises(ValueError, match="relative"):
+    with pytest.raises(ValueError, match="relative") as caught:
         run_smoke(
             SmokeOptions(package_root=package, dataset_root=dataset, report_path=tmp_path / "report.json"),
         )
+    assert caught.value.smoke_report["report_persist_error"] == "report failed"
 
 
 def test_run_portability_rejects_extra_destination_workpiece(tmp_path):
@@ -270,16 +274,26 @@ def test_run_portability_rejects_extra_destination_workpiece(tmp_path):
         ]},
     ]
     sockets = []
+    processes = []
+    def process_factory(*args, **kwargs):
+        process = FakeProcess()
+        process.stdout = type("FakeStdout", (), {"read": lambda self: "destination failure output"})()
+        processes.append(process)
+        return process
     def socket_factory(*args, **kwargs):
         responses = source_responses if not sockets else destination_responses
         sock = FakeSocket([], responses); sockets.append(sock); return sock
+    report_path = tmp_path / "extra-destination.json"
     with pytest.raises(RuntimeError, match="destination workpiece set"):
         run_portability(
             SmokeOptions(source_package_root=source, destination_package_root=destination,
-                         dataset_root=dataset, front_template_count=2, back_template_count=2),
-            process_factory=lambda *a, **k: FakeProcess(), socket_factory=socket_factory,
+                         dataset_root=dataset, front_template_count=2, back_template_count=2,
+                         report_path=report_path),
+            process_factory=process_factory, socket_factory=socket_factory,
             temp_root_factory=lambda: tmp_path / "copy",
         )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["destination"]["backend_log"] == "destination failure output"
 
 
 def test_run_portability_rejects_missing_destination_hello_token(tmp_path, monkeypatch):

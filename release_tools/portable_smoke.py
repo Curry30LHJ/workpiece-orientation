@@ -69,6 +69,16 @@ def _collect_backend_log(report: dict[str, Any], process: Any) -> None:
         report["backend_log_error"] = str(exc)
 
 
+def _persist_report_safely(path: Path | None, report: dict[str, Any]) -> Exception | None:
+    """Persist a report without replacing the operation's primary exception."""
+    try:
+        _persist_report(path, report)
+    except Exception as exc:
+        report["report_persist_error"] = str(exc)
+        return exc
+    return None
+
+
 class _JsonSocket:
     def __init__(self, sock: socket.socket):
         self.sock = sock
@@ -186,10 +196,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         report["error"] = str(exc)
         report["process_exit"] = None
         setattr(exc, "smoke_report", report)
-        try:
-            _persist_report(options.report_path, report)
-        except Exception:
-            pass
+        _persist_report_safely(options.report_path, report)
         raise
     process_factory = process_factory or _real_process_factory
     port = (free_port_factory or port_factory or _free_port)()
@@ -201,10 +208,7 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         report["error"] = str(exc)
         report["process_exit"] = None
         setattr(exc, "smoke_report", report)
-        try:
-            _persist_report(options.report_path, report)
-        except Exception:
-            pass
+        _persist_report_safely(options.report_path, report)
         raise
     client = None
     report["edition"] = config.get("edition")
@@ -312,11 +316,9 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
         _collect_backend_log(report, process)
         report["process_exit"] = _process_exit_code(process)
         if options.report_path:
-            try:
-                _persist_report(Path(options.report_path), report)
-            except Exception:
-                if not primary_error:
-                    raise
+            persist_error = _persist_report_safely(Path(options.report_path), report)
+            if persist_error is not None and not primary_error:
+                raise persist_error
         if cleanup_error is not None and not primary_error:
             raise cleanup_error
     return report
@@ -353,7 +355,8 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
             report["source"] = partial
             report["commands"] = list(partial.get("commands", []))
             report["results"] = list(partial.get("results", []))
-        _persist_report(options.report_path, report)
+        setattr(exc, "smoke_report", report)
+        _persist_report_safely(options.report_path, report)
         raise
     source_factories = dict(factories)
     try:
@@ -374,7 +377,8 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
             report["source"] = partial
             report["commands"] = list(partial.get("commands", []))
             report["results"] = list(partial.get("results", []))
-        _persist_report(options.report_path, report)
+        setattr(exc, "smoke_report", report)
+        _persist_report_safely(options.report_path, report)
         raise
     report["source"] = source
     src_data = Path(source["temp_package"]) / "data"
@@ -398,7 +402,8 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
         process = _start_backend(dest_copy, cfg, port, process_factory)
     except Exception as exc:
         report["error"] = str(exc)
-        _persist_report(options.report_path, report)
+        setattr(exc, "smoke_report", report)
+        _persist_report_safely(options.report_path, report)
         raise
     client = None
     hello: dict[str, Any] = {}
@@ -494,6 +499,7 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
             except Exception as exc:
                 if shutdown_error is None:
                     shutdown_error = exc
+        _collect_backend_log(destination_report, process)
         destination_report["process_exit"] = _process_exit_code(process)
         if primary_error is None and shutdown_error is not None:
             primary_error = shutdown_error
@@ -503,11 +509,9 @@ def run_portability(options: SmokeOptions, **factories: Any) -> SmokeReport:
             report["error"] = str(primary_error)
         report["ok"] = primary_error is None
         if options.report_path:
-            try:
-                _persist_report(Path(options.report_path), report)
-            except Exception:
-                if primary_error is None:
-                    raise
+            persist_error = _persist_report_safely(Path(options.report_path), report)
+            if persist_error is not None and primary_error is None:
+                raise persist_error
     if primary_error is not None:
         raise primary_error
     return report
