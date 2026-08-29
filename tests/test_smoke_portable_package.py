@@ -201,6 +201,23 @@ def test_run_portability_rejects_nonempty_destination_before_copy(tmp_path):
         )
 
 
+def test_run_portability_report_write_error_preserves_primary_error(tmp_path, monkeypatch):
+    import release_tools.portable_smoke as portable_smoke
+
+    source = _package_fixture(tmp_path / "source")
+    destination = _package_fixture(tmp_path / "destination")
+    (destination / "data" / "workpieces" / "already-there").mkdir()
+    def fail_persist(*args, **kwargs):
+        raise OSError("report failed")
+    monkeypatch.setattr(portable_smoke, "_persist_report", fail_persist)
+    with pytest.raises(RuntimeError, match="empty") as caught:
+        run_portability(
+            SmokeOptions(source_package_root=source, destination_package_root=destination,
+                         report_path=tmp_path / "report.json"),
+        )
+    assert caught.value.smoke_report["report_persist_error"] == "report failed"
+
+
 def test_run_smoke_requires_explicit_empty_workpiece_list(tmp_path):
     dataset = _dataset_fixture(tmp_path / "dataset")
     package = _package_fixture(tmp_path / "package")
