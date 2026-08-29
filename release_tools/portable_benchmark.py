@@ -116,7 +116,9 @@ def _explicit_temp_dir(parent: Path, prefix: str) -> Path:
         pass
     for base in candidates:
         for _ in range(8):
-            target = base / f".{prefix}-{uuid.uuid4().hex}"
+            identifier = uuid.uuid4()
+            identifier_text = getattr(identifier, "hex", str(identifier).replace("-", ""))
+            target = base / f".{prefix}-{identifier_text}"
             try:
                 target.mkdir(parents=False)
                 return target
@@ -588,8 +590,13 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("backend did not accept a connection")
-                client = _Client(socket.create_connection(("127.0.0.1", port), timeout=min(5.0, remaining)),
-                                 request_timeout=request_timeout_seconds)
+                sock = socket.create_connection(("127.0.0.1", port), timeout=min(5.0, remaining))
+                try:
+                    client = _Client(sock, request_timeout=request_timeout_seconds)
+                except TypeError:
+                    # Keep the injectable test/client seam compatible with
+                    # older lightweight fakes that accepted only a socket.
+                    client = _Client(sock)
                 lifecycle["connection_established"] = True
                 break
             except OSError:
