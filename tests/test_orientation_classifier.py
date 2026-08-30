@@ -1113,7 +1113,7 @@ def _install_fake_paddle_runtime(monkeypatch, *, compiled=True, gpu_count=1):
     return selected
 
 
-def _install_fake_paddleclas(monkeypatch):
+def _install_fake_paddleclas(monkeypatch, *, cpu_num_threads=10):
     captured = {}
     paddleclas = types.ModuleType("paddleclas")
     deploy = types.ModuleType("paddleclas.deploy")
@@ -1132,7 +1132,7 @@ def _install_fake_paddleclas(monkeypatch):
 
     def get_config(path, show=False):
         captured["config_path"] = path
-        config = SimpleNamespace(Global=SimpleNamespace(cpu_num_threads=10))
+        config = SimpleNamespace(Global=SimpleNamespace(cpu_num_threads=cpu_num_threads))
         captured["config"] = config
         return config
 
@@ -1192,6 +1192,50 @@ def test_invalid_cpu_thread_override_keeps_yaml_value_and_logs_warning(tmp_path,
 
     assert captured["config"].Global.cpu_num_threads == 10
     assert "WORKPIECE_CPU_THREADS" in caplog.text
+
+
+@pytest.mark.parametrize("yaml_threads", [0, -2, "not-an-int", None])
+def test_invalid_yaml_cpu_threads_fall_back_to_default_with_warning(
+    tmp_path, monkeypatch, caplog, yaml_threads
+):
+    captured = _install_fake_paddleclas(monkeypatch, cpu_num_threads=yaml_threads)
+    _install_fake_paddle_runtime(monkeypatch)
+    monkeypatch.delenv("WORKPIECE_CPU_THREADS", raising=False)
+
+    OrientationClassifier.load(
+        tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
+    )
+
+    assert captured["config"].Global.cpu_num_threads == 10
+    assert "cpu_num_threads" in caplog.text
+
+
+def test_invalid_env_and_yaml_cpu_threads_fall_back_to_default(
+    tmp_path, monkeypatch, caplog
+):
+    captured = _install_fake_paddleclas(monkeypatch, cpu_num_threads=-1)
+    _install_fake_paddle_runtime(monkeypatch)
+    monkeypatch.setenv("WORKPIECE_CPU_THREADS", "invalid")
+
+    OrientationClassifier.load(
+        tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
+    )
+
+    assert captured["config"].Global.cpu_num_threads == 10
+    assert "WORKPIECE_CPU_THREADS" in caplog.text
+
+
+def test_valid_yaml_cpu_threads_are_preserved_without_override(tmp_path, monkeypatch):
+    captured = _install_fake_paddleclas(monkeypatch, cpu_num_threads=6)
+    _install_fake_paddle_runtime(monkeypatch)
+    monkeypatch.delenv("WORKPIECE_CPU_THREADS", raising=False)
+
+    loaded = OrientationClassifier.load(
+        tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
+    )
+
+    assert captured["config"].Global.cpu_num_threads == 6
+    assert loaded.cpu_num_threads == 6
 
 
 @pytest.mark.parametrize(

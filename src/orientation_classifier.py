@@ -268,10 +268,19 @@ def _validate_model_fingerprint(value: str) -> str:
 
 def _resolve_cpu_num_threads(global_config: Any) -> int:
     """Resolve the configured CPU thread count, allowing a process override."""
-    configured = getattr(global_config, "cpu_num_threads", DEFAULT_CPU_NUM_THREADS)
+    configured_value = getattr(global_config, "cpu_num_threads", DEFAULT_CPU_NUM_THREADS)
     try:
-        configured = int(configured)
+        if isinstance(configured_value, bool):
+            raise ValueError
+        configured = int(configured_value)
+        if configured <= 0:
+            raise ValueError
     except (TypeError, ValueError):
+        LOGGER.warning(
+            "Ignoring invalid YAML cpu_num_threads=%r; using default=%s",
+            configured_value,
+            DEFAULT_CPU_NUM_THREADS,
+        )
         configured = DEFAULT_CPU_NUM_THREADS
     override = os.environ.get(CPU_THREADS_ENV)
     if override is None:
@@ -392,14 +401,10 @@ class OrientationClassifier:
             project_root / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml"
         )
         config = paddle_config.get_config(str(config_path), show=False)
-        configured_cpu_threads = getattr(config.Global, "cpu_num_threads", DEFAULT_CPU_NUM_THREADS)
-        try:
-            configured_cpu_threads = int(configured_cpu_threads)
-        except (TypeError, ValueError):
-            configured_cpu_threads = DEFAULT_CPU_NUM_THREADS
         cpu_num_threads = (
             _resolve_cpu_num_threads(config.Global)
-            if compute_device == "cpu" else configured_cpu_threads
+            if compute_device == "cpu"
+            else getattr(config.Global, "cpu_num_threads", DEFAULT_CPU_NUM_THREADS)
         )
         try:
             paddle_model_dir = prepare_paddle_model_path(model_dir)
