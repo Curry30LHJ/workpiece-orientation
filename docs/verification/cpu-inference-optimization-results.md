@@ -23,6 +23,18 @@ The workspace model directory is present and its three file hashes are recorded 
 
 The three benchmark attempts wrote only temporary failure JSON outside the repository. Existing `runtime_reports/` files were not overwritten and were not added to git.
 
+## Historical reference: legacy CPU package
+
+For supplemental context only, the sibling worktree package was run without copying it into this branch. Its manifest identifies package commit `d3d1fa0834f11964919124359921c2ebc5db27cc` (Paddle 3.2.2/PaddleClas 2.6.0), ZIP SHA-256 `4044820dcabbd1fcc8c517eb7d80b6b6b6a64478b4210640be0536052d51f2db`, and 50 warmup + 1,000 measured requests per run. These are historical measurements from the pre-optimization package and do not represent code commit `b5c2b47`.
+
+| Legacy package CPU threads | startup ready (ms) | backend elapsed mean/P50/P95/P99/max (ms) | round trip mean/P50/P95/P99/max (ms) | accuracy / review |
+| --- | ---: | --- | --- | --- |
+| 1 | 18,132.10 | 172.52 / 171.25 / 199.49 / 212.32 / 301.42 | 173.24 / 171.97 / 200.21 / 213.79 / 302.29 | 1.0 / 0.0 |
+| 2 | 13,896.07 | 162.70 / 161.69 / 179.76 / 192.84 / 223.60 | 163.45 / 162.39 / 180.81 / 193.68 / 224.32 | 1.0 / 0.0 |
+| 4 | 14,404.12 | 160.59 / 159.93 / 177.39 / 185.44 / 240.97 | 161.32 / 160.62 / 178.13 / 186.61 / 242.34 | 1.0 / 0.0 |
+
+The legacy package did not expose the new slot-dedup telemetry (`global_unique_slots` or model-call count), and no dedup-disabled/default pair was run against the current code. These results must not be used to claim the optimization target is met.
+
 ## Measurements
 
 | Configuration | backend elapsed (mean/P50/P95/P99/max ms) | round trip (mean/P50/P95/P99/max ms) | accuracy | review | unique slots / calls | status |

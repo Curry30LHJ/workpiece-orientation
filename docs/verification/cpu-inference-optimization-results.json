@@ -40,6 +40,23 @@
     "queries": 120,
     "source_note": "Existing user-provided file; not modified or staged. It records an earlier run at commit ca48822b4f4cb9560ab07c22f2bf0dd6e541cd01."
   },
+  "historical_reference": {
+    "status": "completed_on_legacy_package_only",
+    "package_zip": "E:\\Project\\wang\\ai_区分正反\\.worktrees\\offline-portable-packages\\release_artifacts\\WorkpieceOrientation-CPU-x64-1.0.0.zip",
+    "package_sha256": "4044820dcabbd1fcc8c517eb7d80b6b6b6a64478b4210640be0536052d51f2db",
+    "package_git_commit": "d3d1fa0834f11964919124359921c2ebc5db27cc",
+    "versions": {"paddle": "3.2.2", "paddleclas": "2.6.0", "python": "3.10"},
+    "warmup": 50,
+    "iterations": 1000,
+    "represents_current_code": false,
+    "runs": {
+      "threads_1": {"startup_ready_ms": 18132.096800021827, "backend_elapsed_ms": {"mean": 172.5231154995272, "p50": 171.2536999839358, "p95": 199.49367497756612, "p99": 212.31740900198926, "max": 301.424200006295}, "round_trip_ms": {"mean": 173.23930830095196, "p50": 171.97175000910647, "p95": 200.20688500953838, "p99": 213.79477300040887, "max": 302.2899000206962}, "accuracy": 1.0, "review_rate": 0.0},
+      "threads_2": {"startup_ready_ms": 13896.06969995657, "backend_elapsed_ms": {"mean": 162.69959850015584, "p50": 161.69400000944734, "p95": 179.75535998994016, "p99": 192.8416529833339, "max": 223.59500004677102}, "round_trip_ms": {"mean": 163.44681510038208, "p50": 162.38980001071468, "p95": 180.8136099949479, "p99": 193.68486798310184, "max": 224.3153000017628}, "accuracy": 1.0, "review_rate": 0.0},
+      "threads_4": {"startup_ready_ms": 14404.117099998984, "backend_elapsed_ms": {"mean": 160.58554900140734, "p50": 159.93379999417812, "p95": 177.3899350024294, "p99": 185.43635902751703, "max": 240.96909997751936}, "round_trip_ms": {"mean": 161.32037390075857, "p50": 160.6185000273399, "p95": 178.1259299692465, "p99": 186.61305798741523, "max": 242.33500001719221}, "accuracy": 1.0, "review_rate": 0.0}
+    },
+    "dedup_telemetry": null,
+    "note": "Historical reference only; no current-branch or dedup A/B claim."
+  },
   "startup": {"ready_ms": null, "reason": "No backend process was started."},
   "latency": {
     "unit": "ms",
