@@ -78,6 +78,31 @@ class SlotGeometry:
         )
 
 
+class ComparisonErrorImage:
+    def __init__(self, image: np.ndarray) -> None:
+        self._image = image
+
+    @property
+    def shape(self):
+        raise RuntimeError("comparison failed")
+
+    @property
+    def dtype(self):
+        return self._image.dtype
+
+    def __getitem__(self, key):
+        return self._image[key]
+
+
+class RaisingEmbedder:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, images):
+        self.calls += 1
+        raise RuntimeError("embedding failed")
+
+
 def make_small_cache(engine, tmp_path):
     front = write_markers(tmp_path, "front", 20, base=10)
     back = write_markers(tmp_path, "back", 20, base=180)
@@ -234,6 +259,7 @@ def test_cpu_dedup_reuses_identical_query_slots(tmp_path):
     result = engine.predict(marker_image(10), cache)
 
     assert embedder.batch_sizes == [1]
+    assert result["timings_ms"]["global_input_slots"] == 3
     assert result["timings_ms"]["global_unique_slots"] == 1
 
 
@@ -264,6 +290,34 @@ def test_dedup_maps_two_equal_slots_back_to_original_order():
     assert embedder.batch_sizes == [2]
     assert unique_count == 2
     assert np.array_equal(embeddings[1], embeddings[2])
+
+
+def test_dedup_comparison_error_falls_back_to_one_three_slot_call():
+    embedder = FakeEmbedder()
+    engine = FastOrientationEngine(
+        embedder, SlotGeometry((10, 20, 30)), image_reader=read_marker,
+        deduplicate_identical_slots=True,
+    )
+    slots = (marker_image(10), ComparisonErrorImage(marker_image(20)), marker_image(30))
+
+    embeddings, unique_count = engine._embed_query_slots(slots)
+
+    assert embedder.batch_sizes == [3]
+    assert len(embeddings) == 3
+    assert unique_count == 3
+
+
+def test_dedup_does_not_retry_when_embedder_raises():
+    embedder = RaisingEmbedder()
+    engine = FastOrientationEngine(
+        embedder, SlotGeometry((10, 20, 30)), image_reader=read_marker,
+        deduplicate_identical_slots=True,
+    )
+
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        engine._embed_query_slots((marker_image(10), marker_image(20), marker_image(30)))
+
+    assert embedder.calls == 1
 
 
 def test_geometry_failure_returns_direction_and_review_reason(tmp_path):
