@@ -68,14 +68,19 @@ class BatchInferencePool:
             self._thread_slots.slot = slot
         return self._contexts[slot % self._worker_count]
 
-    def _run(self, item: BatchWorkItem) -> BatchItemResult:
+    def _run(self, item: BatchWorkItem, run_item: Callable[[object, BatchWorkItem], object] | None = None) -> BatchItemResult:
         try:
-            value = self._run_item(self._context_for_current_thread(), item)
+            value = (run_item or self._run_item)(self._context_for_current_thread(), item)
         except BaseException as error:
             return BatchItemResult(item.index, item.image_path, None, error)
         return BatchItemResult(item.index, item.image_path, value, None)
 
-    def submit_many(self, items: Sequence[BatchWorkItem]) -> list[BatchItemResult]:
+    def submit_many(
+        self,
+        items: Sequence[BatchWorkItem],
+        *,
+        run_item: Callable[[object, BatchWorkItem], object] | None = None,
+    ) -> list[BatchItemResult]:
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("pool is closed")
@@ -84,7 +89,7 @@ class BatchInferencePool:
             indices = [item.index for item in items]
             if len(set(indices)) != len(indices):
                 raise ValueError("duplicate item indices are not allowed")
-            futures = [self._executor.submit(self._run, item) for item in items]
+            futures = [self._executor.submit(self._run, item, run_item) for item in items]
         return sorted((future.result() for future in futures), key=lambda result: result.index)
 
     @staticmethod

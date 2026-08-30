@@ -19,7 +19,6 @@ import uuid
 
 import cv2
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 
 from src.image_io import read_color_image
 from src.shitu_baseline import classify_embedding
@@ -35,6 +34,7 @@ from src.model_fingerprint import model_directory_sha256
 from src.paddleclas_inference_compat import create_rec_predictor, install_optional_sklearn_stubs
 from src.fast_geometry import FastGeometryProcessor
 from src.fast_orientation import FastOrientationEngine, FastRuntimeCache
+from src.parallel_inference import BatchInferencePool, BatchItemResult, BatchWorkItem
 
 
 ROI_RATIO = 1.0
@@ -159,6 +159,16 @@ class _BatchSession:
     predictor: Any
     engine: FastOrientationEngine
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def close(self) -> None:
+        for name in ("close", "destroy", "shutdown"):
+            method = getattr(self.predictor, name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    LOGGER.debug("batch predictor cleanup failed", exc_info=True)
+                return
 
 
 def _file_sha256(path: Path) -> str:
@@ -363,7 +373,8 @@ class OrientationClassifier:
         self._fast_runtime_transaction_guard = threading.Lock()
         self._fast_runtime_transaction_locks: dict[Path, threading.Lock] = {}
         self._batch_sessions: list[_BatchSession] = []
-        self._batch_executor: ThreadPoolExecutor | None = None
+        self._batch_pool: BatchInferencePool | None = None
+        self._batch_lifecycle_lock = threading.RLock()
         self._batch_threads_per_worker = 1
         self._batch_fallback: str | None = None
         self._batch_predictor_factory: Callable[..., Any] | None = None
@@ -502,7 +513,7 @@ class OrientationClassifier:
         supported = self.compute_device == "cpu" and self.inference_mode == "fast_geometry"
         return {
             "supported": supported,
-            "batch_ready": bool(self._batch_sessions and self._batch_executor),
+            "batch_ready": bool(self._batch_sessions and self._batch_pool and self._batch_pool.ready),
             "worker_count": len(self._batch_sessions),
             "threads_per_worker": self._batch_threads_per_worker,
             **({"fallback": self._batch_fallback} if self._batch_fallback else {}),
@@ -515,7 +526,9 @@ class OrientationClassifier:
             detected = psutil.cpu_count(logical=False)
         except Exception:
             detected = None
-        return max(1, min(4, int(detected or (os.cpu_count() or 1))))
+        if detected is None:
+            return 1
+        return max(1, min(4, int(detected)))
 
     @staticmethod
     def _configure_batch_predictor(predictor: Any, threads_per_worker: int) -> None:
@@ -578,24 +591,31 @@ class OrientationClassifier:
                 return
 
     def close_batch_pool(self) -> None:
-        executor, sessions = self._batch_executor, self._batch_sessions
-        self._batch_executor = None
-        self._batch_sessions = []
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-        for session in sessions:
-            self._close_batch_predictor(session.predictor)
+        with self._batch_lifecycle_lock:
+            pool, sessions = self._batch_pool, self._batch_sessions
+            self._batch_pool = None
+            self._batch_sessions = []
+            if pool is not None:
+                pool.close()
+            else:
+                for session in sessions:
+                    self._close_batch_predictor(session.predictor)
 
     def prepare_batch_pool(
         self, *, worker_count: int | None = None, threads_per_worker: int = 1
     ) -> dict[str, object]:
         self.close_batch_pool()
+        with self._batch_lifecycle_lock:
+            return self._prepare_batch_pool_locked(
+                worker_count=worker_count, threads_per_worker=threads_per_worker
+            )
+
+    def _prepare_batch_pool_locked(
+        self, *, worker_count: int | None = None, threads_per_worker: int = 1
+    ) -> dict[str, object]:
         self._batch_fallback = None
-        try:
-            threads_per_worker = int(threads_per_worker)
-            if threads_per_worker <= 0:
-                raise ValueError("threads_per_worker must be positive")
-        except (TypeError, ValueError) as exc:
+        if isinstance(threads_per_worker, bool) or not isinstance(threads_per_worker, int) or threads_per_worker <= 0:
+            exc = ValueError("threads_per_worker must be a positive integer")
             self._batch_fallback = str(exc)
             return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
         if self.compute_device != "cpu" or self.inference_mode != "fast_geometry":
@@ -605,43 +625,54 @@ class OrientationClassifier:
             self._batch_fallback = "fast orientation engine is unavailable"
             return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
         limit = self._batch_core_limit()
-        requested = limit if worker_count is None else max(1, int(worker_count))
+        if worker_count is not None and (isinstance(worker_count, bool) or not isinstance(worker_count, int) or worker_count <= 0):
+            self._batch_fallback = "worker_count must be a positive integer"
+            return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
+        requested = limit if worker_count is None else worker_count
         count = min(4, limit, requested)
         sessions: list[_BatchSession] = []
-        active_predictor: Any | None = None
         try:
-            for _ in range(count):
-                predictor = self._new_batch_predictor(threads_per_worker)
-                active_predictor = predictor
-                session_lock = threading.Lock()
-                def embed(images, *, _predictor=predictor, _lock=session_lock):
-                    rgb = [image[:, :, ::-1] for image in images]
-                    with _lock:
-                        returned = _predictor.predict(rgb)
-                    if len(returned) != len(images):
-                        raise OrientationClassifierError("global predictor returned unexpected batch size")
-                    return [np.asarray(item, dtype=np.float32) for item in returned]
-                engine = FastOrientationEngine(
-                    embed,
-                    self.fast_engine.geometry,
-                    image_reader=self.fast_engine.image_reader,
-                    deduplicate_identical_slots=self.fast_engine.deduplicate_identical_slots,
-                )
-                probe = embed([np.zeros((512, 512, 3), dtype=np.uint8)])
-                if len(probe) != 1 or probe[0].size == 0 or not np.all(np.isfinite(probe[0])):
-                    raise ValueError("Paddle returned an invalid embedding")
-                sessions.append(_BatchSession(predictor, engine, session_lock))
-                active_predictor = None
+            def create_worker(_slot: int) -> _BatchSession:
+                predictor: Any | None = None
+                try:
+                    predictor = self._new_batch_predictor(threads_per_worker)
+                    session_lock = threading.Lock()
+                    def embed(images, *, _predictor=predictor, _lock=session_lock):
+                        rgb = [image[:, :, ::-1] for image in images]
+                        with _lock:
+                            returned = _predictor.predict(rgb)
+                        if len(returned) != len(images):
+                            raise OrientationClassifierError("global predictor returned unexpected batch size")
+                        return [np.asarray(item, dtype=np.float32) for item in returned]
+                    engine = FastOrientationEngine(
+                        embed,
+                        self.fast_engine.geometry,
+                        image_reader=self.fast_engine.image_reader,
+                        deduplicate_identical_slots=self.fast_engine.deduplicate_identical_slots,
+                    )
+                    probe = embed([np.zeros((512, 512, 3), dtype=np.uint8)])
+                    if len(probe) != 1 or probe[0].size == 0 or not np.all(np.isfinite(probe[0])):
+                        raise ValueError("Paddle returned an invalid embedding")
+                    return _BatchSession(predictor, engine, session_lock)
+                except Exception:
+                    if predictor is not None:
+                        self._close_batch_predictor(predictor)
+                    raise
+
+            for slot in range(count):
+                sessions.append(create_worker(slot))
+
+            def unavailable_run(_session, _item):
+                raise RuntimeError("batch run callback required")
+            pool = BatchInferencePool(count, lambda slot: sessions[slot], unavailable_run)
         except Exception as exc:
-            if active_predictor is not None:
-                self._close_batch_predictor(active_predictor)
             for session in sessions:
-                self._close_batch_predictor(session.predictor)
+                session.close()
             self._batch_fallback = f"session creation failed: {exc}"
             return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
         self._batch_sessions = sessions
         self._batch_threads_per_worker = threads_per_worker
-        self._batch_executor = ThreadPoolExecutor(max_workers=count, thread_name_prefix="orientation-batch")
+        self._batch_pool = pool
         return {"batch_ready": True, "worker_count": count, "threads_per_worker": threads_per_worker}
 
     def predict_many_with_cache(
@@ -656,9 +687,10 @@ class OrientationClassifier:
             return []
         # Capture one immutable caller-provided snapshot for every worker.
         cache_snapshot = cache
-        sessions = tuple(self._batch_sessions)
-        executor = self._batch_executor
-        if not sessions or executor is None:
+        with self._batch_lifecycle_lock:
+            pool = self._batch_pool
+            sessions = tuple(self._batch_sessions)
+        if not sessions or pool is None or not pool.ready:
             predict_one = (
                 self.predict_fast_with_cache
                 if self.inference_mode == "fast_geometry"
@@ -681,17 +713,22 @@ class OrientationClassifier:
                 FastOrientationEngine._validate_cache(runtime)
             except ValueError as exc:
                 raise OrientationClassifierError(str(exc)) from exc
-            def run(index_path):
-                index, path = index_path
-                session = sessions[index % len(sessions)]
-                result = session.engine.predict(_read_image(path), cache_snapshot.fast_runtime)
-                result["index"] = index
-                result["image_path"] = str(path)
+            items = [BatchWorkItem(index, path) for index, path in enumerate(paths)]
+            def run_item(session: _BatchSession, item: BatchWorkItem):
+                image = session.engine.image_reader(item.image_path)
+                return session.engine.predict(image, cache_snapshot.fast_runtime)
+            batch_results = pool.submit_many(items, run_item=run_item)
+            results = []
+            for item in batch_results:
+                result = dict(item.value) if item.error is None and isinstance(item.value, Mapping) else {}
+                if item.error is not None:
+                    result["error"] = str(item.error)
+                    result["error_type"] = type(item.error).__name__
+                result["index"] = item.index
+                result["image_path"] = str(item.image_path)
                 if library_revision is not None:
                     result["library_revision"] = int(library_revision)
-                return result
-            futures = [executor.submit(run, (index, path)) for index, path in enumerate(paths)]
-            results = [future.result() for future in futures]
+                results.append(result)
         for index, (path, result) in enumerate(zip(paths, results)):
             result.setdefault("index", index)
             result.setdefault("image_path", str(path))

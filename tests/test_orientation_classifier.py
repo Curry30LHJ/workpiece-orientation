@@ -136,6 +136,54 @@ def test_failed_session_creation_reports_fallback_without_unlocking_shared_predi
     classifier.predict_fast_with_cache(cache, write_marker(tmp_path / "single.png", 3), library_revision=1)
 
 
+def test_batch_rejects_nonpositive_worker_count(tmp_path):
+    classifier, _ = _batch_classifier(tmp_path, _UncloneablePredictor())
+    status = classifier.prepare_batch_pool(worker_count=0, threads_per_worker=1)
+    assert status["batch_ready"] is False
+    assert status["worker_count"] == 0
+    assert "fallback" in status
+
+
+def test_batch_keeps_per_item_errors_and_uses_engine_reader(tmp_path):
+    predictor = _UncloneablePredictor()
+    classifier, cache = _batch_classifier(tmp_path, predictor)
+    classifier._batch_predictor_factory = lambda **_: _UncloneablePredictor()
+    images = {"ok.png": np.full((8, 8, 3), 3, dtype=np.uint8)}
+    def reader(path):
+        if path.name == "bad.png":
+            raise ValueError("custom reader failure")
+        return images[path.name]
+    classifier.fast_engine.image_reader = reader
+    assert classifier.prepare_batch_pool(worker_count=1, threads_per_worker=1)["batch_ready"] is True
+    results = classifier.predict_many_with_cache(cache, [Path("bad.png"), Path("ok.png")], library_revision=1)
+    assert results[0]["index"] == 0
+    assert "error" in results[0]
+    assert results[1]["index"] == 1
+    classifier.close_batch_pool()
+
+
+def test_batch_core_limit_without_physical_core_info_is_safe(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda logical=False: None))
+    monkeypatch.setattr(os, "cpu_count", lambda: 64)
+    assert OrientationClassifier._batch_core_limit() == 1
+
+
+def test_batch_uses_fresh_factory_when_clone_fails_and_applies_thread_setting(tmp_path):
+    predictor = _UncloneablePredictor()
+    classifier, _ = _batch_classifier(tmp_path, predictor)
+    created = []
+    def factory(**kwargs):
+        worker = _UncloneablePredictor()
+        created.append(worker)
+        return worker
+    classifier._batch_predictor_factory = factory
+    status = classifier.prepare_batch_pool(worker_count=2, threads_per_worker=3)
+    assert status["batch_ready"] is True
+    assert len(created) == 2
+    assert all(worker.threads_per_worker == 3 for worker in created)
+    classifier.close_batch_pool()
+
+
 class FakeGlobalPredictor:
     def __init__(self):
         self.calls = 0
