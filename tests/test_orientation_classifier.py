@@ -1194,7 +1194,7 @@ def test_invalid_cpu_thread_override_keeps_yaml_value_and_logs_warning(tmp_path,
     assert "WORKPIECE_CPU_THREADS" in caplog.text
 
 
-@pytest.mark.parametrize("yaml_threads", [0, -2, "not-an-int", None])
+@pytest.mark.parametrize("yaml_threads", [0, -2, 1.5, 1.0, "not-an-int", None])
 def test_invalid_yaml_cpu_threads_fall_back_to_default_with_warning(
     tmp_path, monkeypatch, caplog, yaml_threads
 ):

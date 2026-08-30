@@ -272,7 +272,12 @@ def _resolve_cpu_num_threads(global_config: Any) -> int:
     try:
         if isinstance(configured_value, bool):
             raise ValueError
-        configured = int(configured_value)
+        if isinstance(configured_value, int):
+            configured = configured_value
+        elif isinstance(configured_value, str):
+            configured = int(configured_value)
+        else:
+            raise ValueError
         if configured <= 0:
             raise ValueError
     except (TypeError, ValueError):
