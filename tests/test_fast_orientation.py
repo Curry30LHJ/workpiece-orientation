@@ -66,6 +66,27 @@ class FakeEmbedder:
         return result
 
 
+class SlotGeometry:
+    def __init__(self, markers):
+        self.markers = tuple(markers)
+
+    def build_variants(self, image, compiled):
+        images = tuple(np.full_like(image, marker) for marker in self.markers)
+        return FastGeometryVariants(
+            images, "not_configured", False, (), {},
+            {"geometry_context": 0.0, "geometry_fit": 0.0, "mask_build": 0.0},
+        )
+
+
+def make_small_cache(engine, tmp_path):
+    front = write_markers(tmp_path, "front", 20, base=10)
+    back = write_markers(tmp_path, "back", 20, base=180)
+    return engine.build_cache(
+        front, back, geometry_profile=None, library_revision=1,
+        model_fingerprint="m",
+    )
+
+
 def fake_engine(*, fail_geometry: bool = False, record_batches: bool = False):
     embedder = FakeEmbedder(record_batches=record_batches)
     geometry = FastGeometryProcessor(FakeCalibrator(fail=fail_geometry))
@@ -199,6 +220,50 @@ def test_predict_calls_one_three_image_batch_and_returns_fast_ridge_result(tmp_p
     assert result["label"] in {"front", "back"}
     assert "local_prediction" not in result
     assert result["timings_ms"].keys() >= {"geometry_context", "geometry_fit", "mask_build", "global_batch", "linear_head", "total"}
+
+
+def test_cpu_dedup_reuses_identical_query_slots(tmp_path):
+    embedder = FakeEmbedder()
+    engine = FastOrientationEngine(
+        embedder, SlotGeometry((10, 10, 10)), image_reader=read_marker,
+        deduplicate_identical_slots=True,
+    )
+    cache = make_small_cache(engine, tmp_path)
+    embedder.batch_sizes.clear()
+
+    result = engine.predict(marker_image(10), cache)
+
+    assert embedder.batch_sizes == [1]
+    assert result["timings_ms"]["global_unique_slots"] == 1
+
+
+def test_dedup_keeps_three_calls_when_geometry_slots_differ(tmp_path):
+    embedder = FakeEmbedder()
+    engine = FastOrientationEngine(
+        embedder, SlotGeometry((10, 20, 30)), image_reader=read_marker,
+        deduplicate_identical_slots=True,
+    )
+    cache = make_small_cache(engine, tmp_path)
+    embedder.batch_sizes.clear()
+
+    engine.predict(marker_image(10), cache)
+
+    assert embedder.batch_sizes == [3]
+
+
+def test_dedup_maps_two_equal_slots_back_to_original_order():
+    embedder = FakeEmbedder()
+    engine = FastOrientationEngine(
+        embedder, SlotGeometry((10, 20, 20)), image_reader=read_marker,
+        deduplicate_identical_slots=True,
+    )
+    slots = (marker_image(10), marker_image(20), marker_image(20))
+
+    embeddings, unique_count = engine._embed_query_slots(slots)
+
+    assert embedder.batch_sizes == [2]
+    assert unique_count == 2
+    assert np.array_equal(embeddings[1], embeddings[2])
 
 
 def test_geometry_failure_returns_direction_and_review_reason(tmp_path):

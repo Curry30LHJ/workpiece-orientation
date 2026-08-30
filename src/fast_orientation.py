@@ -216,10 +216,12 @@ class FastOrientationEngine:
         geometry: FastGeometryProcessor,
         *,
         image_reader: Callable[[Path], np.ndarray],
+        deduplicate_identical_slots: bool = False,
     ) -> None:
         self.embed_batch = embed_batch
         self.geometry = geometry
         self.image_reader = image_reader
+        self.deduplicate_identical_slots = deduplicate_identical_slots
 
     def build_cache(
         self,
@@ -335,7 +337,7 @@ class FastOrientationEngine:
         self._validate_cache(cache)
         variants = self.geometry.build_variants(image, cache.compiled_geometry)
         batch_started = perf_counter()
-        embeddings = self.embed_batch(variants.images)
+        embeddings, unique_count = self._embed_query_slots(variants.images)
         global_batch_ms = (perf_counter() - batch_started) * 1000.0
         feature, _ = _pack_three_embeddings(
             embeddings,
@@ -351,7 +353,12 @@ class FastOrientationEngine:
             codes.append("FAST_MODE_NOT_VALIDATED")
         codes = list(dict.fromkeys(codes))
         timings = dict(variants.timings_ms)
-        timings.update({"global_batch": global_batch_ms, "linear_head": linear_head_ms})
+        timings.update({
+            "global_batch": global_batch_ms,
+            "global_input_slots": 3,
+            "global_unique_slots": unique_count,
+            "linear_head": linear_head_ms,
+        })
         timings["total"] = (perf_counter() - started) * 1000.0
         review_reason = "；".join({
             "FAST_GEOMETRY_LOW_CONFIDENCE": "几何拟合置信度不足",
@@ -372,6 +379,31 @@ class FastOrientationEngine:
             "elapsed_ms": timings["total"],
             "timings_ms": timings,
         }
+
+    def _embed_query_slots(self, images: Sequence[np.ndarray]) -> tuple[list[np.ndarray], int]:
+        if not self.deduplicate_identical_slots:
+            return self.embed_batch(images), len(images)
+
+        unique_images: list[np.ndarray] = []
+        slot_to_unique: list[int] = []
+        try:
+            for image in images:
+                matching_index = None
+                for index, unique_image in enumerate(unique_images):
+                    if image.shape == unique_image.shape and image.dtype == unique_image.dtype and np.array_equal(image, unique_image):
+                        matching_index = index
+                        break
+                if matching_index is None:
+                    matching_index = len(unique_images)
+                    unique_images.append(image)
+                slot_to_unique.append(matching_index)
+        except Exception:
+            return self.embed_batch(images), len(images)
+
+        returned = self.embed_batch(unique_images)
+        if not isinstance(returned, Sequence) or len(returned) != len(unique_images):
+            raise _feature_error("embedder returned an unexpected batch size")
+        return [returned[index] for index in slot_to_unique], len(unique_images)
 
     @staticmethod
     def _progress(callback: Callable[[dict[str, Any]], None] | None, phase: str, completed: int, total: int, unit: str) -> None:
