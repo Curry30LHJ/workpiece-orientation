@@ -1,10 +1,10 @@
 {
   "branch": "feature/20260830/cpu-inference-optimization",
-  "code_commit": "b5c2b47eb1bdafd123ea7374f683bf9cb17cddc9",
-  "report_commit": "381c9c2",
-  "report_commit_note": "This is the prior report commit; the current clarification commit is intentionally not self-referenced.",
-  "model_fingerprint": null,
-  "model_fingerprint_reason": "The workspace model files are present, but the required release ZIP is absent; the bundled model used by a packaged benchmark therefore cannot be verified.",
+  "code_commit": "9ae717509d32711a7a5b067080ebaa613551d666",
+  "report_commit": "1fb1cf0",
+  "report_commit_note": "This is the prior report commit; the current documentation commit intentionally has a different SHA and is not self-referenced.",
+  "model_fingerprint": "1fab156fb025705a836ad6c28590fc32e1141ae5c530282369412a3078300b33",
+  "model_fingerprint_reason": "Verified against the current benchmark-only package app_config.json/version.json and the three packaged model files.",
   "workspace_model_files": {
     "directory": "third_party/models/shiru_rec/general_PPLCNetV2_base_pretrained_v1.0_infer",
     "files": [
@@ -14,10 +14,10 @@
     ]
   },
   "runtime_versions": {
-    "python": "3.12.7 (base environment)",
-    "paddle": null,
-    "paddleclas": null,
-    "reason": "Neither paddle nor paddleclas is importable in the active environment."
+    "python": "3.10.20 (packaged benchmark runtime)",
+    "paddle": "3.2.2",
+    "paddleclas": "2.6.0",
+    "active_environment_note": "The separate base Python 3.12.7 environment used for pytest does not import paddle/paddleclas; benchmark versions come from package metadata."
   },
   "cpu": {
     "platform": "Windows-10-10.0.19045-SP0",
@@ -29,8 +29,8 @@
   "thread_config": {
     "env_var": "WORKPIECE_CPU_THREADS",
     "candidates": [1, 2, 4],
-    "selected": null,
-    "reason": "Benchmark blocked because release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip is missing."
+    "selected": 2,
+    "selection_basis": "Default-dedup thread 2 had the lowest round-trip P95 (62.35 ms) with unchanged accuracy/review versus threads 1 and 4."
   },
   "sample_fingerprint": {
     "acceptance_spec": "runtime_reports/fast-geometry-acceptance.json",
@@ -39,6 +39,112 @@
     "cases": ["M1", "M2", "M7"],
     "queries": 120,
     "source_note": "Existing user-provided file; not modified or staged. It records an earlier run at commit ca48822b4f4cb9560ab07c22f2bf0dd6e541cd01."
+  },
+  "current_package": {
+    "path": "release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0-cpuopt-benchmark.zip",
+    "sha256": "d4b288d1ed5e509a47254a98921c82a16ca7fdefb67eb2ca1e23b218a1d578c7",
+    "edition": "cpu",
+    "version": "1.0.0",
+    "code_commit": "9ae717509d32711a7a5b067080ebaa613551d666",
+    "manifest_audit": "passed",
+    "zip_audit": "passed",
+    "file_count": 1171,
+    "build_method": "Current PyInstaller backend filtered into a fresh copy of the authorized legacy package; old ZIP was not modified."
+  },
+  "current_benchmark": {
+    "warmup": 50,
+    "iterations": 1000,
+    "dedup_disabled_env": "WORKPIECE_CPU_DEDUPLICATE_SLOTS=0",
+    "dedup_default_env": "unset (CPU default enabled)",
+    "prediction_comparison": {
+      "identities": 120,
+      "changed_predictions": 0,
+      "all_six_runs_same_labels": true,
+      "comparison_baseline": "dedup_disabled_thread_1"
+    },
+    "runs": {
+      "dedup_disabled_thread_1": {
+        "cpu_threads": 1,
+        "dedup_enabled": false,
+        "startup_ready_ms": 16746.751700004097,
+        "backend_elapsed_ms": {"count": 1000, "mean": 225.60631769988686, "p50": 187.65155001892708, "p95": 350.6217600137461, "p99": 477.5537210382754, "max": 814.3179000471719},
+        "round_trip_ms": {"count": 1000, "mean": 226.50986419938272, "p50": 188.36744996951893, "p95": 351.7851000156952, "p99": 479.08262101584114, "max": 815.8665999653749},
+        "accuracy_rate": 1.0,
+        "review_rate": 0.0,
+        "global_input_slots": {"3": 1000},
+        "global_unique_slots": {"3": 1000},
+        "aggregate_slot_elements_proxy": 3000,
+        "model_call_count": null
+      },
+      "dedup_disabled_thread_2": {
+        "cpu_threads": 2,
+        "dedup_enabled": false,
+        "startup_ready_ms": 56919.59000000497,
+        "backend_elapsed_ms": {"count": 1000, "mean": 159.0240671003121, "p50": 155.612500035204, "p95": 177.98009996186008, "p99": 244.3357400008244, "max": 404.88460002234206},
+        "round_trip_ms": {"count": 1000, "mean": 159.8880968001904, "p50": 156.41244998550974, "p95": 178.93234004150142, "p99": 245.62057198665565, "max": 405.49259999534115},
+        "accuracy_rate": 1.0,
+        "review_rate": 0.0,
+        "global_input_slots": {"3": 1000},
+        "global_unique_slots": {"3": 1000},
+        "aggregate_slot_elements_proxy": 3000,
+        "model_call_count": null
+      },
+      "dedup_disabled_thread_4": {
+        "cpu_threads": 4,
+        "dedup_enabled": false,
+        "startup_ready_ms": 14385.003700037487,
+        "backend_elapsed_ms": {"count": 1000, "mean": 145.188729799469, "p50": 142.892000003485, "p95": 162.4007100064773, "p99": 190.24952796986327, "max": 259.4037000089884},
+        "round_trip_ms": {"count": 1000, "mean": 145.95604839950101, "p50": 143.60969999688677, "p95": 163.3841350179864, "p99": 191.32631601009052, "max": 261.1674999934621},
+        "accuracy_rate": 1.0,
+        "review_rate": 0.0,
+        "global_input_slots": {"3": 1000},
+        "global_unique_slots": {"3": 1000},
+        "aggregate_slot_elements_proxy": 3000,
+        "model_call_count": null
+      },
+      "dedup_default_enabled_thread_1": {
+        "cpu_threads": 1,
+        "dedup_enabled": true,
+        "startup_ready_ms": 35228.96719997516,
+        "backend_elapsed_ms": {"count": 1000, "mean": 57.540579300082754, "p50": 56.08384998049587, "p95": 64.94989996717777, "p99": 73.29967403318732, "max": 335.8312000054866},
+        "round_trip_ms": {"count": 1000, "mean": 58.2342277005082, "p50": 56.74795000231825, "p95": 65.89160497824196, "p99": 74.58557198755442, "max": 336.4499000017531},
+        "accuracy_rate": 1.0,
+        "review_rate": 0.0,
+        "global_input_slots": {"3": 1000},
+        "global_unique_slots": {"1": 1000},
+        "aggregate_slot_elements_proxy": 1000,
+        "model_call_count": null
+      },
+      "dedup_default_enabled_thread_2": {
+        "cpu_threads": 2,
+        "dedup_enabled": true,
+        "startup_ready_ms": 32494.084899954032,
+        "backend_elapsed_ms": {"count": 1000, "mean": 53.71485280035995, "p50": 52.75864998111501, "p95": 61.4781549811596, "p99": 78.4586670162389, "max": 89.0027999994345},
+        "round_trip_ms": {"count": 1000, "mean": 54.45579579932382, "p50": 53.48119998234324, "p95": 62.34851994959172, "p99": 79.45318300684448, "max": 91.22550004394725},
+        "accuracy_rate": 1.0,
+        "review_rate": 0.0,
+        "global_input_slots": {"3": 1000},
+        "global_unique_slots": {"1": 1000},
+        "aggregate_slot_elements_proxy": 1000,
+        "model_call_count": null
+      },
+      "dedup_default_enabled_thread_4": {
+        "cpu_threads": 4,
+        "dedup_enabled": true,
+        "startup_ready_ms": 16621.792300022207,
+        "backend_elapsed_ms": {"count": 1000, "mean": 52.38815099996282, "p50": 50.89205002877861, "p95": 64.57281501207035, "p99": 77.74056700582148, "max": 102.68020001240075},
+        "round_trip_ms": {"count": 1000, "mean": 53.21716780040879, "p50": 51.699700008612126, "p95": 65.67130502662621, "p99": 79.13150997250337, "max": 104.70770002575591},
+        "accuracy_rate": 1.0,
+        "review_rate": 0.0,
+        "global_input_slots": {"3": 1000},
+        "global_unique_slots": {"1": 1000},
+        "aggregate_slot_elements_proxy": 1000,
+        "model_call_count": null
+      }
+    },
+    "dedup_ratio": 0.6666666666666666,
+    "model_call_count": null,
+    "model_call_proxy_note": "The TCP protocol exposes per-request predictor batch cardinality, not an authoritative model-call counter. Aggregate slot-elements are reported as the nearest observable proxy (3000 without dedup vs 1000 with dedup)."
   },
   "historical_reference": {
     "status": "completed_on_legacy_package_only",
@@ -57,25 +163,40 @@
     "dedup_telemetry": null,
     "note": "Historical reference only; no current-branch or dedup A/B claim."
   },
-  "startup": {"ready_ms": null, "reason": "No backend process was started."},
+  "startup": {
+    "ready_ms": 32494.084899954032,
+    "selected_configuration": "dedup_default_enabled_thread_2",
+    "by_configuration": {
+      "dedup_disabled_thread_1": 16746.751700004097,
+      "dedup_disabled_thread_2": 56919.59000000497,
+      "dedup_disabled_thread_4": 14385.003700037487,
+      "dedup_default_enabled_thread_1": 35228.96719997516,
+      "dedup_default_enabled_thread_2": 32494.084899954032,
+      "dedup_default_enabled_thread_4": 16621.792300022207
+    },
+    "note": "Cold-start ready time is recorded separately from the 1,000-request hot distributions."
+  },
   "latency": {
     "unit": "ms",
-    "backend_elapsed_ms": {"mean": null, "p50": null, "p95": null, "p99": null, "max": null},
-    "round_trip_ms": {"mean": null, "p50": null, "p95": null, "p99": null, "max": null},
+    "selected_configuration": "dedup_default_enabled_thread_2",
+    "backend_elapsed_ms": {"count": 1000, "mean": 53.71485280035995, "p50": 52.75864998111501, "p95": 61.4781549811596, "p99": 78.4586670162389, "max": 89.0027999994345},
+    "round_trip_ms": {"count": 1000, "mean": 54.45579579932382, "p50": 53.48119998234324, "p95": 62.34851994959172, "p99": 79.45318300684448, "max": 91.22550004394725},
     "by_configuration": {
-      "dedup_disabled_thread_1": {"dedup": false, "cpu_threads": 1, "status": "unavailable: package missing"},
-      "dedup_disabled_thread_2": {"dedup": false, "cpu_threads": 2, "status": "unavailable: package missing"},
-      "dedup_disabled_thread_4": {"dedup": false, "cpu_threads": 4, "status": "unavailable: package missing"},
-      "dedup_default_enabled_thread_1": {"dedup": true, "cpu_threads": 1, "status": "unavailable: package missing"},
-      "dedup_default_enabled_thread_2": {"dedup": true, "cpu_threads": 2, "status": "unavailable: package missing"},
-      "dedup_default_enabled_thread_4": {"dedup": true, "cpu_threads": 4, "status": "unavailable: package missing"}
+      "dedup_disabled_thread_1": {"dedup": false, "cpu_threads": 1, "backend_elapsed_ms": {"count": 1000, "mean": 225.60631769988686, "p50": 187.65155001892708, "p95": 350.6217600137461, "p99": 477.5537210382754, "max": 814.3179000471719}, "round_trip_ms": {"count": 1000, "mean": 226.50986419938272, "p50": 188.36744996951893, "p95": 351.7851000156952, "p99": 479.08262101584114, "max": 815.8665999653749}, "accuracy_rate": 1.0, "review_rate": 0.0, "global_input_slots": {"3": 1000}, "global_unique_slots": {"3": 1000}, "aggregate_slot_elements_proxy": 3000},
+      "dedup_disabled_thread_2": {"dedup": false, "cpu_threads": 2, "backend_elapsed_ms": {"count": 1000, "mean": 159.0240671003121, "p50": 155.612500035204, "p95": 177.98009996186008, "p99": 244.3357400008244, "max": 404.88460002234206}, "round_trip_ms": {"count": 1000, "mean": 159.8880968001904, "p50": 156.41244998550974, "p95": 178.93234004150142, "p99": 245.62057198665565, "max": 405.49259999534115}, "accuracy_rate": 1.0, "review_rate": 0.0, "global_input_slots": {"3": 1000}, "global_unique_slots": {"3": 1000}, "aggregate_slot_elements_proxy": 3000},
+      "dedup_disabled_thread_4": {"dedup": false, "cpu_threads": 4, "backend_elapsed_ms": {"count": 1000, "mean": 145.188729799469, "p50": 142.892000003485, "p95": 162.4007100064773, "p99": 190.24952796986327, "max": 259.4037000089884}, "round_trip_ms": {"count": 1000, "mean": 145.95604839950101, "p50": 143.60969999688677, "p95": 163.3841350179864, "p99": 191.32631601009052, "max": 261.1674999934621}, "accuracy_rate": 1.0, "review_rate": 0.0, "global_input_slots": {"3": 1000}, "global_unique_slots": {"3": 1000}, "aggregate_slot_elements_proxy": 3000},
+      "dedup_default_enabled_thread_1": {"dedup": true, "cpu_threads": 1, "backend_elapsed_ms": {"count": 1000, "mean": 57.540579300082754, "p50": 56.08384998049587, "p95": 64.94989996717777, "p99": 73.29967403318732, "max": 335.8312000054866}, "round_trip_ms": {"count": 1000, "mean": 58.2342277005082, "p50": 56.74795000231825, "p95": 65.89160497824196, "p99": 74.58557198755442, "max": 336.4499000017531}, "accuracy_rate": 1.0, "review_rate": 0.0, "global_input_slots": {"3": 1000}, "global_unique_slots": {"1": 1000}, "aggregate_slot_elements_proxy": 1000},
+      "dedup_default_enabled_thread_2": {"dedup": true, "cpu_threads": 2, "backend_elapsed_ms": {"count": 1000, "mean": 53.71485280035995, "p50": 52.75864998111501, "p95": 61.4781549811596, "p99": 78.4586670162389, "max": 89.0027999994345}, "round_trip_ms": {"count": 1000, "mean": 54.45579579932382, "p50": 53.48119998234324, "p95": 62.34851994959172, "p99": 79.45318300684448, "max": 91.22550004394725}, "accuracy_rate": 1.0, "review_rate": 0.0, "global_input_slots": {"3": 1000}, "global_unique_slots": {"1": 1000}, "aggregate_slot_elements_proxy": 1000},
+      "dedup_default_enabled_thread_4": {"dedup": true, "cpu_threads": 4, "backend_elapsed_ms": {"count": 1000, "mean": 52.38815099996282, "p50": 50.89205002877861, "p95": 64.57281501207035, "p99": 77.74056700582148, "max": 102.68020001240075}, "round_trip_ms": {"count": 1000, "mean": 53.21716780040879, "p50": 51.699700008612126, "p95": 65.67130502662621, "p99": 79.13150997250337, "max": 104.70770002575591}, "accuracy_rate": 1.0, "review_rate": 0.0, "global_input_slots": {"3": 1000}, "global_unique_slots": {"1": 1000}, "aggregate_slot_elements_proxy": 1000}
     }
   },
-  "accuracy": {"accuracy_rate": null, "queries": null, "reason": "Packaged benchmark did not run."},
-  "review_rate": {"rate": null, "reason": "Packaged benchmark did not run."},
-  "dedup": {"ratio": null, "global_input_slots": null, "global_unique_slots": null, "model_call_count": null, "reason": "No backend telemetry was produced."},
+  "accuracy": {"accuracy_rate": 1.0, "queries": 120, "measured_requests": 1000, "all_configurations_equal": true},
+  "review_rate": {"rate": 0.0, "count": 0, "all_configurations_equal": true},
+  "dedup": {"ratio": 0.6666666666666666, "global_input_slots": 3000, "global_unique_slots": 1000, "model_call_count": null, "model_call_proxy": {"dedup_disabled_slot_elements": 3000, "dedup_enabled_slot_elements": 1000}, "reason": "The protocol exposes predictor batch cardinality, not a direct model-call counter."},
   "failures": [
-    {"kind": "benchmark_unavailable", "message": "FileNotFoundError: E:\\Project\\wang\\pp_813\\release_artifacts\\WorkpieceOrientation-CPU-x64-1.0.0.zip"},
+    {"kind": "canonical_release_artifact_unavailable", "message": "The normal release path E:\\Project\\wang\\pp_813\\release_artifacts\\WorkpieceOrientation-CPU-x64-1.0.0.zip was absent; an isolated benchmark-only package was used instead."},
+    {"kind": "smoke_parameter_validation", "message": "A one-request smoke attempt was rejected before startup because the benchmark CLI requires iterations >= 1000; all six required 1000-request runs subsequently completed."},
+    {"kind": "backend_log_encoding", "message": "The benchmark runner could not decode captured backend logs as UTF-8 (byte 0xd0); all six protocol runs exited 0 with shutdown_confirmed=true, so metrics remain valid while log text is unavailable."},
     {"kind": "pytest_collection", "message": "python -m pytest -q failed during collection with PermissionError (WinError 5) scanning qt_app/tests/build-test_geometryrulespage/pytest-task10-profiles."},
     {"kind": "pytest_environment", "message": "Targeted tests completed with 103 passed and 177 errors; errors were predominantly pytest tmpdir lock PermissionError under C:\\Users\\Administrator\\AppData\\Local\\Temp\\pytest-of-Administrator."},
     {"kind": "runtime_dependency", "message": "paddle and paddleclas are not importable in the active Python 3.12.7 environment."}
