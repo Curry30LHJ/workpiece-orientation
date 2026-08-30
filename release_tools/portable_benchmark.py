@@ -487,10 +487,13 @@ def _acceptance_rows(spec_path: Path, temp_root: Path) -> tuple[dict[str, list[P
 
 def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                   iterations: int = 1000, compare: Path | None = None,
-                  timeout_seconds: float = 180.0) -> dict[str, Any]:
+                  timeout_seconds: float = 180.0,
+                  cpu_threads: int | None = None) -> dict[str, Any]:
     """Extract an immutable package copy and benchmark its TCP backend."""
     if warmup < 0 or iterations < 1000:
         raise ValueError("warmup must be non-negative and iterations must be at least 1000")
+    if cpu_threads is not None and (type(cpu_threads) is not int or cpu_threads <= 0):
+        raise ValueError("cpu_threads must be None or a positive integer")
     package_zip = Path(package_zip).resolve()
     if not package_zip.is_file():
         raise FileNotFoundError(package_zip)
@@ -511,7 +514,8 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
     }
     report: dict[str, Any] = {"package_zip": str(package_zip), "package_sha256": _sha256(package_zip),
                               "warmup": warmup, "iterations": iterations, "startup": {},
-                              "lifecycle": lifecycle}
+                              "lifecycle": lifecycle,
+                              "settings": {"cpu_threads": cpu_threads}}
     try:
         package_root = temp_parent / "package-copy"
         if package_root.exists() and any(package_root.iterdir()):
@@ -580,8 +584,12 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 "--parent-pid", str(os.getpid()), "--local-search-mode", str(config.get("local_search_mode", "adaptive")),
                 "--inference-mode", str(config.get("inference_mode", "fast_geometry"))]
         log_handle = (temp_parent / "backend.log").open("w+", encoding="utf-8")
+        process_environment = os.environ.copy()
+        if config.get("compute_device") == "cpu" and cpu_threads is not None:
+            process_environment["WORKPIECE_CPU_THREADS"] = str(cpu_threads)
         process = subprocess.Popen(args, cwd=str(package_root), stdout=log_handle, stderr=subprocess.STDOUT,
-                                   text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                   text=True, env=process_environment,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         lifecycle["process_spawned"] = True
         report["startup"]["process_spawn_ms"] = (perf_counter() - started) * 1000.0
         deadline = time.monotonic() + timeout_seconds

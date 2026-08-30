@@ -100,6 +100,54 @@ def _minimal_config() -> dict[str, str]:
     }
 
 
+def test_run_benchmark_passes_cpu_thread_override_to_backend(tmp_path: Path, monkeypatch):
+    config = {**_minimal_config(), "edition": "cpu", "compute_device": "cpu"}
+    package = tmp_path / "package.zip"
+    _write_zip(package, {"app_config.json": json.dumps(config).encode(), "backend/config.yaml": b"x"})
+    template = tmp_path / "template.png"
+    query = tmp_path / "query.png"
+    _write_image(template, 1)
+    _write_image(query, 2)
+    monkeypatch.setattr(benchmark.tempfile, "mkdtemp", lambda prefix: str(tmp_path / "run"))
+    (tmp_path / "run").mkdir()
+    monkeypatch.setattr(benchmark, "_environment", lambda config: {})
+    monkeypatch.setattr(benchmark, "_acceptance_rows", lambda spec, root: (
+        {"M1:front": [template], "M1:back": [template]},
+        [{"case": "M1", "expected_orientation": "front", "image_path": str(query), "query_identity": "q1"}],
+    ))
+    token = "12345678-1234-1234-1234-123456789abc"
+    monkeypatch.setattr(benchmark.uuid, "uuid4", lambda: token)
+    captured = {}
+
+    class CapturingProcess:
+        returncode = None
+        def __init__(self, *args, **kwargs):
+            captured["env"] = kwargs["env"]
+        def poll(self): return None if self.returncode is None else self.returncode
+        def wait(self, timeout=None): self.returncode = 0; return 0
+        def kill(self): self.returncode = -9
+
+    class FakeClient:
+        def __init__(self, *_): pass
+        def request(self, command, **fields):
+            if command == "hello":
+                return {"ready": True, "status": "ready", "phase": "ready", "edition": "cpu",
+                        "compute_device": "cpu", "package_version": "1.0.0", "model_fingerprint": "a" * 64,
+                        "instance_token": token}
+            if command == "register": return {"template_counts": {"front": 1, "back": 1}, "workpiece": {"id": "wp1"}}
+            if command == "predict": return {"label": "front", "elapsed_ms": 1.0, "timings_ms": {"total": 1.0}, "needs_review": False}
+            if command == "shutdown": return {"ok": True}
+            raise AssertionError(command)
+        def close(self): pass
+
+    monkeypatch.setattr(benchmark.subprocess, "Popen", CapturingProcess)
+    monkeypatch.setattr(benchmark.socket, "create_connection", lambda *args, **kwargs: object())
+    monkeypatch.setattr(benchmark, "_Client", FakeClient)
+    report = run_benchmark(package, tmp_path / "unused.json", iterations=1000, warmup=0, cpu_threads=4)
+    assert report["settings"]["cpu_threads"] == 4
+    assert captured["env"]["WORKPIECE_CPU_THREADS"] == "4"
+
+
 def test_summarize_reports_required_percentiles():
     summary = summarize([10.0, 20.0, 30.0, 40.0, 50.0])
     assert set(summary) == {"count", "mean", "p50", "p95", "p99", "max"}
@@ -266,10 +314,12 @@ def test_run_benchmark_accepts_versioned_top_level_zip_and_reports_lifecycle(tmp
     }]))
     token = "12345678-1234-1234-1234-123456789abc"
     monkeypatch.setattr(benchmark.uuid, "uuid4", lambda: token)
+    captured_environment = {}
 
     class FakeProcess:
         returncode = None
         def __init__(self, *args, **kwargs):
+            captured_environment["env"] = kwargs["env"]
             kwargs["stdout"].write("fake backend log\n")
             kwargs["stdout"].flush()
         def poll(self): return None if self.returncode is None else self.returncode
@@ -295,11 +345,12 @@ def test_run_benchmark_accepts_versioned_top_level_zip_and_reports_lifecycle(tmp
     monkeypatch.setattr(benchmark.subprocess, "Popen", FakeProcess)
     monkeypatch.setattr(benchmark.socket, "create_connection", lambda *args, **kwargs: object())
     monkeypatch.setattr(benchmark, "_Client", FakeClient)
-    report = run_benchmark(package, tmp_path / "unused.json", iterations=1000, warmup=0)
+    report = run_benchmark(package, tmp_path / "unused.json", iterations=1000, warmup=0, cpu_threads=4)
     assert report["passed"] is True
     assert report["lifecycle"]["shutdown_confirmed"] is True
     assert report["lifecycle"]["process_exit"] == 0
     assert "fake backend log" in report["backend_log"]
+    assert "WORKPIECE_CPU_THREADS" not in captured_environment["env"]
     assert report["versions"] == {"package": "1.0.0", "python": "3.10", "paddle": "3.2.2", "paddleclas": "2.6.0", "pyinstaller": "6.22.2", "qt": "5.14.2"}
 
 

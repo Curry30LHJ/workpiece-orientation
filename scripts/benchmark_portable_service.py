@@ -13,12 +13,24 @@ if __package__ in {None, ""}:
 from release_tools.portable_benchmark import run_benchmark
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark a packaged offline backend")
     parser.add_argument("--package-zip", type=Path, required=True)
     parser.add_argument("--acceptance-spec", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--cpu-threads", type=_positive_int,
+                        help="override CPU backend thread count")
     parser.add_argument("--timeout-seconds", type=float, default=600.0,
                         help="overall startup and benchmark timeout (default: 600s)")
     parser.add_argument("--compare", type=Path)
@@ -27,7 +39,8 @@ def main() -> int:
     try:
         report = run_benchmark(args.package_zip, args.acceptance_spec, warmup=args.warmup,
                                iterations=args.iterations, compare=args.compare,
-                               timeout_seconds=args.timeout_seconds)
+                               timeout_seconds=args.timeout_seconds,
+                               cpu_threads=args.cpu_threads)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return 0 if report.get("passed") is True else 2
