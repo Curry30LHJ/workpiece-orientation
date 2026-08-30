@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+import logging
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Mapping, Sequence
@@ -29,6 +30,7 @@ FAST_AUGMENT_BELOW_PER_SIDE = 20
 FAST_BUILD_IMAGE_BATCH = 32
 _CACHE_ERROR = "FAST_CACHE_REVISION_MISMATCH"
 _FEATURE_ERROR = "FAST_FEATURE_INVALID"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -386,19 +388,32 @@ class FastOrientationEngine:
 
         unique_images: list[np.ndarray] = []
         slot_to_unique: list[int] = []
-        try:
-            for image in images:
-                matching_index = None
-                for index, unique_image in enumerate(unique_images):
-                    if image.shape == unique_image.shape and image.dtype == unique_image.dtype and np.array_equal(image, unique_image):
-                        matching_index = index
-                        break
-                if matching_index is None:
-                    matching_index = len(unique_images)
-                    unique_images.append(image)
-                slot_to_unique.append(matching_index)
-        except Exception:
-            return self.embed_batch(images), len(images)
+        for slot_index, image in enumerate(images):
+            matching_index = None
+            for unique_index, unique_image in enumerate(unique_images):
+                try:
+                    is_match = (
+                        image.shape == unique_image.shape
+                        and image.dtype == unique_image.dtype
+                        and np.array_equal(image, unique_image)
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "CPU slot dedup comparison failed for input slot %d against unique slot %d "
+                        "during shape/dtype/np.array_equal: %s: %s",
+                        slot_index,
+                        unique_index,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    return self.embed_batch(images), len(images)
+                if is_match:
+                    matching_index = unique_index
+                    break
+            if matching_index is None:
+                matching_index = len(unique_images)
+                unique_images.append(image)
+            slot_to_unique.append(matching_index)
 
         returned = self.embed_batch(unique_images)
         if not isinstance(returned, Sequence) or len(returned) != len(unique_images):

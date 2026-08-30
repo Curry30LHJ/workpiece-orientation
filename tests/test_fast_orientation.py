@@ -292,7 +292,7 @@ def test_dedup_maps_two_equal_slots_back_to_original_order():
     assert np.array_equal(embeddings[1], embeddings[2])
 
 
-def test_dedup_comparison_error_falls_back_to_one_three_slot_call():
+def test_dedup_comparison_error_falls_back_to_one_three_slot_call(caplog):
     embedder = FakeEmbedder()
     engine = FastOrientationEngine(
         embedder, SlotGeometry((10, 20, 30)), image_reader=read_marker,
@@ -300,11 +300,20 @@ def test_dedup_comparison_error_falls_back_to_one_three_slot_call():
     )
     slots = (marker_image(10), ComparisonErrorImage(marker_image(20)), marker_image(30))
 
-    embeddings, unique_count = engine._embed_query_slots(slots)
+    with caplog.at_level("WARNING", logger="src.fast_orientation"):
+        embeddings, unique_count = engine._embed_query_slots(slots)
 
     assert embedder.batch_sizes == [3]
     assert len(embeddings) == 3
     assert unique_count == 3
+    assert any(
+        "comparison" in record.message.lower()
+        and "slot 1" in record.message.lower()
+        and "slot 0" in record.message.lower()
+        and "RuntimeError" in record.message
+        and "comparison failed" in record.message
+        for record in caplog.records
+    )
 
 
 def test_dedup_does_not_retry_when_embedder_raises():
