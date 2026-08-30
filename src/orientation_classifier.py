@@ -19,6 +19,7 @@ import uuid
 
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 from src.image_io import read_color_image
 from src.shitu_baseline import classify_embedding
@@ -151,6 +152,13 @@ class LocalSearchResult:
     diagnostics: dict[str, object]
     matching_ms: float
     trace: dict[str, object]
+
+
+@dataclass
+class _BatchSession:
+    predictor: Any
+    engine: FastOrientationEngine
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 def _file_sha256(path: Path) -> str:
@@ -354,6 +362,11 @@ class OrientationClassifier:
         self._template_caches: dict[str, TemplateCache] = {}
         self._fast_runtime_transaction_guard = threading.Lock()
         self._fast_runtime_transaction_locks: dict[Path, threading.Lock] = {}
+        self._batch_sessions: list[_BatchSession] = []
+        self._batch_executor: ThreadPoolExecutor | None = None
+        self._batch_threads_per_worker = 1
+        self._batch_fallback: str | None = None
+        self._batch_predictor_factory: Callable[..., Any] | None = None
 
     def _fast_runtime_transaction_lock(self, root: Path) -> threading.Lock:
         guard = getattr(self, "_fast_runtime_transaction_guard", None)
@@ -461,6 +474,22 @@ class OrientationClassifier:
             compute_device=selected_compute_device,
         )
         classifier.cpu_num_threads = cpu_num_threads
+        def create_batch_predictor(*, threads_per_worker: int = 1):
+            session_config = deepcopy(config)
+            session_global = getattr(session_config, "Global", None)
+            if session_global is None and isinstance(session_config, Mapping):
+                session_global = session_config.get("Global")
+            if isinstance(session_global, Mapping):
+                session_global["cpu_num_threads"] = threads_per_worker
+                session_global["enable_mkldnn"] = True
+                session_global["use_gpu"] = False
+            else:
+                session_global.cpu_num_threads = threads_per_worker
+                session_global.enable_mkldnn = True
+                session_global.use_gpu = False
+            return create_rec_predictor(RecPredictor, session_config, paddle, paddle_model_dir)
+
+        classifier._batch_predictor_factory = create_batch_predictor
         classifier.fast_engine = FastOrientationEngine(
             classifier._global_embeddings,
             FastGeometryProcessor(calibrator),
@@ -468,6 +497,207 @@ class OrientationClassifier:
             deduplicate_identical_slots=_resolve_cpu_slot_dedup(selected_compute_device),
         )
         return classifier
+
+    def batch_capabilities(self) -> dict[str, object]:
+        supported = self.compute_device == "cpu" and self.inference_mode == "fast_geometry"
+        return {
+            "supported": supported,
+            "batch_ready": bool(self._batch_sessions and self._batch_executor),
+            "worker_count": len(self._batch_sessions),
+            "threads_per_worker": self._batch_threads_per_worker,
+            **({"fallback": self._batch_fallback} if self._batch_fallback else {}),
+        }
+
+    @staticmethod
+    def _batch_core_limit() -> int:
+        try:
+            import psutil  # type: ignore[import-not-found]
+            detected = psutil.cpu_count(logical=False)
+        except Exception:
+            detected = None
+        return max(1, min(4, int(detected or (os.cpu_count() or 1))))
+
+    @staticmethod
+    def _configure_batch_predictor(predictor: Any, threads_per_worker: int) -> None:
+        for method_name in ("set_cpu_math_library_num_threads", "set_cpu_threads"):
+            method = getattr(predictor, method_name, None)
+            if callable(method):
+                method(int(threads_per_worker))
+                break
+        for attr_name in ("cpu_num_threads", "threads_per_worker"):
+            try:
+                setattr(predictor, attr_name, int(threads_per_worker))
+            except Exception:
+                continue
+        config = getattr(predictor, "config", None)
+        global_config = getattr(config, "Global", None)
+        if global_config is None and isinstance(config, Mapping):
+            global_config = config.get("Global")
+        if isinstance(global_config, Mapping):
+            try:
+                global_config["cpu_num_threads"] = int(threads_per_worker)
+            except Exception:
+                pass
+        elif global_config is not None:
+            try:
+                global_config.cpu_num_threads = int(threads_per_worker)
+            except Exception:
+                pass
+
+    def _new_batch_predictor(self, threads_per_worker: int) -> Any:
+        clone = getattr(self.global_predictor, "clone", None)
+        if callable(clone):
+            try:
+                predictor = clone()
+            except Exception:
+                predictor = None
+            if predictor is self.global_predictor:
+                predictor = None
+        else:
+            predictor = None
+        if predictor is None:
+            factory = self._batch_predictor_factory
+            if factory is None:
+                raise RuntimeError("predictor clone and configured factory are unavailable")
+            try:
+                predictor = factory(threads_per_worker=threads_per_worker)
+            except TypeError:
+                predictor = factory()
+        self._configure_batch_predictor(predictor, threads_per_worker)
+        return predictor
+
+    @staticmethod
+    def _close_batch_predictor(predictor: Any) -> None:
+        for name in ("close", "destroy", "shutdown"):
+            method = getattr(predictor, name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    LOGGER.debug("batch predictor cleanup failed", exc_info=True)
+                return
+
+    def close_batch_pool(self) -> None:
+        executor, sessions = self._batch_executor, self._batch_sessions
+        self._batch_executor = None
+        self._batch_sessions = []
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        for session in sessions:
+            self._close_batch_predictor(session.predictor)
+
+    def prepare_batch_pool(
+        self, *, worker_count: int | None = None, threads_per_worker: int = 1
+    ) -> dict[str, object]:
+        self.close_batch_pool()
+        self._batch_fallback = None
+        try:
+            threads_per_worker = int(threads_per_worker)
+            if threads_per_worker <= 0:
+                raise ValueError("threads_per_worker must be positive")
+        except (TypeError, ValueError) as exc:
+            self._batch_fallback = str(exc)
+            return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
+        if self.compute_device != "cpu" or self.inference_mode != "fast_geometry":
+            self._batch_fallback = "batch sessions require CPU fast_geometry mode"
+            return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
+        if not isinstance(self.fast_engine, FastOrientationEngine):
+            self._batch_fallback = "fast orientation engine is unavailable"
+            return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
+        limit = self._batch_core_limit()
+        requested = limit if worker_count is None else max(1, int(worker_count))
+        count = min(4, limit, requested)
+        sessions: list[_BatchSession] = []
+        active_predictor: Any | None = None
+        try:
+            for _ in range(count):
+                predictor = self._new_batch_predictor(threads_per_worker)
+                active_predictor = predictor
+                session_lock = threading.Lock()
+                def embed(images, *, _predictor=predictor, _lock=session_lock):
+                    rgb = [image[:, :, ::-1] for image in images]
+                    with _lock:
+                        returned = _predictor.predict(rgb)
+                    if len(returned) != len(images):
+                        raise OrientationClassifierError("global predictor returned unexpected batch size")
+                    return [np.asarray(item, dtype=np.float32) for item in returned]
+                engine = FastOrientationEngine(
+                    embed,
+                    self.fast_engine.geometry,
+                    image_reader=self.fast_engine.image_reader,
+                    deduplicate_identical_slots=self.fast_engine.deduplicate_identical_slots,
+                )
+                probe = embed([np.zeros((512, 512, 3), dtype=np.uint8)])
+                if len(probe) != 1 or probe[0].size == 0 or not np.all(np.isfinite(probe[0])):
+                    raise ValueError("Paddle returned an invalid embedding")
+                sessions.append(_BatchSession(predictor, engine, session_lock))
+                active_predictor = None
+        except Exception as exc:
+            if active_predictor is not None:
+                self._close_batch_predictor(active_predictor)
+            for session in sessions:
+                self._close_batch_predictor(session.predictor)
+            self._batch_fallback = f"session creation failed: {exc}"
+            return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
+        self._batch_sessions = sessions
+        self._batch_threads_per_worker = threads_per_worker
+        self._batch_executor = ThreadPoolExecutor(max_workers=count, thread_name_prefix="orientation-batch")
+        return {"batch_ready": True, "worker_count": count, "threads_per_worker": threads_per_worker}
+
+    def predict_many_with_cache(
+        self,
+        cache: TemplateCache,
+        image_paths: Sequence[Path],
+        *,
+        library_revision: int | None = None,
+    ) -> list[dict[str, object]]:
+        paths = [Path(path) for path in image_paths]
+        if not paths:
+            return []
+        # Capture one immutable caller-provided snapshot for every worker.
+        cache_snapshot = cache
+        sessions = tuple(self._batch_sessions)
+        executor = self._batch_executor
+        if not sessions or executor is None:
+            predict_one = (
+                self.predict_fast_with_cache
+                if self.inference_mode == "fast_geometry"
+                else self.predict_with_cache
+            )
+            results = [predict_one(cache_snapshot, path, library_revision=library_revision) for path in paths]
+        else:
+            runtime = getattr(cache_snapshot, "fast_runtime", None)
+            if runtime is None or self.fast_engine is None:
+                raise OrientationClassifierError("FAST_CACHE_NOT_READY: fast runtime cache is unavailable")
+            if runtime.model_fingerprint != self.model_fingerprint:
+                raise OrientationClassifierError("FAST_CACHE_REVISION_MISMATCH: model fingerprint differs")
+            if library_revision is not None and runtime.library_revision != int(library_revision):
+                raise OrientationClassifierError("FAST_CACHE_REVISION_MISMATCH: library revision differs")
+            if runtime.geometry_profile_revision != getattr(cache_snapshot, "geometry_profile_revision", None):
+                raise OrientationClassifierError("FAST_CACHE_REVISION_MISMATCH: geometry revision differs")
+            if not self._fast_template_signatures_match(runtime.template_signature, getattr(cache_snapshot, "fast_template_signature", None)):
+                raise OrientationClassifierError("FAST_CACHE_REVISION_MISMATCH: template content differs")
+            try:
+                FastOrientationEngine._validate_cache(runtime)
+            except ValueError as exc:
+                raise OrientationClassifierError(str(exc)) from exc
+            def run(index_path):
+                index, path = index_path
+                session = sessions[index % len(sessions)]
+                result = session.engine.predict(_read_image(path), cache_snapshot.fast_runtime)
+                result["index"] = index
+                result["image_path"] = str(path)
+                if library_revision is not None:
+                    result["library_revision"] = int(library_revision)
+                return result
+            futures = [executor.submit(run, (index, path)) for index, path in enumerate(paths)]
+            results = [future.result() for future in futures]
+        for index, (path, result) in enumerate(zip(paths, results)):
+            result.setdefault("index", index)
+            result.setdefault("image_path", str(path))
+            if library_revision is not None:
+                result.setdefault("library_revision", int(library_revision))
+        return results
 
     def _global_embeddings(self, images: Sequence[np.ndarray]) -> list[np.ndarray]:
         if not images:

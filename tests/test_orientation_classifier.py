@@ -56,6 +56,86 @@ def test_paddleclas_sklearn_compat_supports_import_without_sklearn(monkeypatch):
             sys.modules.pop(name, None)
 
 
+class _BlockingBatchPredictor:
+    def __init__(self, state=None):
+        self.state = state or {"active": 0, "max_active": 0, "lock": threading.Lock(), "barrier": threading.Barrier(2)}
+
+    def clone(self):
+        return _BlockingBatchPredictor(self.state)
+
+    def predict(self, images):
+        with self.state["lock"]:
+            self.state["active"] += 1
+            self.state["max_active"] = max(self.state["max_active"], self.state["active"])
+        try:
+            marker = int(images[0][0, 0, 0])
+            if marker:
+                self.state["barrier"].wait(timeout=5)
+            return [np.asarray([float(marker), 1.0], dtype=np.float32) for _ in images]
+        finally:
+            with self.state["lock"]:
+                self.state["active"] -= 1
+
+
+class _UncloneablePredictor(_BlockingBatchPredictor):
+    def clone(self):
+        raise RuntimeError("clone unavailable")
+
+    def predict(self, images):
+        marker = int(images[0][0, 0, 0])
+        return [np.asarray([float(marker), 1.0], dtype=np.float32) for _ in images]
+
+
+def _batch_classifier(tmp_path, predictor):
+    classifier = OrientationClassifier(
+        global_predictor=predictor,
+        extractor=FakeExtractor(),
+        matcher=FakeMatcher(),
+        device="cpu",
+        compute_device="cpu",
+        inference_mode="fast_geometry",
+    )
+    classifier.model_fingerprint = "batch-model"
+    classifier.fast_engine = FastOrientationEngine(
+        lambda images: predictor.predict([image[:, :, ::-1] for image in images]),
+        FastGeometryProcessor(FakeGeometryCalibrator()),
+        image_reader=lambda path: cv2.imread(str(path), cv2.IMREAD_COLOR),
+    )
+    front = [write_marker(tmp_path / "batch-front.png", 1)]
+    back = [write_marker(tmp_path / "batch-back.png", 2)]
+    runtime = make_fast_engine().build_cache(
+        front, back, geometry_profile=None, library_revision=1, model_fingerprint="batch-model"
+    )
+    cache = TemplateCache(
+        global_vectors={"front": np.ones((1, 2), dtype=np.float32), "back": np.ones((1, 2), dtype=np.float32)},
+        local_features={"front": [{}], "back": [{}]},
+        fast_runtime=runtime,
+        fast_template_signature=runtime.template_signature,
+    )
+    return classifier, cache
+
+
+def test_predict_many_uses_independent_sessions_and_preserves_order(tmp_path):
+    predictor = _BlockingBatchPredictor()
+    classifier, cache = _batch_classifier(tmp_path, predictor)
+    assert classifier.prepare_batch_pool(worker_count=2, threads_per_worker=1)["batch_ready"] is True
+    paths = [write_marker(tmp_path / "a.png", 3), write_marker(tmp_path / "b.png", 4)]
+    results = classifier.predict_many_with_cache(cache, paths, library_revision=1)
+    assert [result["index"] for result in results] == [0, 1]
+    assert [result["image_path"] for result in results] == [str(path) for path in paths]
+    assert predictor.state["max_active"] >= 2
+    classifier.close_batch_pool()
+
+
+def test_failed_session_creation_reports_fallback_without_unlocking_shared_predictor(tmp_path):
+    predictor = _UncloneablePredictor()
+    classifier, cache = _batch_classifier(tmp_path, predictor)
+    status = classifier.prepare_batch_pool(worker_count=4, threads_per_worker=1)
+    assert status["batch_ready"] is False
+    assert "fallback" in status
+    classifier.predict_fast_with_cache(cache, write_marker(tmp_path / "single.png", 3), library_revision=1)
+
+
 class FakeGlobalPredictor:
     def __init__(self):
         self.calls = 0
