@@ -8,8 +8,11 @@ loaded.
 from __future__ import annotations
 
 import platform
+import subprocess
 import struct
 import sys
+from pathlib import Path
+import shutil
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -46,6 +49,65 @@ EDITIONS: dict[str, BundleEdition] = {
     ),
     "cpu": BundleEdition("cpu", "paddlepaddle", "3.2.2", "cpu", ()),
 }
+
+
+# Fully-qualified project modules imported by the production TCP service and
+# its fast-geometry path.  Keeping this contract immutable prevents the
+# frozen build from silently falling back to loose project source files.
+_PRODUCTION_SRC_MODULES = (
+    "src.orientation_tcp_service",
+    "src.orientation_classifier",
+    "src.workpiece_catalog",
+    "src.workpiece_library",
+    "src.runtime_data",
+    "src.fast_orientation",
+    "src.fast_geometry",
+    "src.fast_ridge",
+    "src.geometry_calibration",
+    "src.geometry_mask_profiles",
+    "src.geometry_profile_schema",
+    "src.image_io",
+    "src.shitu_baseline",
+    "src.interference_masks",
+    "src.model_execution_gate",
+    "src.model_fingerprint",
+    "src.paddleclas_inference_compat",
+    "src.fast_cache_jobs",
+    "src.template_evolution",
+    "src.windows_parent_watchdog",
+)
+
+
+def production_src_modules() -> tuple[str, ...]:
+    """Return the explicit project-module contract for the frozen backend."""
+
+    return _PRODUCTION_SRC_MODULES
+
+
+def assert_frozen_backend_modules(backend_dir: Path) -> None:
+    """Assert that the generated PyInstaller archive contains project modules.
+
+    PyInstaller's PYZ/PKG archives are not ordinary ZIP files.  The archive
+    viewer is therefore used when available; plain listing files and archive
+    bytes are also accepted to keep this validation usable in CI fixtures.
+    """
+
+    root = Path(backend_dir)
+    archives = [*root.rglob("*.pyz"), *root.rglob("*.pkg"), *root.rglob("*.exe")]
+    if not archives:
+        raise RuntimeError(f"no generated PYZ/PKG archive found under {root}")
+    listing = bytearray()
+    viewer = shutil.which("pyi-archive_viewer")
+    for archive in archives:
+        if viewer:
+            result = subprocess.run(
+                [viewer, "--list", str(archive)], capture_output=True, text=True, check=False
+            )
+            listing.extend(result.stdout.encode("utf-8", "replace"))
+        listing.extend(archive.read_bytes())
+    missing = [module for module in production_src_modules() if module.encode() not in listing]
+    if missing:
+        raise RuntimeError("frozen backend archive missing modules: " + ", ".join(missing))
 
 
 def edition_for(name: str) -> BundleEdition:
@@ -167,6 +229,8 @@ __all__ = [
     "BundleEnvironmentError",
     "EDITIONS",
     "edition_for",
+    "production_src_modules",
+    "assert_frozen_backend_modules",
     "pyinstaller_excludes",
     "validate_installed_distributions",
 ]

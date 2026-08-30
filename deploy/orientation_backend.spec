@@ -7,7 +7,12 @@ from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
-from release_tools.backend_bundle import edition_for, pyinstaller_excludes, validate_installed_distributions
+from release_tools.backend_bundle import (
+    edition_for,
+    production_src_modules,
+    pyinstaller_excludes,
+    validate_installed_distributions,
+)
 
 
 edition_name = os.environ.get("WORKPIECE_PACKAGE_EDITION", "").strip().lower()
@@ -47,6 +52,7 @@ a = Analysis(
     binaries=paddle_binaries + cuda_binaries,
     datas=paddle_datas,
     hiddenimports=[
+        *production_src_modules(),
         "paddle.base.core",
         "paddle.inference",
         "paddleclas.deploy.python.predict_rec",

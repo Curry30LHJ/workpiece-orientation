@@ -39,6 +39,8 @@ try {
 $backend = Join-Path $editionRoot 'orientation_backend'
 $exe = Join-Path $backend 'orientation_backend.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "Frozen backend missing orientation_backend.exe: $exe" }
+& $Python -c "import sys; sys.path.insert(0, r'$project'); from pathlib import Path; from release_tools.backend_bundle import assert_frozen_backend_modules; assert_frozen_backend_modules(Path(r'$backend'))"
+if ($LASTEXITCODE -ne 0) { throw "Frozen backend archive is missing production src modules" }
 $visibleSources = @(Get-ChildItem -LiteralPath $backend -Recurse -File | Where-Object {
     # Windows PowerShell 5.1 ignores -Include when -LiteralPath is used;
     # filter on the extension explicitly so DLLs are never misreported as
