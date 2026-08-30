@@ -15,7 +15,7 @@ Global:
   enable_mkldnn: True
   # The CPU default is selected from the measured hot-path benchmark. It can
   # be overridden at runtime with WORKPIECE_CPU_THREADS.
-  cpu_num_threads: 2
+  cpu_num_threads: 4
   enable_benchmark: True
   use_fp16: False
   ir_optim: True

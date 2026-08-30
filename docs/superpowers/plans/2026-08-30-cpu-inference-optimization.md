@@ -209,7 +209,7 @@ python -m pytest tests/test_orientation_classifier.py -k "cpu_load_applies or gp
 
 在 orientation_classifier.py 中：
 
-1. 从 config.Global.cpu_num_threads 读取默认值；当前部署配置和代码回退默认值均为 2。WORKPIECE_CPU_THREADS 存在时要求为大于 0 的十进制整数，否则 warning 并保留有效 YAML 值或回退到 2。
+1. 从 config.Global.cpu_num_threads 读取默认值；当前部署配置和代码回退默认值均为 4。WORKPIECE_CPU_THREADS 存在时要求为大于 0 的十进制整数，否则 warning 并保留有效 YAML 值或回退到 4。
 2. 仅 compute_device == cpu 时写回 config.Global.cpu_num_threads；GPU 不受该环境变量影响。
 3. 解析 WORKPIECE_CPU_DEDUPLICATE_SLOTS 的 0/1、true/false、yes/no；CPU 默认启用，GPU 强制关闭；非法值 warning 后采用设备默认值。
 4. 将 deduplicate_identical_slots 传给 FastOrientationEngine，并保存 classifier.cpu_num_threads。

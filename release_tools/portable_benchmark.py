@@ -58,6 +58,26 @@ def summarize(values: Sequence[float]) -> dict[str, float | int]:
     }
 
 
+def _latency_gate(edition: object, actual: float, limit: float = 25.0) -> dict[str, Any]:
+    """Describe the latency target without treating an unmet CPU target as a pass.
+
+    The GPU latency threshold is a hard acceptance gate.  CPU latency remains a
+    monitored target for this optimization phase: it is reported as
+    ``target_met`` but deliberately has no boolean ``passed`` value, so callers
+    cannot mistake a correctness pass for meeting the 25 ms CPU objective.
+    """
+    is_gpu = str(edition).strip().lower() == "gpu"
+    target_met = bool(actual <= limit)
+    return {
+        "actual": float(actual),
+        "limit": float(limit),
+        "applicable": True,
+        "status": "gate" if is_gpu else "monitoring",
+        "target_met": target_met,
+        "passed": target_met if is_gpu else None,
+    }
+
+
 def compare_predictions(
     gpu: Mapping[str, str], cpu: Mapping[str, str]
 ) -> list[dict[str, str | None]]:
@@ -759,12 +779,15 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                                 "review_count": review_count, "review_rate": review_rate,
                                 "per_query_review_rate": identity_review_rate}
         backend_summary = report["timings"]["backend_elapsed_ms"]
-        report["gates"] = {"gpu_backend_p95_ms": {"actual": backend_summary["p95"], "limit": 25.0,
-                                                      "passed": report["edition"] != "gpu" or backend_summary["p95"] <= 25.0},
+        report["gates"] = {"gpu_backend_p95_ms": _latency_gate(report["edition"], backend_summary["p95"]),
                          "accuracy_complete": {"actual": len(predictions), "limit": len(expected), "passed": len(predictions) == len(expected)},
                          "correctness": {"actual": sample_accuracy, "limit": 1.0, "passed": sample_accuracy == 1.0},
                          "review_rate": {"actual": review_rate, "limit": 0.05, "passed": review_rate <= 0.05}}
-        report["passed"] = all(item["passed"] for item in report["gates"].values())
+        report["passed"] = all(
+            item["passed"] is True
+            for item in report["gates"].values()
+            if item.get("status") != "monitoring"
+        )
         if compare is not None:
             previous = json.loads(Path(compare).read_text(encoding="utf-8"))
             report["differences"] = compare_predictions(previous.get("predictions", {}), predictions)

@@ -14,6 +14,7 @@ import pytest
 import release_tools.portable_benchmark as benchmark
 
 from release_tools.portable_benchmark import (
+    _latency_gate,
     _validate_config,
     _acceptance_rows,
     compare_predictions,
@@ -174,6 +175,22 @@ def test_summarize_reports_required_percentiles():
     assert summary["mean"] == 30.0
     assert summary["max"] == 50.0
     assert summary["p50"] == 30.0
+
+
+def test_cpu_latency_target_is_monitoring_not_a_false_pass():
+    gate = _latency_gate("cpu", 60.0)
+
+    assert gate["status"] == "monitoring"
+    assert gate["target_met"] is False
+    assert gate["passed"] is None
+
+
+def test_gpu_latency_target_remains_a_hard_gate():
+    gate = _latency_gate("gpu", 26.0)
+
+    assert gate["status"] == "gate"
+    assert gate["target_met"] is False
+    assert gate["passed"] is False
 
 
 def test_compare_predictions_lists_every_cpu_gpu_difference():
