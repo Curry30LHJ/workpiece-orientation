@@ -1206,7 +1206,7 @@ def test_invalid_yaml_cpu_threads_fall_back_to_default_with_warning(
         tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
     )
 
-    assert captured["config"].Global.cpu_num_threads == 2
+    assert captured["config"].Global.cpu_num_threads == 4
     assert "cpu_num_threads" in caplog.text
 
 
@@ -1221,7 +1221,7 @@ def test_invalid_env_and_yaml_cpu_threads_fall_back_to_default(
         tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
     )
 
-    assert captured["config"].Global.cpu_num_threads == 2
+    assert captured["config"].Global.cpu_num_threads == 4
     assert "WORKPIECE_CPU_THREADS" in caplog.text
 
 
