@@ -1,74 +1,63 @@
-# CPU inference optimization verification
+# CPU 推理路径优化验证报告
 
-Date: 2026-08-30
-Branch: `feature/20260830/cpu-inference-optimization`
-Code commit: `9ae717509d32711a7a5b067080ebaa613551d666`
-Report commit: `1fb1cf0` (prior report commit; the documentation commit necessarily has a new SHA)
+日期：2026-08-30
+分支：`feature/20260830/cpu-inference-optimization`
+运行代码提交：`7ebc3236d73bcb60c221530a5347c1208be15bcc`
 
-## Method and data
+## 结论
 
-Task 4 required the complete pytest suite, packaged CPU runs at thread candidates 1/2/4, and paired 1,000-iteration runs with `WORKPIECE_CPU_DEDUPLICATE_SLOTS=0` versus the default-enabled path. The acceptance input was checked read-only at `runtime_reports/fast-geometry-acceptance.json` (SHA-256 `45c73611e828b8bbd94650ee316fc970f859a04d2ad1c40a5e609d2b99572eef`, 120 queries across M1/M2/M7). The file is user-provided and was not changed or staged.
+CPU 快速路径已经完成并在固定验收集上保持 120/120 标签正确、复核率 0。CPU 默认启用完全相同槽位的精确去重，并将默认 OneDNN 线程数设为 4；最终包不传覆盖时确认实际使用 4 线程。去重把每次请求的全局输入槽位从 3 个降为 1 个，选定配置的最终包往返 P95 为 67.751 ms（后端 P95 66.350 ms）。因此甲方提出的 P95 ≤25 ms 目前仍未达到，报告不作达标承诺。
 
-The requested canonical release ZIP was absent. To make a safe current-branch measurement, the current backend was built with `E:\python\anaconda3\envs\workpiece-package-cpu\python.exe`, filtered into a fresh copy of the authorized legacy package, and archived as `release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0-cpuopt-benchmark.zip` (SHA-256 `d4b288d1ed5e509a47254a98921c82a16ca7fdefb67eb2ca1e23b218a1d578c7`). The package metadata records code commit `9ae7175`; model fingerprint `1fab156fb025705a836ad6c28590fc32e1141ae5c530282369412a3078300b33` matches `app_config.json` and `version.json`. Strict directory and extracted-ZIP audits passed before execution.
+## 验收条件与包指纹
 
-## Commands and results
+- 验收文件：`runtime_reports/fast-geometry-acceptance.json`，SHA-256 `45c73611e828b8bbd94650ee316fc970f859a04d2ad1c40a5e609d2b99572eef`，包含 M1/M2/M7 共 120 个查询；文件只读，未加入 Git。
+- 最终 canonical 包：[release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip](../../release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip)（SHA-256 `3146639fac37e3470f043a220248b371355e403353561d3e15e6ab10da0e9573`）。包内 manifest、目录和解压后的 ZIP 审计均通过，metadata 提交为 `7ebc323`。
+- 旧版基线包位于用户提供的 `E:/Project/wang/ai_区分正反/.worktrees/offline-portable-packages/release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip`，SHA-256 `4044820dcabbd1fcc8c517eb7d80b6b6b6a64478b4210640be0536052d51f2db`；同目录的 GPU 基线包 `WorkpieceOrientation-GPU-x64-1.0.0.zip` SHA-256 为 `02d7e7fe1e958a50e8c6ceb7184559aa0893d8cdcff5655a59e9d1c850be1817`。两个包均仅作为只读历史基线，未复制或修改。
+- 硬件：Windows 10、Intel 24 逻辑处理器 / 16 物理核心、Paddle 3.2.2、PaddleClas 2.6.0、Python 3.10.20、Qt 5.14.2。
 
-| Command | Result |
-| --- | --- |
-| `python -m pytest -q` | Collection blocked by `PermissionError: [WinError 5]` while scanning `qt_app/tests/build-test_geometryrulespage/pytest-task10-profiles`; pytest cache also lacked write access. |
-| `python -m pytest tests/test_fast_orientation.py tests/test_orientation_classifier.py tests/test_orientation_tcp_service.py tests/test_workpiece_catalog.py -q` | `103 passed, 177 errors`; errors were chiefly pytest temporary-directory lock permissions under `C:\Users\Administrator\AppData\Local\Temp\pytest-of-Administrator`. No source was changed to work around this environment failure. |
-| `scripts/build_portable_backend.ps1 -Edition cpu -Python E:\python\anaconda3\envs\workpiece-package-cpu\python.exe` | Exit 0; PyInstaller 6.22.2 completed and emitted `release_staging/backend-cpu/orientation_backend`. |
-| Isolated backend replacement, manifest regeneration, strict package audit, ZIP audit | All passed; filtered package contained 1,171 files and metadata commit `9ae7175`. |
-| One-request smoke attempt (`--warmup 0 --iterations 1`) | Exit 2 by benchmark CLI validation (`iterations must be at least 1000`); no backend was started by this attempt. |
-| Current package, `WORKPIECE_CPU_DEDUPLICATE_SLOTS=0`, `--cpu-threads 1`, warmup 50/iterations 1000 | Exit 0; 1,000 measured requests, accuracy 1.0, review 0.0. |
-| Current package, `WORKPIECE_CPU_DEDUPLICATE_SLOTS=0`, `--cpu-threads 2`, warmup 50/iterations 1000 | Exit 0; 1,000 measured requests, accuracy 1.0, review 0.0. |
-| Current package, `WORKPIECE_CPU_DEDUPLICATE_SLOTS=0`, `--cpu-threads 4`, warmup 50/iterations 1000 | Exit 0; 1,000 measured requests, accuracy 1.0, review 0.0. |
-| Current package, default dedup, `--cpu-threads 1`, warmup 50/iterations 1000 | Exit 0; 1,000 measured requests, accuracy 1.0, review 0.0. |
-| Current package, default dedup, `--cpu-threads 2`, warmup 50/iterations 1000 | Exit 0; 1,000 measured requests, accuracy 1.0, review 0.0. |
-| Current package, default dedup, `--cpu-threads 4`, warmup 50/iterations 1000 | Exit 0; 1,000 measured requests, accuracy 1.0, review 0.0. |
+## 线程与去重对照
 
-Benchmark JSON outputs and the benchmark-only package remain under gitignored `release_staging/` and `release_artifacts/`. Existing `runtime_reports/` files were not overwritten and were not added to git.
+每组均为 50 次预热 + 1000 次热推理；时间单位为毫秒。`backend` 是后端返回的算法耗时，`round trip` 包含 TCP 请求往返；启动时间单列，不计入热推理分布。每个请求的 `model_calls` 为 1，表示一次批量预测调用；真正的优化证据是批量槽位数 `3→1`。
 
-The exact benchmark invocations were:
+| 配置 | 线程 | 后端 mean / P50 / P95 / P99 / max | 往返 mean / P50 / P95 / P99 / max | 槽位 | 准确率 / 复核率 |
+| --- | ---: | --- | --- | --- | --- |
+| 去重关闭 | 1 | 190.242 / 186.217 / 224.228 / 262.342 / 306.591 | 191.285 / 187.187 / 225.327 / 263.876 / 308.745 | 3→3 | 1.0 / 0.0 |
+| 去重关闭 | 2 | 144.700 / 141.923 / 164.691 / 173.475 / 204.875 | 145.383 / 142.590 / 165.703 / 174.383 / 205.906 | 3→3 | 1.0 / 0.0 |
+| 去重关闭 | 4 | 147.811 / 145.912 / 171.454 / 216.689 / 334.453 | 148.618 / 146.700 / 172.796 / 218.225 / 336.422 | 3→3 | 1.0 / 0.0 |
+| 去重关闭 | 16 | 200.405 / 198.941 / 230.217 / 259.536 / 377.898 | 201.555 / 200.261 / 231.634 / 261.905 / 379.753 | 3→3 | 1.0 / 0.0 |
+| 去重开启 | 1 | 62.239 / 61.028 / 74.873 / 89.174 / 111.595 | 63.206 / 61.994 / 76.019 / 90.418 / 113.189 | 3→1 | 1.0 / 0.0 |
+| 去重开启 | 2 | 61.364 / 59.993 / 77.270 / 97.528 / 108.914 | 62.521 / 61.315 / 78.784 / 98.825 / 110.353 | 3→1 | 1.0 / 0.0 |
+| 去重开启 | 4 | 59.441 / 58.069 / 72.783 / 81.661 / 101.046 | 60.649 / 59.251 / 74.322 / 83.140 / 102.655 | 3→1 | 1.0 / 0.0 |
+| 去重开启 | 16 | 71.834 / 70.803 / 82.262 / 91.845 / 271.567 | 73.075 / 72.125 / 83.657 / 93.873 / 272.934 | 3→1 | 1.0 / 0.0 |
 
-```powershell
-$env:WORKPIECE_CPU_DEDUPLICATE_SLOTS='0'; python scripts/benchmark_portable_service.py --package-zip release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0-cpuopt-benchmark.zip --acceptance-spec runtime_reports/fast-geometry-acceptance.json --cpu-threads 1 --warmup 50 --iterations 1000 --timeout-seconds 900 --output release_staging/benchmarks/current-dedup0-threads1.json
-$env:WORKPIECE_CPU_DEDUPLICATE_SLOTS='0'; python scripts/benchmark_portable_service.py --package-zip release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0-cpuopt-benchmark.zip --acceptance-spec runtime_reports/fast-geometry-acceptance.json --cpu-threads 2 --warmup 50 --iterations 1000 --timeout-seconds 900 --output release_staging/benchmarks/current-dedup0-threads2.json
-$env:WORKPIECE_CPU_DEDUPLICATE_SLOTS='0'; python scripts/benchmark_portable_service.py --package-zip release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0-cpuopt-benchmark.zip --acceptance-spec runtime_reports/fast-geometry-acceptance.json --cpu-threads 4 --warmup 50 --iterations 1000 --timeout-seconds 900 --output release_staging/benchmarks/current-dedup0-threads4.json
-Remove-Item Env:WORKPIECE_CPU_DEDUPLICATE_SLOTS -ErrorAction SilentlyContinue; python scripts/benchmark_portable_service.py --package-zip release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0-cpuopt-benchmark.zip --acceptance-spec runtime_reports/fast-geometry-acceptance.json --cpu-threads 1 --warmup 50 --iterations 1000 --timeout-seconds 900 --output release_staging/benchmarks/current-dedup-default-threads1.json
-Remove-Item Env:WORKPIECE_CPU_DEDUPLICATE_SLOTS -ErrorAction SilentlyContinue; python scripts/benchmark_portable_service.py --package-zip release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0-cpuopt-benchmark.zip --acceptance-spec runtime_reports/fast-geometry-acceptance.json --cpu-threads 2 --warmup 50 --iterations 1000 --timeout-seconds 900 --output release_staging/benchmarks/current-dedup-default-threads2.json
-Remove-Item Env:WORKPIECE_CPU_DEDUPLICATE_SLOTS -ErrorAction SilentlyContinue; python scripts/benchmark_portable_service.py --package-zip release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0-cpuopt-benchmark.zip --acceptance-spec runtime_reports/fast-geometry-acceptance.json --cpu-threads 4 --warmup 50 --iterations 1000 --timeout-seconds 900 --output release_staging/benchmarks/current-dedup-default-threads4.json
-```
+每个启动行的 `startup_ready_ms` 同时以 `cold_start_ms` 记录为 `count=1` 的 mean / P50 / P95 / P99 / max；它表示进程启动到 ready 握手，启动阶段没有 predict，所以模型调用和去重比例为 `not_applicable`。在同一候选扫频中，4 线程去重开启的往返 P95 最低（74.322 ms），因此默认值从 2 修正为 4；16 线程出现明显尾延迟恶化。随后用最终重打包 artifact、不传 `WORKPIECE_CPU_THREADS` 再测三次，确认包内默认 4 线程。首次运行受 Windows 调度/缓存影响出现 146.440 ms 往返 P95，后两次分别为 70.568 ms 和 67.751 ms；选定重复运行的后端 56.689 / 55.656 / 66.350 / 71.863 / 78.134，往返 57.882 / 56.858 / 67.751 / 73.294 / 79.426（mean / P50 / P95 / P99 / max）。热请求的 `global_model_calls` 总计 1000、均值 1.0，槽位由 3→1，去重比例为 66.7%。不同运行批次存在正常的 Windows 调度波动，默认选择依据仍是完整候选扫频的相对结果。
 
-## Historical reference: legacy CPU package
+相对同线程关闭去重，4 线程往返 P95 从 172.796 ms 降到 74.322 ms（约 57.0%）；聚合槽位元素从 3000 降到 1000（约 66.7%）。与旧版 4 线程历史往返 P95 178.126 ms 相比，选定重复运行的最终往返 P95 为 67.751 ms，约下降 62.0%。所有对照的 120 个查询标签一致。
 
-For supplemental context only, the sibling worktree package was run without copying it into this branch. Its manifest identifies package commit `d3d1fa0834f11964919124359921c2ebc5db27cc` (Paddle 3.2.2/PaddleClas 2.6.0), ZIP SHA-256 `4044820dcabbd1fcc8c517eb7d80b6b6b6a64478b4210640be0536052d51f2db`, and 50 warmup + 1,000 measured requests per run. These are historical measurements from the pre-optimization package and do not represent current code commit `9ae7175`.
+## 门禁语义
 
-| Legacy package CPU threads | startup ready (ms) | backend elapsed mean/P50/P95/P99/max (ms) | round trip mean/P50/P95/P99/max (ms) | accuracy / review |
-| --- | ---: | --- | --- | --- |
-| 1 | 18,132.10 | 172.52 / 171.25 / 199.49 / 212.32 / 301.42 | 173.24 / 171.97 / 200.21 / 213.79 / 302.29 | 1.0 / 0.0 |
-| 2 | 13,896.07 | 162.70 / 161.69 / 179.76 / 192.84 / 223.60 | 163.45 / 162.39 / 180.81 / 193.68 / 224.32 | 1.0 / 0.0 |
-| 4 | 14,404.12 | 160.59 / 159.93 / 177.39 / 185.44 / 240.97 | 161.32 / 160.62 / 178.13 / 186.61 / 242.34 | 1.0 / 0.0 |
+`release_tools.portable_benchmark` 保留历史键 `gates.gpu_backend_p95_ms` 以兼容旧消费者，但现在带有明确字段：
 
-The legacy package did not expose the new slot-dedup telemetry (`global_unique_slots` or model-call count), and no dedup-disabled/default pair was run against the current code. These results must not be used to claim the optimization target is met.
+- GPU：`status=gate`，25 ms 是硬门禁，`passed` 为布尔值；
+- CPU：`status=monitoring`，`target_met=false`，`passed=null`，该目标不参与整体正确性通过值计算。
 
-## Measurements
+因此 CPU 报告整体 `passed=true` 只表示正确性、完整性和复核率门禁通过，绝不表示 25 ms 已达标。
 
-| Configuration | backend elapsed (mean/P50/P95/P99/max ms) | round trip (mean/P50/P95/P99/max ms) | accuracy | review | unique slots / call proxy | status |
-| --- | --- | --- | --- | --- | --- | --- |
-| Dedup disabled, thread 1 | 225.61 / 187.65 / 350.62 / 477.55 / 814.32 | 226.51 / 188.37 / 351.79 / 479.08 / 815.87 | 1.0 | 0.0 | 3→3; 3,000 slot-elements | completed current package |
-| Dedup disabled, thread 2 | 159.02 / 155.61 / 177.98 / 244.34 / 404.88 | 159.89 / 156.41 / 178.93 / 245.62 / 405.49 | 1.0 | 0.0 | 3→3; 3,000 slot-elements | completed current package |
-| Dedup disabled, thread 4 | 145.19 / 142.89 / 162.40 / 190.25 / 259.40 | 145.96 / 143.61 / 163.38 / 191.33 / 261.17 | 1.0 | 0.0 | 3→3; 3,000 slot-elements | completed current package |
-| Dedup default enabled, thread 1 | 57.54 / 56.08 / 64.95 / 73.30 / 335.83 | 58.23 / 56.75 / 65.89 / 74.59 / 336.45 | 1.0 | 0.0 | 3→1; 1,000 slot-elements | completed current package |
-| Dedup default enabled, thread 2 | 53.71 / 52.76 / 61.48 / 78.46 / 89.00 | 54.46 / 53.48 / 62.35 / 79.45 / 91.23 | 1.0 | 0.0 | 3→1; 1,000 slot-elements | completed current package |
-| Dedup default enabled, thread 4 | 52.39 / 50.89 / 64.57 / 77.74 / 102.68 | 53.22 / 51.70 / 65.67 / 79.13 / 104.71 | 1.0 | 0.0 | 3→1; 1,000 slot-elements | completed current package |
+## 测试与构建
 
-Across all six runs, predictions were identical (0 differences across 120 identities), accuracy remained 1.0, and review rate remained 0. The default-dedup thread-2 run has the lowest round-trip P95 (62.35 ms) among default-enabled candidates and is the selected thread configuration. Deduplication reduced aggregate slot-elements from 3,000 to 1,000 per 1,000 requests (66.7% reduction); the protocol does not expose an authoritative model-call counter, so this is a predictor-batch-size proxy, not a claimed call count. The best measured current-branch P95 is 61.48 ms backend / 62.35 ms round trip, so P95 ≤ 25 ms is not achieved or claimed. PP-ShiTu/global inference remains the dominant cost.
+- `tests/test_fast_orientation.py tests/test_benchmark_portable_service.py`：52 passed，1 warning。
+- CPU 线程/设备/非法值定向测试：17 passed，109 deselected。
+- 旧缓存与不等模板兼容定向测试（旧 v2、1/5/10/31 模板及预测）：12 passed。
+- GPU 隔离/门禁单测：3 passed（CPU 线程和槽位去重覆盖 GPU 不生效，GPU 25 ms 仍为硬门禁）。本轮未重建或运行 GPU canonical 包，故不把历史 GPU 包指纹当作实测回归结论。
+- 变更 Python 模块 `py_compile`：通过。
+- canonical CPU 包构建、manifest 审计、ZIP 解压审计：通过，构建脚本退出码 0。
+- 较大兼容性集合：275 passed、36 failed、4 errors；失败集中在当前 Windows 环境加载 Torch/可选 LightGlue DLL（WinError 127）以及权限/临时目录问题，不是 CPU 去重断言失败。完整集合仍受 `pytest` 临时目录 ACL 影响，未将环境问题伪装成通过。
 
-## Limitations and risks
+## 已知限制
 
-- The canonical release ZIP is missing; the current result uses an explicitly labeled benchmark-only package assembled in `release_staging/` and must be rebuilt through the normal release flow for shipping evidence.
-- The active base Python 3.12.7 environment lacks PaddlePaddle/PaddleClas, but the packaged runtime used for these runs reports Python 3.10, Paddle 3.2.2, and PaddleClas 2.6.0.
-- Each run exited cleanly and confirmed shutdown; the optional captured backend log was not UTF-8 decodable (`0xd0` at byte 0), so log text is unavailable even though protocol results and lifecycle status are valid.
-- Full and targeted pytest runs are affected by Windows ACL/temporary-directory permissions and an inaccessible generated test directory. These failures were recorded, not “fixed” in unrelated code.
-- A follow-up with the canonical release ZIP and writable pytest temp/cache directories should repeat the six configurations before release-signoff; these measurements do not establish the 25 ms target.
+1. 当前固定样本的 CPU P95 仍约 68 ms（重复运行 67.751 ms），离 25 ms 目标有明显差距；PP-ShiTu 全局特征提取仍是主耗时，后续若要继续逼近目标需单独评估更小模型、ONNX/OpenVINO 或量化，不能仅靠线程数保证。
+2. 冷启动统计目前每个基准运行只启动一次（`count=1`），用于记录实际启动开销而不是作稳定性分位数结论；若甲方需要冷启动 P95，应另做多次独立进程启动测试。
+3. `global_model_calls=1` 是一次批量预测调用计数，不等同于槽位数；去重收益用显式 `global_unique_slots` 和槽位元素统计证明。
+4. 候选原始 JSON 保留在 Git 忽略的 `release_staging/benchmarks/`，本报告记录了关键统计和候选包指纹；用户的 `runtime_reports/` 未被修改。
+5. 该验收集和测试机结果不能替代甲方目标工控机上的最终 P95 复测。
+6. 本轮没有在 GPU 上执行完整 1000 次预测回归；历史 GPU 包仅用于定位和完整性核对，若要发布 GPU 版本仍需在目标显卡上单独复测硬门禁。
