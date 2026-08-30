@@ -2,7 +2,8 @@
 
 Date: 2026-08-30  
 Branch: `feature/20260830/cpu-inference-optimization`  
-Commit: `b5c2b47eb1bdafd123ea7374f683bf9cb17cddc9`
+Code commit: `b5c2b47eb1bdafd123ea7374f683bf9cb17cddc9`  
+Report commit: `381c9c2` (the prior report commit; this clarification commit necessarily has a new SHA)
 
 ## Method and data
 
@@ -26,8 +27,12 @@ The three benchmark attempts wrote only temporary failure JSON outside the repos
 
 | Configuration | backend elapsed (mean/P50/P95/P99/max ms) | round trip (mean/P50/P95/P99/max ms) | accuracy | review | unique slots / calls | status |
 | --- | --- | --- | --- | --- | --- | --- |
-| Dedup disabled, threads 1/2/4 | — | — | — | — | — | unavailable: package missing |
-| Dedup default enabled, threads 1/2/4 | — | — | — | — | — | unavailable: package missing |
+| Dedup disabled, thread 1 | — | — | — | — | — | unavailable: package missing |
+| Dedup disabled, thread 2 | — | — | — | — | — | unavailable: package missing |
+| Dedup disabled, thread 4 | — | — | — | — | — | unavailable: package missing |
+| Dedup default enabled, thread 1 | — | — | — | — | — | unavailable: package missing |
+| Dedup default enabled, thread 2 | — | — | — | — | — | unavailable: package missing |
+| Dedup default enabled, thread 4 | — | — | — | — | — | unavailable: package missing |
 
 No P95 target conclusion is possible for this branch. In particular, P95 ≤ 25 ms is not claimed without a real packaged measurement. The existing acceptance JSON contains a historical fast-geometry total P95 of 23.324 ms at a different commit and environment; it is reference evidence only, not this verification run.
 
@@ -37,4 +42,3 @@ No P95 target conclusion is possible for this branch. In particular, P95 ≤ 25 
 - PaddlePaddle/PaddleClas are unavailable in the active Python environment (Python 3.12.7); versions are therefore `null` in JSON.
 - Full and targeted pytest runs are affected by Windows ACL/temporary-directory permissions and an inaccessible generated test directory. These failures were recorded, not “fixed” in unrelated code.
 - A follow-up on a machine with the release ZIP, writable pytest temp/cache directories, and the intended Paddle runtime must run all six benchmark configurations and fill the null metrics before making performance claims.
-

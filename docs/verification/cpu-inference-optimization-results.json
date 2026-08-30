@@ -1,6 +1,8 @@
 {
   "branch": "feature/20260830/cpu-inference-optimization",
-  "commit": "b5c2b47eb1bdafd123ea7374f683bf9cb17cddc9",
+  "code_commit": "b5c2b47eb1bdafd123ea7374f683bf9cb17cddc9",
+  "report_commit": "381c9c2",
+  "report_commit_note": "This is the prior report commit; the current clarification commit is intentionally not self-referenced.",
   "model_fingerprint": null,
   "model_fingerprint_reason": "The workspace model files are present, but the required release ZIP is absent; the bundled model used by a packaged benchmark therefore cannot be verified.",
   "workspace_model_files": {
@@ -21,7 +23,8 @@
     "platform": "Windows-10-10.0.19045-SP0",
     "processor_identifier": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
     "logical_processors": 24,
-    "physical_cores": null
+    "physical_cores": null,
+    "physical_cores_reason": "Windows API/tool access was denied in this environment (Get-CimInstance returned Access Denied); only logical processor count was available."
   },
   "thread_config": {
     "env_var": "WORKPIECE_CPU_THREADS",
@@ -43,8 +46,12 @@
     "backend_elapsed_ms": {"mean": null, "p50": null, "p95": null, "p99": null, "max": null},
     "round_trip_ms": {"mean": null, "p50": null, "p95": null, "p99": null, "max": null},
     "by_configuration": {
-      "dedup_disabled": {"thread_candidates": [1, 2, 4], "status": "unavailable"},
-      "dedup_default_enabled": {"thread_candidates": [1, 2, 4], "status": "unavailable"}
+      "dedup_disabled_thread_1": {"dedup": false, "cpu_threads": 1, "status": "unavailable: package missing"},
+      "dedup_disabled_thread_2": {"dedup": false, "cpu_threads": 2, "status": "unavailable: package missing"},
+      "dedup_disabled_thread_4": {"dedup": false, "cpu_threads": 4, "status": "unavailable: package missing"},
+      "dedup_default_enabled_thread_1": {"dedup": true, "cpu_threads": 1, "status": "unavailable: package missing"},
+      "dedup_default_enabled_thread_2": {"dedup": true, "cpu_threads": 2, "status": "unavailable: package missing"},
+      "dedup_default_enabled_thread_4": {"dedup": true, "cpu_threads": 4, "status": "unavailable: package missing"}
     }
   },
   "accuracy": {"accuracy_rate": null, "queries": null, "reason": "Packaged benchmark did not run."},
