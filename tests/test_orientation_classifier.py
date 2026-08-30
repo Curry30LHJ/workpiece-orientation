@@ -1132,7 +1132,7 @@ def _install_fake_paddleclas(monkeypatch):
 
     def get_config(path, show=False):
         captured["config_path"] = path
-        config = SimpleNamespace(Global=SimpleNamespace())
+        config = SimpleNamespace(Global=SimpleNamespace(cpu_num_threads=10))
         captured["config"] = config
         return config
 
@@ -1148,6 +1148,50 @@ def _install_fake_paddleclas(monkeypatch):
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
     return captured
+
+
+def test_cpu_load_applies_thread_override_and_enables_slot_dedup(tmp_path, monkeypatch):
+    captured = _install_fake_paddleclas(monkeypatch)
+    _install_fake_paddle_runtime(monkeypatch)
+    monkeypatch.setenv("WORKPIECE_CPU_THREADS", "4")
+    monkeypatch.delenv("WORKPIECE_CPU_DEDUPLICATE_SLOTS", raising=False)
+
+    loaded = OrientationClassifier.load(
+        tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
+    )
+
+    assert captured["config"].Global.cpu_num_threads == 4
+    assert loaded.cpu_num_threads == 4
+    assert loaded.fast_engine.deduplicate_identical_slots is True
+
+
+def test_gpu_load_ignores_cpu_slot_dedup_and_cpu_thread_override(tmp_path, monkeypatch):
+    captured = _install_fake_paddleclas(monkeypatch)
+    _install_fake_paddle_runtime(monkeypatch)
+    monkeypatch.setenv("WORKPIECE_CPU_THREADS", "1")
+    monkeypatch.setenv("WORKPIECE_CPU_DEDUPLICATE_SLOTS", "1")
+
+    loaded = OrientationClassifier.load(
+        tmp_path, tmp_path / "model", compute_device="gpu", inference_mode="fast_geometry"
+    )
+
+    assert loaded.fast_engine.deduplicate_identical_slots is False
+    assert captured["config"].Global.use_gpu is True
+    assert captured["config"].Global.enable_mkldnn is False
+    assert captured["config"].Global.cpu_num_threads == 10
+
+
+def test_invalid_cpu_thread_override_keeps_yaml_value_and_logs_warning(tmp_path, monkeypatch, caplog):
+    captured = _install_fake_paddleclas(monkeypatch)
+    _install_fake_paddle_runtime(monkeypatch)
+    monkeypatch.setenv("WORKPIECE_CPU_THREADS", "not-an-int")
+
+    OrientationClassifier.load(
+        tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
+    )
+
+    assert captured["config"].Global.cpu_num_threads == 10
+    assert "WORKPIECE_CPU_THREADS" in caplog.text
 
 
 @pytest.mark.parametrize(

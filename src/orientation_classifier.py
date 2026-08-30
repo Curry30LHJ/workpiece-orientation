@@ -52,6 +52,9 @@ INFERENCE_MODES = ("legacy", "fast_geometry", "compare")
 DEFAULT_INFERENCE_MODE = "legacy"
 COMPUTE_DEVICES = ("gpu", "cpu")
 DEFAULT_COMPUTE_DEVICE = "gpu"
+CPU_THREADS_ENV = "WORKPIECE_CPU_THREADS"
+CPU_SLOT_DEDUP_ENV = "WORKPIECE_CPU_DEDUPLICATE_SLOTS"
+DEFAULT_CPU_NUM_THREADS = 10
 _GEOMETRY_REVISION_FROM_RECORD = object()
 
 
@@ -263,6 +266,37 @@ def _validate_model_fingerprint(value: str) -> str:
     return fingerprint
 
 
+def _resolve_cpu_num_threads(global_config: Any) -> int:
+    """Resolve the configured CPU thread count, allowing a process override."""
+    configured = getattr(global_config, "cpu_num_threads", DEFAULT_CPU_NUM_THREADS)
+    try:
+        configured = int(configured)
+    except (TypeError, ValueError):
+        configured = DEFAULT_CPU_NUM_THREADS
+    override = os.environ.get(CPU_THREADS_ENV)
+    if override is None:
+        return configured
+    if override.isdecimal() and int(override) > 0:
+        return int(override)
+    LOGGER.warning("Ignoring invalid %s=%r; keeping YAML cpu_num_threads=%s", CPU_THREADS_ENV, override, configured)
+    return configured
+
+
+def _resolve_cpu_slot_dedup(compute_device: str) -> bool:
+    """Resolve exact query-slot deduplication, enabled by default on CPU only."""
+    default = compute_device == "cpu"
+    override = os.environ.get(CPU_SLOT_DEDUP_ENV)
+    if override is None:
+        return default
+    normalized = override.strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return default if compute_device == "gpu" else True
+    if normalized in {"0", "false", "no"}:
+        return False if compute_device == "cpu" else default
+    LOGGER.warning("Ignoring invalid %s=%r; using device default=%s", CPU_SLOT_DEDUP_ENV, override, default)
+    return default
+
+
 class OrientationClassifier:
     """Fuse global retrieval with decisive soft-center local evidence."""
 
@@ -295,6 +329,7 @@ class OrientationClassifier:
         self.inference_mode = _validate_inference_mode(inference_mode)
         self.model_fingerprint = _validate_model_fingerprint(model_fingerprint)
         self.compute_device = _validate_compute_device(compute_device)
+        self.cpu_num_threads = None
         self.fast_engine = fast_engine
         self._inference_lock = threading.RLock()
         self._template_caches: dict[str, TemplateCache] = {}
@@ -357,6 +392,15 @@ class OrientationClassifier:
             project_root / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml"
         )
         config = paddle_config.get_config(str(config_path), show=False)
+        configured_cpu_threads = getattr(config.Global, "cpu_num_threads", DEFAULT_CPU_NUM_THREADS)
+        try:
+            configured_cpu_threads = int(configured_cpu_threads)
+        except (TypeError, ValueError):
+            configured_cpu_threads = DEFAULT_CPU_NUM_THREADS
+        cpu_num_threads = (
+            _resolve_cpu_num_threads(config.Global)
+            if compute_device == "cpu" else configured_cpu_threads
+        )
         try:
             paddle_model_dir = prepare_paddle_model_path(model_dir)
         except Exception as exc:
@@ -367,6 +411,8 @@ class OrientationClassifier:
         config.Global.rec_inference_model_dir = str(paddle_model_dir)
         config.Global.use_gpu = compute_device == "gpu"
         config.Global.enable_mkldnn = compute_device == "cpu"
+        if compute_device == "cpu":
+            config.Global.cpu_num_threads = cpu_num_threads
         config.Global.enable_benchmark = False
         config.Global.gpu_mem = 1024
         global_predictor = create_rec_predictor(RecPredictor, config, paddle, paddle_model_dir)
@@ -394,10 +440,12 @@ class OrientationClassifier:
             model_fingerprint=model_fingerprint,
             compute_device=selected_compute_device,
         )
+        classifier.cpu_num_threads = cpu_num_threads
         classifier.fast_engine = FastOrientationEngine(
             classifier._global_embeddings,
             FastGeometryProcessor(calibrator),
             image_reader=_read_image,
+            deduplicate_identical_slots=_resolve_cpu_slot_dedup(selected_compute_device),
         )
         return classifier
 
@@ -528,6 +576,7 @@ class OrientationClassifier:
             background_embed,
             engine.geometry,
             image_reader=engine.image_reader,
+            deduplicate_identical_slots=engine.deduplicate_identical_slots,
         )
 
     @staticmethod
