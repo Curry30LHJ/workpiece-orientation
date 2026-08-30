@@ -1,0 +1,59 @@
+{
+  "branch": "feature/20260830/cpu-inference-optimization",
+  "commit": "b5c2b47eb1bdafd123ea7374f683bf9cb17cddc9",
+  "model_fingerprint": null,
+  "model_fingerprint_reason": "The workspace model files are present, but the required release ZIP is absent; the bundled model used by a packaged benchmark therefore cannot be verified.",
+  "workspace_model_files": {
+    "directory": "third_party/models/shiru_rec/general_PPLCNetV2_base_pretrained_v1.0_infer",
+    "files": [
+      {"path": "inference.pdiparams", "size": 18307022, "sha256": "9f2613210c4126a2880d32108ad573a5179c0af53a0acbb5db96155f8ec2ce8d"},
+      {"path": "inference.pdiparams.info", "size": 28855, "sha256": "7af601351a3b806a62452945f8b758d065256d0e609e442e6195b4bb82c02fb4"},
+      {"path": "inference.pdmodel", "size": 1141862, "sha256": "3e0ade05639ff7b5fe450a55883a8087dc2b5c2349fe6b73897cbe2a5eeb6ee8"}
+    ]
+  },
+  "runtime_versions": {
+    "python": "3.12.7 (base environment)",
+    "paddle": null,
+    "paddleclas": null,
+    "reason": "Neither paddle nor paddleclas is importable in the active environment."
+  },
+  "cpu": {
+    "platform": "Windows-10-10.0.19045-SP0",
+    "processor_identifier": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "logical_processors": 24,
+    "physical_cores": null
+  },
+  "thread_config": {
+    "env_var": "WORKPIECE_CPU_THREADS",
+    "candidates": [1, 2, 4],
+    "selected": null,
+    "reason": "Benchmark blocked because release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip is missing."
+  },
+  "sample_fingerprint": {
+    "acceptance_spec": "runtime_reports/fast-geometry-acceptance.json",
+    "sha256": "45c73611e828b8bbd94650ee316fc970f859a04d2ad1c40a5e609d2b99572eef",
+    "bytes": 1557594,
+    "cases": ["M1", "M2", "M7"],
+    "queries": 120,
+    "source_note": "Existing user-provided file; not modified or staged. It records an earlier run at commit ca48822b4f4cb9560ab07c22f2bf0dd6e541cd01."
+  },
+  "startup": {"ready_ms": null, "reason": "No backend process was started."},
+  "latency": {
+    "unit": "ms",
+    "backend_elapsed_ms": {"mean": null, "p50": null, "p95": null, "p99": null, "max": null},
+    "round_trip_ms": {"mean": null, "p50": null, "p95": null, "p99": null, "max": null},
+    "by_configuration": {
+      "dedup_disabled": {"thread_candidates": [1, 2, 4], "status": "unavailable"},
+      "dedup_default_enabled": {"thread_candidates": [1, 2, 4], "status": "unavailable"}
+    }
+  },
+  "accuracy": {"accuracy_rate": null, "queries": null, "reason": "Packaged benchmark did not run."},
+  "review_rate": {"rate": null, "reason": "Packaged benchmark did not run."},
+  "dedup": {"ratio": null, "global_input_slots": null, "global_unique_slots": null, "model_call_count": null, "reason": "No backend telemetry was produced."},
+  "failures": [
+    {"kind": "benchmark_unavailable", "message": "FileNotFoundError: E:\\Project\\wang\\pp_813\\release_artifacts\\WorkpieceOrientation-CPU-x64-1.0.0.zip"},
+    {"kind": "pytest_collection", "message": "python -m pytest -q failed during collection with PermissionError (WinError 5) scanning qt_app/tests/build-test_geometryrulespage/pytest-task10-profiles."},
+    {"kind": "pytest_environment", "message": "Targeted tests completed with 103 passed and 177 errors; errors were predominantly pytest tmpdir lock PermissionError under C:\\Users\\Administrator\\AppData\\Local\\Temp\\pytest-of-Administrator."},
+    {"kind": "runtime_dependency", "message": "paddle and paddleclas are not importable in the active Python 3.12.7 environment."}
+  ]
+}
