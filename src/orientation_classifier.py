@@ -54,7 +54,7 @@ COMPUTE_DEVICES = ("gpu", "cpu")
 DEFAULT_COMPUTE_DEVICE = "gpu"
 CPU_THREADS_ENV = "WORKPIECE_CPU_THREADS"
 CPU_SLOT_DEDUP_ENV = "WORKPIECE_CPU_DEDUPLICATE_SLOTS"
-DEFAULT_CPU_NUM_THREADS = 10
+DEFAULT_CPU_NUM_THREADS = 2
 _GEOMETRY_REVISION_FROM_RECORD = object()
 
 
@@ -402,8 +402,13 @@ class OrientationClassifier:
         from src.paddleclas_inference_compat import prepare_paddle_model_path
 
         selected_compute_device = _select_paddle_device(paddle, compute_device)
-        config_path = paddle_config_path or (
-            project_root / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml"
+        default_config_candidates = (
+            project_root / "deploy" / "configs" / "inference_general.yaml",
+            project_root / "third_party" / "PaddleClas" / "deploy" / "configs" / "inference_general.yaml",
+        )
+        config_path = paddle_config_path or next(
+            (candidate for candidate in default_config_candidates if candidate.is_file()),
+            default_config_candidates[0],
         )
         config = paddle_config.get_config(str(config_path), show=False)
         cpu_num_threads = (

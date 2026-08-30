@@ -244,7 +244,11 @@ def test_predict_calls_one_three_image_batch_and_returns_fast_ridge_result(tmp_p
     assert result["decision_source"] == "fast_ridge"
     assert result["label"] in {"front", "back"}
     assert "local_prediction" not in result
-    assert result["timings_ms"].keys() >= {"geometry_context", "geometry_fit", "mask_build", "global_batch", "linear_head", "total"}
+    assert result["timings_ms"].keys() >= {
+        "geometry_context", "geometry_fit", "mask_build", "global_batch",
+        "global_model_calls", "linear_head", "total",
+    }
+    assert result["timings_ms"]["global_model_calls"] == 1
 
 
 def test_cpu_dedup_reuses_identical_query_slots(tmp_path):
@@ -261,6 +265,7 @@ def test_cpu_dedup_reuses_identical_query_slots(tmp_path):
     assert embedder.batch_sizes == [1]
     assert result["timings_ms"]["global_input_slots"] == 3
     assert result["timings_ms"]["global_unique_slots"] == 1
+    assert result["timings_ms"]["global_model_calls"] == 1
 
 
 def test_dedup_keeps_three_calls_when_geometry_slots_differ(tmp_path):
@@ -314,6 +319,36 @@ def test_dedup_comparison_error_falls_back_to_one_three_slot_call(caplog):
         and "comparison failed" in record.message
         for record in caplog.records
     )
+    warning = next(record.message for record in caplog.records if "comparison failed" in record.message.lower())
+    assert "raw" in warning and "front" in warning
+    assert "shape=" in warning and "dtype=" in warning and "nbytes=" in warning
+    assert "reason=" in warning
+
+
+def test_dedup_treats_nbytes_as_an_explicit_slot_identity_field():
+    embedder = FakeEmbedder()
+    engine = FastOrientationEngine(
+        embedder, SlotGeometry((10, 20, 30)), image_reader=read_marker,
+        deduplicate_identical_slots=True,
+    )
+
+    class NbytesMismatchImage:
+        shape = (64, 64, 3)
+        dtype = np.dtype(np.uint8)
+        nbytes = 1
+
+        def __init__(self, image):
+            self.image = image
+
+        def __getitem__(self, key):
+            return self.image[key]
+
+    slots = (marker_image(10), NbytesMismatchImage(marker_image(20)), marker_image(30))
+    embeddings, unique_count = engine._embed_query_slots(slots)
+
+    assert embedder.batch_sizes == [3]
+    assert unique_count == 3
+    assert len(embeddings) == 3
 
 
 def test_dedup_does_not_retry_when_embedder_raises():

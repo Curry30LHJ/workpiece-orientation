@@ -339,7 +339,10 @@ class FastOrientationEngine:
         self._validate_cache(cache)
         variants = self.geometry.build_variants(image, cache.compiled_geometry)
         batch_started = perf_counter()
-        embeddings, unique_count = self._embed_query_slots(variants.images)
+        embeddings, unique_count, model_calls = self._embed_query_slots_with_stats(
+            variants.images,
+            slot_names=("raw", "front", "back"),
+        )
         global_batch_ms = (perf_counter() - batch_started) * 1000.0
         feature, _ = _pack_three_embeddings(
             embeddings,
@@ -359,6 +362,7 @@ class FastOrientationEngine:
             "global_batch": global_batch_ms,
             "global_input_slots": 3,
             "global_unique_slots": unique_count,
+            "global_model_calls": model_calls,
             "linear_head": linear_head_ms,
         })
         timings["total"] = (perf_counter() - started) * 1000.0
@@ -383,42 +387,89 @@ class FastOrientationEngine:
         }
 
     def _embed_query_slots(self, images: Sequence[np.ndarray]) -> tuple[list[np.ndarray], int]:
+        """Embed query slots while preserving the historical two-value API."""
+        embeddings, unique_count, _ = self._embed_query_slots_with_stats(images)
+        return embeddings, unique_count
+
+    def _embed_query_slots_with_stats(
+        self,
+        images: Sequence[np.ndarray],
+        *,
+        slot_names: Sequence[str] | None = None,
+    ) -> tuple[list[np.ndarray], int, int]:
+        """Embed query slots and return (embeddings, unique_slots, model_calls)."""
+        calls = 0
+        if slot_names is None and len(images) == 3:
+            slot_names = ("raw", "front", "back")
+
+        def embed(batch: Sequence[np.ndarray]):
+            nonlocal calls
+            calls += 1
+            return self.embed_batch(batch)
+
         if not self.deduplicate_identical_slots:
-            return self.embed_batch(images), len(images)
+            return embed(images), len(images), calls
 
         unique_images: list[np.ndarray] = []
+        unique_names: list[str] = []
         slot_to_unique: list[int] = []
         for slot_index, image in enumerate(images):
+            input_name = (
+                str(slot_names[slot_index])
+                if slot_names is not None and slot_index < len(slot_names)
+                else f"slot-{slot_index}"
+            )
             matching_index = None
             for unique_index, unique_image in enumerate(unique_images):
+                unique_name = unique_names[unique_index]
+                image_shape = unique_shape = None
+                image_dtype = unique_dtype = None
+                image_nbytes = unique_nbytes = None
                 try:
+                    image_shape = image.shape
+                    unique_shape = unique_image.shape
+                    image_dtype = image.dtype
+                    unique_dtype = unique_image.dtype
+                    image_nbytes = image.nbytes
+                    unique_nbytes = unique_image.nbytes
                     is_match = (
-                        image.shape == unique_image.shape
-                        and image.dtype == unique_image.dtype
+                        image_shape == unique_shape
+                        and image_dtype == unique_dtype
+                        and image_nbytes == unique_nbytes
                         and np.array_equal(image, unique_image)
                     )
                 except Exception as exc:
                     LOGGER.warning(
-                        "CPU slot dedup comparison failed for input slot %d against unique slot %d "
-                        "during shape/dtype/np.array_equal: %s: %s",
+                        "CPU slot dedup comparison failed for input slot %d (%s) against unique slot %d (%s); "
+                        "shape=%r/%r dtype=%r/%r nbytes=%r/%r reason=%s: %s: %s",
                         slot_index,
+                        input_name,
                         unique_index,
+                        unique_name,
+                        image_shape,
+                        unique_shape,
+                        image_dtype,
+                        unique_dtype,
+                        image_nbytes,
+                        unique_nbytes,
+                        "slot metadata or pixel comparison raised",
                         type(exc).__name__,
                         exc,
                     )
-                    return self.embed_batch(images), len(images)
+                    return embed(images), len(images), calls
                 if is_match:
                     matching_index = unique_index
                     break
             if matching_index is None:
                 matching_index = len(unique_images)
                 unique_images.append(image)
+                unique_names.append(input_name)
             slot_to_unique.append(matching_index)
 
-        returned = self.embed_batch(unique_images)
+        returned = embed(unique_images)
         if not isinstance(returned, Sequence) or len(returned) != len(unique_images):
             raise _feature_error("embedder returned an unexpected batch size")
-        return [returned[index] for index in slot_to_unique], len(unique_images)
+        return [returned[index] for index in slot_to_unique], len(unique_images), calls
 
     @staticmethod
     def _progress(callback: Callable[[dict[str, Any]], None] | None, phase: str, completed: int, total: int, unit: str) -> None:

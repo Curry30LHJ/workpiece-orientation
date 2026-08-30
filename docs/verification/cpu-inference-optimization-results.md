@@ -1,8 +1,8 @@
 # CPU inference optimization verification
 
-Date: 2026-08-30  
-Branch: `feature/20260830/cpu-inference-optimization`  
-Code commit: `9ae717509d32711a7a5b067080ebaa613551d666`  
+Date: 2026-08-30
+Branch: `feature/20260830/cpu-inference-optimization`
+Code commit: `9ae717509d32711a7a5b067080ebaa613551d666`
 Report commit: `1fb1cf0` (prior report commit; the documentation commit necessarily has a new SHA)
 
 ## Method and data

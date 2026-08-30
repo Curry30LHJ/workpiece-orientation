@@ -1113,7 +1113,7 @@ def _install_fake_paddle_runtime(monkeypatch, *, compiled=True, gpu_count=1):
     return selected
 
 
-def _install_fake_paddleclas(monkeypatch, *, cpu_num_threads=10):
+def _install_fake_paddleclas(monkeypatch, *, cpu_num_threads=2):
     captured = {}
     paddleclas = types.ModuleType("paddleclas")
     deploy = types.ModuleType("paddleclas.deploy")
@@ -1178,7 +1178,7 @@ def test_gpu_load_ignores_cpu_slot_dedup_and_cpu_thread_override(tmp_path, monke
     assert loaded.fast_engine.deduplicate_identical_slots is False
     assert captured["config"].Global.use_gpu is True
     assert captured["config"].Global.enable_mkldnn is False
-    assert captured["config"].Global.cpu_num_threads == 10
+    assert captured["config"].Global.cpu_num_threads == 2
 
 
 def test_invalid_cpu_thread_override_keeps_yaml_value_and_logs_warning(tmp_path, monkeypatch, caplog):
@@ -1190,7 +1190,7 @@ def test_invalid_cpu_thread_override_keeps_yaml_value_and_logs_warning(tmp_path,
         tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
     )
 
-    assert captured["config"].Global.cpu_num_threads == 10
+    assert captured["config"].Global.cpu_num_threads == 2
     assert "WORKPIECE_CPU_THREADS" in caplog.text
 
 
@@ -1206,7 +1206,7 @@ def test_invalid_yaml_cpu_threads_fall_back_to_default_with_warning(
         tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
     )
 
-    assert captured["config"].Global.cpu_num_threads == 10
+    assert captured["config"].Global.cpu_num_threads == 2
     assert "cpu_num_threads" in caplog.text
 
 
@@ -1221,7 +1221,7 @@ def test_invalid_env_and_yaml_cpu_threads_fall_back_to_default(
         tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
     )
 
-    assert captured["config"].Global.cpu_num_threads == 10
+    assert captured["config"].Global.cpu_num_threads == 2
     assert "WORKPIECE_CPU_THREADS" in caplog.text
 
 

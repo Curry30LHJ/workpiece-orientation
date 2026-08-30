@@ -169,6 +169,8 @@ def _environment(config: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "platform": platform.platform(),
         "cpu": platform.processor() or platform.machine(),
+        "logical_processors": os.cpu_count(),
+        "physical_cores": None,
         "memory_bytes": None,
         "gpu_name": None,
         "gpu_driver": None,
@@ -177,6 +179,9 @@ def _environment(config: Mapping[str, Any]) -> dict[str, Any]:
     try:
         import psutil  # type: ignore
         result["memory_bytes"] = int(psutil.virtual_memory().total)
+        physical_cores = psutil.cpu_count(logical=False)
+        if physical_cores is not None and int(physical_cores) > 0:
+            result["physical_cores"] = int(physical_cores)
     except Exception:
         pass
     try:
@@ -669,6 +674,8 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         samples: list[dict[str, Any]] = []
         predictions: dict[str, str] = {}
         correct_samples = 0
+        model_call_values: list[int] = []
+        model_call_missing = False
         for index in range(iterations):
             if time.monotonic() >= deadline:
                 raise TimeoutError("benchmark overall timeout exceeded")
@@ -688,14 +695,52 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
             backend_total = response.get("elapsed_ms", backend_timings.get("total"))
             if backend_total is None:
                 raise RuntimeError("predict response omitted elapsed_ms/timings_ms.total")
+            raw_model_calls = backend_timings.get("global_model_calls")
+            if raw_model_calls is None:
+                model_call_missing = True
+                model_calls = None
+            else:
+                if isinstance(raw_model_calls, bool):
+                    raise RuntimeError("predict response global_model_calls must be a non-negative integer")
+                try:
+                    if isinstance(raw_model_calls, int):
+                        model_calls = raw_model_calls
+                    elif isinstance(raw_model_calls, float):
+                        if not math.isfinite(raw_model_calls) or not raw_model_calls.is_integer():
+                            raise ValueError
+                        model_calls = int(raw_model_calls)
+                    elif isinstance(raw_model_calls, str) and raw_model_calls.strip().isdecimal():
+                        model_calls = int(raw_model_calls.strip())
+                    else:
+                        raise ValueError
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError("predict response global_model_calls must be a non-negative integer") from exc
+                if model_calls < 0:
+                    raise RuntimeError("predict response global_model_calls must be a non-negative integer")
+                model_call_values.append(model_calls)
             samples.append({"image": str(row["query_identity"]), "expected": row.get("expected_orientation"),
                             "label": label, "round_trip_ms": round_trip_ms,
                             "backend_elapsed_ms": float(backend_total) if backend_total is not None else None,
                             "backend_timings_ms": dict(backend_timings),
+                            "global_model_calls": model_calls,
                             "needs_review": bool(response.get("needs_review", False))})
         report.update({"workpieces": workpieces, "predictions": predictions, "requests": samples,
                        "timings": {"round_trip_ms": summarize([r["round_trip_ms"] for r in samples]),
                                    "backend_elapsed_ms": summarize([r["backend_elapsed_ms"] for r in samples])}})
+        if model_call_missing or len(model_call_values) != len(samples):
+            report["model_calls"] = {
+                "status": "unavailable",
+                "count": len(model_call_values),
+                "total": None,
+                "mean": None,
+            }
+        else:
+            report["model_calls"] = {
+                "status": "measured",
+                "count": len(model_call_values),
+                "total": sum(model_call_values),
+                "mean": (sum(model_call_values) / len(model_call_values)) if model_call_values else None,
+            }
         expected = {str(row["query_identity"]): str(row.get("expected_orientation")) for row in queries}
         correct = sum(predictions.get(k) == v for k, v in expected.items())
         sample_accuracy = float(correct_samples / len(samples)) if samples else 0.0

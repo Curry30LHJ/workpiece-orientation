@@ -193,7 +193,7 @@ def test_invalid_cpu_thread_override_keeps_yaml_value_and_logs_warning(tmp_path,
         inference_mode="fast_geometry",
     )
 
-    assert captured["config"].Global.cpu_num_threads == 10
+    assert captured["config"].Global.cpu_num_threads == 2
     assert "WORKPIECE_CPU_THREADS" in caplog.text
 ~~~
 
@@ -209,7 +209,7 @@ python -m pytest tests/test_orientation_classifier.py -k "cpu_load_applies or gp
 
 在 orientation_classifier.py 中：
 
-1. 从 config.Global.cpu_num_threads 读取默认值；WORKPIECE_CPU_THREADS 存在时要求为大于 0 的十进制整数，否则 warning 并保留 YAML 值（当前 YAML 默认值为 10）。
+1. 从 config.Global.cpu_num_threads 读取默认值；当前部署配置和代码回退默认值均为 2。WORKPIECE_CPU_THREADS 存在时要求为大于 0 的十进制整数，否则 warning 并保留有效 YAML 值或回退到 2。
 2. 仅 compute_device == cpu 时写回 config.Global.cpu_num_threads；GPU 不受该环境变量影响。
 3. 解析 WORKPIECE_CPU_DEDUPLICATE_SLOTS 的 0/1、true/false、yes/no；CPU 默认启用，GPU 强制关闭；非法值 warning 后采用设备默认值。
 4. 将 deduplicate_identical_slots 传给 FastOrientationEngine，并保存 classifier.cpu_num_threads。
@@ -329,7 +329,7 @@ python scripts/benchmark_portable_service.py --package-zip release_artifacts/Wor
 
 - [ ] **Step 4: 写入报告**
 
-JSON 必须包含分支、提交、模型指纹、Paddle/PaddleClas 版本、CPU、线程配置、样本指纹、冷启动、mean/P50/P95/P99/max、准确率、复核率、去重比例和失败信息。Markdown 表格列出优化前、优化后和各线程候选；若未达到 25 ms，明确写出实测 P95 和 PP-ShiTu 仍占主导的结论，不宣称达标。
+JSON 必须包含分支、提交、模型指纹、Paddle/PaddleClas 版本、CPU（逻辑/物理核心）、线程配置、样本指纹、冷启动、mean/P50/P95/P99/max、准确率、复核率、去重比例、实测 PP-ShiTu 调用次数和失败信息。Markdown 表格列出优化前、优化后和各线程候选；若未达到 25 ms，明确写出实测 P95 和 PP-ShiTu 仍占主导的结论，不宣称达标。
 
 - [ ] **Step 5: 提交验收报告**
 

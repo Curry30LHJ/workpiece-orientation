@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import socket
 import subprocess
+import sys
+from types import SimpleNamespace
 from zipfile import ZipFile, ZipInfo
 
 import cv2
@@ -135,7 +137,7 @@ def test_run_benchmark_passes_cpu_thread_override_to_backend(tmp_path: Path, mon
                         "compute_device": "cpu", "package_version": "1.0.0", "model_fingerprint": "a" * 64,
                         "instance_token": token}
             if command == "register": return {"template_counts": {"front": 1, "back": 1}, "workpiece": {"id": "wp1"}}
-            if command == "predict": return {"label": "front", "elapsed_ms": 1.0, "timings_ms": {"total": 1.0}, "needs_review": False}
+            if command == "predict": return {"label": "front", "elapsed_ms": 1.0, "timings_ms": {"total": 1.0, "global_model_calls": 1}, "needs_review": False}
             if command == "shutdown": return {"ok": True}
             raise AssertionError(command)
         def close(self): pass
@@ -146,6 +148,23 @@ def test_run_benchmark_passes_cpu_thread_override_to_backend(tmp_path: Path, mon
     report = run_benchmark(package, tmp_path / "unused.json", iterations=1000, warmup=0, cpu_threads=4)
     assert report["settings"]["cpu_threads"] == 4
     assert captured["env"]["WORKPIECE_CPU_THREADS"] == "4"
+    assert report["model_calls"]["status"] == "measured"
+    assert report["model_calls"]["total"] == 1000
+    assert report["model_calls"]["mean"] == 1.0
+    assert all(row["global_model_calls"] == 1 for row in report["requests"])
+
+
+def test_environment_reports_physical_cores_from_psutil(monkeypatch):
+    fake_psutil = SimpleNamespace(
+        virtual_memory=lambda: SimpleNamespace(total=123),
+        cpu_count=lambda logical=True: 8 if logical else 4,
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    environment = benchmark._environment({"compute_device": "cpu"})
+
+    assert environment["memory_bytes"] == 123
+    assert environment["physical_cores"] == 4
 
 
 def test_summarize_reports_required_percentiles():
@@ -352,6 +371,9 @@ def test_run_benchmark_accepts_versioned_top_level_zip_and_reports_lifecycle(tmp
     assert "fake backend log" in report["backend_log"]
     assert "WORKPIECE_CPU_THREADS" not in captured_environment["env"]
     assert report["versions"] == {"package": "1.0.0", "python": "3.10", "paddle": "3.2.2", "paddleclas": "2.6.0", "pyinstaller": "6.22.2", "qt": "5.14.2"}
+    assert report["model_calls"]["status"] == "unavailable"
+    assert report["model_calls"]["total"] is None
+    assert all(row["global_model_calls"] is None for row in report["requests"])
 
 
 def test_run_benchmark_timeout_preserves_process_exit_log_and_lifecycle(tmp_path: Path, monkeypatch):
