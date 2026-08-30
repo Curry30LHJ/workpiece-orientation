@@ -41,6 +41,7 @@ class BatchInferencePool:
         self._slot_lock = threading.Lock()
         self._next_slot = 0
         self._thread_slots = threading.local()
+        self._lifecycle_lock = threading.Lock()
         self._closed = False
         try:
             self._contexts = [create_worker(slot) for slot in range(worker_count)]
@@ -75,14 +76,15 @@ class BatchInferencePool:
         return BatchItemResult(item.index, item.image_path, value, None)
 
     def submit_many(self, items: Sequence[BatchWorkItem]) -> list[BatchItemResult]:
-        if self._closed:
-            raise RuntimeError("pool is closed")
-        if not items:
-            raise ValueError("items must contain at least one item")
-        indices = [item.index for item in items]
-        if len(set(indices)) != len(indices):
-            raise ValueError("duplicate item indices are not allowed")
-        futures = [self._executor.submit(self._run, item) for item in items]
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("pool is closed")
+            if not items:
+                raise ValueError("items must contain at least one item")
+            indices = [item.index for item in items]
+            if len(set(indices)) != len(indices):
+                raise ValueError("duplicate item indices are not allowed")
+            futures = [self._executor.submit(self._run, item) for item in items]
         return sorted((future.result() for future in futures), key=lambda result: result.index)
 
     @staticmethod
@@ -92,9 +94,17 @@ class BatchInferencePool:
             close()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
         self._executor.shutdown(wait=True)
+        first_error: BaseException | None = None
         for context in self._contexts:
-            self._close_context(context)
+            try:
+                self._close_context(context)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
