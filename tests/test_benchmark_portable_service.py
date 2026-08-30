@@ -138,7 +138,18 @@ def test_run_benchmark_passes_cpu_thread_override_to_backend(tmp_path: Path, mon
                         "compute_device": "cpu", "package_version": "1.0.0", "model_fingerprint": "a" * 64,
                         "instance_token": token}
             if command == "register": return {"template_counts": {"front": 1, "back": 1}, "workpiece": {"id": "wp1"}}
-            if command == "predict": return {"label": "front", "elapsed_ms": 1.0, "timings_ms": {"total": 1.0, "global_model_calls": 1}, "needs_review": False}
+            if command == "predict":
+                return {
+                    "label": "front",
+                    "elapsed_ms": 1.0,
+                    "timings_ms": {
+                        "total": 1.0,
+                        "global_model_calls": 1,
+                        "global_input_slots": 3,
+                        "global_unique_slots": 1,
+                    },
+                    "needs_review": False,
+                }
             if command == "shutdown": return {"ok": True}
             raise AssertionError(command)
         def close(self): pass
@@ -153,6 +164,12 @@ def test_run_benchmark_passes_cpu_thread_override_to_backend(tmp_path: Path, mon
     assert report["model_calls"]["total"] == 1000
     assert report["model_calls"]["mean"] == 1.0
     assert all(row["global_model_calls"] == 1 for row in report["requests"])
+    assert report["deduplication"]["status"] == "measured"
+    assert report["deduplication"]["total_input_slots"] == 3000
+    assert report["deduplication"]["total_unique_slots"] == 1000
+    assert report["deduplication"]["dedup_ratio"] == pytest.approx(2 / 3)
+    assert report["startup"]["cold_start_ms"]["count"] == 1
+    assert report["startup"]["cold_start_model_calls"]["status"] == "not_applicable"
 
 
 def test_environment_reports_physical_cores_from_psutil(monkeypatch):
@@ -391,6 +408,9 @@ def test_run_benchmark_accepts_versioned_top_level_zip_and_reports_lifecycle(tmp
     assert report["model_calls"]["status"] == "unavailable"
     assert report["model_calls"]["total"] is None
     assert all(row["global_model_calls"] is None for row in report["requests"])
+    assert report["deduplication"]["status"] == "unavailable"
+    assert report["deduplication"]["dedup_ratio"] is None
+    assert report["startup"]["cold_start_ms"]["count"] == 1
 
 
 def test_run_benchmark_timeout_preserves_process_exit_log_and_lifecycle(tmp_path: Path, monkeypatch):

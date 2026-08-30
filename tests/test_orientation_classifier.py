@@ -1181,7 +1181,7 @@ def test_gpu_load_ignores_cpu_slot_dedup_and_cpu_thread_override(tmp_path, monke
     assert captured["config"].Global.cpu_num_threads == 2
 
 
-def test_invalid_cpu_thread_override_keeps_yaml_value_and_logs_warning(tmp_path, monkeypatch, caplog):
+def test_invalid_cpu_thread_override_falls_back_to_default_and_logs_warning(tmp_path, monkeypatch, caplog):
     captured = _install_fake_paddleclas(monkeypatch)
     _install_fake_paddle_runtime(monkeypatch)
     monkeypatch.setenv("WORKPIECE_CPU_THREADS", "not-an-int")
@@ -1190,7 +1190,7 @@ def test_invalid_cpu_thread_override_keeps_yaml_value_and_logs_warning(tmp_path,
         tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
     )
 
-    assert captured["config"].Global.cpu_num_threads == 2
+    assert captured["config"].Global.cpu_num_threads == 4
     assert "WORKPIECE_CPU_THREADS" in caplog.text
 
 
@@ -1236,6 +1236,20 @@ def test_valid_yaml_cpu_threads_are_preserved_without_override(tmp_path, monkeyp
 
     assert captured["config"].Global.cpu_num_threads == 6
     assert loaded.cpu_num_threads == 6
+
+
+def test_invalid_cpu_thread_override_does_not_preserve_non_default_yaml_value(tmp_path, monkeypatch, caplog):
+    captured = _install_fake_paddleclas(monkeypatch, cpu_num_threads=6)
+    _install_fake_paddle_runtime(monkeypatch)
+    monkeypatch.setenv("WORKPIECE_CPU_THREADS", "2.5")
+
+    loaded = OrientationClassifier.load(
+        tmp_path, tmp_path / "model", compute_device="cpu", inference_mode="fast_geometry"
+    )
+
+    assert captured["config"].Global.cpu_num_threads == 4
+    assert loaded.cpu_num_threads == 4
+    assert "WORKPIECE_CPU_THREADS" in caplog.text
 
 
 @pytest.mark.parametrize(

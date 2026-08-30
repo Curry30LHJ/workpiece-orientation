@@ -292,8 +292,13 @@ def _resolve_cpu_num_threads(global_config: Any) -> int:
         return configured
     if override.isdecimal() and int(override) > 0:
         return int(override)
-    LOGGER.warning("Ignoring invalid %s=%r; keeping YAML cpu_num_threads=%s", CPU_THREADS_ENV, override, configured)
-    return configured
+    LOGGER.warning(
+        "Ignoring invalid %s=%r; using default cpu_num_threads=%s",
+        CPU_THREADS_ENV,
+        override,
+        DEFAULT_CPU_NUM_THREADS,
+    )
+    return DEFAULT_CPU_NUM_THREADS
 
 
 def _resolve_cpu_slot_dedup(compute_device: str) -> bool:

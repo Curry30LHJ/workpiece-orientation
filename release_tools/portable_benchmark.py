@@ -58,6 +58,28 @@ def summarize(values: Sequence[float]) -> dict[str, float | int]:
     }
 
 
+def _parse_non_negative_int(value: object, field: str) -> int:
+    """Parse a counter without accepting booleans, fractions, or negatives."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a non-negative integer")
+    try:
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, float):
+            if not math.isfinite(value) or not value.is_integer():
+                raise ValueError
+            parsed = int(value)
+        elif isinstance(value, str) and value.strip().isdecimal():
+            parsed = int(value.strip())
+        else:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return parsed
+
+
 def _latency_gate(edition: object, actual: float, limit: float = 25.0) -> dict[str, Any]:
     """Describe the latency target without treating an unmet CPU target as a pass.
 
@@ -612,11 +634,12 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         process_environment = os.environ.copy()
         if config.get("compute_device") == "cpu" and cpu_threads is not None:
             process_environment["WORKPIECE_CPU_THREADS"] = str(cpu_threads)
+        process_started = perf_counter()
         process = subprocess.Popen(args, cwd=str(package_root), stdout=log_handle, stderr=subprocess.STDOUT,
                                    text=True, env=process_environment,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         lifecycle["process_spawned"] = True
-        report["startup"]["process_spawn_ms"] = (perf_counter() - started) * 1000.0
+        report["startup"]["process_spawn_ms"] = (perf_counter() - process_started) * 1000.0
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
@@ -638,14 +661,14 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 if time.monotonic() >= deadline:
                     raise TimeoutError("backend did not accept a connection")
                 time.sleep(0.1)
-        report["startup"]["connection_ms"] = (perf_counter() - started) * 1000.0
+        report["startup"]["connection_ms"] = (perf_counter() - process_started) * 1000.0
         phases: list[dict[str, Any]] = []
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("backend did not become ready")
             hello = client.request("hello", timeout=min(request_timeout_seconds, remaining))
-            phases.append({"phase": hello.get("phase"), "status": hello.get("status"), "elapsed_ms": (perf_counter() - started) * 1000.0})
+            phases.append({"phase": hello.get("phase"), "status": hello.get("status"), "elapsed_ms": (perf_counter() - process_started) * 1000.0})
             if hello.get("ready") is True:
                 break
             if hello.get("status") != "loading":
@@ -654,7 +677,21 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         else:
             raise TimeoutError("backend did not become ready")
         report["startup"]["phases"] = phases
-        report["startup"]["ready_ms"] = (perf_counter() - started) * 1000.0
+        ready_ms = (perf_counter() - process_started) * 1000.0
+        report["startup"]["ready_ms"] = ready_ms
+        # A single process launch is intentionally used by this benchmark.  Keep
+        # a complete statistic shape while making the sample count explicit;
+        # no prediction is issued before readiness, so model-call and dedup
+        # metrics are not applicable to this cold-start phase.
+        report["startup"]["cold_start_ms"] = summarize([ready_ms])
+        report["startup"]["cold_start_model_calls"] = {
+            "status": "not_applicable",
+            "reason": "模型加载/服务就绪阶段未发送 predict 请求",
+        }
+        report["startup"]["cold_start_deduplication"] = {
+            "status": "not_applicable",
+            "reason": "服务就绪前不存在查询槽位",
+        }
         deadline = time.monotonic() + timeout_seconds
         if hello.get("edition") != config.get("edition") or hello.get("compute_device") != config.get("compute_device"):
             raise RuntimeError("backend hello edition/device does not match app_config")
@@ -696,6 +733,9 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
         correct_samples = 0
         model_call_values: list[int] = []
         model_call_missing = False
+        input_slot_values: list[int] = []
+        unique_slot_values: list[int] = []
+        slot_metadata_missing = False
         for index in range(iterations):
             if time.monotonic() >= deadline:
                 raise TimeoutError("benchmark overall timeout exceeded")
@@ -720,29 +760,34 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 model_call_missing = True
                 model_calls = None
             else:
-                if isinstance(raw_model_calls, bool):
-                    raise RuntimeError("predict response global_model_calls must be a non-negative integer")
                 try:
-                    if isinstance(raw_model_calls, int):
-                        model_calls = raw_model_calls
-                    elif isinstance(raw_model_calls, float):
-                        if not math.isfinite(raw_model_calls) or not raw_model_calls.is_integer():
-                            raise ValueError
-                        model_calls = int(raw_model_calls)
-                    elif isinstance(raw_model_calls, str) and raw_model_calls.strip().isdecimal():
-                        model_calls = int(raw_model_calls.strip())
-                    else:
-                        raise ValueError
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise RuntimeError("predict response global_model_calls must be a non-negative integer") from exc
-                if model_calls < 0:
-                    raise RuntimeError("predict response global_model_calls must be a non-negative integer")
+                    model_calls = _parse_non_negative_int(raw_model_calls, "predict response global_model_calls")
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from exc
                 model_call_values.append(model_calls)
+            raw_input_slots = backend_timings.get("global_input_slots")
+            raw_unique_slots = backend_timings.get("global_unique_slots")
+            if raw_input_slots is None or raw_unique_slots is None:
+                slot_metadata_missing = True
+                input_slots = None
+                unique_slots = None
+            else:
+                try:
+                    input_slots = _parse_non_negative_int(raw_input_slots, "predict response global_input_slots")
+                    unique_slots = _parse_non_negative_int(raw_unique_slots, "predict response global_unique_slots")
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from exc
+                if unique_slots > input_slots:
+                    raise RuntimeError("predict response global_unique_slots cannot exceed global_input_slots")
+                input_slot_values.append(input_slots)
+                unique_slot_values.append(unique_slots)
             samples.append({"image": str(row["query_identity"]), "expected": row.get("expected_orientation"),
                             "label": label, "round_trip_ms": round_trip_ms,
                             "backend_elapsed_ms": float(backend_total) if backend_total is not None else None,
                             "backend_timings_ms": dict(backend_timings),
                             "global_model_calls": model_calls,
+                            "global_input_slots": input_slots,
+                            "global_unique_slots": unique_slots,
                             "needs_review": bool(response.get("needs_review", False))})
         report.update({"workpieces": workpieces, "predictions": predictions, "requests": samples,
                        "timings": {"round_trip_ms": summarize([r["round_trip_ms"] for r in samples]),
@@ -760,6 +805,31 @@ def run_benchmark(package_zip: Path, acceptance_spec: Path, *, warmup: int = 50,
                 "count": len(model_call_values),
                 "total": sum(model_call_values),
                 "mean": (sum(model_call_values) / len(model_call_values)) if model_call_values else None,
+            }
+        if slot_metadata_missing or len(input_slot_values) != len(samples):
+            report["deduplication"] = {
+                "status": "unavailable",
+                "count": len(input_slot_values),
+                "input_slots": None,
+                "unique_slots": None,
+                "total_input_slots": None,
+                "total_unique_slots": None,
+                "dedup_ratio": None,
+            }
+        else:
+            total_input_slots = sum(input_slot_values)
+            total_unique_slots = sum(unique_slot_values)
+            report["deduplication"] = {
+                "status": "measured",
+                "count": len(input_slot_values),
+                "input_slots": summarize(input_slot_values),
+                "unique_slots": summarize(unique_slot_values),
+                "total_input_slots": total_input_slots,
+                "total_unique_slots": total_unique_slots,
+                "dedup_ratio": (
+                    float(1.0 - total_unique_slots / total_input_slots)
+                    if total_input_slots > 0 else 0.0
+                ),
             }
         expected = {str(row["query_identity"]): str(row.get("expected_orientation")) for row in queries}
         correct = sum(predictions.get(k) == v for k, v in expected.items())
