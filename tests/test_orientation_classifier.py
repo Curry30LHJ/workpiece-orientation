@@ -86,6 +86,38 @@ class _UncloneablePredictor(_BlockingBatchPredictor):
         return [np.asarray([float(marker), 1.0], dtype=np.float32) for _ in images]
 
 
+class _LifecycleCountingPredictor:
+    """Fresh worker predictor that records close calls for lifecycle races."""
+
+    def __init__(self, registry):
+        self.registry = registry
+        self.close_calls = 0
+        self.threads_per_worker = None
+        registry.append(self)
+
+    def predict(self, images):
+        return [np.asarray([float(images[0][0, 0, 0]), 1.0], dtype=np.float32) for _ in images]
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_calls > 1:
+            raise AssertionError("worker predictor closed more than once")
+
+
+class _RecordingLock:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.enter_count = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._lock.release()
+
+
 def _tracked_predictor(*, fail_on_zero: bool = False, fail_on_config: bool = False):
     predictor = _UncloneablePredictor()
     predictor.close_calls = 0
@@ -268,6 +300,104 @@ def test_batch_fallback_single_prediction_uses_original_predictor_lock(tmp_path)
     assert classifier.prepare_batch_pool(worker_count=1, threads_per_worker=1)["batch_ready"] is False
     classifier.predict_many_with_cache(cache, [write_marker(tmp_path / "single-lock.png", 3)], library_revision=1)
     assert calls
+
+
+def test_classifier_batch_lifecycle_is_safe_under_concurrent_prepare_and_close(tmp_path, monkeypatch):
+    classifier, _ = _batch_classifier(tmp_path, _UncloneablePredictor())
+    created = []
+    classifier._batch_predictor_factory = lambda **_: _LifecycleCountingPredictor(created)
+    monkeypatch.setattr(OrientationClassifier, "_batch_core_limit", staticmethod(lambda: 2))
+
+    start = threading.Event()
+    errors = []
+
+    def prepare_worker():
+        start.wait(timeout=5)
+        try:
+            for _ in range(5):
+                classifier.prepare_batch_pool(worker_count=2, threads_per_worker=1)
+        except BaseException as exc:  # report all race failures in one assertion
+            errors.append(exc)
+
+    def close_worker():
+        start.wait(timeout=5)
+        try:
+            for _ in range(5):
+                classifier.close_batch_pool()
+        except BaseException as exc:  # report all race failures in one assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=prepare_worker), threading.Thread(target=close_worker)]
+    for thread in threads:
+        thread.start()
+    start.set()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    classifier.close_batch_pool()
+    assert errors == []
+    assert classifier._batch_pool is None
+    assert classifier._batch_sessions == []
+    assert created
+    assert all(predictor.close_calls == 1 for predictor in created)
+
+
+def test_fast_single_prediction_after_batch_fallback_uses_original_predictor_and_lock(tmp_path):
+    predictor = _UncloneablePredictor()
+    calls = []
+    original_predict = predictor.predict
+
+    def predict(images):
+        calls.append(len(images))
+        return original_predict(images)
+
+    predictor.predict = predict
+    classifier, cache = _batch_classifier(tmp_path, predictor)
+    classifier.fast_engine = make_fast_engine(classifier._global_embeddings)
+    classifier._batch_predictor_factory = lambda **_: (_ for _ in ()).throw(RuntimeError("factory failed"))
+    classifier._inference_lock = lock = _RecordingLock()
+    assert classifier.prepare_batch_pool(worker_count=1, threads_per_worker=1)["batch_ready"] is False
+
+    classifier.predict_fast_with_cache(
+        cache,
+        write_marker(tmp_path / "single-fast-original.png", 3),
+        library_revision=1,
+    )
+
+    assert calls
+    assert lock.enter_count > 0
+
+
+def test_legacy_single_prediction_after_batch_fallback_uses_original_predictor_and_lock(tmp_path):
+    predictor = FakeGlobalPredictor()
+    classifier = OrientationClassifier(
+        global_predictor=predictor,
+        extractor=FakeExtractor(),
+        matcher=FakeMatcher(),
+        device="cpu",
+        extract_features_fn=fake_extract_features,
+        score_feature_pair_fn=fake_score_feature_pair,
+        inference_mode="legacy",
+        compute_device="cpu",
+        model_fingerprint="legacy-batch-model",
+    )
+    front = [write_marker(tmp_path / "legacy-front.png", 1)]
+    back = [write_marker(tmp_path / "legacy-back.png", 2)]
+    cache = classifier.build_template_cache(front, back, library_revision=1)
+    classifier._batch_predictor_factory = lambda **_: (_ for _ in ()).throw(RuntimeError("factory failed"))
+    classifier._inference_lock = lock = _RecordingLock()
+    assert classifier.prepare_batch_pool(worker_count=1, threads_per_worker=1)["batch_ready"] is False
+    calls_before = predictor.calls
+
+    classifier.predict_with_cache(
+        cache,
+        write_marker(tmp_path / "single-legacy-original.png", 3),
+        library_revision=1,
+    )
+
+    assert predictor.calls > calls_before
+    assert lock.enter_count > 0
 
 
 class FakeGlobalPredictor:
