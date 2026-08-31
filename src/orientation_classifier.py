@@ -576,7 +576,11 @@ class OrientationClassifier:
                 predictor = factory(threads_per_worker=threads_per_worker)
             except TypeError:
                 predictor = factory()
-        self._configure_batch_predictor(predictor, threads_per_worker)
+        try:
+            self._configure_batch_predictor(predictor, threads_per_worker)
+        except Exception:
+            self._close_batch_predictor(predictor)
+            raise
         return predictor
 
     @staticmethod
@@ -592,20 +596,23 @@ class OrientationClassifier:
 
     def close_batch_pool(self) -> None:
         with self._batch_lifecycle_lock:
-            pool, sessions = self._batch_pool, self._batch_sessions
-            self._batch_pool = None
-            self._batch_sessions = []
-            if pool is not None:
-                pool.close()
-            else:
-                for session in sessions:
-                    self._close_batch_predictor(session.predictor)
+            self._close_batch_pool_locked()
+
+    def _close_batch_pool_locked(self) -> None:
+        pool, sessions = self._batch_pool, self._batch_sessions
+        self._batch_pool = None
+        self._batch_sessions = []
+        if pool is not None:
+            pool.close()
+        else:
+            for session in sessions:
+                session.close()
 
     def prepare_batch_pool(
         self, *, worker_count: int | None = None, threads_per_worker: int = 1
     ) -> dict[str, object]:
-        self.close_batch_pool()
         with self._batch_lifecycle_lock:
+            self._close_batch_pool_locked()
             return self._prepare_batch_pool_locked(
                 worker_count=worker_count, threads_per_worker=threads_per_worker
             )
@@ -717,7 +724,28 @@ class OrientationClassifier:
             def run_item(session: _BatchSession, item: BatchWorkItem):
                 image = session.engine.image_reader(item.image_path)
                 return session.engine.predict(image, cache_snapshot.fast_runtime)
-            batch_results = pool.submit_many(items, run_item=run_item)
+            try:
+                batch_results = pool.submit_many(items, run_item=run_item)
+            except RuntimeError as exc:
+                if "closed" not in str(exc).lower():
+                    raise
+                predict_one = self.predict_fast_with_cache
+                results = [predict_one(cache_snapshot, path, library_revision=library_revision) for path in paths]
+                batch_results = None
+            if batch_results is None:
+                return [
+                    {
+                        **result,
+                        "index": index,
+                        "image_path": str(path),
+                        **(
+                            {"library_revision": int(library_revision)}
+                            if library_revision is not None
+                            else {}
+                        ),
+                    }
+                    for index, (path, result) in enumerate(zip(paths, results))
+                ]
             results = []
             for item in batch_results:
                 result = dict(item.value) if item.error is None and isinstance(item.value, Mapping) else {}

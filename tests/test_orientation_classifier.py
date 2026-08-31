@@ -86,6 +86,23 @@ class _UncloneablePredictor(_BlockingBatchPredictor):
         return [np.asarray([float(marker), 1.0], dtype=np.float32) for _ in images]
 
 
+def _tracked_predictor(*, fail_on_zero: bool = False, fail_on_config: bool = False):
+    predictor = _UncloneablePredictor()
+    predictor.close_calls = 0
+    original_predict = predictor.predict
+
+    def predict(images):
+        if fail_on_zero and int(images[0][0, 0, 0]) == 0:
+            raise RuntimeError("warmup failed")
+        return original_predict(images)
+
+    predictor.predict = predict
+    if fail_on_config:
+        predictor.set_cpu_threads = lambda _threads: (_ for _ in ()).throw(RuntimeError("config failed"))
+    predictor.close = lambda: setattr(predictor, "close_calls", predictor.close_calls + 1)
+    return predictor
+
+
 def _batch_classifier(tmp_path, predictor):
     classifier = OrientationClassifier(
         global_predictor=predictor,
@@ -182,6 +199,75 @@ def test_batch_uses_fresh_factory_when_clone_fails_and_applies_thread_setting(tm
     assert len(created) == 2
     assert all(worker.threads_per_worker == 3 for worker in created)
     classifier.close_batch_pool()
+
+
+def test_batch_submission_closed_pool_falls_back_to_serial(tmp_path, monkeypatch):
+    classifier, cache = _batch_classifier(tmp_path, _UncloneablePredictor())
+    classifier._batch_predictor_factory = lambda **_: _UncloneablePredictor()
+    assert classifier.prepare_batch_pool(worker_count=1, threads_per_worker=1)["batch_ready"] is True
+    pool = classifier._batch_pool
+    original = pool.submit_many
+    monkeypatch.setattr(pool, "submit_many", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("pool is closed")))
+    path = write_marker(tmp_path / "serial.png", 3)
+    result = classifier.predict_many_with_cache(cache, [path], library_revision=1)
+    assert result[0]["index"] == 0
+    assert result[0]["image_path"] == str(path)
+    assert result[0]["library_revision"] == 1
+    monkeypatch.setattr(pool, "submit_many", original)
+    classifier.close_batch_pool()
+
+
+def test_batch_pool_close_is_idempotent_for_each_session(tmp_path):
+    classifier, _ = _batch_classifier(tmp_path, _UncloneablePredictor())
+    created = []
+    classifier._batch_predictor_factory = lambda **_: created.append(_tracked_predictor()) or created[-1]
+    assert classifier.prepare_batch_pool(worker_count=2, threads_per_worker=1)["batch_ready"] is True
+    classifier.close_batch_pool()
+    classifier.close_batch_pool()
+    assert [predictor.close_calls for predictor in created] == [1, 1]
+
+
+def test_batch_warmup_failure_closes_partial_and_failing_sessions(tmp_path):
+    classifier, _ = _batch_classifier(tmp_path, _UncloneablePredictor())
+    created = []
+
+    def factory(**_):
+        predictor = _tracked_predictor(fail_on_zero=len(created) == 1)
+        created.append(predictor)
+        return predictor
+
+    classifier._batch_predictor_factory = factory
+    status = classifier.prepare_batch_pool(worker_count=2, threads_per_worker=1)
+    assert status["batch_ready"] is False
+    assert [predictor.close_calls for predictor in created] == [1, 1]
+
+
+def test_batch_configuration_failure_closes_created_session(tmp_path):
+    classifier, _ = _batch_classifier(tmp_path, _UncloneablePredictor())
+    created = []
+
+    def factory(**_):
+        predictor = _tracked_predictor(fail_on_config=True)
+        created.append(predictor)
+        return predictor
+
+    classifier._batch_predictor_factory = factory
+    status = classifier.prepare_batch_pool(worker_count=1, threads_per_worker=1)
+    assert status["batch_ready"] is False
+    assert [predictor.close_calls for predictor in created] == [1]
+
+
+def test_batch_fallback_single_prediction_uses_original_predictor_lock(tmp_path):
+    predictor = _UncloneablePredictor()
+    calls = []
+    original_predict = predictor.predict
+    predictor.predict = lambda images: calls.append(len(images)) or original_predict(images)
+    classifier, cache = _batch_classifier(tmp_path, predictor)
+    classifier.fast_engine.embed_batch = classifier._global_embeddings
+    classifier._batch_predictor_factory = lambda **_: (_ for _ in ()).throw(RuntimeError("factory failed"))
+    assert classifier.prepare_batch_pool(worker_count=1, threads_per_worker=1)["batch_ready"] is False
+    classifier.predict_many_with_cache(cache, [write_marker(tmp_path / "single-lock.png", 3)], library_revision=1)
+    assert calls
 
 
 class FakeGlobalPredictor:
