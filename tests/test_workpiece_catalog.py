@@ -133,6 +133,18 @@ class BatchCatalogClassifier(FakeClassifier):
         return {"batch_ready": True, "worker_count": 1, "threads_per_worker": 1}
 
 
+class LegacyReadyBatchCatalogClassifier(BatchCatalogClassifier):
+    batch_capabilities = None
+    batch_ready = True
+
+
+class PartialFailureCatalogClassifier(FakeClassifier):
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        if Path(image_path).name == "bad.png":
+            raise OSError("unable to decode image")
+        return super().predict_with_cache(cache, image_path, library_revision=library_revision)
+
+
 class RevisionAwareFastClassifier(FakeClassifier):
     inference_mode = "fast_geometry"
 
@@ -286,12 +298,37 @@ def test_predict_batch_captures_one_snapshot_and_returns_input_order(tmp_path):
     catalog = WorkpieceCatalog(library, classifier)
     front = [image(tmp_path / "batch-front.png", 10)]
     back = [image(tmp_path / "batch-back.png", 20)]
-    catalog.register("M7", front, back, False)
+    record, _ = catalog.register("M7", front, back, False)
 
-    result = catalog.predict_many("m7", [Path("a.png"), Path("b.png"), Path("c.png")])
+    result = catalog.predict_many(record.id, [Path("a.png"), Path("b.png"), Path("c.png")])
 
     assert [item["index"] for item in result] == [0, 1, 2]
     assert classifier.snapshot_calls == 1
+
+
+def test_predict_many_uses_legacy_batch_ready_attribute_without_capabilities(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "legacy-batch-library")
+    classifier = LegacyReadyBatchCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "legacy-front.png", 10)], [image(tmp_path / "legacy-back.png", 20)], False)
+
+    result = catalog.predict_many(record.id, [Path("a.png"), Path("b.png")])
+
+    assert [item["index"] for item in result] == [0, 1]
+    assert classifier.batch_paths == [Path("a.png"), Path("b.png")]
+
+
+def test_predict_many_keeps_partial_scalar_errors_in_input_order(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "partial-batch-library")
+    classifier = PartialFailureCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "partial-front.png", 10)], [image(tmp_path / "partial-back.png", 20)], False)
+
+    result = catalog.predict_many(record.id, [Path("a.png"), Path("bad.png"), Path("c.png")])
+
+    assert [item["index"] for item in result] == [0, 1, 2]
+    assert [item["ok"] for item in result] == [True, False, True]
+    assert result[1]["error"]["code"] == "MODEL_ERROR"
 
 
 def test_workpiece_summary_reports_unequal_counts_and_rules(tmp_path):

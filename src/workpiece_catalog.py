@@ -928,7 +928,12 @@ class WorkpieceCatalog:
             except Exception:
                 capabilities = {}
         batch_reader = getattr(self.classifier, "predict_many_with_cache", None)
-        use_batch = callable(batch_reader) and capabilities.get("batch_ready") is True
+        batch_ready = (
+            capabilities.get("batch_ready")
+            if callable(capabilities_reader)
+            else getattr(self.classifier, "batch_ready", False)
+        )
+        use_batch = callable(batch_reader) and batch_ready is True
 
         def item_error(exc: BaseException) -> dict[str, object]:
             code = getattr(exc, "code", None)

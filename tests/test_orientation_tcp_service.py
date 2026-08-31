@@ -172,6 +172,13 @@ class FakeClassifier:
         return {"supported": False, "batch_ready": False, "worker_count": 0, "threads_per_worker": 1}
 
 
+class PartialFailureClassifier(FakeClassifier):
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        if Path(image_path).name == "bad.png":
+            raise OSError("unable to decode image")
+        return super().predict_with_cache(cache, image_path, library_revision=library_revision)
+
+
 class FakeEvolution:
     def __init__(self):
         self.jobs = []
@@ -579,6 +586,16 @@ def test_register_and_predict_responses_preserve_request_id(client, running_serv
 
 
 def test_dispatch_predict_batch_reports_ordered_items(client, running_server):
+    registered = client.request(
+        "register",
+        request_id="register-batch-1",
+        name="M7",
+        replace=False,
+        front_images=["front.png"],
+        back_images=["back.png"],
+    )
+    assert registered["ok"] is True
+
     response = client.request(
         "predict_batch",
         request_id="batch-1",
@@ -591,11 +608,52 @@ def test_dispatch_predict_batch_reports_ordered_items(client, running_server):
     assert "worker_count" in response
 
 
+def test_dispatch_predict_batch_keeps_partial_item_error_without_dropping_items():
+    dispatcher = OrientationCommandDispatcher(PartialFailureClassifier(), FakeLibrary())
+    registered = dispatcher.dispatch({
+        "version": 1,
+        "request_id": "register-batch",
+        "command": "register",
+        "name": "M7",
+        "replace": False,
+        "front_images": ["front.png"],
+        "back_images": ["back.png"],
+    })
+    assert registered["ok"] is True
+
+    response = dispatcher.dispatch({
+        "version": 1,
+        "request_id": "batch-partial",
+        "command": "predict_batch",
+        "workpiece_id": "m7",
+        "image_paths": ["a.png", "bad.png", "c.png"],
+    })
+
+    assert response["ok"] is True
+    assert [item["index"] for item in response["items"]] == [0, 1, 2]
+    assert [item["ok"] for item in response["items"]] == [True, False, True]
+    assert response["items"][1]["error"]["code"] == "MODEL_ERROR"
+    assert set(response["batch_timings_ms"]) == {"decode", "inference", "postprocess", "total"}
+    assert response["fallback"] is None
+
+
 @pytest.mark.parametrize("paths", [[], [1], ["a.png", None]])
 def test_dispatch_predict_batch_rejects_invalid_lists(client, paths):
     response = client.request("predict_batch", workpiece_id="m7", image_paths=paths)
     assert response["ok"] is False
     assert response["error"]["code"] == "INVALID_REQUEST"
+
+
+def test_hello_reports_batch_capabilities(client):
+    response = client.request("hello")
+
+    assert response["ok"] is True
+    assert response["capabilities"] == {
+        "predict_batch": True,
+        "batch_ready": False,
+        "batch_workers": 0,
+        "batch_threads_per_worker": 1,
+    }
 
 
 def test_register_rejects_non_string_template_item(client, running_server):
