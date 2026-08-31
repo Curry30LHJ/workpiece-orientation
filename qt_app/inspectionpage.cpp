@@ -824,10 +824,18 @@ void InspectionPage::failBatchProtocol(const QString &message) {
         record->disposition = BatchDisposition::PredictionFailed;
         record->error = message;
     }
+    if (!selectedRecordId_.isEmpty()) {
+        const InspectionRecord *selected = batchRecord(selectedRecordId_);
+        if (selected != nullptr) {
+            batchState_.visibleRecord = *selected;
+            batchState_.hasRecord = selected->completedAt.isValid();
+        }
+    }
     batchState_.message = message;
+    rebuildBatchTable();
     updateBatchSummary();
     renderActiveState();
-    finishBatch(false);
+    finishBatch(false, true);
 }
 
 void InspectionPage::finishBatch(bool stopped, bool tableAlreadyRebuilt) {

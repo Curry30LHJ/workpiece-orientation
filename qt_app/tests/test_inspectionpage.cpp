@@ -1282,6 +1282,39 @@ private slots:
 
         QCOMPARE(insertedRows.count(), paths.size());
     }
+
+    void malformedBatchResponseKeepsManualSelectionAndRefreshesFailureRows() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{writeImage(directory, QStringLiteral("held-0.png")),
+                                writeImage(directory, QStringLiteral("held-1.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        page.setBatchPredictionCapabilities(true, true, 2);
+        page.beginBatch(paths, QStringLiteral("m1"));
+        const QStringList ids = page.batchRecordIds();
+        auto *table = page.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        auto *image = page.findChild<QLabel *>(QStringLiteral("currentImageLabel"));
+        QVERIFY(table != nullptr);
+        QVERIFY(image != nullptr);
+
+        table->setCurrentCell(1, 0);
+        QCOMPARE(page.selectedRecordId(), ids.at(1));
+        QVERIFY(image->text().contains(QStringLiteral("held-1.png")));
+        QSignalSpy insertedRows(table->model(), &QAbstractItemModel::rowsInserted);
+
+        page.handleBackendResponse(QStringLiteral("predict_batch"), QJsonObject{
+            {QStringLiteral("items"), QJsonArray()}});
+
+        QCOMPARE(insertedRows.count(), paths.size());
+        QCOMPARE(table->rowCount(), paths.size());
+        for (int row = 0; row < table->rowCount(); ++row) {
+            QCOMPARE(table->item(row, 4)->text(), QStringLiteral("预测失败"));
+        }
+        QCOMPARE(page.selectedRecordId(), ids.at(1));
+        QCOMPARE(table->currentItem()->data(Qt::UserRole).toString(), ids.at(1));
+        QVERIFY(image->text().contains(QStringLiteral("held-1.png")));
+    }
 };
 
 QTEST_MAIN(TestInspectionPage)
