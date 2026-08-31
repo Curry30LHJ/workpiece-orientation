@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import subprocess
 
+import cv2
+import numpy as np
 import pytest
 
 
@@ -163,3 +165,138 @@ def test_native_cli_rejects_zero_threads_with_stable_json(native_exe, tmp_path):
     assert report["ok"] is False
     assert report["error"]["code"] == "INVALID_ARGUMENT"
     assert "threads" in report["error"]["message"]
+
+
+def _write_lossless_png(path, bgr_pixels):
+    ok, encoded = cv2.imencode(".png", np.asarray(bgr_pixels, dtype=np.uint8))
+    assert ok
+    encoded.tofile(path)
+
+
+def _run_preprocess(native_exe, tmp_path, image_paths):
+    image_list = tmp_path / "images.json"
+    image_list.write_text(
+        json.dumps([str(path) for path in image_paths], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "report.json"
+    dump_path = tmp_path / "inputs.f32"
+    result = subprocess.run(
+        [
+            str(native_exe),
+            "--model-dir",
+            str(tmp_path / "unused-model"),
+            "--image-list",
+            str(image_list),
+            "--report",
+            str(report_path),
+            "--preprocess-only",
+            "--dump-inputs",
+            str(dump_path),
+            "--input-width",
+            "2",
+            "--input-height",
+            "2",
+            "--scale",
+            str(1.0 / 255.0),
+            "--mean-rgb",
+            "0.485,0.456,0.406",
+            "--std-rgb",
+            "0.229,0.224,0.225",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    return result, report, dump_path
+
+
+@pytest.mark.integration
+def test_native_preprocess_matches_hand_checked_rgb_nchw_in_chinese_path(
+    native_exe, tmp_path
+):
+    image_dir = tmp_path / "中文目录"
+    image_dir.mkdir()
+    image_path = image_dir / "彩色.png"
+    _write_lossless_png(
+        image_path,
+        [
+            [[0, 0, 0], [0, 0, 255]],
+            [[0, 255, 0], [255, 0, 0]],
+        ],
+    )
+
+    result, report, dump_path = _run_preprocess(
+        native_exe, tmp_path, [image_path]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report["ok"] is True
+    assert report["ordered_images"] == [str(image_path)]
+    assert report["tensor_shape"] == [1, 3, 2, 2]
+    actual = np.fromfile(dump_path, dtype=np.float32)
+    expected_r = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    expected_g = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    expected_b = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    expected = np.concatenate(
+        [
+            (expected_r - 0.485) / 0.229,
+            (expected_g - 0.456) / 0.224,
+            (expected_b - 0.406) / 0.225,
+        ]
+    ).astype(np.float32)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.integration
+def test_native_preprocess_preserves_order_and_rejects_any_unreadable_image(
+    native_exe, tmp_path
+):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    _write_lossless_png(first, np.zeros((2, 2, 3), dtype=np.uint8))
+    _write_lossless_png(second, np.full((2, 2, 3), 255, dtype=np.uint8))
+
+    result, report, _ = _run_preprocess(native_exe, tmp_path, [second, first])
+
+    assert result.returncode == 0, result.stderr
+    assert report["ordered_images"] == [str(second), str(first)]
+    assert report["input_count"] == 2
+
+    missing = tmp_path / "missing.png"
+    failed, error_report, _ = _run_preprocess(
+        native_exe, tmp_path, [first, missing, second]
+    )
+    assert failed.returncode == 3
+    assert error_report["ok"] is False
+    assert error_report["error"]["code"] == "IMAGE_UNREADABLE"
+    assert "missing.png" in error_report["error"]["message"]
+
+
+@pytest.mark.integration
+def test_native_preprocess_rejects_malformed_image_list(native_exe, tmp_path):
+    image_list = tmp_path / "images.json"
+    image_list.write_text('["one.png", 2]', encoding="utf-8")
+    report_path = tmp_path / "report.json"
+    dump_path = tmp_path / "inputs.f32"
+
+    result = subprocess.run(
+        [
+            str(native_exe),
+            "--model-dir",
+            str(tmp_path / "unused-model"),
+            "--image-list",
+            str(image_list),
+            "--report",
+            str(report_path),
+            "--preprocess-only",
+            "--dump-inputs",
+            str(dump_path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 3
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["error"]["code"] == "IMAGE_LIST_INVALID"

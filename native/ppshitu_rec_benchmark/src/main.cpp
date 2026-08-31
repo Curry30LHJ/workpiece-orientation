@@ -1,17 +1,30 @@
 #include <windows.h>
 
+#include "preprocess.h"
+
+#include <array>
+#include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include <opencv2/core.hpp>
 
 namespace {
+
+using workpiece::ppshitu::BatchTensor;
+using workpiece::ppshitu::ImageTensor;
+using workpiece::ppshitu::PreprocessOptions;
 
 enum class ExitCode : int {
   kSuccess = 0,
@@ -27,7 +40,10 @@ struct Options {
   std::filesystem::path model_dir;
   std::filesystem::path image_list;
   std::filesystem::path report;
+  std::filesystem::path dump_inputs;
+  PreprocessOptions preprocess;
   int threads = 1;
+  bool preprocess_only = false;
 };
 
 std::string WideToUtf8(const std::wstring& value) {
@@ -38,12 +54,16 @@ std::string WideToUtf8(const std::wstring& value) {
                                        static_cast<int>(value.size()), nullptr,
                                        0, nullptr, nullptr);
   if (size <= 0) {
-    return {};
+    throw std::runtime_error("unable to encode a Windows path as UTF-8");
   }
   std::string result(static_cast<std::size_t>(size), '\0');
   WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
                       result.data(), size, nullptr, nullptr);
   return result;
+}
+
+std::string PathToUtf8(const std::filesystem::path& path) {
+  return WideToUtf8(path.wstring());
 }
 
 std::string JsonEscape(const std::string& value) {
@@ -84,43 +104,84 @@ std::string JsonEscape(const std::string& value) {
   return output.str();
 }
 
-bool WriteErrorReport(const std::filesystem::path& report_path,
-                      const std::string& code, const std::string& message) {
-  if (report_path.empty()) {
+bool ReplaceFile(const std::filesystem::path& temporary,
+                 const std::filesystem::path& destination) {
+  return MoveFileExW(temporary.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
+bool WriteJsonAtomically(const std::filesystem::path& path,
+                         const std::string& json) {
+  if (path.empty()) {
     return false;
   }
-  std::filesystem::path temporary = report_path;
+  std::filesystem::path temporary = path;
   temporary += L".tmp";
   {
     std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
     if (!stream) {
       return false;
     }
-    stream << "{\"schema_version\":1,\"ok\":false,\"error\":{"
-           << "\"code\":\"" << JsonEscape(code) << "\","
-           << "\"message\":\"" << JsonEscape(message) << "\"}}";
+    stream.write(json.data(), static_cast<std::streamsize>(json.size()));
     stream.flush();
     if (!stream) {
       return false;
     }
   }
-  return MoveFileExW(temporary.c_str(), report_path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+  return ReplaceFile(temporary, path);
+}
+
+bool WriteFloat32Atomically(const std::filesystem::path& path,
+                            const std::vector<float>& values) {
+  if (path.empty()) {
+    return false;
+  }
+  std::filesystem::path temporary = path;
+  temporary += L".tmp";
+  {
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+      return false;
+    }
+    stream.write(reinterpret_cast<const char*>(values.data()),
+                 static_cast<std::streamsize>(values.size() * sizeof(float)));
+    stream.flush();
+    if (!stream) {
+      return false;
+    }
+  }
+  return ReplaceFile(temporary, path);
+}
+
+bool WriteErrorReport(const std::filesystem::path& report_path,
+                      const std::string& code, const std::string& message) {
+  std::ostringstream report;
+  report << "{\"schema_version\":1,\"ok\":false,\"error\":{"
+         << "\"code\":\"" << JsonEscape(code) << "\","
+         << "\"message\":\"" << JsonEscape(message) << "\"}}";
+  return WriteJsonAtomically(report_path, report.str());
 }
 
 void PrintHelp() {
   std::cout
       << "PP-ShiTuV2 native recognition benchmark\n\n"
       << "Required:\n"
-      << "  --model-dir <path>   Paddle inference model directory\n"
-      << "  --image-list <path>  UTF-8 JSON image-list file\n"
-      << "  --report <path>      JSON report output\n\n"
+      << "  --model-dir <path>    Paddle inference model directory\n"
+      << "  --image-list <path>   UTF-8 JSON image-list file\n"
+      << "  --report <path>       JSON report output\n\n"
       << "Options:\n"
-      << "  --threads <n>        Paddle CPU threads (default: 1)\n"
-      << "  --help               Show this help\n";
+      << "  --threads <n>         Paddle CPU threads (default: 1)\n"
+      << "  --preprocess-only     Stop after NCHW preprocessing\n"
+      << "  --dump-inputs <path>  Write row-major NCHW float32 values\n"
+      << "  --input-width <n>     Resize width (default: 224)\n"
+      << "  --input-height <n>    Resize height (default: 224)\n"
+      << "  --scale <value>       Pixel scale (default: 1/255)\n"
+      << "  --mean-rgb <r,g,b>    RGB mean values\n"
+      << "  --std-rgb <r,g,b>     RGB standard deviations\n"
+      << "  --help                Show this help\n";
 }
 
-std::optional<int> ParsePositiveOrZeroInteger(const std::wstring& value) {
+std::optional<int> ParseNonNegativeInteger(const std::wstring& value) {
   try {
     std::size_t consumed = 0;
     const long long parsed = std::stoll(value, &consumed, 10);
@@ -134,17 +195,66 @@ std::optional<int> ParsePositiveOrZeroInteger(const std::wstring& value) {
   }
 }
 
+std::optional<float> ParseFiniteFloat(const std::wstring& value) {
+  try {
+    std::size_t consumed = 0;
+    const float parsed = std::stof(value, &consumed);
+    if (consumed != value.size() || !std::isfinite(parsed)) {
+      return std::nullopt;
+    }
+    return parsed;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<std::array<float, 3>> ParseFloatTriplet(
+    const std::wstring& value) {
+  std::array<float, 3> result{};
+  std::size_t begin = 0;
+  for (std::size_t index = 0; index < result.size(); ++index) {
+    const std::size_t end = value.find(L',', begin);
+    if ((index < result.size() - 1 && end == std::wstring::npos) ||
+        (index == result.size() - 1 && end != std::wstring::npos)) {
+      return std::nullopt;
+    }
+    const std::wstring part = value.substr(begin, end - begin);
+    const auto parsed = ParseFiniteFloat(part);
+    if (!parsed) {
+      return std::nullopt;
+    }
+    result[index] = *parsed;
+    begin = end == std::wstring::npos ? value.size() : end + 1;
+  }
+  return result;
+}
+
+bool IsValueArgument(const std::wstring& key) {
+  return key == L"--model-dir" || key == L"--image-list" ||
+         key == L"--report" || key == L"--threads" ||
+         key == L"--dump-inputs" || key == L"--input-width" ||
+         key == L"--input-height" || key == L"--scale" ||
+         key == L"--mean-rgb" || key == L"--std-rgb";
+}
+
 std::optional<Options> ParseArguments(int argc, wchar_t** argv,
-                                      std::filesystem::path* report_hint,
                                       std::string* error) {
   std::unordered_map<std::wstring, std::wstring> values;
+  bool preprocess_only = false;
   for (int index = 1; index < argc; ++index) {
     const std::wstring key = argv[index];
     if (key == L"--help") {
       continue;
     }
-    if (key != L"--model-dir" && key != L"--image-list" &&
-        key != L"--report" && key != L"--threads") {
+    if (key == L"--preprocess-only") {
+      if (preprocess_only) {
+        *error = "duplicate argument: --preprocess-only";
+        return std::nullopt;
+      }
+      preprocess_only = true;
+      continue;
+    }
+    if (!IsValueArgument(key)) {
       *error = "unknown argument: " + WideToUtf8(key);
       return std::nullopt;
     }
@@ -159,11 +269,6 @@ std::optional<Options> ParseArguments(int argc, wchar_t** argv,
     values.emplace(key, argv[++index]);
   }
 
-  const auto report = values.find(L"--report");
-  if (report != values.end()) {
-    *report_hint = std::filesystem::path(report->second);
-  }
-
   for (const wchar_t* required : {L"--model-dir", L"--image-list",
                                   L"--report"}) {
     if (values.find(required) == values.end()) {
@@ -176,15 +281,294 @@ std::optional<Options> ParseArguments(int argc, wchar_t** argv,
   options.model_dir = values.at(L"--model-dir");
   options.image_list = values.at(L"--image-list");
   options.report = values.at(L"--report");
-  if (const auto threads = values.find(L"--threads"); threads != values.end()) {
-    const auto parsed = ParsePositiveOrZeroInteger(threads->second);
+  options.preprocess_only = preprocess_only;
+  if (const auto found = values.find(L"--threads"); found != values.end()) {
+    const auto parsed = ParseNonNegativeInteger(found->second);
     if (!parsed || *parsed == 0) {
       *error = "threads must be a positive integer";
       return std::nullopt;
     }
     options.threads = *parsed;
   }
+  if (const auto found = values.find(L"--input-width");
+      found != values.end()) {
+    const auto parsed = ParseNonNegativeInteger(found->second);
+    if (!parsed || *parsed == 0) {
+      *error = "input width must be a positive integer";
+      return std::nullopt;
+    }
+    options.preprocess.width = *parsed;
+  }
+  if (const auto found = values.find(L"--input-height");
+      found != values.end()) {
+    const auto parsed = ParseNonNegativeInteger(found->second);
+    if (!parsed || *parsed == 0) {
+      *error = "input height must be a positive integer";
+      return std::nullopt;
+    }
+    options.preprocess.height = *parsed;
+  }
+  if (const auto found = values.find(L"--scale"); found != values.end()) {
+    const auto parsed = ParseFiniteFloat(found->second);
+    if (!parsed || *parsed <= 0.0f) {
+      *error = "scale must be finite and positive";
+      return std::nullopt;
+    }
+    options.preprocess.scale = *parsed;
+  }
+  if (const auto found = values.find(L"--mean-rgb"); found != values.end()) {
+    const auto parsed = ParseFloatTriplet(found->second);
+    if (!parsed) {
+      *error = "mean-rgb must contain three finite comma-separated values";
+      return std::nullopt;
+    }
+    options.preprocess.mean = *parsed;
+  }
+  if (const auto found = values.find(L"--std-rgb"); found != values.end()) {
+    const auto parsed = ParseFloatTriplet(found->second);
+    if (!parsed || (*parsed)[0] <= 0.0f || (*parsed)[1] <= 0.0f ||
+        (*parsed)[2] <= 0.0f) {
+      *error = "std-rgb must contain three finite positive values";
+      return std::nullopt;
+    }
+    options.preprocess.std = *parsed;
+  }
+  if (const auto found = values.find(L"--dump-inputs");
+      found != values.end()) {
+    options.dump_inputs = found->second;
+  }
+  if (options.preprocess_only && options.dump_inputs.empty()) {
+    *error = "--dump-inputs is required with --preprocess-only";
+    return std::nullopt;
+  }
+  if (!options.preprocess_only && !options.dump_inputs.empty()) {
+    *error = "--dump-inputs requires --preprocess-only";
+    return std::nullopt;
+  }
   return options;
+}
+
+class JsonStringArrayParser {
+ public:
+  explicit JsonStringArrayParser(std::string_view input) : input_(input) {}
+
+  std::vector<std::string> Parse() {
+    SkipWhitespace();
+    Expect('[');
+    SkipWhitespace();
+    std::vector<std::string> result;
+    if (Consume(']')) {
+      throw std::runtime_error("image list must not be empty");
+    }
+    while (true) {
+      result.push_back(ParseString());
+      SkipWhitespace();
+      if (Consume(']')) {
+        break;
+      }
+      Expect(',');
+      SkipWhitespace();
+    }
+    SkipWhitespace();
+    if (position_ != input_.size()) {
+      throw std::runtime_error("unexpected data after image list");
+    }
+    return result;
+  }
+
+ private:
+  void SkipWhitespace() {
+    while (position_ < input_.size() &&
+           (input_[position_] == ' ' || input_[position_] == '\t' ||
+            input_[position_] == '\r' || input_[position_] == '\n')) {
+      ++position_;
+    }
+  }
+
+  bool Consume(char expected) {
+    if (position_ < input_.size() && input_[position_] == expected) {
+      ++position_;
+      return true;
+    }
+    return false;
+  }
+
+  void Expect(char expected) {
+    if (!Consume(expected)) {
+      throw std::runtime_error(std::string("expected '") + expected + "'");
+    }
+  }
+
+  static int HexValue(char character) {
+    if (character >= '0' && character <= '9') {
+      return character - '0';
+    }
+    if (character >= 'a' && character <= 'f') {
+      return character - 'a' + 10;
+    }
+    if (character >= 'A' && character <= 'F') {
+      return character - 'A' + 10;
+    }
+    return -1;
+  }
+
+  std::uint32_t ParseHex4() {
+    if (position_ + 4 > input_.size()) {
+      throw std::runtime_error("truncated unicode escape");
+    }
+    std::uint32_t value = 0;
+    for (int count = 0; count < 4; ++count) {
+      const int digit = HexValue(input_[position_++]);
+      if (digit < 0) {
+        throw std::runtime_error("invalid unicode escape");
+      }
+      value = value * 16 + static_cast<std::uint32_t>(digit);
+    }
+    return value;
+  }
+
+  static void AppendUtf8(std::uint32_t code_point, std::string* output) {
+    if (code_point == 0 || code_point > 0x10ffff) {
+      throw std::runtime_error("invalid unicode code point in path");
+    }
+    if (code_point <= 0x7f) {
+      output->push_back(static_cast<char>(code_point));
+    } else if (code_point <= 0x7ff) {
+      output->push_back(static_cast<char>(0xc0 | (code_point >> 6)));
+      output->push_back(static_cast<char>(0x80 | (code_point & 0x3f)));
+    } else if (code_point <= 0xffff) {
+      output->push_back(static_cast<char>(0xe0 | (code_point >> 12)));
+      output->push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3f)));
+      output->push_back(static_cast<char>(0x80 | (code_point & 0x3f)));
+    } else {
+      output->push_back(static_cast<char>(0xf0 | (code_point >> 18)));
+      output->push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3f)));
+      output->push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3f)));
+      output->push_back(static_cast<char>(0x80 | (code_point & 0x3f)));
+    }
+  }
+
+  std::string ParseString() {
+    Expect('\"');
+    std::string output;
+    while (position_ < input_.size()) {
+      const unsigned char character =
+          static_cast<unsigned char>(input_[position_++]);
+      if (character == '\"') {
+        return output;
+      }
+      if (character < 0x20) {
+        throw std::runtime_error("unescaped control character in path");
+      }
+      if (character != '\\') {
+        output.push_back(static_cast<char>(character));
+        continue;
+      }
+      if (position_ >= input_.size()) {
+        throw std::runtime_error("truncated escape in path");
+      }
+      const char escaped = input_[position_++];
+      switch (escaped) {
+        case '\"':
+        case '\\':
+        case '/':
+          output.push_back(escaped);
+          break;
+        case 'b':
+          output.push_back('\b');
+          break;
+        case 'f':
+          output.push_back('\f');
+          break;
+        case 'n':
+          output.push_back('\n');
+          break;
+        case 'r':
+          output.push_back('\r');
+          break;
+        case 't':
+          output.push_back('\t');
+          break;
+        case 'u': {
+          std::uint32_t code_point = ParseHex4();
+          if (code_point >= 0xd800 && code_point <= 0xdbff) {
+            if (position_ + 2 > input_.size() || input_[position_] != '\\' ||
+                input_[position_ + 1] != 'u') {
+              throw std::runtime_error("missing low unicode surrogate");
+            }
+            position_ += 2;
+            const std::uint32_t low = ParseHex4();
+            if (low < 0xdc00 || low > 0xdfff) {
+              throw std::runtime_error("invalid low unicode surrogate");
+            }
+            code_point =
+                0x10000 + ((code_point - 0xd800) << 10) + (low - 0xdc00);
+          } else if (code_point >= 0xdc00 && code_point <= 0xdfff) {
+            throw std::runtime_error("unexpected low unicode surrogate");
+          }
+          AppendUtf8(code_point, &output);
+          break;
+        }
+        default:
+          throw std::runtime_error("invalid escape in path");
+      }
+    }
+    throw std::runtime_error("unterminated path string");
+  }
+
+  std::string_view input_;
+  std::size_t position_ = 0;
+};
+
+std::vector<std::filesystem::path> ReadImageList(
+    const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    throw std::runtime_error("unable to open image-list file");
+  }
+  std::string content((std::istreambuf_iterator<char>(stream)),
+                      std::istreambuf_iterator<char>());
+  if (content.size() >= 3 &&
+      static_cast<unsigned char>(content[0]) == 0xef &&
+      static_cast<unsigned char>(content[1]) == 0xbb &&
+      static_cast<unsigned char>(content[2]) == 0xbf) {
+    content.erase(0, 3);
+  }
+  const std::vector<std::string> encoded_paths =
+      JsonStringArrayParser(content).Parse();
+  std::vector<std::filesystem::path> paths;
+  paths.reserve(encoded_paths.size());
+  for (const std::string& encoded_path : encoded_paths) {
+    if (encoded_path.empty()) {
+      throw std::runtime_error("image paths must not be empty");
+    }
+    paths.push_back(std::filesystem::u8path(encoded_path));
+  }
+  return paths;
+}
+
+std::string BuildPreprocessReport(
+    const Options& options,
+    const std::vector<std::filesystem::path>& image_paths,
+    const BatchTensor& batch) {
+  std::ostringstream report;
+  report << "{\"schema_version\":1,\"ok\":true,"
+         << "\"mode\":\"preprocess_only\","
+         << "\"input_count\":" << image_paths.size() << ','
+         << "\"ordered_images\":[";
+  for (std::size_t index = 0; index < image_paths.size(); ++index) {
+    if (index != 0) {
+      report << ',';
+    }
+    report << '\"' << JsonEscape(PathToUtf8(image_paths[index])) << '\"';
+  }
+  report << "],\"tensor_shape\":[" << batch.batch << ',' << batch.channels
+         << ',' << batch.height << ',' << batch.width << "],"
+         << "\"preprocess\":{"
+         << "\"width\":" << options.preprocess.width << ','
+         << "\"height\":" << options.preprocess.height << ','
+         << "\"scale\":" << options.preprocess.scale << "}}";
+  return report.str();
 }
 
 int Fail(const std::filesystem::path& report_path, ExitCode exit_code,
@@ -194,6 +578,48 @@ int Fail(const std::filesystem::path& report_path, ExitCode exit_code,
     return static_cast<int>(ExitCode::kReportWriteFailed);
   }
   return static_cast<int>(exit_code);
+}
+
+int RunPreprocessOnly(const Options& options) {
+  std::vector<std::filesystem::path> image_paths;
+  try {
+    image_paths = ReadImageList(options.image_list);
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kInputUnreadable,
+                "IMAGE_LIST_INVALID", exception.what());
+  }
+
+  std::vector<ImageTensor> images;
+  images.reserve(image_paths.size());
+  for (const std::filesystem::path& image_path : image_paths) {
+    try {
+      images.push_back(
+          workpiece::ppshitu::LoadAndPreprocess(image_path, options.preprocess));
+    } catch (const std::exception& exception) {
+      return Fail(options.report, ExitCode::kInputUnreadable,
+                  "IMAGE_UNREADABLE",
+                  PathToUtf8(image_path) + ": " + exception.what());
+    }
+  }
+
+  BatchTensor batch;
+  try {
+    batch = workpiece::ppshitu::StackBatch(images);
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kInvalidArgument,
+                "INVALID_ARGUMENT", exception.what());
+  }
+  if (!WriteFloat32Atomically(options.dump_inputs, batch.nchw)) {
+    return Fail(options.report, ExitCode::kReportWriteFailed,
+                "DUMP_WRITE_FAILED", "unable to write preprocessing dump");
+  }
+  if (!WriteJsonAtomically(
+          options.report,
+          BuildPreprocessReport(options, image_paths, batch))) {
+    std::cerr << "unable to write preprocessing report\n";
+    return static_cast<int>(ExitCode::kReportWriteFailed);
+  }
+  return static_cast<int>(ExitCode::kSuccess);
 }
 
 }  // namespace
@@ -207,8 +633,14 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   std::filesystem::path report_hint;
+  for (int index = 1; index + 1 < argc; ++index) {
+    if (std::wstring(argv[index]) == L"--report") {
+      report_hint = argv[index + 1];
+      break;
+    }
+  }
   std::string error;
-  const auto options = ParseArguments(argc, argv, &report_hint, &error);
+  const auto options = ParseArguments(argc, argv, &error);
   if (!options) {
     return Fail(report_hint, ExitCode::kInvalidArgument, "INVALID_ARGUMENT",
                 error);
@@ -216,6 +648,9 @@ int wmain(int argc, wchar_t** argv) {
   if (!cv::checkHardwareSupport(CV_CPU_AVX)) {
     return Fail(options->report, ExitCode::kCpuUnsupported,
                 "CPU_FEATURE_UNSUPPORTED", "AVX CPU support is required");
+  }
+  if (options->preprocess_only) {
+    return RunPreprocessOnly(*options);
   }
   return Fail(options->report, ExitCode::kInferenceFailed, "NOT_IMPLEMENTED",
               "feature extraction is not implemented yet");

@@ -32,8 +32,11 @@ find_package(OpenCV REQUIRED PATHS
     "${OPENCV_ROOT}/build"
     NO_DEFAULT_PATH)
 
-add_executable(ppshitu_rec_benchmark src/main.cpp)
+add_executable(ppshitu_rec_benchmark
+    src/main.cpp
+    src/preprocess.cpp)
 target_include_directories(ppshitu_rec_benchmark PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${PADDLE_INFERENCE_ROOT}/paddle/include"
     ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(ppshitu_rec_benchmark PRIVATE
