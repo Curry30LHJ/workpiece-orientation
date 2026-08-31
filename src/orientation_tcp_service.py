@@ -183,6 +183,11 @@ from src.interference_masks import InvalidMaskError
 
 
 LOGGER = logging.getLogger(__name__)
+
+_BATCH_WORKERS_ENV = "WORKPIECE_BATCH_WORKERS"
+_BATCH_THREADS_ENV = "WORKPIECE_BATCH_THREADS_PER_WORKER"
+_DEFAULT_BATCH_WORKERS = 4
+_DEFAULT_BATCH_THREADS_PER_WORKER = 1
 PROTOCOL_VERSION = 1
 SERVICE_NAME = "workpiece-orientation"
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -368,6 +373,7 @@ def _shutdown_runtime_components(
     catalog: Any | None,
     evolution: Any | None,
     geometry_profiles: Any | None,
+    classifier: Any | None = None,
 ) -> None:
     for name, component in (
         ("fast cache jobs", catalog),
@@ -381,6 +387,31 @@ def _shutdown_runtime_components(
             shutdown()
         except Exception:
             LOGGER.exception("Unable to shut down %s", name)
+    close_batch_pool = getattr(classifier, "close_batch_pool", None)
+    if callable(close_batch_pool):
+        try:
+            close_batch_pool()
+        except Exception:
+            LOGGER.exception("Unable to shut down batch inference pool")
+
+
+def _batch_runtime_configuration(environ: Mapping[str, str] | None = None) -> tuple[int, int]:
+    """Read strict positive batch settings without making startup fragile."""
+    values = os.environ if environ is None else environ
+
+    def parse(name: str, default: int) -> int:
+        value = values.get(name)
+        if value is None:
+            return default
+        text = str(value)
+        if text.isdecimal() and int(text) > 0:
+            return int(text)
+        LOGGER.warning("Invalid %s=%r; using safe default %d", name, value, default)
+        return default
+
+    return parse(_BATCH_WORKERS_ENV, _DEFAULT_BATCH_WORKERS), parse(
+        _BATCH_THREADS_ENV, _DEFAULT_BATCH_THREADS_PER_WORKER
+    )
 
 
 class ServiceRuntime:
@@ -500,6 +531,7 @@ class ServiceRuntime:
                     resolved_catalog if owns_catalog else None,
                     evolution,
                     geometry_profiles if owns_geometry_profiles else None,
+                    classifier,
                 )
 
     def set_failed(self, code: str, message: str) -> None:
@@ -1422,7 +1454,7 @@ class OrientationTcpServer:
         assert runtime is not None
         try:
             profiles = runtime.geometry_profiles or getattr(runtime.catalog, "geometry_profiles", None)
-            _shutdown_runtime_components(runtime.catalog, runtime.evolution, profiles)
+            _shutdown_runtime_components(runtime.catalog, runtime.evolution, profiles, runtime.classifier)
         finally:
             self._stop_event.set()
             try:
@@ -1476,6 +1508,17 @@ def _load_runtime(
         )
         catalog.set_geometry_profiles(profiles)
         catalog.recover()
+        if compute_device == "cpu" and inference_mode == "fast_geometry":
+            workers, threads_per_worker = _batch_runtime_configuration()
+            prepare_pool = getattr(classifier, "prepare_batch_pool", None)
+            if callable(prepare_pool):
+                try:
+                    status = prepare_pool(worker_count=workers, threads_per_worker=threads_per_worker)
+                    if not isinstance(status, Mapping) or status.get("batch_ready") is not True:
+                        LOGGER.warning("CPU batch inference pool is unavailable: %s", status)
+                except Exception:
+                    # A batch pool is an optimization.  Keep scalar service startup usable.
+                    LOGGER.exception("CPU batch inference pool prewarm failed; using scalar fallback")
         transferred = runtime.set_ready(classifier, library, catalog)
     except (RuntimeDataError, ComputeDeviceError, ModelFingerprintError) as exc:
         LOGGER.exception("Orientation service startup failed with code %s", exc.code)
@@ -1485,7 +1528,7 @@ def _load_runtime(
         runtime.set_failed("MODEL_LOAD_FAILED", str(exc) or type(exc).__name__)
     finally:
         if not transferred:
-            _shutdown_runtime_components(catalog, None, profiles)
+            _shutdown_runtime_components(catalog, None, profiles, locals().get("classifier"))
 
 
 def _build_argument_parser() -> argparse.ArgumentParser:

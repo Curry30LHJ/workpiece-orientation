@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -20,6 +21,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from release_tools.portable_smoke import _free_port, _package_config, _real_process_factory, _start_backend, main
+from release_tools.backend_bundle import assert_frozen_backend_modules
 
 
 class _JsonClient:
@@ -80,6 +82,7 @@ def run_frozen_batch_smoke(package_root: Path, workpiece_id: str, image_paths: l
     if len(paths) != 5:
         raise ValueError("frozen batch smoke requires exactly 5 image paths")
     config = _package_config(package)
+    assert_frozen_backend_modules((package / config["backend_executable"]).parent)
     work_dir = Path(temp_dir_factory() if temp_dir_factory else package.parent / f".frozen-batch-smoke-{uuid.uuid4().hex}")
     if work_dir.exists():
         raise FileExistsError(f"temporary smoke CWD already exists: {work_dir}")
@@ -118,8 +121,17 @@ def run_frozen_batch_smoke(package_root: Path, workpiece_id: str, image_paths: l
             except Exception:
                 pass
         if process is not None and process.poll() is None:
-            process.terminate()
-            process.wait(timeout=10)
+            try:
+                process.terminate()
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         shutil.rmtree(work_dir, ignore_errors=True)
 
 

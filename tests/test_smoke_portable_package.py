@@ -22,6 +22,10 @@ def _smoke_wrapper_module():
 def test_frozen_batch_smoke_uses_different_cwd_and_runs_ordered_five_image_batch(tmp_path):
     module = _smoke_wrapper_module()
     package = _package_fixture(tmp_path / "package", edition="cpu")
+    from release_tools.backend_bundle import production_src_modules
+    (package / "backend" / "orientation_backend.exe").write_bytes(
+        "\n".join(production_src_modules()).encode("utf-8")
+    )
     images = [tmp_path / f"image-{index}.png" for index in range(5)]
     launched = {}
 
@@ -62,6 +66,7 @@ def test_frozen_batch_smoke_uses_different_cwd_and_runs_ordered_five_image_batch
 def test_frozen_batch_smoke_reports_missing_orientation_classifier_clearly(tmp_path):
     module = _smoke_wrapper_module()
     package = _package_fixture(tmp_path / "package", edition="cpu")
+    (package / "backend" / "orientation_backend.exe").write_bytes(b"src.orientation_tcp_service")
     images = [tmp_path / f"image-{index}.png" for index in range(5)]
 
     class Process:
@@ -71,7 +76,7 @@ def test_frozen_batch_smoke_reports_missing_orientation_classifier_clearly(tmp_p
         def wait(self, timeout=None): return self.returncode
         def terminate(self): pass
 
-    with pytest.raises(RuntimeError, match=r"src\.orientation_classifier"):
+    with pytest.raises(RuntimeError, match="frozen backend archive missing modules.*src.orientation_classifier"):
         module.run_frozen_batch_smoke(
             package, "wp-1", images,
             process_factory=lambda args, cwd: Process(),

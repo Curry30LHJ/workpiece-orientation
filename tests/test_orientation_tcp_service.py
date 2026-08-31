@@ -172,6 +172,104 @@ class FakeClassifier:
         return {"supported": False, "batch_ready": False, "worker_count": 0, "threads_per_worker": 1}
 
 
+def test_runtime_loader_prewarms_requested_cpu_batch_pool_before_ready(monkeypatch, tmp_path):
+    runtime = ServiceRuntime(compute_device="cpu")
+    requested = []
+
+    class LoadedClassifier:
+        compute_device = "cpu"
+        inference_mode = "fast_geometry"
+        model_fingerprint = "f" * 64
+        geometry_calibrator = None
+
+        @classmethod
+        def load(cls, *args, **kwargs):
+            return cls()
+
+        def prepare_batch_pool(self, *, worker_count, threads_per_worker):
+            requested.append((worker_count, threads_per_worker))
+            return {"batch_ready": True, "worker_count": worker_count,
+                    "threads_per_worker": threads_per_worker}
+
+        def batch_capabilities(self):
+            return {"supported": True, "batch_ready": True, "worker_count": 2,
+                    "threads_per_worker": 2}
+
+    class LoadedLibrary:
+        def __init__(self, root): self.library_dir = Path(root)
+
+    class LoadedCatalog:
+        geometry_profiles = None
+        def __init__(self, library, classifier): pass
+        def set_geometry_profiles(self, profiles): self.geometry_profiles = profiles
+        def recover(self): pass
+
+    class Profiles:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+        def shutdown(self): pass
+
+    class Evolution:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+        def shutdown(self): pass
+
+    monkeypatch.setenv("WORKPIECE_BATCH_WORKERS", "2")
+    monkeypatch.setenv("WORKPIECE_BATCH_THREADS_PER_WORKER", "2")
+    monkeypatch.setattr(service_module, "OrientationClassifier", LoadedClassifier)
+    monkeypatch.setattr(service_module, "WorkpieceLibrary", LoadedLibrary)
+    monkeypatch.setattr(service_module, "WorkpieceCatalog", LoadedCatalog)
+    monkeypatch.setattr(service_module, "GeometryMaskProfiles", Profiles)
+    monkeypatch.setattr(service_module, "TemplateEvolution", Evolution)
+    monkeypatch.setattr(service_module, "prepare_runtime_data", lambda root: SimpleNamespace(workpieces=tmp_path / "workpieces"))
+
+    service_module._load_runtime(runtime, tmp_path, tmp_path / "models", None,
+                                 data_root=tmp_path / "data", compute_device="cpu",
+                                 inference_mode="fast_geometry")
+
+    assert requested == [(2, 2)]
+    hello = OrientationCommandDispatcher(runtime).dispatch({
+        "version": 1, "request_id": "ready-batch", "command": "hello",
+    })
+    assert hello["ready"] is True
+    assert hello["capabilities"] == {
+        "predict_batch": True, "batch_ready": True, "batch_workers": 2,
+        "batch_threads_per_worker": 2,
+    }
+
+
+def test_batch_runtime_configuration_rejects_invalid_values_with_safe_defaults(monkeypatch, caplog):
+    monkeypatch.setenv("WORKPIECE_BATCH_WORKERS", "2.5")
+    monkeypatch.setenv("WORKPIECE_BATCH_THREADS_PER_WORKER", "0")
+
+    with caplog.at_level(logging.WARNING):
+        assert service_module._batch_runtime_configuration() == (4, 1)
+
+    assert "WORKPIECE_BATCH_WORKERS" in caplog.text
+    assert "WORKPIECE_BATCH_THREADS_PER_WORKER" in caplog.text
+
+
+def test_server_shutdown_closes_runtime_batch_pool():
+    runtime = ServiceRuntime()
+    closed = []
+
+    class Classifier:
+        compute_device = "cpu"
+        model_fingerprint = ""
+        geometry_calibrator = None
+        def close_batch_pool(self): closed.append("pool")
+
+    class Catalog:
+        geometry_profiles = None
+        def shutdown(self): pass
+
+    assert runtime.set_ready(Classifier(), object(), Catalog()) is True
+    server = OrientationTcpServer(OrientationCommandDispatcher(runtime), host="127.0.0.1", port=0)
+    server.request_shutdown()
+
+    assert closed == ["pool"]
+
+
 class PartialFailureClassifier(FakeClassifier):
     def predict_with_cache(self, cache, image_path, *, library_revision=None):
         if Path(image_path).name == "bad.png":

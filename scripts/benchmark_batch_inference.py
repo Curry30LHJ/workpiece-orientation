@@ -52,7 +52,7 @@ def batch_request(workpiece_id: str, image_paths: Iterable[Path | str], *, reque
             "workpiece_id": workpiece_id, "image_paths": paths}
 
 
-def validate_batch_response(response: dict[str, Any], request_id: str, image_paths: Iterable[Path | str]) -> list[str | None]:
+def validate_batch_response(response: dict[str, Any], request_id: str, image_paths: Iterable[Path | str]) -> list[str]:
     paths = [str(path) for path in image_paths]
     if response.get("request_id") != request_id or response.get("command") != "predict_batch":
         raise RuntimeError("predict_batch response id/command mismatch")
@@ -63,7 +63,7 @@ def validate_batch_response(response: dict[str, Any], request_id: str, image_pat
     items = response.get("items")
     if not isinstance(items, list) or len(items) != len(paths):
         raise RuntimeError("predict_batch response has invalid item count")
-    labels: list[str | None] = []
+    labels: list[str] = []
     for index, (path, item) in enumerate(zip(paths, items)):
         if not isinstance(item, dict) or item.get("index") != index or item.get("image_path") != path:
             raise RuntimeError("predict_batch response item order/path mismatch")
@@ -72,7 +72,12 @@ def validate_batch_response(response: dict[str, Any], request_id: str, image_pat
             message = error.get("message") if isinstance(error, dict) else error
             raise RuntimeError(str(message or f"predict_batch item {index} failed"))
         prediction = item.get("prediction")
-        labels.append(prediction.get("label") if isinstance(prediction, dict) else None)
+        if not isinstance(prediction, dict):
+            raise RuntimeError("predict_batch item prediction must be an object")
+        label = prediction.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise RuntimeError("predict_batch item prediction must contain a non-empty label")
+        labels.append(label)
     return labels
 
 
@@ -112,18 +117,27 @@ def _cleanup(client: Any | None, process: Any | None) -> None:
         except Exception:
             pass
     if process is not None and process.poll() is None:
-        process.terminate()
-        process.wait(timeout=10)
+        try:
+            process.terminate()
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=10)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
 
 def run_batch_measurements(client: Any, process: Any, workpiece_id: str, image_paths: Iterable[Path | str], *,
-                           warmup: int, iterations: int) -> tuple[list[float], list[str | None], dict[str, Any]]:
+                           warmup: int, iterations: int) -> tuple[list[float], list[str], dict[str, Any]]:
     """Use one connected client for hello, warmups, and measured batches."""
     paths = list(image_paths)
     if warmup < 0 or iterations <= 0:
         raise ValueError("warmup must be non-negative and iterations must be positive")
     last_response: dict[str, Any] = {}
-    labels: list[str | None] = []
+    measured_labels: list[str] = []
     try:
         hello_id = str(uuid.uuid4())
         _validate_hello(client.request({"version": 1, "request_id": hello_id, "command": "hello"}), hello_id)
@@ -139,7 +153,8 @@ def run_batch_measurements(client: Any, process: Any, workpiece_id: str, image_p
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             labels = validate_batch_response(last_response, payload["request_id"], paths)
             samples.append(elapsed_ms)
-        return samples, labels, last_response
+            measured_labels.extend(labels)
+        return samples, measured_labels, last_response
     except Exception:
         _cleanup(client, process)
         raise
@@ -181,6 +196,19 @@ def _hardware() -> dict[str, Any]:
             "logical_processors": os.cpu_count()}
 
 
+def accuracy_summary(labels: list[str], expected_labels: list[str] | None) -> dict[str, Any]:
+    if expected_labels is None:
+        return {"available": False, "reason": "no expected labels were supplied"}
+    if len(expected_labels) != 5:
+        raise ValueError("expected_labels must contain exactly five labels")
+    if len(labels) % 5:
+        raise ValueError("measured labels must contain complete five-image batches")
+    expected = expected_labels * (len(labels) // 5)
+    correct = sum(actual == wanted for actual, wanted in zip(labels, expected))
+    return {"available": True, "correct": correct, "total": len(labels),
+            "rate": correct / len(labels) if labels else 0.0}
+
+
 def _free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -188,19 +216,23 @@ def _free_port() -> int:
 
 
 def _launch(package_root: Path, workers: int, threads_per_worker: int) -> tuple[Any, int]:
-    from release_tools.portable_smoke import _package_config, _start_backend, _real_process_factory
+    from release_tools.portable_smoke import _package_config, _start_backend
     config = _package_config(package_root)
     if str(config.get("compute_device")).lower() != "cpu":
         raise ValueError("batch benchmark requires a packaged CPU backend")
     port = _free_port()
-    original_environment = os.environ.copy()
-    os.environ["WORKPIECE_BATCH_WORKERS"] = str(workers)
-    os.environ["WORKPIECE_CPU_THREADS"] = str(threads_per_worker)
-    try:
-        return _start_backend(package_root, config, port, _real_process_factory), port
-    finally:
-        os.environ.clear()
-        os.environ.update(original_environment)
+    environment = os.environ.copy()
+    environment["WORKPIECE_BATCH_WORKERS"] = str(workers)
+    environment["WORKPIECE_BATCH_THREADS_PER_WORKER"] = str(threads_per_worker)
+
+    def start_with_environment(args: list[str], cwd: str, token: str | None = None) -> subprocess.Popen:
+        kwargs: dict[str, Any] = {"cwd": cwd, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
+                                  "text": True, "env": environment}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        return subprocess.Popen(args, **kwargs)
+
+    return _start_backend(package_root, config, start_with_environment), port
 
 
 def main() -> int:
@@ -212,6 +244,8 @@ def main() -> int:
     parser.add_argument("--iterations", type=_positive_int, default=200)
     parser.add_argument("--workers", type=_positive_int, required=True)
     parser.add_argument("--threads-per-worker", type=_positive_int, required=True)
+    parser.add_argument("--expected-label", action="append",
+                        help="optional expected label for each of the five ordered images")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     client = process = None
@@ -230,12 +264,14 @@ def main() -> int:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("timed out waiting for packaged backend")
                 time.sleep(0.1)
+        if args.expected_label is not None and len(args.expected_label) != 5:
+            raise ValueError("--expected-label must be supplied exactly five times when used")
         samples, labels, backend = run_batch_measurements(client, process, args.workpiece_id, args.image,
                                                             warmup=args.warmup, iterations=args.iterations)
         fallback = backend.get("fallback")
         report = build_report(
             samples, args.warmup, args.iterations, args.workers, args.threads_per_worker,
-            _hardware(), {"checked_items": len(labels), "labels": labels},
+            _hardware(), accuracy_summary(labels, args.expected_label),
             {
                 "used": fallback is not None,
                 "reason": fallback if isinstance(fallback, str) else None,

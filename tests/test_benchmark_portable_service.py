@@ -95,6 +95,23 @@ def test_batch_benchmark_validates_protocol_order_and_item_errors():
     item_error = {**valid, "items": [{**valid["items"][0], "ok": False, "error": {"message": "bad image"}}, *valid["items"][1:]]}
     with pytest.raises(RuntimeError, match="bad image"):
         module.validate_batch_response(item_error, "batch-1", paths)
+    malformed_prediction = {**valid, "items": [{**valid["items"][0], "prediction": {"label": ""}}, *valid["items"][1:]]}
+    with pytest.raises(RuntimeError, match="non-empty label"):
+        module.validate_batch_response(malformed_prediction, "batch-1", paths)
+
+
+def test_batch_benchmark_accuracy_is_unavailable_without_ground_truth_and_uses_all_measured_labels():
+    module = _batch_benchmark_module()
+
+    assert module.accuracy_summary(["front", "back"], None) == {
+        "available": False, "reason": "no expected labels were supplied",
+    }
+    assert module.accuracy_summary(
+        ["front", "back", "front", "back", "front"] * 2,
+        ["front", "front", "front", "front", "front"],
+    ) == {
+        "available": True, "correct": 6, "total": 10, "rate": 0.6,
+    }
 
 
 def test_batch_benchmark_closes_persistent_socket_and_backend_on_failure(tmp_path):
@@ -146,11 +163,33 @@ def test_batch_benchmark_reuses_one_connection_and_discards_warmup_samples(tmp_p
         client, Process(), "wp", images, warmup=2, iterations=3,
     )
     assert len(samples) == 3
-    assert labels == ["front"] * 5
+    assert labels == ["front"] * 15
     assert [request["command"] for request in client.requests] == [
         "hello", "predict_batch", "predict_batch", "predict_batch", "predict_batch", "predict_batch",
     ]
     assert len({request["request_id"] for request in client.requests}) == 6
+
+
+def test_batch_benchmark_cleanup_kills_after_terminate_timeout_and_keeps_original_error():
+    module = _batch_benchmark_module()
+    closed = []
+
+    class Client:
+        def close(self):
+            closed.append("socket")
+            raise OSError("socket close failed")
+
+    class Process:
+        def poll(self): return None
+        def terminate(self): closed.append("terminate")
+        def wait(self, timeout=None):
+            closed.append(f"wait:{timeout}")
+            if closed.count(f"wait:{timeout}") == 1:
+                raise subprocess.TimeoutExpired("backend", timeout)
+        def kill(self): closed.append("kill")
+
+    module._cleanup(Client(), Process())
+    assert closed == ["socket", "terminate", "wait:10", "kill", "wait:10"]
 
 
 def _write_image(path: Path, value: int) -> tuple[int, int, str, int]:
