@@ -170,6 +170,55 @@ def test_batch_benchmark_reuses_one_connection_and_discards_warmup_samples(tmp_p
     assert len({request["request_id"] for request in client.requests}) == 6
 
 
+def test_batch_benchmark_waits_for_loading_hello_without_command_before_timing(tmp_path, monkeypatch):
+    module = _batch_benchmark_module()
+    images = [tmp_path / f"{index}.png" for index in range(5)]
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    class Client:
+        def __init__(self): self.requests = []
+        def request(self, payload):
+            self.requests.append(payload)
+            hello_count = sum(request["command"] == "hello" for request in self.requests)
+            if payload["command"] == "hello" and hello_count == 1:
+                return {"ok": True, "request_id": payload["request_id"], "ready": False, "status": "loading"}
+            if payload["command"] == "hello":
+                return {"ok": True, "request_id": payload["request_id"], "ready": True,
+                        "capabilities": {"predict_batch": True, "batch_ready": True}}
+            return {"ok": True, "request_id": payload["request_id"], "items": [
+                {"index": index, "image_path": str(path), "ok": True, "prediction": {"label": "front"}}
+                for index, path in enumerate(images)
+            ]}
+
+    class Process:
+        def poll(self): return None
+
+    client = Client()
+    samples, labels, _ = module.run_batch_measurements(
+        client, Process(), "wp", images, warmup=1, iterations=2,
+    )
+
+    assert len(samples) == 2
+    assert labels == ["front"] * 10
+    assert [request["command"] for request in client.requests] == [
+        "hello", "hello", "predict_batch", "predict_batch", "predict_batch",
+    ]
+    assert len({request["request_id"] for request in client.requests}) == 5
+
+
+def test_batch_benchmark_accepts_missing_response_command_but_rejects_wrong_command():
+    module = _batch_benchmark_module()
+    paths = [f"{index}.png" for index in range(5)]
+    response = {"ok": True, "request_id": "batch", "items": [
+        {"index": index, "image_path": path, "ok": True, "prediction": {"label": "front"}}
+        for index, path in enumerate(paths)
+    ]}
+
+    assert module.validate_batch_response(response, "batch", paths) == ["front"] * 5
+    with pytest.raises(RuntimeError, match="id/command"):
+        module.validate_batch_response({**response, "command": "predict"}, "batch", paths)
+
+
 def test_batch_benchmark_cleanup_kills_after_terminate_timeout_and_keeps_original_error():
     module = _batch_benchmark_module()
     closed = []

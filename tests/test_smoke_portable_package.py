@@ -63,6 +63,58 @@ def test_frozen_batch_smoke_uses_different_cwd_and_runs_ordered_five_image_batch
     assert not (tmp_path / "different cwd").exists()
 
 
+def test_frozen_batch_smoke_waits_for_loading_hello_and_accepts_missing_command(tmp_path, monkeypatch):
+    module = _smoke_wrapper_module()
+    package = _package_fixture(tmp_path / "package", edition="cpu")
+    from release_tools.backend_bundle import production_src_modules
+    (package / "backend" / "orientation_backend.exe").write_bytes(
+        "\n".join(production_src_modules()).encode("utf-8")
+    )
+    paths = [str(index) for index in range(5)]
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    class Process:
+        def poll(self): return None
+        def terminate(self): pass
+        def wait(self, timeout=None): pass
+
+    class Client:
+        def __init__(self): self.requests = []
+        def request(self, payload):
+            self.requests.append(payload)
+            hello_count = sum(request["command"] == "hello" for request in self.requests)
+            if payload["command"] == "hello" and hello_count == 1:
+                return {"ok": True, "request_id": payload["request_id"], "ready": False, "status": "loading"}
+            if payload["command"] == "hello":
+                return {"ok": True, "request_id": payload["request_id"], "ready": True,
+                        "capabilities": {"predict_batch": True, "batch_ready": True}}
+            return {"ok": True, "request_id": payload["request_id"], "items": [
+                {"index": index, "image_path": path, "ok": True, "prediction": {"label": "front"}}
+                for index, path in enumerate(paths)
+            ]}
+        def close(self): pass
+
+    client = Client()
+    result = module.run_frozen_batch_smoke(
+        package, "wp", paths, process_factory=lambda args, cwd: Process(),
+        client_factory=lambda host, port: client, temp_dir_factory=lambda: tmp_path / "other cwd",
+    )
+
+    assert result["labels"] == ["front"] * 5
+    assert [request["command"] for request in client.requests] == ["hello", "hello", "predict_batch"]
+    assert len({request["request_id"] for request in client.requests}) == 3
+
+
+def test_frozen_batch_smoke_rejects_present_wrong_response_command():
+    module = _smoke_wrapper_module()
+    request = {"version": 1, "request_id": "batch", "command": "predict_batch"}
+
+    with pytest.raises(RuntimeError, match="id/command"):
+        module._validate_response(
+            {"ok": True, "request_id": "batch", "command": "predict", "items": []}, request, []
+        )
+
+
 def test_frozen_batch_smoke_reports_missing_orientation_classifier_clearly(tmp_path):
     module = _smoke_wrapper_module()
     package = _package_fixture(tmp_path / "package", edition="cpu")

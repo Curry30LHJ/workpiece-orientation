@@ -54,7 +54,8 @@ def batch_request(workpiece_id: str, image_paths: Iterable[Path | str], *, reque
 
 def validate_batch_response(response: dict[str, Any], request_id: str, image_paths: Iterable[Path | str]) -> list[str]:
     paths = [str(path) for path in image_paths]
-    if response.get("request_id") != request_id or response.get("command") != "predict_batch":
+    if (response.get("request_id") != request_id
+            or ("command" in response and response["command"] != "predict_batch")):
         raise RuntimeError("predict_batch response id/command mismatch")
     if response.get("ok") is not True:
         error = response.get("error")
@@ -102,12 +103,17 @@ def build_report(samples_ms: Iterable[float], warmup: int, iterations: int, work
     }
 
 
-def _validate_hello(response: dict[str, Any], request_id: str) -> None:
-    if response.get("request_id") != request_id or response.get("command") != "hello" or response.get("ok") is not True:
+def _validate_hello(response: dict[str, Any], request_id: str) -> bool:
+    if (response.get("request_id") != request_id
+            or ("command" in response and response["command"] != "hello")
+            or response.get("ok") is not True):
         raise RuntimeError("hello protocol validation failed")
+    if response.get("ready") is not True:
+        return False
     capabilities = response.get("capabilities")
-    if response.get("ready") is not True or not isinstance(capabilities, dict) or capabilities.get("predict_batch") is not True or capabilities.get("batch_ready") is not True:
+    if not isinstance(capabilities, dict) or capabilities.get("predict_batch") is not True or capabilities.get("batch_ready") is not True:
         raise RuntimeError("backend hello does not advertise ready predict_batch support")
+    return True
 
 
 def _cleanup(client: Any | None, process: Any | None) -> None:
@@ -131,7 +137,8 @@ def _cleanup(client: Any | None, process: Any | None) -> None:
 
 
 def run_batch_measurements(client: Any, process: Any, workpiece_id: str, image_paths: Iterable[Path | str], *,
-                           warmup: int, iterations: int) -> tuple[list[float], list[str], dict[str, Any]]:
+                           warmup: int, iterations: int,
+                           startup_timeout_seconds: float = 600.0) -> tuple[list[float], list[str], dict[str, Any]]:
     """Use one connected client for hello, warmups, and measured batches."""
     paths = list(image_paths)
     if warmup < 0 or iterations <= 0:
@@ -139,8 +146,19 @@ def run_batch_measurements(client: Any, process: Any, workpiece_id: str, image_p
     last_response: dict[str, Any] = {}
     measured_labels: list[str] = []
     try:
-        hello_id = str(uuid.uuid4())
-        _validate_hello(client.request({"version": 1, "request_id": hello_id, "command": "hello"}), hello_id)
+        deadline = time.monotonic() + startup_timeout_seconds
+        while True:
+            hello_id = str(uuid.uuid4())
+            hello = client.request({"version": 1, "request_id": hello_id, "command": "hello"})
+            if _validate_hello(hello, hello_id):
+                break
+            if hello.get("status") != "loading":
+                raise RuntimeError(f"backend hello is neither ready nor loading: {hello}")
+            if process.poll() is not None:
+                raise RuntimeError("packaged backend exited during hello handshake")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for ready backend hello")
+            time.sleep(0.1)
         for _ in range(warmup):
             payload = batch_request(workpiece_id, paths)
             last_response = client.request(payload)

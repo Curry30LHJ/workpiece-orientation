@@ -45,8 +45,9 @@ class _JsonClient:
         self.sock.close()
 
 
-def _validate_response(response: dict[str, Any], request: dict[str, Any], paths: list[str] | None = None) -> list[str | None]:
-    if response.get("request_id") != request["request_id"] or response.get("command") != request["command"]:
+def _validate_response(response: dict[str, Any], request: dict[str, Any], paths: list[str] | None = None) -> list[str]:
+    if (response.get("request_id") != request["request_id"]
+            or ("command" in response and response["command"] != request["command"])):
         raise RuntimeError("frozen batch smoke response id/command mismatch")
     if response.get("ok") is not True:
         raise RuntimeError(f"{request['command']} failed: {response.get('error')}")
@@ -76,7 +77,8 @@ def _validate_response(response: dict[str, Any], request: dict[str, Any], paths:
 def run_frozen_batch_smoke(package_root: Path, workpiece_id: str, image_paths: list[Path] | list[str], *,
                            process_factory: Callable[..., Any] = _real_process_factory,
                            client_factory: Callable[[str, int], Any] | None = None,
-                           temp_dir_factory: Callable[[], Path] | None = None) -> dict[str, Any]:
+                           temp_dir_factory: Callable[[], Path] | None = None,
+                           startup_timeout_seconds: float = 30.0) -> dict[str, Any]:
     """Launch a frozen backend from another CWD and validate one ordered batch.
 
     The temporary CWD is owned by this function; the supplied package is never
@@ -113,8 +115,24 @@ def run_frozen_batch_smoke(package_root: Path, workpiece_id: str, image_paths: l
                 if time.monotonic() >= deadline:
                     raise TimeoutError("timed out waiting for frozen backend")
                 time.sleep(0.1)
-        hello = {"version": 1, "request_id": str(uuid.uuid4()), "command": "hello"}
-        _validate_response(client.request(hello), hello)
+        hello_deadline = time.monotonic() + startup_timeout_seconds
+        while True:
+            hello = {"version": 1, "request_id": str(uuid.uuid4()), "command": "hello"}
+            hello_response = client.request(hello)
+            if (hello_response.get("request_id") != hello["request_id"]
+                    or ("command" in hello_response and hello_response["command"] != "hello")
+                    or hello_response.get("ok") is not True):
+                raise RuntimeError("frozen batch smoke response id/command mismatch")
+            if hello_response.get("ready") is True:
+                _validate_response(hello_response, hello)
+                break
+            if hello_response.get("status") != "loading":
+                raise RuntimeError(f"frozen backend hello is neither ready nor loading: {hello_response}")
+            if process.poll() is not None:
+                raise RuntimeError("frozen backend exited during hello handshake")
+            if time.monotonic() >= hello_deadline:
+                raise TimeoutError("timed out waiting for frozen backend hello")
+            time.sleep(0.1)
         batch = {"version": 1, "request_id": str(uuid.uuid4()), "command": "predict_batch",
                  "workpiece_id": workpiece_id, "image_paths": paths}
         labels = _validate_response(client.request(batch), batch, paths)
