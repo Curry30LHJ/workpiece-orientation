@@ -76,13 +76,68 @@ def test_frozen_batch_smoke_reports_missing_orientation_classifier_clearly(tmp_p
         def wait(self, timeout=None): return self.returncode
         def terminate(self): pass
 
-    with pytest.raises(RuntimeError, match="frozen backend archive missing modules.*src.orientation_classifier"):
+    with pytest.raises(RuntimeError, match="frozen backend archive .*missing modules.*src.orientation_classifier"):
         module.run_frozen_batch_smoke(
             package, "wp-1", images,
             process_factory=lambda args, cwd: Process(),
             client_factory=lambda host, port: (_ for _ in ()).throw(OSError("unavailable")),
             temp_dir_factory=lambda: tmp_path / "different cwd",
         )
+
+
+@pytest.mark.parametrize("prediction", [None, {"label": ""}])
+def test_frozen_batch_smoke_rejects_malformed_success_prediction(prediction):
+    module = _smoke_wrapper_module()
+    request = {"version": 1, "request_id": "batch", "command": "predict_batch"}
+    paths = [f"{index}.png" for index in range(5)]
+    response = {"ok": True, "request_id": "batch", "command": "predict_batch", "items": [
+        {"index": index, "image_path": path, "ok": True,
+         "prediction": prediction if index == 0 else {"label": "front"}}
+        for index, path in enumerate(paths)
+    ]}
+
+    with pytest.raises(RuntimeError, match="prediction.*non-empty label|prediction must be an object"):
+        module._validate_response(response, request, paths)
+
+
+def test_frozen_batch_smoke_cleanup_reaps_timeout_and_removes_cwd_despite_client_close_error(tmp_path):
+    module = _smoke_wrapper_module()
+    package = _package_fixture(tmp_path / "package", edition="cpu")
+    from release_tools.backend_bundle import production_src_modules
+    (package / "backend" / "orientation_backend.exe").write_bytes("\n".join(production_src_modules()).encode())
+    work_dir = tmp_path / "owned smoke cwd"
+    events = []
+
+    class Process:
+        def poll(self): return None
+        def terminate(self): events.append("terminate")
+        def wait(self, timeout=None):
+            events.append(f"wait:{timeout}")
+            if events.count(f"wait:{timeout}") == 1:
+                raise subprocess.TimeoutExpired("backend", timeout)
+        def kill(self): events.append("kill")
+
+    class Client:
+        def request(self, payload):
+            if payload["command"] == "hello":
+                return {"ok": True, "request_id": payload["request_id"], "command": "hello", "ready": True,
+                        "capabilities": {"predict_batch": True, "batch_ready": True}}
+            return {"ok": True, "request_id": payload["request_id"], "command": "predict_batch", "items": [
+                {"index": index, "image_path": str(index), "ok": True, "prediction": {"label": "front"}}
+                for index in range(5)
+            ]}
+        def close(self):
+            events.append("close")
+            raise OSError("close failed")
+
+    module.run_frozen_batch_smoke(
+        package, "wp", [str(index) for index in range(5)],
+        process_factory=lambda args, cwd: Process(), client_factory=lambda host, port: Client(),
+        temp_dir_factory=lambda: work_dir,
+    )
+
+    assert events == ["close", "terminate", "wait:10", "kill", "wait:10"]
+    assert not work_dir.exists()
 
 
 def test_json_socket_applies_configured_read_timeout():

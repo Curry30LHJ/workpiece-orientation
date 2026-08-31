@@ -192,6 +192,38 @@ def test_batch_benchmark_cleanup_kills_after_terminate_timeout_and_keeps_origina
     assert closed == ["socket", "terminate", "wait:10", "kill", "wait:10"]
 
 
+def test_batch_benchmark_launch_passes_port_and_dedicated_environment_without_mutating_parent(monkeypatch, tmp_path):
+    module = _batch_benchmark_module()
+    import release_tools.portable_smoke as portable_smoke
+    captured = {}
+    monkeypatch.setenv("WORKPIECE_BATCH_WORKERS", "parent-workers")
+
+    monkeypatch.setattr(portable_smoke, "_package_config", lambda root: {"compute_device": "cpu"})
+    monkeypatch.setattr(module, "_free_port", lambda: 45678)
+
+    class Process:
+        pass
+
+    def fake_popen(args, **kwargs):
+        captured["environment"] = kwargs["env"]
+        return Process()
+
+    def fake_start(root, config, port, factory):
+        captured.update(root=root, config=config, port=port)
+        return factory(["backend.exe"], str(root), "token")
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(portable_smoke, "_start_backend", fake_start)
+
+    process, port = module._launch(tmp_path, workers=2, threads_per_worker=2)
+
+    assert isinstance(process, Process)
+    assert port == captured["port"] == 45678
+    assert captured["environment"]["WORKPIECE_BATCH_WORKERS"] == "2"
+    assert captured["environment"]["WORKPIECE_BATCH_THREADS_PER_WORKER"] == "2"
+    assert module.os.environ["WORKPIECE_BATCH_WORKERS"] == "parent-workers"
+
+
 def _write_image(path: Path, value: int) -> tuple[int, int, str, int]:
     path.parent.mkdir(parents=True, exist_ok=True)
     image = np.full((8, 9, 3), value, dtype=np.uint8)

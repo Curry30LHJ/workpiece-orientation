@@ -64,7 +64,12 @@ def _validate_response(response: dict[str, Any], request: dict[str, Any], paths:
         if not isinstance(item, dict) or item.get("index") != index or item.get("image_path") != path or item.get("ok") is not True:
             raise RuntimeError("frozen batch smoke received unordered or failed batch item")
         prediction = item.get("prediction")
-        labels.append(prediction.get("label") if isinstance(prediction, dict) else None)
+        if not isinstance(prediction, dict):
+            raise RuntimeError("frozen batch smoke item prediction must be an object")
+        label = prediction.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise RuntimeError("frozen batch smoke item prediction must contain a non-empty label")
+        labels.append(label)
     return labels
 
 
@@ -82,7 +87,7 @@ def run_frozen_batch_smoke(package_root: Path, workpiece_id: str, image_paths: l
     if len(paths) != 5:
         raise ValueError("frozen batch smoke requires exactly 5 image paths")
     config = _package_config(package)
-    assert_frozen_backend_modules((package / config["backend_executable"]).parent)
+    assert_frozen_backend_modules(package / config["backend_executable"])
     work_dir = Path(temp_dir_factory() if temp_dir_factory else package.parent / f".frozen-batch-smoke-{uuid.uuid4().hex}")
     if work_dir.exists():
         raise FileExistsError(f"temporary smoke CWD already exists: {work_dir}")

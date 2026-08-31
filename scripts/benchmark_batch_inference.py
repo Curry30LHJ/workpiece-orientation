@@ -232,7 +232,7 @@ def _launch(package_root: Path, workers: int, threads_per_worker: int) -> tuple[
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         return subprocess.Popen(args, **kwargs)
 
-    return _start_backend(package_root, config, start_with_environment), port
+    return _start_backend(package_root, config, port, start_with_environment), port
 
 
 def main() -> int:

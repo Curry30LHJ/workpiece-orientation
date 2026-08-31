@@ -84,7 +84,7 @@ def production_src_modules() -> tuple[str, ...]:
     return _PRODUCTION_SRC_MODULES
 
 
-def assert_frozen_backend_modules(backend_dir: Path) -> None:
+def assert_frozen_backend_modules(backend_target: Path) -> None:
     """Assert that the generated PyInstaller archive contains project modules.
 
     PyInstaller's PYZ/PKG archives are not ordinary ZIP files.  The archive
@@ -92,8 +92,11 @@ def assert_frozen_backend_modules(backend_dir: Path) -> None:
     bytes are also accepted to keep this validation usable in CI fixtures.
     """
 
-    root = Path(backend_dir)
-    archives = [*root.rglob("*.pyz"), *root.rglob("*.pkg"), *root.rglob("*.exe")]
+    root = Path(backend_target)
+    if root.is_file():
+        archives = [root]
+    else:
+        archives = [*root.rglob("*.pyz"), *root.rglob("*.pkg"), *root.rglob("*.exe")]
     if not archives:
         raise RuntimeError(f"no generated PYZ/PKG archive found under {root}")
     listing = bytearray()
@@ -103,11 +106,16 @@ def assert_frozen_backend_modules(backend_dir: Path) -> None:
             result = subprocess.run(
                 [viewer, "--list", str(archive)], capture_output=True, text=True, check=False
             )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"unable to inspect frozen backend archive {archive}: "
+                    f"pyi-archive_viewer exited with {result.returncode}"
+                )
             listing.extend(result.stdout.encode("utf-8", "replace"))
         listing.extend(archive.read_bytes())
     missing = [module for module in production_src_modules() if module.encode() not in listing]
     if missing:
-        raise RuntimeError("frozen backend archive missing modules: " + ", ".join(missing))
+        raise RuntimeError(f"frozen backend archive {root} missing modules: " + ", ".join(missing))
 
 
 def edition_for(name: str) -> BundleEdition:

@@ -7,6 +7,7 @@ import pytest
 from release_tools.backend_bundle import (
     BundleEnvironmentError,
     edition_for,
+    production_src_modules,
     pyinstaller_excludes,
     validate_installed_distributions,
 )
@@ -51,6 +52,26 @@ def test_frozen_backend_archive_reports_missing_production_modules(tmp_path: Pat
 
     with pytest.raises(RuntimeError, match="missing modules"):
         assert_frozen_backend_modules(tmp_path)
+
+
+def test_frozen_backend_exact_target_cannot_be_masked_by_sibling_archive(tmp_path: Path):
+    from release_tools.backend_bundle import assert_frozen_backend_modules
+
+    target = tmp_path / "orientation_backend.exe"
+    target.write_bytes(b"src.orientation_tcp_service")
+    (tmp_path / "decoy.pyz").write_bytes("\n".join(production_src_modules()).encode())
+
+    with pytest.raises(RuntimeError, match="orientation_backend.exe.*src.orientation_classifier"):
+        assert_frozen_backend_modules(target)
+
+
+def test_frozen_backend_exact_target_accepts_all_production_modules(tmp_path: Path):
+    from release_tools.backend_bundle import assert_frozen_backend_modules
+
+    target = tmp_path / "orientation_backend.exe"
+    target.write_bytes("\n".join(production_src_modules()).encode())
+
+    assert_frozen_backend_modules(target) is None
 
 
 def _packages(edition: str = "gpu") -> dict[str, str]:
