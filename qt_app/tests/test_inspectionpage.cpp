@@ -1102,6 +1102,148 @@ private slots:
                                 .arg(view->viewport()->width())
                                 .arg(view->viewport()->height())));
     }
+
+    void capableBatchEmitsOneOrderedRequestAndMapsItemsByIndex() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{writeImage(directory, QStringLiteral("batch-0.png")),
+                                writeImage(directory, QStringLiteral("batch-1.png")),
+                                writeImage(directory, QStringLiteral("batch-2.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        QSignalSpy commandSpy(&page, &InspectionPage::commandRequested);
+
+        page.setBatchPredictionCapabilities(true, true, 3);
+        page.beginBatch(paths, QStringLiteral("m1"));
+
+        QCOMPARE(commandSpy.count(), 1);
+        QCOMPARE(commandSpy.first().at(0).toString(), QStringLiteral("predict_batch"));
+        const QJsonArray requestedPaths = commandSpy.first().at(1).toJsonObject()
+                                              .value(QStringLiteral("image_paths")).toArray();
+        QCOMPARE(requestedPaths.size(), paths.size());
+        for (int index = 0; index < paths.size(); ++index) {
+            QCOMPARE(requestedPaths.at(index).toString(), paths.at(index));
+        }
+
+        page.handleBackendResponse(QStringLiteral("predict_batch"), QJsonObject{
+            {QStringLiteral("items"), QJsonArray{
+                QJsonObject{{QStringLiteral("index"), 2}, {QStringLiteral("ok"), true},
+                            {QStringLiteral("prediction"), predictionResponse(QStringLiteral("back"))}},
+                QJsonObject{{QStringLiteral("index"), 0}, {QStringLiteral("ok"), true},
+                            {QStringLiteral("prediction"), predictionResponse(QStringLiteral("front"))}},
+                QJsonObject{{QStringLiteral("index"), 1}, {QStringLiteral("ok"), true},
+                            {QStringLiteral("prediction"), predictionResponse(QStringLiteral("back"))}}}},
+            {QStringLiteral("batch_timings_ms"), QJsonObject{{QStringLiteral("total"), 37.5}}},
+            {QStringLiteral("worker_count"), 3}, {QStringLiteral("fallback"), QString()}});
+
+        const QStringList ids = page.batchRecordIds();
+        QCOMPARE(page.recordForId(ids.at(0)).label, QStringLiteral("front"));
+        QCOMPARE(page.recordForId(ids.at(1)).label, QStringLiteral("back"));
+        QCOMPARE(page.completedBatchCount(), 3);
+        auto *table = page.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QVERIFY(table != nullptr);
+        table->setCurrentCell(1, 0);
+        QCOMPARE(page.findChild<QLabel *>(QStringLiteral("currentImageLabel"))->text(),
+                 QStringLiteral("batch-1.png"));
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text()
+                    .contains(QStringLiteral("37.5")));
+    }
+
+    void batchItemErrorStaysVisibleWithoutCorruptingOtherRows() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{writeImage(directory, QStringLiteral("good.png")),
+                                writeImage(directory, QStringLiteral("bad.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        page.setBatchPredictionCapabilities(true, true, 2);
+        page.beginBatch(paths, QStringLiteral("m1"));
+
+        page.handleBackendResponse(QStringLiteral("predict_batch"), QJsonObject{
+            {QStringLiteral("items"), QJsonArray{
+                QJsonObject{{QStringLiteral("index"), 0}, {QStringLiteral("ok"), true},
+                            {QStringLiteral("prediction"), predictionResponse(QStringLiteral("front"))}},
+                QJsonObject{{QStringLiteral("index"), 1}, {QStringLiteral("ok"), false},
+                            {QStringLiteral("error"), QJsonObject{{QStringLiteral("code"), QStringLiteral("BAD_IMAGE")},
+                                                                     {QStringLiteral("message"), QStringLiteral("cannot decode")}}}}}}});
+
+        const QStringList ids = page.batchRecordIds();
+        QCOMPARE(page.recordForId(ids.at(0)).label, QStringLiteral("front"));
+        QVERIFY(page.recordForId(ids.at(1)).error.contains(QStringLiteral("cannot decode")));
+        QCOMPARE(page.failedBatchCount(), 1);
+    }
+
+    void malformedBatchEnvelopeFailsAllRowsVisibly() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{writeImage(directory, QStringLiteral("one.png")),
+                                writeImage(directory, QStringLiteral("two.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        page.setBatchPredictionCapabilities(true, true, 2);
+        page.beginBatch(paths, QStringLiteral("m1"));
+
+        page.handleBackendResponse(QStringLiteral("predict_batch"), QJsonObject{
+            {QStringLiteral("items"), QJsonArray{QJsonObject{
+                {QStringLiteral("index"), 0}, {QStringLiteral("ok"), true},
+                {QStringLiteral("prediction"), predictionResponse(QStringLiteral("front"))}}}}});
+
+        QCOMPARE(page.failedBatchCount(), 2);
+        QVERIFY(!page.batchRunning());
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text()
+                    .contains(QStringLiteral("失败 2")));
+    }
+
+    void failedBatchBeforeItemsFallsBackOnceToScalarPrediction() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{writeImage(directory, QStringLiteral("fallback-0.png")),
+                                writeImage(directory, QStringLiteral("fallback-1.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        QSignalSpy commandSpy(&page, &InspectionPage::commandRequested);
+        page.setBatchPredictionCapabilities(true, true, 2);
+        page.beginBatch(paths, QStringLiteral("m1"));
+        QCOMPARE(commandSpy.count(), 1);
+
+        page.handleBackendFailure(QStringLiteral("predict_batch"),
+                                  QStringLiteral("MODEL_ERROR"),
+                                  QStringLiteral("batch unavailable"));
+
+        QCOMPARE(commandSpy.count(), 2);
+        QCOMPARE(commandSpy.at(1).at(0).toString(), QStringLiteral("predict"));
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text()
+                    .contains(QStringLiteral("batch unavailable")));
+        page.handleBackendResponse(QStringLiteral("predict"),
+                                   predictionResponse(QStringLiteral("front")));
+        page.handleBackendFailure(QStringLiteral("predict_batch"),
+                                  QStringLiteral("MODEL_ERROR"), QStringLiteral("late failure"));
+        QCOMPARE(commandSpy.count(), 3);
+    }
+
+    void acceptedBatchItemsDoNotRestartScalarProcessingAfterLateFailure() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{writeImage(directory, QStringLiteral("accepted-0.png")),
+                                writeImage(directory, QStringLiteral("accepted-1.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        QSignalSpy commandSpy(&page, &InspectionPage::commandRequested);
+        page.setBatchPredictionCapabilities(true, true, 2);
+        page.beginBatch(paths, QStringLiteral("m1"));
+
+        page.handleBackendResponse(QStringLiteral("predict_batch"), QJsonObject{
+            {QStringLiteral("items"), QJsonArray{
+                QJsonObject{{QStringLiteral("index"), 0}, {QStringLiteral("ok"), true},
+                            {QStringLiteral("prediction"), predictionResponse(QStringLiteral("front"))}},
+                QJsonObject{{QStringLiteral("index"), 1}, {QStringLiteral("ok"), true},
+                            {QStringLiteral("prediction"), predictionResponse(QStringLiteral("back"))}}}}});
+        page.handleBackendFailure(QStringLiteral("predict_batch"),
+                                  QStringLiteral("MODEL_ERROR"), QStringLiteral("late failure"));
+
+        QCOMPARE(commandSpy.count(), 1);
+        QCOMPARE(page.completedBatchCount(), 2);
+    }
 };
 
 QTEST_MAIN(TestInspectionPage)

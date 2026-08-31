@@ -508,11 +508,16 @@ public:
     bool listen() { return server_.listen(QHostAddress::LocalHost, 0); }
     quint16 port() const { return server_.serverPort(); }
     int predictionCount() const { return predictionCount_; }
+    int batchRequestCount() const { return batchRequestCount_; }
+    QStringList lastBatchPaths() const { return lastBatchPaths_; }
     int confirmationCount() const { return confirmationCount_; }
     int listWorkpieceCount() const { return listWorkpieceCount_; }
     int recycleCount() const { return recycleCount_; }
     QList<QJsonObject> requests() const { return requests_; }
     void setReviewRows(const QSet<int> &rows) { reviewRows_ = rows; }
+    void setBatchCapabilities(bool enabled) { batchCapabilities_ = enabled; }
+    void setBatchErrorRows(const QSet<int> &rows) { batchErrorRows_ = rows; }
+    void failNextBatchRequest() { failNextBatchRequest_ = true; }
     void setHoldPredictions(bool hold) { holdPredictions_ = hold; }
     void setHoldConfirmations(bool hold) { holdConfirmations_ = hold; }
     void setHoldWorkpieceResponses(bool hold) { holdWorkpieceResponses_ = hold; }
@@ -551,10 +556,17 @@ private slots:
             const QString command = request.value(QStringLiteral("command")).toString();
             const QString requestId = request.value(QStringLiteral("request_id")).toString();
             if (command == QStringLiteral("hello")) {
-                send({{"version", 1}, {"request_id", requestId}, {"ok", true},
+                QJsonObject hello{{"version", 1}, {"request_id", requestId}, {"ok", true},
                       {"service", "workpiece-orientation"}, {"ready", true},
                       {"package_version", "dev"}, {"edition", "dev"},
-                      {"compute_device", "gpu"}, {"model_fingerprint", ""}});
+                      {"compute_device", "gpu"}, {"model_fingerprint", ""}};
+                if (batchCapabilities_) {
+                    hello.insert(QStringLiteral("capabilities"), QJsonObject{
+                        {QStringLiteral("predict_batch"), true},
+                        {QStringLiteral("batch_ready"), true},
+                        {QStringLiteral("batch_workers"), 3}});
+                }
+                send(hello);
             } else if (command == QStringLiteral("list_workpieces")) {
                 ++listWorkpieceCount_;
                 if (holdWorkpieceResponses_) {
@@ -586,6 +598,40 @@ private slots:
                 } else {
                     sendPrediction(requestId, predictionCount_);
                 }
+            } else if (command == QStringLiteral("predict_batch")) {
+                ++batchRequestCount_;
+                lastBatchPaths_.clear();
+                const QJsonArray paths = request.value(QStringLiteral("image_paths")).toArray();
+                for (const QJsonValue &path : paths) lastBatchPaths_.append(path.toString());
+                if (failNextBatchRequest_) {
+                    failNextBatchRequest_ = false;
+                    send({{"version", 1}, {"request_id", requestId}, {"ok", false},
+                          {"error", QJsonObject{{"code", "BATCH_FAILED"},
+                                                {"message", "batch failed"}}}});
+                    continue;
+                }
+                QJsonArray items;
+                for (int index = paths.size() - 1; index >= 0; --index) {
+                    if (batchErrorRows_.contains(index)) {
+                        items.append(QJsonObject{{"index", index}, {"ok", false},
+                                                 {"error", QJsonObject{{"code", "BAD_IMAGE"},
+                                                                       {"message", "cannot decode"}}}});
+                        continue;
+                    }
+                    const int oneBasedIndex = index + 1;
+                    const double frontScore = 0.95 - 0.10 * oneBasedIndex;
+                    items.append(QJsonObject{{"index", index}, {"ok", true},
+                        {"prediction", QJsonObject{{"label", oneBasedIndex % 2 == 0 ? "back" : "front"},
+                            {"global_scores", QJsonObject{{"front", frontScore}, {"back", 1.0 - frontScore}}},
+                            {"global_margin", qAbs(frontScore - (1.0 - frontScore))},
+                            {"local_prediction", "front"},
+                            {"local_scores", QJsonObject{{"front", 8.0 + oneBasedIndex}, {"back", 1.0}}},
+                            {"local_margin", 7.0 + oneBasedIndex}, {"decision_source", "global"},
+                            {"needs_review", reviewRows_.contains(index)}, {"elapsed_ms", 12.5 + oneBasedIndex}}}});
+                }
+                send({{"version", 1}, {"request_id", requestId}, {"ok", true},
+                      {"items", items}, {"batch_timings_ms", QJsonObject{{"total", 42.0}}},
+                      {"worker_count", 3}, {"fallback", QString()}});
             } else if (command == QStringLiteral("submit_confirmation")) {
                 ++confirmationCount_;
                 if (holdConfirmations_) {
@@ -643,17 +689,22 @@ private:
     QList<QJsonObject> requests_;
     QQueue<PendingPrediction> pendingPredictions_;
     QSet<int> reviewRows_;
+    QSet<int> batchErrorRows_;
     bool holdPredictions_ = false;
     bool holdConfirmations_ = false;
     bool holdWorkpieceResponses_ = false;
     bool failNextWorkpieceRefresh_ = false;
     bool failNextConfirmation_ = false;
     bool failNextConfirmationJob_ = false;
+    bool batchCapabilities_ = false;
+    bool failNextBatchRequest_ = false;
     int failedPredictionRow_ = -1;
     int predictionCount_ = 0;
+    int batchRequestCount_ = 0;
     int confirmationCount_ = 0;
     int listWorkpieceCount_ = 0;
     int recycleCount_ = 0;
+    QStringList lastBatchPaths_;
 };
 
 class GeometryWorkflowServer : public QObject {
@@ -3160,6 +3211,53 @@ private slots:
         emit client.commandFailed(QStringLiteral("predict"), QStringLiteral("MODEL_ERROR"),
                                   QStringLiteral("synthetic failure"));
         QCOMPARE(table->rowCount(), 3);
+    }
+
+    void capableBackendUsesOneOrderedBatchRequestAndKeepsPartialErrorsVisible() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setBatchCapabilities(true);
+        server.setBatchErrorRows(QSet<int>{1});
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        QTemporaryDir dir;
+        const QStringList paths = writeImages(dir, QStringLiteral("parallel"), 3);
+
+        startBatch(server, client, window, paths);
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.batchRequestCount(), 1, 1000);
+        QCOMPARE(server.lastBatchPaths(), paths);
+        QCOMPARE(server.predictionCount(), 0);
+        waitForBatchCompletion(window, 3);
+        auto *table = window.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QVERIFY(table != nullptr);
+        QCOMPARE(table->item(0, 1)->text(), QStringLiteral("正面"));
+        QCOMPARE(table->item(1, 4)->text(), QStringLiteral("预测失败"));
+        table->setCurrentCell(2, 0);
+        QTRY_VERIFY(window.findChild<QLabel *>(QStringLiteral("currentImageLabel"))
+                        ->text().contains(QStringLiteral("parallel-2.png")));
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text()
+                    .contains(QStringLiteral("42.0")));
+    }
+
+    void failedBatchRequestFallsBackToScalarOnlyBeforeRowsAreAccepted() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setBatchCapabilities(true);
+        server.failNextBatchRequest();
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        QTemporaryDir dir;
+        const QStringList paths = writeImages(dir, QStringLiteral("fallback"), 2);
+
+        startBatch(server, client, window, paths);
+
+        QTRY_COMPARE_WITH_TIMEOUT(server.batchRequestCount(), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), 2, 1000);
+        waitForBatchCompletion(window, 2);
+        QCOMPARE(server.batchRequestCount(), 1);
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text()
+                    .contains(QStringLiteral("batch failed")));
     }
 
     void selectingBatchRowShowsItsImageAndEvidence() {

@@ -735,7 +735,8 @@ void MainWindow::dispatchQueuedCommand() {
         for (int index = 0; index < queuedMutationCommands_.size(); ++index) {
             const QueuedCommandIntent &candidate = queuedMutationCommands_.at(index);
             if (candidate.owner == CommandOwner::Inspection
-                && candidate.command == QStringLiteral("predict")) {
+                && (candidate.command == QStringLiteral("predict")
+                    || candidate.command == QStringLiteral("predict_batch"))) {
                 issuePageCommand(queuedMutationCommands_.takeAt(index));
                 return;
             }
@@ -1516,6 +1517,11 @@ void MainWindow::onBackendReady() {
     backendReady_ = true;
     backendEverReady_ = true;
     clientBusy_ = false;
+    if (inspectionPage_ != nullptr && client_ != nullptr) {
+        inspectionPage_->setBatchPredictionCapabilities(
+            client_->supportsBatchPrediction(), client_->batchPredictionReady(),
+            client_->batchWorkerCount());
+    }
     if (geometryRulesPage_ != nullptr) {
         geometryRulesPage_->setBackendAvailable(true, QString());
         geometryRulesPage_->setBusy(false);
@@ -1834,7 +1840,8 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
     const quint64 responseRefreshTransactionId = pendingRefreshTransactionId_;
     const bool responseIncludedMandatoryRefresh = pendingRefreshIncludesMandatory_;
     clearPendingCommand();
-    if (batchInFlight_ && command == QStringLiteral("predict")) {
+    if (batchInFlight_ && (command == QStringLiteral("predict")
+                           || command == QStringLiteral("predict_batch"))) {
         inspectionPage_->handleBackendResponse(command, response);
         return;
     }
@@ -2120,7 +2127,8 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         workpieceLibraryPage_->handleBackendFailure(failedCommand, code, message);
         return;
     }
-    if (batchInFlight_ && failedCommand == QStringLiteral("predict")
+    if (batchInFlight_ && (failedCommand == QStringLiteral("predict")
+                           || failedCommand == QStringLiteral("predict_batch"))
         && matchesOwner(CommandOwner::Inspection)) {
         inspectionPage_->handleBackendFailure(failedCommand, code, message);
         updateButtonStates();

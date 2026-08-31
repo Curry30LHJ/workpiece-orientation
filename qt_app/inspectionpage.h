@@ -25,6 +25,7 @@ public:
     InspectionUiState uiState() const;
     void setCurrentWorkpiece(const QString &id, const QString &name);
     void setBackendAvailable(bool available, bool busy, const QString &reason);
+    void setBatchPredictionCapabilities(bool supported, bool ready, int workers);
     void setSingleImagePath(const QString &path);
     void clearBatchState();
     void beginBatch(const QStringList &paths, const QString &workpieceId);
@@ -74,6 +75,8 @@ private:
     const ModeState &activeState() const;
     void requestPrediction();
     void requestNextBatchPrediction();
+    void requestBatchPrediction();
+    void failBatchProtocol(const QString &message);
     void finishBatch(bool stopped);
     void requestConfirmation(const QString &orientation);
     void rejectCurrentRecord();
@@ -118,6 +121,15 @@ private:
     QHash<QString, InspectionRecord> batchRecords_;
     QStringList batchRecordOrder_;
     QString currentBatchRequestId_;
+    bool batchRequestInFlight_ = false;
+    bool batchFallbackToScalar_ = false;
+    bool batchItemsAccepted_ = false;
+    QString batchFallbackReason_;
+    double batchElapsedMs_ = 0.0;
+    int batchWorkerCount_ = 0;
+    bool batchPredictionSupported_ = false;
+    bool batchPredictionReady_ = false;
+    int batchPredictionWorkers_ = 0;
     QString selectedRecordId_;
     QString batchWorkpieceId_;
     BatchFilter batchFilter_ = BatchFilter::All;

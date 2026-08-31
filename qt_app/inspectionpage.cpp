@@ -19,6 +19,9 @@
 #include <QUuid>
 #include <QWheelEvent>
 
+#include <cmath>
+#include <limits>
+
 #include "inspectionimageview.h"
 
 namespace {
@@ -217,9 +220,20 @@ void InspectionPage::setBackendAvailable(bool available, bool busy, const QStrin
     backendReason_ = reason;
     renderActiveState();
     if (available && !busy && batchRunning_ && currentBatchRequestId_.isEmpty()
+        && !batchRequestInFlight_
         && !stopRequested_ && batchCursor_ < batchRecordOrder_.size()) {
-        requestNextBatchPrediction();
+        if (batchPredictionReady_ && !batchFallbackToScalar_) {
+            requestBatchPrediction();
+        } else {
+            requestNextBatchPrediction();
+        }
     }
+}
+
+void InspectionPage::setBatchPredictionCapabilities(bool supported, bool ready, int workers) {
+    batchPredictionSupported_ = supported;
+    batchPredictionReady_ = supported && ready;
+    batchPredictionWorkers_ = batchPredictionReady_ && workers > 0 ? workers : 0;
 }
 
 void InspectionPage::setSingleImagePath(const QString &path) {
@@ -238,6 +252,12 @@ void InspectionPage::clearBatchState() {
     batchRecords_.clear();
     batchRecordOrder_.clear();
     currentBatchRequestId_.clear();
+    batchRequestInFlight_ = false;
+    batchFallbackToScalar_ = false;
+    batchItemsAccepted_ = false;
+    batchFallbackReason_.clear();
+    batchElapsedMs_ = 0.0;
+    batchWorkerCount_ = 0;
     selectedRecordId_.clear();
     batchWorkpieceId_.clear();
     batchFilter_ = BatchFilter::All;
@@ -293,7 +313,13 @@ void InspectionPage::beginBatch(const QStringList &paths, const QString &workpie
     rebuildBatchTable();
     updateBatchSummary();
     renderActiveState();
-    if (batchRunning_) requestNextBatchPrediction();
+    if (batchRunning_) {
+        if (batchPredictionReady_) {
+            requestBatchPrediction();
+        } else {
+            requestNextBatchPrediction();
+        }
+    }
 }
 
 void InspectionPage::setBatchFilter(BatchFilter filter) {
@@ -325,7 +351,7 @@ InspectionRecord InspectionPage::recordForId(const QString &recordId) const {
 void InspectionPage::requestBatchStop() {
     if (!batchRunning_) return;
     stopRequested_ = true;
-    if (currentBatchRequestId_.isEmpty()) finishBatch(true);
+    if (currentBatchRequestId_.isEmpty() && !batchRequestInFlight_) finishBatch(true);
     updateActionAvailability();
 }
 
@@ -470,6 +496,96 @@ void InspectionPage::selectRecentRecord(const QString &recordId) {
 
 void InspectionPage::handleBackendResponse(const QString &command,
                                            const QJsonObject &response) {
+    if (command == QStringLiteral("predict_batch")) {
+        if (mode_ != InspectionMode::Batch || !batchRequestInFlight_) return;
+        const QJsonValue itemsValue = response.value(QStringLiteral("items"));
+        if (!itemsValue.isArray()) {
+            failBatchProtocol(QStringLiteral("批量协议错误：缺少 items 数组"));
+            return;
+        }
+        const QJsonArray items = itemsValue.toArray();
+        if (items.size() != batchRecordOrder_.size()) {
+            failBatchProtocol(QStringLiteral("批量协议错误：items 数量不匹配"));
+            return;
+        }
+        QSet<int> seenIndexes;
+        for (const QJsonValue &value : items) {
+            if (!value.isObject()) {
+                failBatchProtocol(QStringLiteral("批量协议错误：items 包含非对象"));
+                return;
+            }
+            const QJsonObject item = value.toObject();
+            const QJsonValue indexValue = item.value(QStringLiteral("index"));
+            const double numericIndex = indexValue.toDouble(std::numeric_limits<double>::quiet_NaN());
+            if (!indexValue.isDouble() || !std::isfinite(numericIndex)
+                || std::floor(numericIndex) != numericIndex || numericIndex < 0
+                || numericIndex >= batchRecordOrder_.size()
+                || !item.contains(QStringLiteral("ok"))
+                || !item.value(QStringLiteral("ok")).isBool()) {
+                failBatchProtocol(QStringLiteral("批量协议错误：items 索引或状态无效"));
+                return;
+            }
+            const int index = static_cast<int>(numericIndex);
+            if (seenIndexes.contains(index)) {
+                failBatchProtocol(QStringLiteral("批量协议错误：items 索引重复"));
+                return;
+            }
+            seenIndexes.insert(index);
+            if (item.value(QStringLiteral("ok")).toBool()) {
+                if (!item.value(QStringLiteral("prediction")).isObject()) {
+                    failBatchProtocol(QStringLiteral("批量协议错误：成功项缺少 prediction"));
+                    return;
+                }
+            } else {
+                const QJsonObject error = item.value(QStringLiteral("error")).toObject();
+                if (error.value(QStringLiteral("code")).toString().isEmpty()
+                    || error.value(QStringLiteral("message")).toString().isEmpty()) {
+                    failBatchProtocol(QStringLiteral("批量协议错误：失败项缺少错误信息"));
+                    return;
+                }
+            }
+        }
+
+        batchRequestInFlight_ = false;
+        batchItemsAccepted_ = true;
+        batchCursor_ = batchRecordOrder_.size();
+        batchElapsedMs_ = response.value(QStringLiteral("batch_timings_ms"))
+                              .toObject().value(QStringLiteral("total")).toDouble();
+        batchWorkerCount_ = response.value(QStringLiteral("worker_count")).toInt();
+        batchFallbackReason_ = response.value(QStringLiteral("fallback")).toString();
+        for (const QJsonValue &value : items) {
+            const QJsonObject item = value.toObject();
+            InspectionRecord *record = batchRecord(batchRecordOrder_.at(
+                item.value(QStringLiteral("index")).toInt()));
+            if (record == nullptr) continue;
+            record->completedAt = QDateTime::currentDateTime();
+            if (item.value(QStringLiteral("ok")).toBool()) {
+                const QJsonObject prediction = item.value(QStringLiteral("prediction")).toObject();
+                record->response = prediction;
+                record->label = prediction.value(QStringLiteral("label")).toString();
+                record->needsReview = prediction.value(QStringLiteral("needs_review")).toBool();
+                record->elapsedMs = prediction.value(QStringLiteral("elapsed_ms")).toDouble();
+                record->error.clear();
+                record->disposition = BatchDisposition::Pending;
+            } else {
+                const QJsonObject error = item.value(QStringLiteral("error")).toObject();
+                record->disposition = BatchDisposition::PredictionFailed;
+                record->error = error.value(QStringLiteral("message")).toString();
+            }
+        }
+        if (!selectedRecordId_.isEmpty()) {
+            const InspectionRecord *selected = batchRecord(selectedRecordId_);
+            if (selected != nullptr) {
+                batchState_.visibleRecord = *selected;
+                batchState_.hasRecord = selected->completedAt.isValid();
+            }
+        }
+        rebuildBatchTable();
+        updateBatchSummary();
+        renderActiveState();
+        finishBatch(stopRequested_);
+        return;
+    }
     if (command == QStringLiteral("predict")) {
         if (mode_ == InspectionMode::Batch && !currentBatchRequestId_.isEmpty()) {
             InspectionRecord *record = batchRecord(currentBatchRequestId_);
@@ -583,6 +699,20 @@ void InspectionPage::handleBackendFailure(const QString &command, const QString 
         renderActiveState();
         return;
     }
+    if (command == QStringLiteral("predict_batch")) {
+        if (mode_ != InspectionMode::Batch || !batchRequestInFlight_) return;
+        batchRequestInFlight_ = false;
+        if (!batchItemsAccepted_ && !batchFallbackToScalar_ && !stopRequested_) {
+            batchFallbackToScalar_ = true;
+            batchFallbackReason_ = QStringLiteral("批量请求失败，已切换兼容模式：%1").arg(message);
+            updateBatchSummary();
+            renderActiveState();
+            requestNextBatchPrediction();
+        } else {
+            failBatchProtocol(QStringLiteral("批量请求失败：%1").arg(message));
+        }
+        return;
+    }
     if (command == QStringLiteral("predict")) {
         if (mode_ == InspectionMode::Batch && !currentBatchRequestId_.isEmpty()) {
             InspectionRecord *record = batchRecord(currentBatchRequestId_);
@@ -645,7 +775,8 @@ void InspectionPage::requestPrediction() {
 }
 
 void InspectionPage::requestNextBatchPrediction() {
-    if (!batchRunning_ || stopRequested_ || !currentBatchRequestId_.isEmpty()) return;
+    if (!batchRunning_ || stopRequested_ || !currentBatchRequestId_.isEmpty()
+        || batchRequestInFlight_) return;
     if (batchCursor_ >= batchRecordOrder_.size()) {
         finishBatch(false);
         return;
@@ -662,18 +793,55 @@ void InspectionPage::requestNextBatchPrediction() {
     });
 }
 
+void InspectionPage::requestBatchPrediction() {
+    if (!batchRunning_ || stopRequested_ || batchRequestInFlight_
+        || !currentBatchRequestId_.isEmpty()) return;
+    QJsonArray imagePaths;
+    for (const QString &recordId : batchRecordOrder_) {
+        imagePaths.append(batchRecords_.value(recordId).imagePath);
+    }
+    batchRequestInFlight_ = true;
+    batchState_.uiState = InspectionUiState::Running;
+    batchState_.message = QStringLiteral("正在批量检测…");
+    updateBatchSummary();
+    emit commandRequested(QStringLiteral("predict_batch"), QJsonObject{
+        {QStringLiteral("workpiece_id"), batchWorkpieceId_},
+        {QStringLiteral("image_paths"), imagePaths},
+    });
+}
+
+void InspectionPage::failBatchProtocol(const QString &message) {
+    batchRequestInFlight_ = false;
+    currentBatchRequestId_.clear();
+    batchFallbackReason_ = message;
+    for (const QString &recordId : batchRecordOrder_) {
+        InspectionRecord *record = batchRecord(recordId);
+        if (record == nullptr || record->completedAt.isValid()) continue;
+        record->completedAt = QDateTime::currentDateTime();
+        record->disposition = BatchDisposition::PredictionFailed;
+        record->error = message;
+    }
+    batchState_.message = message;
+    rebuildBatchTable();
+    updateBatchSummary();
+    renderActiveState();
+    finishBatch(false);
+}
+
 void InspectionPage::finishBatch(bool stopped) {
     if (!batchRunning_) return;
     batchRunning_ = false;
     currentBatchRequestId_.clear();
-    batchSelectionPinned_ = false;
+    batchRequestInFlight_ = false;
+    const bool preserveSelection = batchSelectionPinned_;
     batchState_.uiState = failedBatchCount() > 0
         ? InspectionUiState::Failed : InspectionUiState::Completed;
     batchState_.message = stopped
         ? QStringLiteral("批量检测已停止")
         : (failedBatchCount() > 0 ? QStringLiteral("批量检测完成，存在失败记录")
                                   : QStringLiteral("批量检测完成"));
-    selectPreferredBatchRecord();
+    if (!preserveSelection) selectPreferredBatchRecord();
+    batchSelectionPinned_ = false;
     updateBatchSummary();
     renderActiveState();
     emit batchFinished(stopped);
@@ -892,6 +1060,17 @@ void InspectionPage::updateBatchSummary() {
     ui->batchSummaryLabel->setText(
         QStringLiteral("已处理 %1/%2，成功 %3，需复检 %4，失败 %5")
             .arg(completed).arg(total).arg(successful).arg(review).arg(failed));
+    QString execution;
+    if (batchElapsedMs_ > 0.0) {
+        execution += QStringLiteral("，批量耗时 %1 毫秒").arg(batchElapsedMs_, 0, 'f', 1);
+    }
+    if (batchWorkerCount_ > 0) {
+        execution += QStringLiteral("，工作线程 %1").arg(batchWorkerCount_);
+    }
+    if (!batchFallbackReason_.isEmpty()) {
+        execution += QStringLiteral("，%1").arg(batchFallbackReason_);
+    }
+    ui->batchSummaryLabel->setText(ui->batchSummaryLabel->text() + execution);
     ui->batchProgressBar->setRange(0, qMax(1, total));
     ui->batchProgressBar->setValue(completed);
 }
