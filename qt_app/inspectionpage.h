@@ -77,14 +77,15 @@ private:
     void requestNextBatchPrediction();
     void requestBatchPrediction();
     void failBatchProtocol(const QString &message);
-    void finishBatch(bool stopped);
+    void finishBatch(bool stopped, bool tableAlreadyRebuilt = false);
     void requestConfirmation(const QString &orientation);
     void rejectCurrentRecord();
     void storeRecentRecord(const InspectionRecord &record);
     void rebuildRecentList();
     void rebuildBatchTable();
     void selectBatchRecord(const QString &recordId, bool userInitiated);
-    void selectPreferredBatchRecord(const QString &afterRecordId = QString());
+    void selectPreferredBatchRecord(const QString &afterRecordId = QString(),
+                                    bool rebuildTable = true);
     InspectionRecord *batchRecord(const QString &recordId);
     const InspectionRecord *batchRecord(const QString &recordId) const;
     bool matchesFilter(const InspectionRecord &record) const;
@@ -127,6 +128,7 @@ private:
     QString batchFallbackReason_;
     double batchElapsedMs_ = 0.0;
     int batchWorkerCount_ = 0;
+    bool batchWorkerCountKnown_ = false;
     bool batchPredictionSupported_ = false;
     bool batchPredictionReady_ = false;
     int batchPredictionWorkers_ = 0;

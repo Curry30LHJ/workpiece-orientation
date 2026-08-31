@@ -1244,6 +1244,44 @@ private slots:
         QCOMPARE(commandSpy.count(), 1);
         QCOMPARE(page.completedBatchCount(), 2);
     }
+
+    void batchSummaryShowsReportedZeroWorkers() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(directory, QStringLiteral("serial-fallback.png"));
+        QVERIFY(!path.isEmpty());
+        InspectionPage page;
+        page.setBatchPredictionCapabilities(true, true, 2);
+        page.beginBatch({path}, QStringLiteral("m1"));
+
+        page.handleBackendResponse(QStringLiteral("predict_batch"), QJsonObject{
+            {QStringLiteral("items"), QJsonArray{QJsonObject{
+                {QStringLiteral("index"), 0}, {QStringLiteral("ok"), true},
+                {QStringLiteral("prediction"), predictionResponse(QStringLiteral("front"))}}}},
+            {QStringLiteral("worker_count"), 0}});
+
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text()
+                    .contains(QStringLiteral("工作线程 0")));
+    }
+
+    void malformedBatchResponseRebuildsRowsOnce() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QStringList paths{writeImage(directory, QStringLiteral("bad-0.png")),
+                                writeImage(directory, QStringLiteral("bad-1.png"))};
+        QVERIFY(!paths.contains(QString()));
+        InspectionPage page;
+        page.setBatchPredictionCapabilities(true, true, 2);
+        page.beginBatch(paths, QStringLiteral("m1"));
+        auto *table = page.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
+        QVERIFY(table != nullptr);
+        QSignalSpy insertedRows(table->model(), &QAbstractItemModel::rowsInserted);
+
+        page.handleBackendResponse(QStringLiteral("predict_batch"), QJsonObject{
+            {QStringLiteral("items"), QJsonArray()}});
+
+        QCOMPARE(insertedRows.count(), paths.size());
+    }
 };
 
 QTEST_MAIN(TestInspectionPage)

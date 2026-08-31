@@ -518,6 +518,7 @@ public:
     void setBatchCapabilities(bool enabled) { batchCapabilities_ = enabled; }
     void setBatchErrorRows(const QSet<int> &rows) { batchErrorRows_ = rows; }
     void failNextBatchRequest() { failNextBatchRequest_ = true; }
+    void setHoldBatchResponses(bool hold) { holdBatchResponses_ = hold; }
     void setHoldPredictions(bool hold) { holdPredictions_ = hold; }
     void setHoldConfirmations(bool hold) { holdConfirmations_ = hold; }
     void setHoldWorkpieceResponses(bool hold) { holdWorkpieceResponses_ = hold; }
@@ -603,6 +604,9 @@ private slots:
                 lastBatchPaths_.clear();
                 const QJsonArray paths = request.value(QStringLiteral("image_paths")).toArray();
                 for (const QJsonValue &path : paths) lastBatchPaths_.append(path.toString());
+                if (holdBatchResponses_) {
+                    continue;
+                }
                 if (failNextBatchRequest_) {
                     failNextBatchRequest_ = false;
                     send({{"version", 1}, {"request_id", requestId}, {"ok", false},
@@ -698,6 +702,7 @@ private:
     bool failNextConfirmationJob_ = false;
     bool batchCapabilities_ = false;
     bool failNextBatchRequest_ = false;
+    bool holdBatchResponses_ = false;
     int failedPredictionRow_ = -1;
     int predictionCount_ = 0;
     int batchRequestCount_ = 0;
@@ -3258,6 +3263,35 @@ private slots:
         QCOMPARE(server.batchRequestCount(), 1);
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text()
                     .contains(QStringLiteral("batch failed")));
+    }
+
+    void disconnectedBatchRequestResumesScalarFallbackAfterReconnect() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setBatchCapabilities(true);
+        server.setHoldBatchResponses(true);
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        const QStringList paths = writeImages(dir, QStringLiteral("reconnect-fallback"), 2);
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        QSignalSpy commandRequests(inspectionPage, &InspectionPage::commandRequested);
+
+        startBatch(server, client, window, paths);
+        QTRY_COMPARE_WITH_TIMEOUT(server.batchRequestCount(), 1, 1000);
+        server.disconnectClient();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() != BackendClient::State::Ready, 1000);
+
+        server.setHoldBatchResponses(false);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.predictionCount(), paths.size(), 1500);
+        waitForBatchCompletion(window, paths.size());
+        QCOMPARE(server.batchRequestCount(), 1);
+        QCOMPARE(commandRequests.count(), paths.size() + 1);
+        QCOMPARE(window.findChild<InspectionPage *>()->mode(), InspectionMode::Batch);
     }
 
     void selectingBatchRowShowsItsImageAndEvidence() {

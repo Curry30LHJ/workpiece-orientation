@@ -1547,6 +1547,9 @@ void MainWindow::onBackendReady() {
             requestWorkpieceRefresh(false);
         });
     }
+    if (client_ != nullptr && client_->state() == BackendClient::State::Ready) {
+        dispatchQueuedCommand();
+    }
 }
 
 void MainWindow::onBackendLoading(const QString &phase, const QString &message,
@@ -1609,6 +1612,9 @@ void MainWindow::onBackendUnavailable(const QString &reason, const QString &code
             || interruptedTask == QStringLiteral("publish_geometry_mask_profile")
             || interruptedTask == QStringLiteral("rollback_geometry_mask_profile")
             || interruptedTask == QStringLiteral("resolve_geometry_mask_migration"));
+    const bool preserveRecoverableBatchFallback = backendFailureIsRecoverable_
+        && interruptedTask == QStringLiteral("predict_batch")
+        && inspectionPage_ != nullptr && inspectionPage_->batchRunning();
     if (interruptedGeometryProfileMutation) {
         geometryForceProfileReload_ = true;
     }
@@ -1678,7 +1684,7 @@ void MainWindow::onBackendUnavailable(const QString &reason, const QString &code
     backendReadyHandled_ = false;
     backendReady_ = false;
     clientBusy_ = false;
-    batchInFlight_ = false;
+    batchInFlight_ = preserveRecoverableBatchFallback;
     clearPendingCommand();
     queuedMutationCommands_.clear();
     queuedInternalCommands_.clear();
@@ -2274,8 +2280,10 @@ void MainWindow::onClientTransportFailed(const QString &code, const QString &mes
         backendRecoveryDetail_ = message;
         return;
     }
+    const bool interruptedBatchRequest = pendingCommand_ == QStringLiteral("predict_batch")
+        && batchInFlight_ && inspectionPage_ != nullptr && inspectionPage_->batchRunning();
     if (manager_ != nullptr && backendPresentationState_ == BackendUiState::Recovering
-        && recoverableTransport) {
+        && recoverableTransport && !interruptedBatchRequest) {
         backendRecoveryDetail_ = message;
         return;
     }
