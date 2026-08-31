@@ -22,6 +22,9 @@ public:
     ~BackendClient() override;
 
     State state() const;
+    bool supportsBatchPrediction() const;
+    bool batchPredictionReady() const;
+    int batchWorkerCount() const;
     void connectToService(const QHostAddress &host, quint16 port,
                           int requestTimeoutMs = 120000, quint64 generation = 0);
     QString sendRequest(const QString &command, const QJsonObject &fields = QJsonObject());
@@ -71,6 +74,7 @@ private:
     State state_ = State::Disconnected;
     QByteArray readBuffer_;
     QString handshakeRequestId_;
+    QJsonObject handshakeMetadata_;
     std::unique_ptr<PendingRequest> pending_;
     bool suppressConnectionLost_ = false;
     bool transportFailureReported_ = false;

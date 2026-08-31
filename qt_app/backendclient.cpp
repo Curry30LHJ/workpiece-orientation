@@ -6,6 +6,9 @@
 #include <QTimer>
 #include <QUuid>
 
+#include <cmath>
+#include <limits>
+
 namespace {
 constexpr int kProtocolVersion = 1;
 constexpr int kMaxMessageBytes = 1024 * 1024;
@@ -34,6 +37,34 @@ BackendClient::State BackendClient::state() const {
     return state_;
 }
 
+bool BackendClient::supportsBatchPrediction() const {
+    return handshakeMetadata_.value(QStringLiteral("capabilities"))
+        .toObject().value(QStringLiteral("predict_batch")).toBool();
+}
+
+bool BackendClient::batchPredictionReady() const {
+    return supportsBatchPrediction()
+        && handshakeMetadata_.value(QStringLiteral("capabilities"))
+               .toObject().value(QStringLiteral("batch_ready")).toBool();
+}
+
+int BackendClient::batchWorkerCount() const {
+    if (!batchPredictionReady()) {
+        return 0;
+    }
+    const QJsonValue workers = handshakeMetadata_.value(QStringLiteral("capabilities"))
+        .toObject().value(QStringLiteral("batch_workers"));
+    if (!workers.isDouble()) {
+        return 0;
+    }
+    const double workerCount = workers.toDouble();
+    if (workerCount <= 0 || workerCount > std::numeric_limits<int>::max()
+        || std::floor(workerCount) != workerCount) {
+        return 0;
+    }
+    return static_cast<int>(workerCount);
+}
+
 void BackendClient::connectToService(const QHostAddress &host, quint16 port,
                                      int requestTimeoutMs, quint64 generation) {
     requestTimer_->stop();
@@ -43,6 +74,7 @@ void BackendClient::connectToService(const QHostAddress &host, quint16 port,
     socket_->abort();
     readBuffer_.clear();
     handshakeRequestId_.clear();
+    handshakeMetadata_ = QJsonObject();
     clearPending();
     suppressConnectionLost_ = false;
     transportFailureReported_ = false;
@@ -78,6 +110,7 @@ void BackendClient::disconnectFromService() {
     handshakeRetryTimer_->stop();
     clearPending();
     handshakeRequestId_.clear();
+    handshakeMetadata_ = QJsonObject();
     connectionGeneration_ = 0;
     suppressConnectionLost_ = true;
     socket_->abort();
@@ -138,6 +171,7 @@ void BackendClient::onDisconnected() {
     handshakeRetryTimer_->stop();
     clearPending();
     handshakeRequestId_.clear();
+    handshakeMetadata_ = QJsonObject();
     const quint64 disconnectedGeneration = connectionGeneration_;
     connectionGeneration_ = 0;
     setState(State::Disconnected, QStringLiteral("后端连接已断开"));
@@ -229,6 +263,7 @@ void BackendClient::handleResponse(const QJsonObject &response) {
         requestTimer_->stop();
         handshakeRetryTimer_->stop();
         handshakeRequestId_.clear();
+        handshakeMetadata_ = response;
         setState(State::Ready, QStringLiteral("后端已就绪"));
         emit handshakeSucceeded(connectionGeneration_, response);
         return;
@@ -285,6 +320,7 @@ void BackendClient::failTransport(const QString &code, const QString &message,
     handshakeRetryTimer_->stop();
     clearPending();
     handshakeRequestId_.clear();
+    handshakeMetadata_ = QJsonObject();
     const quint64 failedGeneration = connectionGeneration_;
     connectionGeneration_ = 0;
     setState(State::Error, message);

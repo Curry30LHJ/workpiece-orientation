@@ -197,6 +197,146 @@ private slots:
         QCOMPARE(transportSpy.count(), 0);
     }
 
+    void batchCapabilitiesAreStoredFromHandshake() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            if (request.value(QStringLiteral("command")).toString()
+                != QStringLiteral("hello")) {
+                return;
+            }
+            QJsonObject response = helloResponse(
+                request.value(QStringLiteral("request_id")).toString());
+            response.insert(QStringLiteral("capabilities"), QJsonObject{
+                {QStringLiteral("predict_batch"), true},
+                {QStringLiteral("batch_ready"), true},
+                {QStringLiteral("batch_workers"), 4},
+                {QStringLiteral("batch_threads_per_worker"), 1},
+            });
+            server.sendJson(response);
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000);
+
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QVERIFY(client.supportsBatchPrediction());
+        QVERIFY(client.batchPredictionReady());
+        QCOMPARE(client.batchWorkerCount(), 4);
+    }
+
+    void missingBatchCapabilitiesUseCompatibilityFallback() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        connectWithHello(server, client);
+
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QVERIFY(!client.supportsBatchPrediction());
+        QVERIFY(!client.batchPredictionReady());
+        QCOMPARE(client.batchWorkerCount(), 0);
+    }
+
+    void batchSupportAndReadinessAreDistinct() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            QJsonObject response = helloResponse(
+                request.value(QStringLiteral("request_id")).toString());
+            response.insert(QStringLiteral("capabilities"), QJsonObject{
+                {QStringLiteral("predict_batch"), true},
+                {QStringLiteral("batch_ready"), false},
+                {QStringLiteral("batch_workers"), 4},
+            });
+            server.sendJson(response);
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000);
+
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QVERIFY(client.supportsBatchPrediction());
+        QVERIFY(!client.batchPredictionReady());
+        QCOMPARE(client.batchWorkerCount(), 0);
+    }
+
+    void invalidBatchWorkerCountFallsBackToZero() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            QJsonObject response = helloResponse(
+                request.value(QStringLiteral("request_id")).toString());
+            response.insert(QStringLiteral("capabilities"), QJsonObject{
+                {QStringLiteral("predict_batch"), true},
+                {QStringLiteral("batch_ready"), true},
+                {QStringLiteral("batch_workers"), QStringLiteral("four")},
+            });
+            server.sendJson(response);
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000);
+
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QVERIFY(client.batchPredictionReady());
+        QCOMPARE(client.batchWorkerCount(), 0);
+    }
+
+    void batchCapabilitiesClearWhenTheConnectionIsReplacedOrLost() {
+        FakeTcpServer capableServer;
+        FakeTcpServer replacementServer;
+        QVERIFY(capableServer.start());
+        QVERIFY(replacementServer.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        QObject::connect(&capableServer, &FakeTcpServer::requestReceived,
+                         &capableServer, [&](const QJsonObject &request) {
+            QJsonObject response = helloResponse(
+                request.value(QStringLiteral("request_id")).toString());
+            response.insert(QStringLiteral("capabilities"), QJsonObject{
+                {QStringLiteral("predict_batch"), true},
+                {QStringLiteral("batch_ready"), true},
+                {QStringLiteral("batch_workers"), 2},
+            });
+            capableServer.sendJson(response);
+        });
+
+        client.connectToService(QHostAddress::LocalHost, capableServer.port(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QVERIFY(client.batchPredictionReady());
+
+        client.connectToService(QHostAddress::LocalHost, replacementServer.port(), 1000);
+        QVERIFY(!client.supportsBatchPrediction());
+        QVERIFY(!client.batchPredictionReady());
+        QCOMPARE(client.batchWorkerCount(), 0);
+
+        client.connectToService(QHostAddress::LocalHost, capableServer.port(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 2, 1000);
+        QVERIFY(client.batchPredictionReady());
+
+        client.disconnectFromService();
+        QVERIFY(!client.supportsBatchPrediction());
+        QVERIFY(!client.batchPredictionReady());
+        QCOMPARE(client.batchWorkerCount(), 0);
+
+        client.connectToService(QHostAddress::LocalHost, capableServer.port(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 3, 1000);
+        QVERIFY(client.batchPredictionReady());
+        capableServer.closeClient();
+
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Disconnected, 1000);
+        QVERIFY(!client.supportsBatchPrediction());
+        QVERIFY(!client.batchPredictionReady());
+        QCOMPARE(client.batchWorkerCount(), 0);
+    }
+
     void buffersPartialAndMultipleResponses() {
         FakeTcpServer server;
         QVERIFY(server.start());
