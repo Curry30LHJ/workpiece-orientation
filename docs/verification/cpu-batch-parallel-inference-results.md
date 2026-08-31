@@ -192,7 +192,7 @@ Verified from the saved audit:
 
 - `qt_executable_exists=true`
 - `backend_executable_exists=true`
-- `manifest_file_count=1170`
+- `manifest_file_count=1170`, meaning `manifest.json` lists 1170 payload files and does not count `manifest.json` itself; the ZIP therefore contains 1171 file entries in total
 - `production_src_module_count=20`
 - `forbidden_python_files=[]`
 - Data directories `workpieces`, `rules`, `cache`, `logs`, and `temp` were empty before smoke usage
@@ -200,7 +200,7 @@ Verified from the saved audit:
 - `app_config.compute_device=cpu`
 - `app_config.model_sha256=1fab156fb025705a836ad6c28590fc32e1141ae5c530282369412a3078300b33`
 - `version.git_commit=28833be561036bca140f16068d7ca1b891579c14`
-- `version.build_utc=2026-09-01 04:50:33`
+- `version.build_utc=2026-08-31T20:50:33.687748+00:00`
 
 The extracted backend also passed the frozen-module import verification used by the Task 8 flow.
 
