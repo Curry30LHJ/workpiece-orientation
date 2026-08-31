@@ -2854,6 +2854,30 @@ private slots:
         QCOMPARE(server.listCount(), 3);
     }
 
+    void reconnectCoalescesDeferredUserAndStartupRefresh() {
+        LibraryIntentServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 1, 1000);
+
+        server.disconnectNextListRefresh();
+        QVERIFY(QMetaObject::invokeMethod(&window, "refreshWorkpieces",
+                                          Qt::DirectConnection));
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 2, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Disconnected
+                                     || client.state() == BackendClient::State::Error,
+                                 1000);
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 500);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.listCount(), 3, 1000);
+        QTest::qWait(100);
+        QCOMPARE(server.listCount(), 3);
+    }
+
     void busyStateDisablesRegisterAndPredict() {
         BackendClient client;
         MainWindow window(&client, nullptr);

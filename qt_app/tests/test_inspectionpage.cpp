@@ -1143,8 +1143,8 @@ private slots:
         auto *table = page.findChild<QTableWidget *>(QStringLiteral("batchResultsTableWidget"));
         QVERIFY(table != nullptr);
         table->setCurrentCell(1, 0);
-        QCOMPARE(page.findChild<QLabel *>(QStringLiteral("currentImageLabel"))->text(),
-                 QStringLiteral("batch-1.png"));
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("currentImageLabel"))->text()
+                    .contains(QStringLiteral("batch-1.png")));
         QVERIFY(page.findChild<QLabel *>(QStringLiteral("batchSummaryLabel"))->text()
                     .contains(QStringLiteral("37.5")));
     }

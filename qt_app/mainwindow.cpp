@@ -1547,9 +1547,6 @@ void MainWindow::onBackendReady() {
             requestWorkpieceRefresh(false);
         });
     }
-    if (client_ != nullptr && client_->state() == BackendClient::State::Ready) {
-        dispatchQueuedCommand();
-    }
 }
 
 void MainWindow::onBackendLoading(const QString &phase, const QString &message,
