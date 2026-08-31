@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import socket
@@ -21,6 +22,135 @@ from release_tools.portable_benchmark import (
     run_benchmark,
     summarize,
 )
+
+
+def _batch_benchmark_module():
+    path = Path(__file__).parents[1] / "scripts" / "benchmark_batch_inference.py"
+    spec = importlib.util.spec_from_file_location("batch_benchmark_under_test", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_batch_benchmark_percentiles_are_linear_and_stable_for_small_samples():
+    module = _batch_benchmark_module()
+
+    assert module.percentiles_ms([10.0]) == {"p50": 10.0, "p95": 10.0, "p99": 10.0, "max": 10.0}
+    assert module.percentiles_ms([10.0, 20.0, 30.0]) == {
+        "p50": 20.0, "p95": 29.0, "p99": 29.8, "max": 30.0,
+    }
+
+
+def test_batch_benchmark_builds_ordered_five_path_payloads_with_unique_request_ids(tmp_path):
+    module = _batch_benchmark_module()
+    images = [tmp_path / f"{index}.png" for index in range(5)]
+
+    first = module.batch_request("workpiece-7", images, request_id="first")
+    second = module.batch_request("workpiece-7", images, request_id="second")
+
+    assert first == {
+        "version": 1, "request_id": "first", "command": "predict_batch",
+        "workpiece_id": "workpiece-7", "image_paths": [str(path) for path in images],
+    }
+    assert second["request_id"] != first["request_id"]
+    with pytest.raises(ValueError, match="exactly 5"):
+        module.batch_request("workpiece-7", images[:4], request_id="short")
+
+
+def test_batch_benchmark_excludes_warmups_and_reports_required_schema():
+    module = _batch_benchmark_module()
+
+    report = module.build_report(
+        samples_ms=[20.0, 30.0, 40.0], warmup=2, iterations=3,
+        workers=4, threads_per_worker=1, hardware={"cpu": "test"},
+        accuracy={"checked": 3, "passed": 3}, fallback={"used": False},
+    )
+
+    assert set(report) == {
+        "hardware", "configuration", "warmup", "iterations", "batch_size", "timings_ms",
+        "throughput_images_per_second", "accuracy", "fallback",
+    }
+    assert report["configuration"] == {"workers": 4, "threads_per_worker": 1}
+    assert report["warmup"] == 2
+    assert report["timings_ms"]["samples"] == [20.0, 30.0, 40.0]
+    assert report["timings_ms"]["p50"] == 30.0
+    assert module.build_report([10.0], 0, 1, 2, 2, {}, {}, {})["configuration"] == {
+        "workers": 2, "threads_per_worker": 2,
+    }
+
+
+def test_batch_benchmark_validates_protocol_order_and_item_errors():
+    module = _batch_benchmark_module()
+    paths = [f"{index}.png" for index in range(5)]
+    valid = {"ok": True, "request_id": "batch-1", "command": "predict_batch", "items": [
+        {"index": index, "image_path": path, "ok": True, "prediction": {"label": "front"}}
+        for index, path in enumerate(paths)
+    ]}
+
+    assert module.validate_batch_response(valid, "batch-1", paths) == ["front"] * 5
+    invalid = {**valid, "items": list(reversed(valid["items"]))}
+    with pytest.raises(RuntimeError, match="item order"):
+        module.validate_batch_response(invalid, "batch-1", paths)
+    item_error = {**valid, "items": [{**valid["items"][0], "ok": False, "error": {"message": "bad image"}}, *valid["items"][1:]]}
+    with pytest.raises(RuntimeError, match="bad image"):
+        module.validate_batch_response(item_error, "batch-1", paths)
+
+
+def test_batch_benchmark_closes_persistent_socket_and_backend_on_failure(tmp_path):
+    module = _batch_benchmark_module()
+    images = [tmp_path / f"{index}.png" for index in range(5)]
+    closed = []
+
+    class Client:
+        def __init__(self): self.calls = []
+        def request(self, payload):
+            self.calls.append(payload)
+            if payload["command"] == "hello":
+                return {"ok": True, "request_id": payload["request_id"], "command": "hello", "ready": True,
+                        "capabilities": {"predict_batch": True, "batch_ready": True}}
+            return {"ok": False, "request_id": payload["request_id"], "command": "predict_batch", "error": {"message": "bad batch"}}
+        def close(self): closed.append("socket")
+
+    class Process:
+        def poll(self): return None
+        def terminate(self): closed.append("terminate")
+        def wait(self, timeout=None): closed.append("wait")
+
+    with pytest.raises(RuntimeError, match="bad batch"):
+        module.run_batch_measurements(Client(), Process(), "wp", images, warmup=0, iterations=1)
+    assert closed == ["socket", "terminate", "wait"]
+
+
+def test_batch_benchmark_reuses_one_connection_and_discards_warmup_samples(tmp_path):
+    module = _batch_benchmark_module()
+    images = [tmp_path / f"{index}.png" for index in range(5)]
+
+    class Client:
+        def __init__(self): self.requests = []
+        def request(self, payload):
+            self.requests.append(payload)
+            if payload["command"] == "hello":
+                return {"ok": True, "request_id": payload["request_id"], "command": "hello", "ready": True,
+                        "capabilities": {"predict_batch": True, "batch_ready": True}}
+            return {"ok": True, "request_id": payload["request_id"], "command": "predict_batch", "items": [
+                {"index": index, "image_path": str(path), "ok": True, "prediction": {"label": "front"}}
+                for index, path in enumerate(images)
+            ]}
+
+    class Process:
+        def poll(self): return 0
+
+    client = Client()
+    samples, labels, _backend = module.run_batch_measurements(
+        client, Process(), "wp", images, warmup=2, iterations=3,
+    )
+    assert len(samples) == 3
+    assert labels == ["front"] * 5
+    assert [request["command"] for request in client.requests] == [
+        "hello", "predict_batch", "predict_batch", "predict_batch", "predict_batch", "predict_batch",
+    ]
+    assert len({request["request_id"] for request in client.requests}) == 6
 
 
 def _write_image(path: Path, value: int) -> tuple[int, int, str, int]:

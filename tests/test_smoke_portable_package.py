@@ -1,4 +1,5 @@
 import json
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -7,6 +8,76 @@ import pytest
 
 import release_tools.portable_smoke as smoke
 from release_tools.portable_smoke import SmokeOptions, run_portability, run_smoke
+
+
+def _smoke_wrapper_module():
+    path = Path(__file__).parents[1] / "scripts" / "smoke_portable_package.py"
+    spec = importlib.util.spec_from_file_location("batch_smoke_wrapper_under_test", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_frozen_batch_smoke_uses_different_cwd_and_runs_ordered_five_image_batch(tmp_path):
+    module = _smoke_wrapper_module()
+    package = _package_fixture(tmp_path / "package", edition="cpu")
+    images = [tmp_path / f"image-{index}.png" for index in range(5)]
+    launched = {}
+
+    class Process:
+        returncode = 0
+        def poll(self): return self.returncode
+        def wait(self, timeout=None): return self.returncode
+        def terminate(self): self.returncode = 0
+
+    class Client:
+        def __init__(self): self.requests = []
+        def request(self, payload):
+            self.requests.append(payload)
+            if payload["command"] == "hello":
+                return {"ok": True, "request_id": payload["request_id"], "command": "hello", "ready": True,
+                        "capabilities": {"predict_batch": True, "batch_ready": True}}
+            return {"ok": True, "request_id": payload["request_id"], "command": "predict_batch", "items": [
+                {"index": index, "image_path": str(path), "ok": True, "prediction": {"label": "front"}}
+                for index, path in enumerate(images)
+            ]}
+        def close(self): pass
+
+    client = Client()
+    result = module.run_frozen_batch_smoke(
+        package, "wp-1", images,
+        process_factory=lambda args, cwd: launched.update(args=args, cwd=cwd) or Process(),
+        client_factory=lambda host, port: client,
+        temp_dir_factory=lambda: tmp_path / "different cwd",
+    )
+
+    assert Path(launched["cwd"]).resolve() != package.resolve()
+    assert result["labels"] == ["front"] * 5
+    assert [request["command"] for request in client.requests] == ["hello", "predict_batch"]
+    assert client.requests[1]["image_paths"] == [str(path) for path in images]
+    assert not (tmp_path / "different cwd").exists()
+
+
+def test_frozen_batch_smoke_reports_missing_orientation_classifier_clearly(tmp_path):
+    module = _smoke_wrapper_module()
+    package = _package_fixture(tmp_path / "package", edition="cpu")
+    images = [tmp_path / f"image-{index}.png" for index in range(5)]
+
+    class Process:
+        returncode = 1
+        stdout = None
+        def poll(self): return self.returncode
+        def wait(self, timeout=None): return self.returncode
+        def terminate(self): pass
+
+    with pytest.raises(RuntimeError, match=r"src\.orientation_classifier"):
+        module.run_frozen_batch_smoke(
+            package, "wp-1", images,
+            process_factory=lambda args, cwd: Process(),
+            client_factory=lambda host, port: (_ for _ in ()).throw(OSError("unavailable")),
+            temp_dir_factory=lambda: tmp_path / "different cwd",
+        )
 
 
 def test_json_socket_applies_configured_read_timeout():
