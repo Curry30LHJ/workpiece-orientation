@@ -622,6 +622,25 @@ class OrientationCommandDispatcher:
         runtime = self.runtime.snapshot()
         try:
             if command == "hello":
+                capabilities = {
+                    "predict_batch": runtime.status == "ready",
+                    "batch_ready": False,
+                    "batch_workers": 0,
+                    "batch_threads_per_worker": 1,
+                }
+                capability_reader = getattr(runtime.classifier, "batch_capabilities", None)
+                if callable(capability_reader):
+                    try:
+                        reported = capability_reader()
+                    except Exception:
+                        reported = None
+                    if isinstance(reported, Mapping):
+                        capabilities.update({
+                            "predict_batch": runtime.status == "ready",
+                            "batch_ready": bool(reported.get("batch_ready", False)),
+                            "batch_workers": int(reported.get("worker_count", 0) or 0),
+                            "batch_threads_per_worker": int(reported.get("threads_per_worker", 1) or 1),
+                        })
                 hello = {
                     "service": SERVICE_NAME,
                     "ready": runtime.status == "ready",
@@ -636,6 +655,7 @@ class OrientationCommandDispatcher:
                     "instance_token": runtime.instance_token,
                     "error_action": runtime.error_action,
                     "log_path": runtime.log_path,
+                    "capabilities": capabilities,
                 }
                 if runtime.status == "loading":
                     return self._response(request_id, ok=True, **hello)
@@ -1038,6 +1058,43 @@ class OrientationCommandDispatcher:
                     LOGGER.exception("Orientation classifier failed")
                     return self._error(request_id, "MODEL_ERROR", str(exc))
                 return self._response(request_id, ok=True, **prediction)
+            if command == "predict_batch":
+                if runtime.status != "ready":
+                    return self._runtime_error(request_id, runtime)
+                workpiece_id = request.get("workpiece_id")
+                image_paths = request.get("image_paths")
+                if not isinstance(workpiece_id, str) or not workpiece_id.strip():
+                    return self._error(request_id, "INVALID_REQUEST", "predict_batch requires a non-empty workpiece_id")
+                if not isinstance(image_paths, list) or not image_paths:
+                    return self._error(request_id, "INVALID_REQUEST", "predict_batch requires a non-empty image_paths list")
+                if any(not isinstance(item, str) or not item for item in image_paths):
+                    return self._error(request_id, "INVALID_REQUEST", "image_paths must contain non-empty strings")
+                catalog = runtime.catalog or WorkpieceCatalog(runtime.library, runtime.classifier)
+                started = time.perf_counter()
+                try:
+                    items = catalog.predict_many(workpiece_id, [Path(item) for item in image_paths])
+                except Exception as exc:
+                    fast_error = self._fast_prediction_error(request_id, catalog, workpiece_id, exc)
+                    if fast_error is not None:
+                        return fast_error
+                    if isinstance(exc, OrientationClassifierError):
+                        raise
+                    LOGGER.exception("Orientation classifier batch failed")
+                    return self._error(request_id, "MODEL_ERROR", str(exc))
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                capability_reader = getattr(runtime.classifier, "batch_capabilities", None)
+                reported = capability_reader() if callable(capability_reader) else {}
+                if not isinstance(reported, Mapping):
+                    reported = {}
+                fallback = reported.get("fallback")
+                return self._response(
+                    request_id,
+                    ok=True,
+                    items=items,
+                    batch_timings_ms={"decode": 0.0, "inference": 0.0, "postprocess": 0.0, "total": elapsed_ms},
+                    worker_count=int(reported.get("worker_count", 0) or 0),
+                    fallback=fallback,
+                )
             if command == "shutdown":
                 if (
                     runtime.instance_token != "external"

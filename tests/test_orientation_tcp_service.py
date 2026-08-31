@@ -168,6 +168,9 @@ class FakeClassifier:
             result["library_revision"] = library_revision
         return result
 
+    def batch_capabilities(self):
+        return {"supported": False, "batch_ready": False, "worker_count": 0, "threads_per_worker": 1}
+
 
 class FakeEvolution:
     def __init__(self):
@@ -573,6 +576,26 @@ def test_register_and_predict_responses_preserve_request_id(client, running_serv
     assert response["request_id"] == "predict-8"
     assert response["label"] == "front"
     assert running_server.classifier.predict_calls == [("m7", Path("测试图.png"))]
+
+
+def test_dispatch_predict_batch_reports_ordered_items(client, running_server):
+    response = client.request(
+        "predict_batch",
+        request_id="batch-1",
+        workpiece_id="m7",
+        image_paths=["a.png", "b.png", "c.png"],
+    )
+    assert response["ok"] is True
+    assert [item["index"] for item in response["items"]] == [0, 1, 2]
+    assert response["batch_timings_ms"]["total"] >= 0
+    assert "worker_count" in response
+
+
+@pytest.mark.parametrize("paths", [[], [1], ["a.png", None]])
+def test_dispatch_predict_batch_rejects_invalid_lists(client, paths):
+    response = client.request("predict_batch", workpiece_id="m7", image_paths=paths)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_REQUEST"
 
 
 def test_register_rejects_non_string_template_item(client, running_server):

@@ -907,6 +907,95 @@ class WorkpieceCatalog:
             library_revision=snapshot.record.revision,
         )
 
+    def predict_many(self, workpiece_id: str, image_paths: Sequence[Path]) -> list[dict[str, object]]:
+        """Predict an ordered batch against one immutable catalog snapshot.
+
+        The active record/cache pair is captured exactly once.  Batch-capable
+        classifiers receive the whole sequence; otherwise scalar inference is
+        used while isolating failures to individual items.
+        """
+        paths = tuple(Path(path) for path in image_paths)
+        if not paths:
+            return []
+        snapshot = self.capture_snapshot(workpiece_id)
+        capabilities = {}
+        capabilities_reader = getattr(self.classifier, "batch_capabilities", None)
+        if callable(capabilities_reader):
+            try:
+                value = capabilities_reader()
+                if isinstance(value, dict):
+                    capabilities = value
+            except Exception:
+                capabilities = {}
+        batch_reader = getattr(self.classifier, "predict_many_with_cache", None)
+        use_batch = callable(batch_reader) and capabilities.get("batch_ready") is True
+
+        def item_error(exc: BaseException) -> dict[str, object]:
+            code = getattr(exc, "code", None)
+            if not isinstance(code, str) or not code:
+                if type(exc).__name__ == "ImageUnreadableError":
+                    code = "IMAGE_UNREADABLE"
+                else:
+                    text = str(exc)
+                    code = text.split(":", 1)[0] if text.startswith("FAST_CACHE_") else "MODEL_ERROR"
+            return {"code": code, "message": str(exc) or type(exc).__name__}
+
+        results: list[dict[str, object]] = []
+
+        def scalar_results() -> list[dict[str, object]]:
+            scalar: list[dict[str, object]] = []
+            predict_one = getattr(self.classifier, "predict_with_cache")
+            for index, path in enumerate(paths):
+                try:
+                    prediction = predict_one(snapshot.cache, path, library_revision=snapshot.record.revision)
+                    scalar.append({"index": index, "image_path": str(path), "ok": True, "prediction": prediction})
+                except Exception as exc:
+                    scalar.append({"index": index, "image_path": str(path), "ok": False, "error": item_error(exc)})
+            return scalar
+
+        if use_batch:
+            try:
+                raw_results = batch_reader(
+                    snapshot.cache,
+                    paths,
+                    library_revision=snapshot.record.revision,
+                )
+                raw_results = list(raw_results)
+            except Exception as exc:
+                # Preserve per-item failures when a backend cannot execute a
+                # mixed batch; cache/revision failures remain top-level errors.
+                if "FAST_CACHE" in str(exc):
+                    raise
+                return scalar_results()
+            for index, path in enumerate(paths):
+                raw = raw_results[index] if index < len(raw_results) else None
+                if raw is None:
+                    results.append({
+                        "index": index,
+                        "image_path": str(path),
+                        "ok": False,
+                        "error": {"code": "MODEL_ERROR", "message": "batch result missing"},
+                    })
+                    continue
+                if isinstance(raw, dict) and raw.get("error") is not None:
+                    error = raw.get("error")
+                    if isinstance(error, dict):
+                        error_payload = dict(error)
+                    else:
+                        error_type = str(raw.get("error_type", ""))
+                        code = "IMAGE_UNREADABLE" if error_type == "ImageUnreadableError" else "MODEL_ERROR"
+                        error_payload = {"code": code, "message": str(error)}
+                    results.append({"index": index, "image_path": str(path), "ok": False, "error": error_payload})
+                else:
+                    prediction = dict(raw) if isinstance(raw, dict) else raw
+                    if isinstance(prediction, dict):
+                        prediction.pop("index", None)
+                        prediction.pop("image_path", None)
+                    results.append({"index": index, "image_path": str(path), "ok": True, "prediction": prediction})
+            return results
+
+        return scalar_results()
+
     def commit_prepared_append(
         self,
         prepared: PreparedTemplateUpdate,

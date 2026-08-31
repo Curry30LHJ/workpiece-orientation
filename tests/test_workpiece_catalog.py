@@ -118,6 +118,21 @@ class FakeClassifier:
         return {"label": "front", "library_revision": library_revision}
 
 
+class BatchCatalogClassifier(FakeClassifier):
+    def __init__(self):
+        super().__init__()
+        self.snapshot_calls = 0
+        self.batch_paths = None
+
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        self.snapshot_calls += 1
+        self.batch_paths = list(image_paths)
+        return [{"label": "front", "library_revision": library_revision} for _ in image_paths]
+
+    def batch_capabilities(self):
+        return {"batch_ready": True, "worker_count": 1, "threads_per_worker": 1}
+
+
 class RevisionAwareFastClassifier(FakeClassifier):
     inference_mode = "fast_geometry"
 
@@ -263,6 +278,20 @@ def create_catalog_with_counts(tmp_path, front_count, back_count):
     ]
     record, _ = catalog.register("M-summary", front, back, False)
     return catalog, classifier, record
+
+
+def test_predict_batch_captures_one_snapshot_and_returns_input_order(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "batch-library")
+    classifier = BatchCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    front = [image(tmp_path / "batch-front.png", 10)]
+    back = [image(tmp_path / "batch-back.png", 20)]
+    catalog.register("M7", front, back, False)
+
+    result = catalog.predict_many("m7", [Path("a.png"), Path("b.png"), Path("c.png")])
+
+    assert [item["index"] for item in result] == [0, 1, 2]
+    assert classifier.snapshot_calls == 1
 
 
 def test_workpiece_summary_reports_unequal_counts_and_rules(tmp_path):
