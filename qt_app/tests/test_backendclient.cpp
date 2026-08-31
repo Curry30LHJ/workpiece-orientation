@@ -227,6 +227,35 @@ private slots:
         QCOMPARE(client.batchWorkerCount(), 4);
     }
 
+    void batchCapabilitiesAreAvailableDuringHandshakeSucceeded() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        bool checkedDuringEmission = false;
+        QObject::connect(&client, &BackendClient::handshakeSucceeded, &client,
+                         [&](quint64, const QJsonObject &) {
+            QVERIFY(client.supportsBatchPrediction());
+            QVERIFY(client.batchPredictionReady());
+            QCOMPARE(client.batchWorkerCount(), 4);
+            checkedDuringEmission = true;
+        });
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            QJsonObject response = helloResponse(
+                request.value(QStringLiteral("request_id")).toString());
+            response.insert(QStringLiteral("capabilities"), QJsonObject{
+                {QStringLiteral("predict_batch"), true},
+                {QStringLiteral("batch_ready"), true},
+                {QStringLiteral("batch_workers"), 4},
+            });
+            server.sendJson(response);
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000);
+
+        QTRY_VERIFY_WITH_TIMEOUT(checkedDuringEmission, 1000);
+    }
+
     void missingBatchCapabilitiesUseCompatibilityFallback() {
         FakeTcpServer server;
         QVERIFY(server.start());
@@ -265,7 +294,18 @@ private slots:
         QCOMPARE(client.batchWorkerCount(), 0);
     }
 
+    void invalidBatchWorkerCountFallsBackToZero_data() {
+        QTest::addColumn<QJsonValue>("workerCount");
+        QTest::newRow("missing") << QJsonValue(QJsonValue::Undefined);
+        QTest::newRow("non-numeric") << QJsonValue(QStringLiteral("four"));
+        QTest::newRow("fractional") << QJsonValue(1.5);
+        QTest::newRow("zero") << QJsonValue(0);
+        QTest::newRow("negative") << QJsonValue(-1);
+        QTest::newRow("out-of-range") << QJsonValue(2147483648.0);
+    }
+
     void invalidBatchWorkerCountFallsBackToZero() {
+        QFETCH(QJsonValue, workerCount);
         FakeTcpServer server;
         QVERIFY(server.start());
         BackendClient client;
@@ -274,11 +314,14 @@ private slots:
                          [&](const QJsonObject &request) {
             QJsonObject response = helloResponse(
                 request.value(QStringLiteral("request_id")).toString());
-            response.insert(QStringLiteral("capabilities"), QJsonObject{
+            QJsonObject capabilities{
                 {QStringLiteral("predict_batch"), true},
                 {QStringLiteral("batch_ready"), true},
-                {QStringLiteral("batch_workers"), QStringLiteral("four")},
-            });
+            };
+            if (!workerCount.isUndefined()) {
+                capabilities.insert(QStringLiteral("batch_workers"), workerCount);
+            }
+            response.insert(QStringLiteral("capabilities"), capabilities);
             server.sendJson(response);
         });
 
@@ -286,6 +329,37 @@ private slots:
 
         QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
         QVERIFY(client.batchPredictionReady());
+        QCOMPARE(client.batchWorkerCount(), 0);
+    }
+
+    void batchCapabilitiesClearAfterMalformedResponse() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        QSignalSpy transportSpy(&client, &BackendClient::transportFailed);
+        QObject::connect(&server, &FakeTcpServer::requestReceived, &server,
+                         [&](const QJsonObject &request) {
+            QJsonObject response = helloResponse(
+                request.value(QStringLiteral("request_id")).toString());
+            response.insert(QStringLiteral("capabilities"), QJsonObject{
+                {QStringLiteral("predict_batch"), true},
+                {QStringLiteral("batch_ready"), true},
+                {QStringLiteral("batch_workers"), 2},
+            });
+            server.sendJson(response);
+        });
+
+        client.connectToService(QHostAddress::LocalHost, server.port(), 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QVERIFY(client.batchPredictionReady());
+
+        server.sendFragments({QByteArray("{bad-json}\n")});
+
+        QTRY_COMPARE_WITH_TIMEOUT(transportSpy.count(), 1, 1000);
+        QCOMPARE(transportSpy.at(0).at(1).toString(), QStringLiteral("PROTOCOL_ERROR"));
+        QVERIFY(!client.supportsBatchPrediction());
+        QVERIFY(!client.batchPredictionReady());
         QCOMPARE(client.batchWorkerCount(), 0);
     }
 

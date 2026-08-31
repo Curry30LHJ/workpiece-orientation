@@ -39,3 +39,22 @@ exit code: 0
 The final invocation rebuilt `test_backendclient` and completed successfully.
 The script's Qt test invocation emitted no textual test summary, but returned
 success after launching the target.
+
+## Repair round 1
+
+- Added a direct same-thread `handshakeSucceeded` slot assertion. It reads all
+  three accessors inside signal delivery, proving metadata is available before
+  receivers run rather than only after a `QSignalSpy` observes the signal.
+- Added a real socket malformed-JSON regression after a capability-bearing
+  handshake. The client emits `PROTOCOL_ERROR` and all three accessors reset to
+  their compatibility values.
+- Expanded worker validation to data-driven cases: missing, non-numeric,
+  fractional, zero, negative, and greater-than-`int`-range values. Each keeps
+  a supported and ready batch capability while returning worker count `0`.
+
+Repair verification:
+
+~~~text
+powershell -ExecutionPolicy Bypass -File .\scripts\run_qt5_tests.ps1 -Targets test_backendclient
+exit code: 0
+~~~
