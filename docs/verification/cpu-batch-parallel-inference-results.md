@@ -3,15 +3,28 @@
 Date: 2026-09-01  
 Repository: `E:\Project\wang\pp_813`  
 Branch: `feature/20260830/cpu-inference-optimization`  
-Verified commit: `28833be561036bca140f16068d7ca1b891579c14` (`fix: coalesce refreshes after backend reconnect`)
+Source and tooling verification commit: `77fb5c3` (`fix: tolerate loading batch handshakes`)
+Runtime package build commit: `28833be561036bca140f16068d7ca1b891579c14` (`fix: coalesce refreshes after backend reconnect`)
 
 ## Scope
 
-This record covers Task 8 verification for the CPU portable package after the Task 6 fix landed on `28833be561036bca140f16068d7ca1b891579c14`. No production source or test files were modified during this verification pass. Only this document is intended to be committed.
+This record covers Task 8 verification for the CPU portable package after the Task 6 fix landed on `28833be561036bca140f16068d7ca1b891579c14`, with the packaged smoke and benchmark CLI revalidated after the Task 7 CLI fixes landed on `77fb5c3`. No production source or test files were modified during this verification pass. Only this document is intended to be committed.
+
+Between `28833be561036bca140f16068d7ca1b891579c14` and `77fb5c3`, the changed paths were:
+
+```text
+docs/verification/cpu-batch-parallel-inference-results.md
+scripts/benchmark_batch_inference.py
+scripts/smoke_portable_package.py
+tests/test_benchmark_portable_service.py
+tests/test_smoke_portable_package.py
+```
+
+That means the CPU `1.1.0` ZIP validated here still contains runtime bytes built from `28833be561036bca140f16068d7ca1b891579c14`; the later `77fb5c3` work only changed documentation, verification scripts, and their tests.
 
 ## Repository state observed
 
-Initial `git status --short` in the target repository reported:
+The original Task 8 verification pass started with:
 
 ```text
 ?? .pytest-task8-tmp/
@@ -19,6 +32,12 @@ Initial `git status --short` in the target repository reported:
 ```
 
 Earlier `git status` invocations also emitted ACL warnings for `.pytest-task8-tmp/` and `.pytest-tmp-task2/`. Per task constraints, `runtime_reports/` and `.pytest-tmp-task2/` were left untouched. `.pytest-task8-tmp/` was verified to resolve exactly to `E:\Project\wang\pp_813\.pytest-task8-tmp` and was removed after the test evidence was captured.
+
+The follow-up evidence refresh on `77fb5c3` started with:
+
+```text
+?? runtime_reports/
+```
 
 ## Full Python test suite
 
@@ -208,6 +227,31 @@ E:\Project\wang\pp_813\release_staging\task8-exact-zip-verify-28833be\.便携 sm
 - Reported `workpiece_id`: `8c68b62a8014428a9e8e0468ef5f3301`
 - Process exit code: `0`
 
+## Official exact ZIP smoke CLI revalidation on 77fb5c3
+
+Command:
+
+```text
+E:\python\anaconda3\envs\shitu\python.exe scripts\smoke_portable_package.py --package-root E:\Project\wang\pp_813\release_staging\task8-exact-zip-verify-28833be\WorkpieceOrientation-CPU --dataset-root E:\Project\wang\pp_813\data\1_M1 --report E:\Project\wang\pp_813\release_staging\reports\task8-exact-zip-smoke-official-77fb5c3.json
+```
+
+Saved report:
+
+```text
+release_staging\reports\task8-exact-zip-smoke-official-77fb5c3.json
+```
+
+Verified from the saved report:
+
+- Smoke completed with `ok=true`
+- `package_root=E:\Project\wang\pp_813\release_staging\task8-exact-zip-verify-28833be\WorkpieceOrientation-CPU`
+- `temp_package=E:\Project\wang\pp_813\release_staging\task8-exact-zip-verify-28833be\.便携 smoke package-1988c7efa4934855889387f98b5718d8\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
+- `workpiece_id=f931ed23f39d4ca59b0f6ee9fb5df3bf`
+- `template_counts.front=5`
+- `template_counts.back=10`
+- Final `hello` reported `ready=true`, `predict_batch=true`, `batch_workers=4`, `batch_threads_per_worker=1`
+- `process_exit=0`
+
 ## Five-image batch smoke from different working directory
 
 Ordered images used:
@@ -247,13 +291,26 @@ front, back, front, back, front
 
 - Process exit code: `0`
 
-## Local short benchmark on this machine
+## Official packaged benchmark CLI on this machine
+
+These benchmark runs used the retained exact-package root and workpiece from the successful exact-ZIP retained smoke above, as requested:
+
+```text
+package_root=E:\Project\wang\pp_813\release_staging\task8-exact-zip-verify-28833be\.便携 smoke package-8139a84763f14a50a552cadc36ace1e4\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+workpiece_id=8c68b62a8014428a9e8e0468ef5f3301
+```
+
+CLI form used for both runs:
+
+```text
+E:\python\anaconda3\envs\shitu\python.exe scripts\benchmark_batch_inference.py --package-root <retained package root> --workpiece-id 8c68b62a8014428a9e8e0468ef5f3301 --image <same ordered five-image batch> --warmup 5 --iterations 20 --workers <N> --threads-per-worker <M> --expected-label front --expected-label back --expected-label front --expected-label back --expected-label front --report <report path>
+```
 
 Saved reports:
 
 ```text
-release_staging\benchmarks\task8-batch-4x1-28833be.json
-release_staging\benchmarks\task8-batch-2x2-28833be.json
+release_staging\benchmarks\task8-batch-4x1-official-77fb5c3.json
+release_staging\benchmarks\task8-batch-2x2-official-77fb5c3.json
 ```
 
 Environment recorded in both reports:
@@ -266,25 +323,22 @@ Environment recorded in both reports:
 - Batch size: `5`
 - Accuracy: `100/100 = 1.0`
 - Fallback: `used=false`
+- Actual worker count matched the requested worker count in both runs
 
 Measured results:
 
 | Config | Throughput (images/s) | Batch p50 (ms) | Batch p95 (ms) | Batch p99 (ms) | Batch max (ms) | Reported workers | Reported threads/worker |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4×1 | 42.98 | 116.16 | 120.92 | 124.14 | 124.94 | 4 | 1 |
-| 2×2 | 30.23 | 163.89 | 179.98 | 182.52 | 183.16 | 2 | 2 |
+| 4×1 | 40.93 | 120.59 | 132.06 | 135.21 | 136.00 | 4 | 1 |
+| 2×2 | 31.87 | 157.60 | 163.05 | 163.55 | 163.67 | 2 | 2 |
 
-Observed label sequence matched the expected five-image order in both runs. On this development machine, `4×1` was clearly faster than `2×2` for the short run.
-
-## Benchmark harness note
-
-The existing packaged-benchmark helper path was not directly reusable as-is for this verification because the packaged backend can legitimately emit multiple `hello` responses in `loading` state before the first `ready=true` response, and the response path used here did not echo the `command` field in the way the helper expected. That affected the verification harness, not the proven package runtime behavior. The final Task 8 batch smoke and short benchmark evidence above was collected by polling until `ready=true` and then validating `predict_batch` responses directly, without modifying production code.
+Observed labels matched the expected five-image order in both runs via the official benchmark CLI. On this development machine, `4×1` remained faster than `2×2` for the short run.
 
 ## Target i5 acceptance status
 
 Status: `PENDING TARGET-HARDWARE MEASUREMENT`
 
-The local short benchmark above is only a development-machine smoke check. The required target-hardware acceptance run still needs to be executed on the designated i5 machine against the same `1.1.0` CPU package.
+The official CLI benchmark above is still only a development-machine check. The required target-hardware acceptance run still needs to be executed on the designated i5 machine against the same `1.1.0` CPU package.
 
 Recommended target run parameters:
 
@@ -297,8 +351,8 @@ Recommended target run parameters:
 Recommended target flow on the i5 machine:
 
 1. Extract the exact `WorkpieceOrientation-CPU-x64-1.1.0.zip`.
-2. Run the exact-ZIP smoke flow first so the package creates a retained temp package and returns the new `workpiece_id`.
-3. Use that retained package root and workpiece id with the benchmark CLI below.
+2. Run `scripts\smoke_portable_package.py` against the extracted package so the package creates a retained temp package and returns the new `workpiece_id`.
+3. Use that retained package root and workpiece id directly with the benchmark CLI below.
 
 Benchmark commands for the target i5 machine, run from the repository root:
 
@@ -307,11 +361,11 @@ E:\python\anaconda3\envs\shitu\python.exe scripts\benchmark_batch_inference.py -
 E:\python\anaconda3\envs\shitu\python.exe scripts\benchmark_batch_inference.py --package-root "<retained package root from the exact-ZIP smoke run>" --workpiece-id "<workpiece_id from the same smoke run>" --image "E:\Project\wang\pp_813\data\1_M1\0\4763_1460_0_39_2026_05_25_07_33_29_4353.png" --image "E:\Project\wang\pp_813\data\1_M1\1\3753_1233_0_11_2026_05_25_07_36_20_2185.png" --image "E:\Project\wang\pp_813\data\1_M1\0\2847_2531_0_14_2026_05_25_07_33_27_1613.png" --image "E:\Project\wang\pp_813\data\1_M1\1\1611_1394_0_32_2026_05_25_07_36_21_9885.png" --image "E:\Project\wang\pp_813\data\1_M1\0\2706_1271_0_37_2026_05_25_07_33_29_2593.png" --warmup 50 --iterations 200 --workers 2 --threads-per-worker 2 --expected-label front --expected-label back --expected-label front --expected-label back --expected-label front --report release_staging\benchmarks\task8-batch-2x2-i5.json
 ```
 
-Interpretation rule: compare throughput and latency percentiles on the i5 box using the same five-image ordered batch, then choose the faster configuration only if accuracy remains `100%` and `fallback.used=false`. If the benchmark helper on the i5 box rejects an initial non-ready `hello` response, use the same ready-poll procedure used for the local short benchmark in this verification pass and preserve the resulting JSON fields.
+Interpretation rule: compare throughput and latency percentiles on the i5 box using the same five-image ordered batch, then choose the faster configuration only if accuracy remains `100%`, `fallback.used=false`, and `fallback.actual_worker_count` matches the requested worker count.
 
 ## Final verification conclusion
 
-On commit `28833be561036bca140f16068d7ca1b891579c14`, the current repository state provides:
+With source/tooling verified on `77fb5c3` and the runtime ZIP still built from `28833be561036bca140f16068d7ca1b891579c14`, the current repository state provides:
 
 - full Python suite passing,
 - full Qt suite passing,
@@ -319,6 +373,6 @@ On commit `28833be561036bca140f16068d7ca1b891579c14`, the current repository sta
 - exact ZIP static verification passing,
 - exact ZIP smoke passing,
 - five-image different-working-directory batch smoke passing,
-- local short benchmark evidence showing `4×1` outperforming `2×2` on the development machine.
+- official packaged benchmark CLI evidence showing `4×1` outperforming `2×2` on the development machine.
 
 No new production-source defect was proven during this pass. The only open item is the required target-i5 measurement.
