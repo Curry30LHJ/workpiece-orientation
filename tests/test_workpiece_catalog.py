@@ -11,7 +11,7 @@ import pytest
 
 from src.fast_geometry import FastGeometryProcessor
 from src.fast_orientation import FastOrientationEngine
-from src.orientation_classifier import OrientationClassifier, TemplateCache
+from src.orientation_classifier import OrientationClassifier, OrientationClassifierError, TemplateCache
 from src.geometry_mask_profiles import GeometryMaskProfiles
 from src.workpiece_catalog import RestoreConflictError, WorkpieceCatalog
 from src.workpiece_library import StaleWorkpieceRevisionError, WorkpieceLibrary
@@ -127,7 +127,10 @@ class BatchCatalogClassifier(FakeClassifier):
     def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
         self.snapshot_calls += 1
         self.batch_paths = list(image_paths)
-        return [{"label": "front", "library_revision": library_revision} for _ in image_paths]
+        return [
+            {"index": index, "image_path": str(path), "label": "front", "library_revision": library_revision}
+            for index, path in enumerate(image_paths)
+        ]
 
     def batch_capabilities(self):
         return {"batch_ready": True, "worker_count": 1, "threads_per_worker": 1}
@@ -143,6 +146,27 @@ class PartialFailureCatalogClassifier(FakeClassifier):
         if Path(image_path).name == "bad.png":
             raise OSError("unable to decode image")
         return super().predict_with_cache(cache, image_path, library_revision=library_revision)
+
+
+class FastCacheFailureCatalogClassifier(FakeClassifier):
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        raise OrientationClassifierError("FAST_CACHE_NOT_READY: cache is unavailable")
+
+
+class ReorderedBatchCatalogClassifier(BatchCatalogClassifier):
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        return list(reversed([
+            {"index": index, "image_path": str(path), "label": f"label-{index}"}
+            for index, path in enumerate(image_paths)
+        ]))
+
+
+class MalformedBatchCatalogClassifier(BatchCatalogClassifier):
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        return [
+            {"index": 0, "image_path": str(image_paths[0]), "label": "front"},
+            {"index": 0, "image_path": str(image_paths[1]), "label": "back"},
+        ]
 
 
 class RevisionAwareFastClassifier(FakeClassifier):
@@ -292,18 +316,26 @@ def create_catalog_with_counts(tmp_path, front_count, back_count):
     return catalog, classifier, record
 
 
-def test_predict_batch_captures_one_snapshot_and_returns_input_order(tmp_path):
+def test_predict_batch_captures_one_snapshot_and_returns_input_order(tmp_path, monkeypatch):
     library = WorkpieceLibrary(tmp_path / "batch-library")
     classifier = BatchCatalogClassifier()
     catalog = WorkpieceCatalog(library, classifier)
     front = [image(tmp_path / "batch-front.png", 10)]
     back = [image(tmp_path / "batch-back.png", 20)]
     record, _ = catalog.register("M7", front, back, False)
+    captured = catalog.capture_snapshot
+    calls = []
+
+    def count_capture(workpiece_id):
+        calls.append(workpiece_id)
+        return captured(workpiece_id)
+
+    monkeypatch.setattr(catalog, "capture_snapshot", count_capture)
 
     result = catalog.predict_many(record.id, [Path("a.png"), Path("b.png"), Path("c.png")])
 
     assert [item["index"] for item in result] == [0, 1, 2]
-    assert classifier.snapshot_calls == 1
+    assert calls == [record.id]
 
 
 def test_predict_many_uses_legacy_batch_ready_attribute_without_capabilities(tmp_path):
@@ -329,6 +361,38 @@ def test_predict_many_keeps_partial_scalar_errors_in_input_order(tmp_path):
     assert [item["index"] for item in result] == [0, 1, 2]
     assert [item["ok"] for item in result] == [True, False, True]
     assert result[1]["error"]["code"] == "MODEL_ERROR"
+
+
+def test_predict_many_reraises_fast_cache_errors_from_scalar_fallback(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "fast-cache-batch-library")
+    classifier = FastCacheFailureCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "fast-front.png", 10)], [image(tmp_path / "fast-back.png", 20)], False)
+
+    with pytest.raises(OrientationClassifierError, match="FAST_CACHE_NOT_READY"):
+        catalog.predict_many(record.id, [Path("a.png")])
+
+
+def test_predict_many_reorders_batch_results_by_declared_index(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "reordered-batch-library")
+    classifier = ReorderedBatchCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "reordered-front.png", 10)], [image(tmp_path / "reordered-back.png", 20)], False)
+
+    result = catalog.predict_many(record.id, [Path("a.png"), Path("b.png")])
+
+    assert [item["index"] for item in result] == [0, 1]
+    assert [item["prediction"]["label"] for item in result] == ["label-0", "label-1"]
+
+
+def test_predict_many_rejects_duplicate_batch_result_indices(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "malformed-batch-library")
+    classifier = MalformedBatchCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "malformed-batch-front.png", 10)], [image(tmp_path / "malformed-batch-back.png", 20)], False)
+
+    with pytest.raises(Exception, match="batch result"):
+        catalog.predict_many(record.id, [Path("a.png"), Path("b.png")])
 
 
 def test_workpiece_summary_reports_unequal_counts_and_rules(tmp_path):

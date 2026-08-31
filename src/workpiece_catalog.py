@@ -7,7 +7,8 @@ from pathlib import Path
 import json
 import logging
 import threading
-from typing import Any, Sequence
+import time
+from typing import Any, Mapping, Sequence
 import uuid
 
 from src.image_io import read_color_image
@@ -36,6 +37,10 @@ class WorkpieceCatalogError(RuntimeError):
 
 class RestoreConflictError(WorkpieceCatalogError):
     """Raised when restoring would collide with an active workpiece."""
+
+
+class BatchResultProtocolError(WorkpieceCatalogError):
+    """Raised when a batch classifier violates the ordered-result contract."""
 
 
 @dataclass(frozen=True)
@@ -907,23 +912,26 @@ class WorkpieceCatalog:
             library_revision=snapshot.record.revision,
         )
 
-    def predict_many(self, workpiece_id: str, image_paths: Sequence[Path]) -> list[dict[str, object]]:
-        """Predict an ordered batch against one immutable catalog snapshot.
-
-        The active record/cache pair is captured exactly once.  Batch-capable
-        classifiers receive the whole sequence; otherwise scalar inference is
-        used while isolating failures to individual items.
-        """
+    def _predict_many_with_diagnostics(
+        self, workpiece_id: str, image_paths: Sequence[Path]
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Run one ordered batch and return request-local execution details."""
         paths = tuple(Path(path) for path in image_paths)
+        started = time.perf_counter()
         if not paths:
-            return []
+            return [], {
+                "batch_mode": "serial",
+                "batch_timings_ms": {"decode": 0.0, "inference": 0.0, "postprocess": 0.0, "total": 0.0},
+                "worker_count": 0,
+                "fallback": "serial_batch_unavailable",
+            }
         snapshot = self.capture_snapshot(workpiece_id)
-        capabilities = {}
+        capabilities: Mapping[str, object] = {}
         capabilities_reader = getattr(self.classifier, "batch_capabilities", None)
         if callable(capabilities_reader):
             try:
                 value = capabilities_reader()
-                if isinstance(value, dict):
+                if isinstance(value, Mapping):
                     capabilities = value
             except Exception:
                 capabilities = {}
@@ -934,6 +942,11 @@ class WorkpieceCatalog:
             else getattr(self.classifier, "batch_ready", False)
         )
         use_batch = callable(batch_reader) and batch_ready is True
+        worker_value = capabilities.get("worker_count", 0)
+        worker_count = worker_value if isinstance(worker_value, int) and not isinstance(worker_value, bool) and worker_value >= 0 else 0
+        reported_fallback = capabilities.get("fallback")
+        reported_fallback = reported_fallback if isinstance(reported_fallback, str) and reported_fallback else None
+        item_timings = {"decode": 0.0, "postprocess": 0.0}
 
         def item_error(exc: BaseException) -> dict[str, object]:
             code = getattr(exc, "code", None)
@@ -945,46 +958,87 @@ class WorkpieceCatalog:
                     code = text.split(":", 1)[0] if text.startswith("FAST_CACHE_") else "MODEL_ERROR"
             return {"code": code, "message": str(exc) or type(exc).__name__}
 
-        results: list[dict[str, object]] = []
+        def is_fast_cache_error(exc: BaseException) -> bool:
+            code = getattr(exc, "code", None)
+            return (isinstance(code, str) and code.startswith("FAST_CACHE_")) or str(exc).startswith("FAST_CACHE_")
 
-        def scalar_results() -> list[dict[str, object]]:
+        def collect_item_timings(prediction: object) -> None:
+            if not isinstance(prediction, Mapping):
+                return
+            timings = prediction.get("timings_ms")
+            if not isinstance(timings, Mapping):
+                return
+            for name in item_timings:
+                value = timings.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                    item_timings[name] += float(value)
+
+        def diagnostics(mode: str, inference_ms: float, fallback: str | None) -> dict[str, object]:
+            return {
+                "batch_mode": mode,
+                "batch_timings_ms": {
+                    "decode": item_timings["decode"],
+                    "inference": inference_ms,
+                    "postprocess": item_timings["postprocess"],
+                    "total": (time.perf_counter() - started) * 1000.0,
+                },
+                "worker_count": worker_count if mode == "batch" else 0,
+                "fallback": fallback,
+            }
+
+        def scalar_results(fallback: str) -> tuple[list[dict[str, object]], dict[str, object]]:
             scalar: list[dict[str, object]] = []
             predict_one = getattr(self.classifier, "predict_with_cache")
+            inference_started = time.perf_counter()
             for index, path in enumerate(paths):
                 try:
                     prediction = predict_one(snapshot.cache, path, library_revision=snapshot.record.revision)
+                    collect_item_timings(prediction)
                     scalar.append({"index": index, "image_path": str(path), "ok": True, "prediction": prediction})
                 except Exception as exc:
+                    if is_fast_cache_error(exc):
+                        raise
                     scalar.append({"index": index, "image_path": str(path), "ok": False, "error": item_error(exc)})
-            return scalar
+            return scalar, diagnostics("serial", (time.perf_counter() - inference_started) * 1000.0, fallback)
 
         if use_batch:
+            inference_started = time.perf_counter()
             try:
-                raw_results = batch_reader(
+                raw_results = list(batch_reader(
                     snapshot.cache,
                     paths,
                     library_revision=snapshot.record.revision,
-                )
-                raw_results = list(raw_results)
+                ))
             except Exception as exc:
-                # Preserve per-item failures when a backend cannot execute a
-                # mixed batch; cache/revision failures remain top-level errors.
-                if "FAST_CACHE" in str(exc):
+                if is_fast_cache_error(exc):
                     raise
-                return scalar_results()
+                return scalar_results("serial_after_batch_failure")
+            inference_ms = (time.perf_counter() - inference_started) * 1000.0
+            if len(raw_results) != len(paths):
+                raise BatchResultProtocolError(
+                    f"batch result count mismatch: expected {len(paths)}, got {len(raw_results)}"
+                )
+            indexed_results: list[Mapping[str, object] | None] = [None] * len(paths)
+            for raw in raw_results:
+                if not isinstance(raw, Mapping):
+                    raise BatchResultProtocolError("batch result item must be an object with an index")
+                result_index = raw.get("index")
+                if not isinstance(result_index, int) or isinstance(result_index, bool) or not 0 <= result_index < len(paths):
+                    raise BatchResultProtocolError("batch result index is invalid")
+                if indexed_results[result_index] is not None:
+                    raise BatchResultProtocolError("batch result index is duplicated")
+                reported_path = raw.get("image_path")
+                if reported_path is not None and reported_path != str(paths[result_index]):
+                    raise BatchResultProtocolError("batch result image_path does not match its index")
+                indexed_results[result_index] = raw
+            results: list[dict[str, object]] = []
             for index, path in enumerate(paths):
-                raw = raw_results[index] if index < len(raw_results) else None
+                raw = indexed_results[index]
                 if raw is None:
-                    results.append({
-                        "index": index,
-                        "image_path": str(path),
-                        "ok": False,
-                        "error": {"code": "MODEL_ERROR", "message": "batch result missing"},
-                    })
-                    continue
-                if isinstance(raw, dict) and raw.get("error") is not None:
+                    raise BatchResultProtocolError("batch result index is missing")
+                if raw.get("error") is not None:
                     error = raw.get("error")
-                    if isinstance(error, dict):
+                    if isinstance(error, Mapping):
                         error_payload = dict(error)
                     else:
                         error_type = str(raw.get("error_type", ""))
@@ -992,14 +1046,19 @@ class WorkpieceCatalog:
                         error_payload = {"code": code, "message": str(error)}
                     results.append({"index": index, "image_path": str(path), "ok": False, "error": error_payload})
                 else:
-                    prediction = dict(raw) if isinstance(raw, dict) else raw
-                    if isinstance(prediction, dict):
-                        prediction.pop("index", None)
-                        prediction.pop("image_path", None)
+                    prediction = dict(raw)
+                    prediction.pop("index", None)
+                    prediction.pop("image_path", None)
+                    collect_item_timings(prediction)
                     results.append({"index": index, "image_path": str(path), "ok": True, "prediction": prediction})
-            return results
+            return results, diagnostics("batch", inference_ms, None)
 
-        return scalar_results()
+        return scalar_results(reported_fallback or "serial_batch_unavailable")
+
+    def predict_many(self, workpiece_id: str, image_paths: Sequence[Path]) -> list[dict[str, object]]:
+        """Predict an ordered batch against one immutable catalog snapshot."""
+        items, _ = self._predict_many_with_diagnostics(workpiece_id, image_paths)
+        return items
 
     def commit_prepared_append(
         self,

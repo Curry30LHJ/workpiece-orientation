@@ -179,6 +179,57 @@ class PartialFailureClassifier(FakeClassifier):
         return super().predict_with_cache(cache, image_path, library_revision=library_revision)
 
 
+class FastCacheFailureClassifier(FakeClassifier):
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        raise OrientationClassifierError("FAST_CACHE_NOT_READY: cache is unavailable")
+
+
+class BatchProtocolClassifier(FakeClassifier):
+    def __init__(self, *, capabilities=None, batch_results=None, delay_seconds=0.0):
+        super().__init__()
+        self.capabilities = capabilities or {
+            "batch_ready": True,
+            "worker_count": 2,
+            "threads_per_worker": 1,
+        }
+        self.batch_results = batch_results
+        self.delay_seconds = delay_seconds
+
+    def batch_capabilities(self):
+        return self.capabilities
+
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        if self.delay_seconds:
+            time.sleep(self.delay_seconds)
+        if self.batch_results is not None:
+            return self.batch_results
+        return [
+            {"index": index, "image_path": str(path), "label": "front"}
+            for index, path in enumerate(image_paths)
+        ]
+
+
+class BrokenCapabilitiesClassifier(FakeClassifier):
+    def batch_capabilities(self):
+        raise RuntimeError("capability reader unavailable")
+
+
+class MalformedCapabilitiesClassifier(FakeClassifier):
+    def batch_capabilities(self):
+        return {
+            "batch_ready": False,
+            "worker_count": "not-an-int",
+            "threads_per_worker": object(),
+            "fallback": object(),
+        }
+
+
+class SlowScalarClassifier(FakeClassifier):
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        time.sleep(0.005)
+        return super().predict_with_cache(cache, image_path, library_revision=library_revision)
+
+
 class FakeEvolution:
     def __init__(self):
         self.jobs = []
@@ -634,7 +685,91 @@ def test_dispatch_predict_batch_keeps_partial_item_error_without_dropping_items(
     assert [item["ok"] for item in response["items"]] == [True, False, True]
     assert response["items"][1]["error"]["code"] == "MODEL_ERROR"
     assert set(response["batch_timings_ms"]) == {"decode", "inference", "postprocess", "total"}
+    assert response["fallback"] == "serial_batch_unavailable"
+
+
+def test_dispatch_predict_batch_returns_fast_cache_error_from_scalar_fallback():
+    dispatcher = OrientationCommandDispatcher(FastCacheFailureClassifier(), FakeLibrary())
+    registered = dispatcher.dispatch({
+        "version": 1, "request_id": "register-fast", "command": "register", "name": "M7",
+        "replace": False, "front_images": ["front.png"], "back_images": ["back.png"],
+    })
+    assert registered["ok"] is True
+
+    response = dispatcher.dispatch({
+        "version": 1, "request_id": "batch-fast", "command": "predict_batch",
+        "workpiece_id": "m7", "image_paths": ["a.png"],
+    })
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "FAST_CACHE_NOT_READY"
+
+
+def test_dispatch_predict_batch_rejects_malformed_batch_results():
+    classifier = BatchProtocolClassifier(batch_results=[{"index": 0, "image_path": "a.png", "label": "front"}])
+    dispatcher = OrientationCommandDispatcher(classifier, FakeLibrary())
+    registered = dispatcher.dispatch({
+        "version": 1, "request_id": "register-malformed", "command": "register", "name": "M7",
+        "replace": False, "front_images": ["front.png"], "back_images": ["back.png"],
+    })
+    assert registered["ok"] is True
+
+    response = dispatcher.dispatch({
+        "version": 1, "request_id": "batch-malformed", "command": "predict_batch",
+        "workpiece_id": "m7", "image_paths": ["a.png", "b.png"],
+    })
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "BATCH_RESULT_INVALID"
+
+
+def test_dispatch_predict_batch_reports_actual_serial_timing_and_fallback():
+    dispatcher = OrientationCommandDispatcher(SlowScalarClassifier(), FakeLibrary())
+    registered = dispatcher.dispatch({
+        "version": 1, "request_id": "register-serial", "command": "register", "name": "M7",
+        "replace": False, "front_images": ["front.png"], "back_images": ["back.png"],
+    })
+    assert registered["ok"] is True
+
+    response = dispatcher.dispatch({
+        "version": 1, "request_id": "batch-serial", "command": "predict_batch",
+        "workpiece_id": "m7", "image_paths": ["a.png", "b.png"],
+    })
+
+    assert response["ok"] is True
+    assert response["batch_mode"] == "serial"
+    assert response["fallback"] == "serial_batch_unavailable"
+    assert response["worker_count"] == 0
+    assert response["batch_timings_ms"]["inference"] >= 10.0
+    assert response["batch_timings_ms"]["total"] >= response["batch_timings_ms"]["inference"]
+
+
+def test_dispatch_predict_batch_reports_actual_batch_timing():
+    classifier = BatchProtocolClassifier(delay_seconds=0.005)
+    dispatcher = OrientationCommandDispatcher(classifier, FakeLibrary())
+    registered = dispatcher.dispatch({
+        "version": 1, "request_id": "register-timed", "command": "register", "name": "M7",
+        "replace": False, "front_images": ["front.png"], "back_images": ["back.png"],
+    })
+    assert registered["ok"] is True
+
+    response = dispatcher.dispatch({
+        "version": 1, "request_id": "batch-timed", "command": "predict_batch",
+        "workpiece_id": "m7", "image_paths": ["a.png", "b.png"],
+    })
+
+    assert response["ok"] is True
+    assert response["batch_mode"] == "batch"
     assert response["fallback"] is None
+    assert response["worker_count"] == 2
+    assert response["batch_timings_ms"]["inference"] >= 5.0
+
+
+def test_dispatch_predict_batch_maps_unknown_workpiece_to_not_found(client):
+    response = client.request("predict_batch", workpiece_id="missing", image_paths=["a.png"])
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "WORKPIECE_NOT_FOUND"
 
 
 @pytest.mark.parametrize("paths", [[], [1], ["a.png", None]])
@@ -654,6 +789,34 @@ def test_hello_reports_batch_capabilities(client):
         "batch_workers": 0,
         "batch_threads_per_worker": 1,
     }
+
+
+@pytest.mark.parametrize("classifier", [BrokenCapabilitiesClassifier(), MalformedCapabilitiesClassifier()])
+def test_hello_and_predict_batch_tolerate_broken_capabilities(classifier):
+    dispatcher = OrientationCommandDispatcher(classifier, FakeLibrary())
+    hello = dispatcher.dispatch({"version": 1, "request_id": "hello-safe", "command": "hello"})
+
+    assert hello["ok"] is True
+    assert hello["capabilities"] == {
+        "predict_batch": True,
+        "batch_ready": False,
+        "batch_workers": 0,
+        "batch_threads_per_worker": 1,
+    }
+
+    registered = dispatcher.dispatch({
+        "version": 1, "request_id": "register-safe", "command": "register", "name": "M7",
+        "replace": False, "front_images": ["front.png"], "back_images": ["back.png"],
+    })
+    assert registered["ok"] is True
+    response = dispatcher.dispatch({
+        "version": 1, "request_id": "batch-safe", "command": "predict_batch",
+        "workpiece_id": "m7", "image_paths": ["a.png"],
+    })
+
+    assert response["ok"] is True
+    assert response["worker_count"] == 0
+    assert response["fallback"] == "serial_batch_unavailable"
 
 
 def test_register_rejects_non_string_template_item(client, running_server):

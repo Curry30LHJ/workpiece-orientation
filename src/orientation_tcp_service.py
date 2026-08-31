@@ -154,7 +154,7 @@ from src.workpiece_library import (
     WorkpieceExistsError,
     WorkpieceLibrary,
 )
-from src.workpiece_catalog import RestoreConflictError, WorkpieceCatalog
+from src.workpiece_catalog import BatchResultProtocolError, RestoreConflictError, WorkpieceCatalog
 from src.geometry_mask_profiles import (
     CorruptGeometryProfileError,
     DuplicateLogicalRuleError,
@@ -572,6 +572,38 @@ class OrientationCommandDispatcher:
     def _error(cls, request_id: object, code: str, message: str) -> dict[str, object]:
         return cls._response(request_id, ok=False, error={"code": code, "message": message})
 
+    @staticmethod
+    def _safe_batch_count(value: object, *, default: int, minimum: int) -> int:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= minimum:
+            return value
+        return default
+
+    @classmethod
+    def _batch_hello_capabilities(cls, classifier: object, *, ready: bool) -> dict[str, object]:
+        capabilities = {
+            "predict_batch": ready,
+            "batch_ready": False,
+            "batch_workers": 0,
+            "batch_threads_per_worker": 1,
+        }
+        capability_reader = getattr(classifier, "batch_capabilities", None)
+        if not callable(capability_reader):
+            return capabilities
+        try:
+            reported = capability_reader()
+        except Exception:
+            return capabilities
+        if not isinstance(reported, Mapping):
+            return capabilities
+        capabilities.update({
+            "batch_ready": reported.get("batch_ready") is True,
+            "batch_workers": cls._safe_batch_count(reported.get("worker_count"), default=0, minimum=0),
+            "batch_threads_per_worker": cls._safe_batch_count(
+                reported.get("threads_per_worker"), default=1, minimum=1
+            ),
+        })
+        return capabilities
+
     @classmethod
     def _fast_prediction_error(
         cls,
@@ -622,25 +654,9 @@ class OrientationCommandDispatcher:
         runtime = self.runtime.snapshot()
         try:
             if command == "hello":
-                capabilities = {
-                    "predict_batch": runtime.status == "ready",
-                    "batch_ready": False,
-                    "batch_workers": 0,
-                    "batch_threads_per_worker": 1,
-                }
-                capability_reader = getattr(runtime.classifier, "batch_capabilities", None)
-                if callable(capability_reader):
-                    try:
-                        reported = capability_reader()
-                    except Exception:
-                        reported = None
-                    if isinstance(reported, Mapping):
-                        capabilities.update({
-                            "predict_batch": runtime.status == "ready",
-                            "batch_ready": bool(reported.get("batch_ready", False)),
-                            "batch_workers": int(reported.get("worker_count", 0) or 0),
-                            "batch_threads_per_worker": int(reported.get("threads_per_worker", 1) or 1),
-                        })
+                capabilities = self._batch_hello_capabilities(
+                    runtime.classifier, ready=runtime.status == "ready"
+                )
                 hello = {
                     "service": SERVICE_NAME,
                     "ready": runtime.status == "ready",
@@ -1070,30 +1086,28 @@ class OrientationCommandDispatcher:
                 if any(not isinstance(item, str) or not item for item in image_paths):
                     return self._error(request_id, "INVALID_REQUEST", "image_paths must contain non-empty strings")
                 catalog = runtime.catalog or WorkpieceCatalog(runtime.library, runtime.classifier)
-                started = time.perf_counter()
                 try:
-                    items = catalog.predict_many(workpiece_id, [Path(item) for item in image_paths])
+                    items, diagnostics = catalog._predict_many_with_diagnostics(
+                        workpiece_id, [Path(item) for item in image_paths]
+                    )
                 except Exception as exc:
                     fast_error = self._fast_prediction_error(request_id, catalog, workpiece_id, exc)
                     if fast_error is not None:
                         return fast_error
+                    if isinstance(exc, (KeyError, WorkpieceNotFoundError, BatchResultProtocolError)):
+                        raise
                     if isinstance(exc, OrientationClassifierError):
                         raise
                     LOGGER.exception("Orientation classifier batch failed")
                     return self._error(request_id, "MODEL_ERROR", str(exc))
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-                capability_reader = getattr(runtime.classifier, "batch_capabilities", None)
-                reported = capability_reader() if callable(capability_reader) else {}
-                if not isinstance(reported, Mapping):
-                    reported = {}
-                fallback = reported.get("fallback")
                 return self._response(
                     request_id,
                     ok=True,
                     items=items,
-                    batch_timings_ms={"decode": 0.0, "inference": 0.0, "postprocess": 0.0, "total": elapsed_ms},
-                    worker_count=int(reported.get("worker_count", 0) or 0),
-                    fallback=fallback,
+                    batch_timings_ms=diagnostics["batch_timings_ms"],
+                    worker_count=diagnostics["worker_count"],
+                    fallback=diagnostics["fallback"],
+                    batch_mode=diagnostics["batch_mode"],
                 )
             if command == "shutdown":
                 if (
@@ -1113,6 +1127,8 @@ class OrientationCommandDispatcher:
             return self._error(request_id, "INVALID_TEMPLATE_SET", str(exc))
         except FeatureBuildError as exc:
             return self._error(request_id, "MODEL_ERROR", str(exc))
+        except BatchResultProtocolError as exc:
+            return self._error(request_id, "BATCH_RESULT_INVALID", str(exc))
         except WorkpieceNotFoundError as exc:
             return self._error(request_id, "WORKPIECE_NOT_FOUND", str(exc))
         except RestoreConflictError as exc:
