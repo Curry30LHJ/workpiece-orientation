@@ -207,6 +207,15 @@ class ConcurrentExecutionCatalogClassifier(BatchCatalogClassifier):
         )
 
 
+class PoolNotReadyCatalogClassifier(FakeClassifier):
+    def batch_capabilities(self):
+        return {
+            "supported": True,
+            "batch_ready": False,
+            "worker_count": 2,
+        }
+
+
 class RevisionAwareFastClassifier(FakeClassifier):
     inference_mode = "fast_geometry"
 
@@ -469,6 +478,32 @@ def test_predict_many_keeps_concurrent_execution_diagnostics_request_local(tmp_p
     assert results["serial"]["worker_count"] == 0
     assert results["batch"]["batch_mode"] == "batch"
     assert results["batch"]["worker_count"] == 2
+
+
+def test_predict_many_reports_supported_but_not_ready_pool_diagnostics(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "pool-not-ready-catalog-library")
+    classifier = PoolNotReadyCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "not-ready-front.png", 10)], [image(tmp_path / "not-ready-back.png", 20)], False)
+
+    _, diagnostics = catalog._predict_many_with_diagnostics(record.id, [Path("a.png")])
+
+    assert diagnostics["batch_mode"] == "serial"
+    assert diagnostics["worker_count"] == 0
+    assert diagnostics["fallback"] == "batch_pool_not_ready"
+
+
+def test_predict_many_keeps_unsupported_batch_diagnostics_unavailable(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "unsupported-batch-library")
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "unsupported-front.png", 10)], [image(tmp_path / "unsupported-back.png", 20)], False)
+
+    _, diagnostics = catalog._predict_many_with_diagnostics(record.id, [Path("a.png")])
+
+    assert diagnostics["batch_mode"] == "serial"
+    assert diagnostics["worker_count"] == 0
+    assert diagnostics["fallback"] == "serial_batch_unavailable"
 
 
 def test_workpiece_summary_reports_unequal_counts_and_rules(tmp_path):

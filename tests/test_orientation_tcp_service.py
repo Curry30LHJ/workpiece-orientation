@@ -247,6 +247,21 @@ class ClosedPoolFallbackProtocolClassifier(BatchProtocolClassifier):
         )
 
 
+class PoolNotReadyProtocolClassifier(BatchProtocolClassifier):
+    def __init__(self):
+        super().__init__(capabilities={
+            "supported": True,
+            "batch_ready": False,
+            "worker_count": 2,
+            "threads_per_worker": 1,
+        })
+        self.batch_calls = 0
+
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        self.batch_calls += 1
+        raise AssertionError("not-ready batch pool must not be called")
+
+
 class FakeEvolution:
     def __init__(self):
         self.jobs = []
@@ -799,6 +814,27 @@ def test_dispatch_predict_batch_uses_closed_pool_execution_diagnostics():
     assert response["batch_mode"] == "serial"
     assert response["worker_count"] == 0
     assert response["fallback"] == "serial_closed_pool"
+
+
+def test_dispatch_predict_batch_reports_supported_not_ready_pool_diagnostics():
+    classifier = PoolNotReadyProtocolClassifier()
+    dispatcher = OrientationCommandDispatcher(classifier, FakeLibrary())
+    registered = dispatcher.dispatch({
+        "version": 1, "request_id": "register-not-ready", "command": "register", "name": "M7",
+        "replace": False, "front_images": ["front.png"], "back_images": ["back.png"],
+    })
+    assert registered["ok"] is True
+
+    response = dispatcher.dispatch({
+        "version": 1, "request_id": "batch-not-ready", "command": "predict_batch",
+        "workpiece_id": "m7", "image_paths": ["a.png"],
+    })
+
+    assert response["ok"] is True
+    assert classifier.batch_calls == 0
+    assert response["batch_mode"] == "serial"
+    assert response["worker_count"] == 0
+    assert response["fallback"] == "batch_pool_not_ready"
 
 
 def test_dispatch_predict_batch_maps_unknown_workpiece_to_not_found(client):

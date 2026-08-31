@@ -1076,6 +1076,8 @@ class WorkpieceCatalog:
                     results.append({"index": index, "image_path": str(path), "ok": True, "prediction": prediction})
             return results, diagnostics(actual_mode, inference_ms, actual_fallback, actual_worker_count)
 
+        if capabilities.get("supported") is True and batch_ready is not True:
+            return scalar_results(reported_fallback or "batch_pool_not_ready")
         return scalar_results(reported_fallback or "serial_batch_unavailable")
 
     def predict_many(self, workpiece_id: str, image_paths: Sequence[Path]) -> list[dict[str, object]]:
