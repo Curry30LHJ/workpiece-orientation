@@ -171,6 +171,14 @@ class _BatchSession:
                 return
 
 
+class BatchPredictionResults(list[dict[str, object]]):
+    """List-compatible batch results with request-local execution metadata."""
+
+    def __init__(self, items: Sequence[dict[str, object]], *, execution: Mapping[str, object]) -> None:
+        super().__init__(items)
+        self.execution = dict(execution)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -691,13 +699,18 @@ class OrientationClassifier:
     ) -> list[dict[str, object]]:
         paths = [Path(path) for path in image_paths]
         if not paths:
-            return []
+            return BatchPredictionResults([], execution={
+                "batch_mode": "serial", "worker_count": 0, "fallback": "serial_pool_not_ready",
+            })
         # Capture one immutable caller-provided snapshot for every worker.
         cache_snapshot = cache
         with self._batch_lifecycle_lock:
             pool = self._batch_pool
             sessions = tuple(self._batch_sessions)
         if not sessions or pool is None or not pool.ready:
+            execution = {
+                "batch_mode": "serial", "worker_count": 0, "fallback": "serial_pool_not_ready",
+            }
             predict_one = (
                 self.predict_fast_with_cache
                 if self.inference_mode == "fast_geometry"
@@ -729,11 +742,14 @@ class OrientationClassifier:
             except RuntimeError as exc:
                 if "closed" not in str(exc).lower():
                     raise
+                execution = {
+                    "batch_mode": "serial", "worker_count": 0, "fallback": "serial_closed_pool",
+                }
                 predict_one = self.predict_fast_with_cache
                 results = [predict_one(cache_snapshot, path, library_revision=library_revision) for path in paths]
                 batch_results = None
             if batch_results is None:
-                return [
+                return BatchPredictionResults([
                     {
                         **result,
                         "index": index,
@@ -745,7 +761,10 @@ class OrientationClassifier:
                         ),
                     }
                     for index, (path, result) in enumerate(zip(paths, results))
-                ]
+                ], execution=execution)
+            execution = {
+                "batch_mode": "batch", "worker_count": len(sessions), "fallback": None,
+            }
             results = []
             for item in batch_results:
                 result = dict(item.value) if item.error is None and isinstance(item.value, Mapping) else {}
@@ -762,7 +781,7 @@ class OrientationClassifier:
             result.setdefault("image_path", str(path))
             if library_revision is not None:
                 result.setdefault("library_revision", int(library_revision))
-        return results
+        return BatchPredictionResults(results, execution=execution)
 
     def _global_embeddings(self, images: Sequence[np.ndarray]) -> list[np.ndarray]:
         if not images:

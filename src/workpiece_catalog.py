@@ -973,7 +973,12 @@ class WorkpieceCatalog:
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                     item_timings[name] += float(value)
 
-        def diagnostics(mode: str, inference_ms: float, fallback: str | None) -> dict[str, object]:
+        def diagnostics(
+            mode: str,
+            inference_ms: float,
+            fallback: str | None,
+            actual_worker_count: int = worker_count,
+        ) -> dict[str, object]:
             return {
                 "batch_mode": mode,
                 "batch_timings_ms": {
@@ -982,7 +987,7 @@ class WorkpieceCatalog:
                     "postprocess": item_timings["postprocess"],
                     "total": (time.perf_counter() - started) * 1000.0,
                 },
-                "worker_count": worker_count if mode == "batch" else 0,
+                "worker_count": actual_worker_count if mode == "batch" else 0,
                 "fallback": fallback,
             }
 
@@ -1004,16 +1009,34 @@ class WorkpieceCatalog:
         if use_batch:
             inference_started = time.perf_counter()
             try:
-                raw_results = list(batch_reader(
+                batch_output = batch_reader(
                     snapshot.cache,
                     paths,
                     library_revision=snapshot.record.revision,
-                ))
+                )
+                execution = getattr(batch_output, "execution", None)
+                raw_results = list(batch_output)
             except Exception as exc:
                 if is_fast_cache_error(exc):
                     raise
                 return scalar_results("serial_after_batch_failure")
             inference_ms = (time.perf_counter() - inference_started) * 1000.0
+            actual_mode = "batch"
+            actual_worker_count = worker_count
+            actual_fallback = None
+            if isinstance(execution, Mapping):
+                reported_mode = execution.get("batch_mode")
+                if reported_mode in ("batch", "serial"):
+                    actual_mode = reported_mode
+                reported_workers = execution.get("worker_count")
+                if isinstance(reported_workers, int) and not isinstance(reported_workers, bool) and reported_workers >= 0:
+                    actual_worker_count = reported_workers
+                reported_execution_fallback = execution.get("fallback")
+                if isinstance(reported_execution_fallback, str) and reported_execution_fallback:
+                    actual_fallback = reported_execution_fallback
+            if actual_mode == "serial":
+                actual_worker_count = 0
+                actual_fallback = actual_fallback or "serial_batch_unavailable"
             if len(raw_results) != len(paths):
                 raise BatchResultProtocolError(
                     f"batch result count mismatch: expected {len(paths)}, got {len(raw_results)}"
@@ -1051,7 +1074,7 @@ class WorkpieceCatalog:
                     prediction.pop("image_path", None)
                     collect_item_timings(prediction)
                     results.append({"index": index, "image_path": str(path), "ok": True, "prediction": prediction})
-            return results, diagnostics("batch", inference_ms, None)
+            return results, diagnostics(actual_mode, inference_ms, actual_fallback, actual_worker_count)
 
         return scalar_results(reported_fallback or "serial_batch_unavailable")
 

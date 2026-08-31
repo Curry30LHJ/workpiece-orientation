@@ -230,6 +230,23 @@ class SlowScalarClassifier(FakeClassifier):
         return super().predict_with_cache(cache, image_path, library_revision=library_revision)
 
 
+class RequestLocalBatchResults(list):
+    def __init__(self, items, execution):
+        super().__init__(items)
+        self.execution = execution
+
+
+class ClosedPoolFallbackProtocolClassifier(BatchProtocolClassifier):
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        return RequestLocalBatchResults(
+            [
+                {"index": index, "image_path": str(path), "label": "front"}
+                for index, path in enumerate(image_paths)
+            ],
+            {"batch_mode": "serial", "worker_count": 0, "fallback": "serial_closed_pool"},
+        )
+
+
 class FakeEvolution:
     def __init__(self):
         self.jobs = []
@@ -763,6 +780,25 @@ def test_dispatch_predict_batch_reports_actual_batch_timing():
     assert response["fallback"] is None
     assert response["worker_count"] == 2
     assert response["batch_timings_ms"]["inference"] >= 5.0
+
+
+def test_dispatch_predict_batch_uses_closed_pool_execution_diagnostics():
+    dispatcher = OrientationCommandDispatcher(ClosedPoolFallbackProtocolClassifier(), FakeLibrary())
+    registered = dispatcher.dispatch({
+        "version": 1, "request_id": "register-closed", "command": "register", "name": "M7",
+        "replace": False, "front_images": ["front.png"], "back_images": ["back.png"],
+    })
+    assert registered["ok"] is True
+
+    response = dispatcher.dispatch({
+        "version": 1, "request_id": "batch-closed", "command": "predict_batch",
+        "workpiece_id": "m7", "image_paths": ["a.png"],
+    })
+
+    assert response["ok"] is True
+    assert response["batch_mode"] == "serial"
+    assert response["worker_count"] == 0
+    assert response["fallback"] == "serial_closed_pool"
 
 
 def test_dispatch_predict_batch_maps_unknown_workpiece_to_not_found(client):

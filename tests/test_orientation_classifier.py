@@ -172,6 +172,11 @@ def test_predict_many_uses_independent_sessions_and_preserves_order(tmp_path):
     results = classifier.predict_many_with_cache(cache, paths, library_revision=1)
     assert [result["index"] for result in results] == [0, 1]
     assert [result["image_path"] for result in results] == [str(path) for path in paths]
+    assert results.execution == {
+        "batch_mode": "batch",
+        "worker_count": 2,
+        "fallback": None,
+    }
     assert predictor.state["max_active"] >= 2
     classifier.close_batch_pool()
 
@@ -183,6 +188,20 @@ def test_failed_session_creation_reports_fallback_without_unlocking_shared_predi
     assert status["batch_ready"] is False
     assert "fallback" in status
     classifier.predict_fast_with_cache(cache, write_marker(tmp_path / "single.png", 3), library_revision=1)
+
+
+def test_batch_pool_not_ready_reports_request_local_serial_execution(tmp_path):
+    classifier, cache = _batch_classifier(tmp_path, _UncloneablePredictor())
+    path = write_marker(tmp_path / "pool-not-ready.png", 3)
+
+    result = classifier.predict_many_with_cache(cache, [path], library_revision=1)
+
+    assert isinstance(result, list)
+    assert result.execution == {
+        "batch_mode": "serial",
+        "worker_count": 0,
+        "fallback": "serial_pool_not_ready",
+    }
 
 
 def test_batch_rejects_nonpositive_worker_count(tmp_path):
@@ -245,6 +264,11 @@ def test_batch_submission_closed_pool_falls_back_to_serial(tmp_path, monkeypatch
     assert result[0]["index"] == 0
     assert result[0]["image_path"] == str(path)
     assert result[0]["library_revision"] == 1
+    assert result.execution == {
+        "batch_mode": "serial",
+        "worker_count": 0,
+        "fallback": "serial_closed_pool",
+    }
     monkeypatch.setattr(pool, "submit_many", original)
     classifier.close_batch_pool()
 

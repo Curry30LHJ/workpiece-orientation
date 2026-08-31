@@ -169,6 +169,44 @@ class MalformedBatchCatalogClassifier(BatchCatalogClassifier):
         ]
 
 
+class RequestLocalBatchResults(list):
+    def __init__(self, items, execution):
+        super().__init__(items)
+        self.execution = execution
+
+
+class ClosedPoolFallbackCatalogClassifier(BatchCatalogClassifier):
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        return RequestLocalBatchResults(
+            [
+                {"index": index, "image_path": str(path), "label": "front"}
+                for index, path in enumerate(image_paths)
+            ],
+            {"batch_mode": "serial", "worker_count": 0, "fallback": "serial_closed_pool"},
+        )
+
+
+class ConcurrentExecutionCatalogClassifier(BatchCatalogClassifier):
+    def __init__(self):
+        super().__init__()
+        self.barrier = threading.Barrier(2)
+
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        self.barrier.wait(timeout=2)
+        mode = "serial" if Path(image_paths[0]).name.startswith("serial") else "batch"
+        return RequestLocalBatchResults(
+            [
+                {"index": index, "image_path": str(path), "label": "front"}
+                for index, path in enumerate(image_paths)
+            ],
+            {
+                "batch_mode": mode,
+                "worker_count": 0 if mode == "serial" else 2,
+                "fallback": "serial_closed_pool" if mode == "serial" else None,
+            },
+        )
+
+
 class RevisionAwareFastClassifier(FakeClassifier):
     inference_mode = "fast_geometry"
 
@@ -393,6 +431,44 @@ def test_predict_many_rejects_duplicate_batch_result_indices(tmp_path):
 
     with pytest.raises(Exception, match="batch result"):
         catalog.predict_many(record.id, [Path("a.png"), Path("b.png")])
+
+
+def test_predict_many_uses_request_local_closed_pool_execution_diagnostics(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "closed-pool-catalog-library")
+    classifier = ClosedPoolFallbackCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "closed-front.png", 10)], [image(tmp_path / "closed-back.png", 20)], False)
+
+    _, diagnostics = catalog._predict_many_with_diagnostics(record.id, [Path("a.png")])
+
+    assert diagnostics["batch_mode"] == "serial"
+    assert diagnostics["worker_count"] == 0
+    assert diagnostics["fallback"] == "serial_closed_pool"
+
+
+def test_predict_many_keeps_concurrent_execution_diagnostics_request_local(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "concurrent-diagnostics-library")
+    classifier = ConcurrentExecutionCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "concurrent-front.png", 10)], [image(tmp_path / "concurrent-back.png", 20)], False)
+    results = {}
+
+    def run(key, path):
+        results[key] = catalog._predict_many_with_diagnostics(record.id, [Path(path)])[1]
+
+    serial = threading.Thread(target=run, args=("serial", "serial.png"))
+    batch = threading.Thread(target=run, args=("batch", "batch.png"))
+    serial.start()
+    batch.start()
+    serial.join(timeout=3)
+    batch.join(timeout=3)
+
+    assert not serial.is_alive()
+    assert not batch.is_alive()
+    assert results["serial"]["batch_mode"] == "serial"
+    assert results["serial"]["worker_count"] == 0
+    assert results["batch"]["batch_mode"] == "batch"
+    assert results["batch"]["worker_count"] == 2
 
 
 def test_workpiece_summary_reports_unequal_counts_and_rules(tmp_path):
