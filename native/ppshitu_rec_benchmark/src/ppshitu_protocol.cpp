@@ -1,9 +1,11 @@
 #include "ppshitu_protocol.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace workpiece::ppshitu::protocol {
 namespace {
@@ -129,6 +131,18 @@ class Cursor {
       return false;
     }
     value->assign(reinterpret_cast<const char*>(bytes_.data() + offset_), length);
+    offset_ += length;
+    return true;
+  }
+
+  bool ReadStringBytes(const std::uint16_t length, const bool allow_empty,
+                       std::string* value) {
+    if (value == nullptr || (!allow_empty && length == 0) ||
+        static_cast<std::size_t>(length) > bytes_.size() - offset_) {
+      return false;
+    }
+    value->assign(reinterpret_cast<const char*>(bytes_.data() + offset_),
+                  length);
     offset_ += length;
     return true;
   }
@@ -395,9 +409,11 @@ bool DecodePredict(const Frame& frame,
   payload->images.reserve(count);
   for (std::uint32_t index = 0; index < count; ++index) {
     ImageRecord image;
+    std::uint16_t reserved = 0;
     std::uint32_t data_length = 0;
     if (!cursor.ReadU32(&image.width) || !cursor.ReadU32(&image.height) ||
-        !cursor.ReadU16(&image.channels) || !cursor.ReadU32(&data_length) ||
+        !cursor.ReadU16(&image.channels) || !cursor.ReadU16(&reserved) ||
+        !cursor.ReadU32(&data_length) || reserved != 0 ||
         image.channels != 3 || image.width == 0 || image.height == 0 ||
         image.width > kMaxImageWidth || image.height > kMaxImageHeight) {
       SetError(error, "PREDICT image header is invalid");
@@ -497,12 +513,26 @@ bool EncodeError(const ErrorPayload& payload,
     SetError(error, "error output is null");
     return false;
   }
-  std::vector<std::uint8_t> encoded;
-  if (!AppendString(&encoded, payload.code, false, "error code is empty", error) ||
-      !AppendString(&encoded, payload.message, false, "error message is empty", error) ||
-      !AppendString(&encoded, payload.diagnostic, true, "", error)) {
+  if (payload.code.empty() || payload.message.empty() ||
+      payload.code.size() > kMaxStringBytes ||
+      payload.message.size() > kMaxStringBytes ||
+      payload.diagnostic.size() > kMaxStringBytes) {
+    SetError(error, "ERROR string is empty or exceeds UTF-8 length limit");
     return false;
   }
+  std::vector<std::uint8_t> encoded;
+  encoded.reserve(6 + payload.code.size() + payload.message.size() +
+                  payload.diagnostic.size());
+  // ERROR uses a length table followed by the three byte strings.  Keeping
+  // all lengths up front makes malformed payloads rejectable before any
+  // string bytes are interpreted and matches the Python client codec.
+  AppendU16(&encoded, static_cast<std::uint16_t>(payload.code.size()));
+  AppendU16(&encoded, static_cast<std::uint16_t>(payload.message.size()));
+  AppendU16(&encoded, static_cast<std::uint16_t>(payload.diagnostic.size()));
+  encoded.insert(encoded.end(), payload.code.begin(), payload.code.end());
+  encoded.insert(encoded.end(), payload.message.begin(), payload.message.end());
+  encoded.insert(encoded.end(), payload.diagnostic.begin(),
+                 payload.diagnostic.end());
   frame->kind = Kind::kError;
   frame->request_id = request_id;
   frame->payload = std::move(encoded);
@@ -515,9 +545,15 @@ bool DecodeError(const Frame& frame, ErrorPayload* payload, std::string* error) 
     return false;
   }
   Cursor cursor(frame.payload);
-  if (!cursor.ReadString(false, &payload->code) ||
-      !cursor.ReadString(false, &payload->message) ||
-      !cursor.ReadString(true, &payload->diagnostic) || cursor.remaining() != 0) {
+  std::uint16_t code_length = 0;
+  std::uint16_t message_length = 0;
+  std::uint16_t diagnostic_length = 0;
+  if (!cursor.ReadU16(&code_length) || !cursor.ReadU16(&message_length) ||
+      !cursor.ReadU16(&diagnostic_length) ||
+      !cursor.ReadStringBytes(code_length, false, &payload->code) ||
+      !cursor.ReadStringBytes(message_length, false, &payload->message) ||
+      !cursor.ReadStringBytes(diagnostic_length, true, &payload->diagnostic) ||
+      cursor.remaining() != 0) {
     SetError(error, "ERROR payload is invalid");
     return false;
   }

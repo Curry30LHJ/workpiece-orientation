@@ -122,6 +122,7 @@ def test_build_script_stages_only_the_vs2019_opencv_runtime(tmp_path):
         "if \"%1\"==\"--build\" (\n"
         "  mkdir \"%~2\\Release\" 2>NUL\n"
         "  type NUL > \"%~2\\Release\\ppshitu_rec_benchmark.exe\"\n"
+        "  type NUL > \"%~2\\Release\\ppshitu_rec_service.exe\"\n"
         ")\n"
         "exit /b 0\n",
         encoding="ascii",

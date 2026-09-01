@@ -90,6 +90,18 @@ add_executable(ppshitu_preprocess_probe
 target_link_libraries(ppshitu_preprocess_probe PRIVATE
     ppshitu_preprocess)
 
+add_executable(ppshitu_rec_service
+    src/service_main.cpp
+    src/native_service.cpp)
+target_include_directories(ppshitu_rec_service PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ppshitu_rec_service SYSTEM PRIVATE
+    "${PADDLE_INFERENCE_ROOT}/paddle/include"
+    ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(ppshitu_rec_service PRIVATE
+    ppshitu_core
+    ppshitu_protocol)
+
 target_compile_definitions(ppshitu_rec_benchmark PRIVATE
     WORKPIECE_GIT_COMMIT="${WORKPIECE_GIT_COMMIT}")
 
@@ -105,5 +117,7 @@ if(MSVC)
   target_compile_options(ppshitu_rec_benchmark PRIVATE
       /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
   target_compile_options(ppshitu_preprocess_probe PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
+  target_compile_options(ppshitu_rec_service PRIVATE
       /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
 endif()

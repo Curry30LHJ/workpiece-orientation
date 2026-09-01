@@ -107,6 +107,8 @@ if ($LASTEXITCODE -ne 0) {
 $outputDir = Join-Path $resolvedBuildDir $Configuration
 $executable = Join-Path $outputDir "ppshitu_rec_benchmark.exe"
 Assert-RequiredFile -Description "Native benchmark executable" -Path $executable
+$serviceExecutable = Join-Path $outputDir "ppshitu_rec_service.exe"
+Assert-RequiredFile -Description "Native service executable" -Path $serviceExecutable
 
 $runtimeFiles = @($paddleRuntime)
 $runtimeFiles += Get-ChildItem -LiteralPath $resolvedPaddleRoot -Recurse -File -Filter "*.dll" |
