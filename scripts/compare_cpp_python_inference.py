@@ -302,8 +302,10 @@ def _read_preprocess_spec(config_path: Path) -> _PreprocessSpec:
         if isinstance(resize, Mapping) and "size" in resize:
             size = resize["size"]
             parsed_size = _sequence_of_numbers(size, "ResizeImage.size", 2)
+            if any(item != int(item) for item in parsed_size):
+                raise RuntimeError("ResizeImage.size must contain positive integers")
             width, height = (int(item) for item in parsed_size)
-            if width <= 0 or height <= 0 or any(item != int(item) for item in parsed_size):
+            if width <= 0 or height <= 0:
                 raise RuntimeError("ResizeImage.size must contain positive integers")
         normalize = operation.get("NormalizeImage")
         if isinstance(normalize, Mapping):
@@ -407,12 +409,11 @@ def run_python_embeddings(
         raise RuntimeError(f"model directory does not exist: {model_dir}")
     if not config_path.is_file():
         raise RuntimeError(f"configuration file does not exist: {config_path}")
-    model_fingerprint = _model_fingerprint(model_dir)
-
     root = Path(project_root)
     value = str(root)
     if value not in sys.path:
         sys.path.insert(0, value)
+    model_fingerprint = _model_fingerprint(model_dir)
     try:
         import paddle
         from paddleclas.deploy.python.predict_rec import RecPredictor

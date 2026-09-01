@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "verified_on": "2026-09-01",
+  "platform": "windows-x64",
+  "source_git_commit": "e0383ede781b1682c216535b3e2a58aec4a81329",
+  "toolchain": {
+    "generator": "Visual Studio 16 2019",
+    "architecture": "x64",
+    "compiler": "MSVC",
+    "compiler_version": "19.29.30159.0",
+    "configuration": "Release"
+  },
+  "dependencies": [
+    {
+      "name": "paddle-inference",
+      "version": "3.0.0",
+      "build": "CPU AVX MKL MSVC2019",
+      "source_url": "https://paddle-inference-lib.bj.bcebos.com/3.0.0/cxx_c/Windows/CPU/x86-64_avx-mkl-vs2019/paddle_inference.zip",
+      "downloaded_filename": "paddle_inference-3.0.0-windows-cpu-avx-mkl-vs2019.zip",
+      "archive_size_bytes": 83959479,
+      "archive_sha256": "01A03D1B4E994F193151975F8BD71954ED9DF8AD1AE4FA186371D54F85CCDC26",
+      "resolved_build": {
+        "git_commit": "6ed5dd3833c32c3b21e14b1fb1a71f5a535a0fcc",
+        "with_mkl": true,
+        "with_onednn": true,
+        "with_gpu": false,
+        "compiler_version": "19.29.30158.0"
+      }
+    },
+    {
+      "name": "opencv",
+      "version": "4.6.0",
+      "build": "Windows VC14/VC15",
+      "source_url": "https://github.com/opencv/opencv/releases/download/4.6.0/opencv-4.6.0-vc14_vc15.exe",
+      "downloaded_filename": "opencv-4.6.0-vc14-vc15.exe",
+      "archive_size_bytes": 236724220,
+      "archive_sha256": "3FB046E14DC5B50719A86EA0395B5B1E3299E2343111EBD2E31828AA31D6D477",
+      "resolved_runtime": "x64/vc15"
+    }
+  ],
+  "model": {
+    "logical_path": "models/shitu_rec",
+    "fingerprint_algorithm": "sha256(relative-path-utf8 || file-bytes), sorted relative paths",
+    "fingerprint": "b5c295881006bdc7438a86a358f52289f510fe70c9f2429fc23b6d7a4427ec4a",
+    "files": [
+      {
+        "path": "inference.pdmodel",
+        "size_bytes": 1141862,
+        "sha256": "3E0ADE05639FF7B5FE450A55883A8087DC2B5C2349FE6B73897CBE2A5EEB6EE8"
+      },
+      {
+        "path": "inference.pdiparams",
+        "size_bytes": 18307022,
+        "sha256": "9F2613210C4126A2880D32108AD573A5179C0AF53A0ACBB5DB96155F8EC2CE8D"
+      }
+    ]
+  },
+  "native_artifact": {
+    "logical_path": ".native-build/ppshitu-cpp/Release/ppshitu_rec_benchmark.exe",
+    "size_bytes": 165376,
+    "sha256": "BECF4443DAE60B574035EA86903B5F8C45B045C4D4F59EBD2FC2B8B9E6493F90",
+    "built_from_commit": "e0383ede781b1682c216535b3e2a58aec4a81329"
+  },
+  "staged_runtime_dlls": [
+    {
+      "name": "common.dll",
+      "size_bytes": 687104,
+      "sha256": "241495E49331319317802889FE15B0D201BB42157FC0756DBF3B1644269BB047"
+    },
+    {
+      "name": "libiomp5md.dll",
+      "size_bytes": 1726848,
+      "sha256": "BC9E17190505A3BEDA7FEEDD90BA3AB7B6DC3F7CA5D980B2140C53AE459FC5AE"
+    },
+    {
+      "name": "mkldnn.dll",
+      "size_bytes": 47322112,
+      "sha256": "A25DF93583067D58B84F7B7A4D645D1C6881770D01879129455EF893E4C2673D"
+    },
+    {
+      "name": "mklml.dll",
+      "size_bytes": 92649344,
+      "sha256": "E2A7FD93E1534568626CFFE22676B15164A5A2B3A62F1919A55993478B45811E"
+    },
+    {
+      "name": "opencv_world460.dll",
+      "size_bytes": 64350720,
+      "sha256": "012B3B79F380A5D813B78D836BF9F378B6F79F514B413996A7C2AF8B800CB122"
+    },
+    {
+      "name": "opencv_world460d.dll",
+      "size_bytes": 130790400,
+      "sha256": "F01CFDFC64D3641342916411825A652B1B854101B3C690EA79F1EADD69381A7F",
+      "role": "staged_debug_extra"
+    },
+    {
+      "name": "paddle_inference.dll",
+      "size_bytes": 121158656,
+      "sha256": "4B1C820E7F46EB02771C020C471AE84164BF316E7B60BEE7A3FBFA4A63771D4B"
+    }
+  ]
+}
