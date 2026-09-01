@@ -110,16 +110,19 @@ from src.orientation_classifier import (
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_INFERENCE_MODE,
     DEFAULT_LOCAL_SEARCH_MODE,
+    DEFAULT_PP_BACKEND,
     ComputeDeviceError,
     ImageUnreadableError,
     INFERENCE_MODES,
     LOCAL_SEARCH_MODES,
     ModelFingerprintError,
+    PP_BACKENDS,
     OrientationClassifier,
     OrientationClassifierError,
     PropagationModelError,
     WorkpieceNotFoundError,
 )
+from src.native_pp_client import NativePPError
 from src.runtime_data import RuntimeDataError, legacy_runtime_data, prepare_runtime_data
 from src.windows_parent_watchdog import start_parent_watchdog
 from src.workpiece_library import (
@@ -200,6 +203,11 @@ STARTUP_ERROR_ACTIONS = {
     "DATA_LAYOUT_AMBIGUOUS": "备份 data 后移除无法识别的文件，禁止合并两个非空 data",
     "DATA_MIGRATION_FAILED": "保留现有 data 和自动备份，查看日志后重试或联系技术支持",
     "FAST_CACHE_BUILD_FAILED": "保留工件库并重启；仍失败时查看日志并重新建立该工件缓存",
+    "NATIVE_PP_CONFIG_INVALID": "检查 native PP-ShiTu 可执行文件路径和 CPU/fast_geometry 配置",
+    "NATIVE_PP_UNSUPPORTED_MODE": "native PP-ShiTu 仅支持 CPU + fast_geometry，请调整配置或改回 Python 后端",
+    "NATIVE_PP_STARTUP_FAILED": "检查 native PP-ShiTu 运行库、模型文件和 DLL 搜索路径，然后重启程序",
+    "NATIVE_PP_MODEL_MISMATCH": "确认 native PP-ShiTu 使用的模型目录与配置指纹一致，然后重启程序",
+    "NATIVE_PP_DIMENSION_MISMATCH": "确认 C++ 与模板缓存使用相同的特征维度，必要时重建缓存",
 }
 DEFAULT_STARTUP_ERROR_ACTION = "查看后端日志并联系技术支持"
 
@@ -332,6 +340,10 @@ class RuntimeSnapshot:
     package_version: str = "dev"
     edition: str = "dev"
     compute_device: str = "gpu"
+    pp_backend: str = DEFAULT_PP_BACKEND
+    native_service_version: str = ""
+    native_model_sha256: str = ""
+    feature_dim: int | None = None
     model_fingerprint: str = ""
     instance_token: str = "external"
     error_action: str = ""
@@ -363,6 +375,13 @@ def _shutdown_runtime_components(
             shutdown()
         except Exception:
             LOGGER.exception("Unable to shut down %s", name)
+    close_classifier = getattr(classifier, "close", None)
+    if callable(close_classifier):
+        try:
+            close_classifier()
+        except Exception:
+            LOGGER.exception("Unable to shut down orientation classifier")
+        return
     close_batch_pool = getattr(classifier, "close_batch_pool", None)
     if callable(close_batch_pool):
         try:
@@ -399,6 +418,10 @@ class ServiceRuntime:
         package_version: str = "dev",
         edition: str = "dev",
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        pp_backend: str = DEFAULT_PP_BACKEND,
+        native_service_version: str = "",
+        native_model_sha256: str = "",
+        feature_dim: int | None = None,
         model_fingerprint: str = "",
         instance_token: str = "external",
         log_path: str = "",
@@ -409,6 +432,10 @@ class ServiceRuntime:
             package_version=package_version,
             edition=edition,
             compute_device=compute_device,
+            pp_backend=pp_backend,
+            native_service_version=native_service_version,
+            native_model_sha256=native_model_sha256,
+            feature_dim=feature_dim,
             model_fingerprint=model_fingerprint,
             instance_token=instance_token,
             log_path=log_path,
@@ -475,6 +502,27 @@ class ServiceRuntime:
                     geometry_profiles=geometry_profiles,
                     start_worker=False,
                 )
+            metadata_reader = getattr(classifier, "native_backend_info", None)
+            if callable(metadata_reader):
+                metadata = metadata_reader()
+            else:
+                metadata = {
+                    "backend": getattr(classifier, "pp_backend", DEFAULT_PP_BACKEND),
+                    "service_version": "",
+                    "model_sha256": "",
+                    "feature_dim": None,
+                }
+            if not isinstance(metadata, Mapping):
+                raise RuntimeError("classifier native backend metadata is invalid")
+            pp_backend = str(metadata.get("backend", DEFAULT_PP_BACKEND)).strip().lower()
+            if pp_backend not in PP_BACKENDS:
+                raise RuntimeError("classifier native backend metadata has an unknown backend")
+            service_version = str(metadata.get("service_version", "") or "")
+            native_model_sha256 = str(metadata.get("model_sha256", "") or "")
+            feature_dim = metadata.get("feature_dim")
+            if feature_dim is not None:
+                if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim <= 0:
+                    raise RuntimeError("classifier native backend metadata has an invalid feature dimension")
             with self._lock:
                 if self._shutdown_requested:
                     return False
@@ -486,6 +534,10 @@ class ServiceRuntime:
                     message="后端已就绪",
                     progress=100,
                     compute_device=getattr(classifier, "compute_device", self._snapshot.compute_device),
+                    pp_backend=pp_backend,
+                    native_service_version=service_version,
+                    native_model_sha256=native_model_sha256,
+                    feature_dim=feature_dim,
                     model_fingerprint=getattr(classifier, "model_fingerprint", self._snapshot.model_fingerprint),
                     classifier=classifier,
                     library=library,
@@ -675,6 +727,10 @@ class OrientationCommandDispatcher:
                     "package_version": runtime.package_version,
                     "edition": runtime.edition,
                     "compute_device": runtime.compute_device,
+                    "pp_backend": runtime.pp_backend,
+                    "native_service_version": runtime.native_service_version,
+                    "native_model_sha256": runtime.native_model_sha256,
+                    "feature_dim": runtime.feature_dim,
                     "model_fingerprint": runtime.model_fingerprint,
                     "instance_token": runtime.instance_token,
                     "error_action": runtime.error_action,
@@ -1079,6 +1135,8 @@ class OrientationCommandDispatcher:
                         return fast_error
                     if isinstance(exc, OrientationClassifierError):
                         raise
+                    if isinstance(exc, NativePPError):
+                        raise
                     LOGGER.exception("Orientation classifier failed")
                     return self._error(request_id, "MODEL_ERROR", str(exc))
                 return self._response(request_id, ok=True, **prediction)
@@ -1105,6 +1163,8 @@ class OrientationCommandDispatcher:
                     if isinstance(exc, (KeyError, WorkpieceNotFoundError, BatchResultProtocolError)):
                         raise
                     if isinstance(exc, OrientationClassifierError):
+                        raise
+                    if isinstance(exc, NativePPError):
                         raise
                     LOGGER.exception("Orientation classifier batch failed")
                     return self._error(request_id, "MODEL_ERROR", str(exc))
@@ -1189,6 +1249,8 @@ class OrientationCommandDispatcher:
             return self._error(request_id, "MODEL_ERROR", str(exc))
         except OrientationClassifierError as exc:
             return self._error(request_id, "MODEL_ERROR", str(exc))
+        except NativePPError as exc:
+            return self._error(request_id, exc.code, exc.message)
         except Exception:
             LOGGER.exception("Unhandled orientation command failure")
             return self._error(request_id, "INTERNAL_ERROR", "Internal server error")
@@ -1451,6 +1513,8 @@ def _load_runtime(
     paddle_config_path: Path | None = None,
     compute_device: str = DEFAULT_COMPUTE_DEVICE,
     model_sha256: str | None = None,
+    pp_backend: str = DEFAULT_PP_BACKEND,
+    native_pp_executable: Path | None = None,
 ) -> None:
     catalog = None
     profiles = None
@@ -1464,15 +1528,19 @@ def _load_runtime(
         else:
             raise RuntimeDataError("DATA_LAYOUT_AMBIGUOUS", "No runtime data path was provided")
         runtime.update_loading("loading_model", "正在加载 PP-ShiTu 模型", 35)
-        classifier = OrientationClassifier.load(
-            project_root,
-            model_dir,
-            paddle_config_path=paddle_config_path,
-            compute_device=compute_device,
-            expected_model_fingerprint=model_sha256,
-            local_search_mode=local_search_mode,
-            inference_mode=inference_mode,
-        )
+        load_kwargs = {
+            "paddle_config_path": paddle_config_path,
+            "compute_device": compute_device,
+            "expected_model_fingerprint": model_sha256,
+            "local_search_mode": local_search_mode,
+            "inference_mode": inference_mode,
+        }
+        if str(pp_backend).strip().lower() != DEFAULT_PP_BACKEND or native_pp_executable is not None:
+            load_kwargs.update({
+                "pp_backend": pp_backend,
+                "native_pp_executable": native_pp_executable,
+            })
+        classifier = OrientationClassifier.load(project_root, model_dir, **load_kwargs)
         runtime.update_loading("restoring_library", "正在恢复工件库和快速缓存", 80)
         library = WorkpieceLibrary(paths.workpieces)
         catalog = WorkpieceCatalog(library, classifier)
@@ -1496,7 +1564,7 @@ def _load_runtime(
                     # A batch pool is an optimization.  Keep scalar service startup usable.
                     LOGGER.exception("CPU batch inference pool prewarm failed; using scalar fallback")
         transferred = runtime.set_ready(classifier, library, catalog)
-    except (RuntimeDataError, ComputeDeviceError, ModelFingerprintError) as exc:
+    except (RuntimeDataError, ComputeDeviceError, ModelFingerprintError, NativePPError) as exc:
         LOGGER.exception("Orientation service startup failed with code %s", exc.code)
         runtime.set_failed(exc.code, str(exc) or type(exc).__name__)
     except Exception as exc:
@@ -1518,6 +1586,8 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     data_group.add_argument("--library-dir", type=Path)
     parser.add_argument("--paddle-config", type=Path)
     parser.add_argument("--compute-device", choices=COMPUTE_DEVICES, default=DEFAULT_COMPUTE_DEVICE)
+    parser.add_argument("--pp-backend", choices=PP_BACKENDS, default=DEFAULT_PP_BACKEND)
+    parser.add_argument("--native-pp-executable", type=Path)
     parser.add_argument("--model-sha256")
     parser.add_argument("--package-version", default="dev")
     parser.add_argument("--edition", default="dev")
@@ -1536,6 +1606,34 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_native_arguments(args: argparse.Namespace) -> None:
+    """Validate native executable and supported mode before model loading."""
+    backend = str(getattr(args, "pp_backend", DEFAULT_PP_BACKEND)).strip().lower()
+    if backend not in PP_BACKENDS:
+        raise SystemExit(f"NATIVE_PP_CONFIG_INVALID: unknown pp_backend {backend!r}")
+    if backend != "native_cpp":
+        return
+    compute_device = str(getattr(args, "compute_device", DEFAULT_COMPUTE_DEVICE)).strip().lower()
+    inference_mode = str(getattr(args, "inference_mode", DEFAULT_INFERENCE_MODE)).strip().lower()
+    if compute_device != "cpu" or inference_mode != "fast_geometry":
+        raise SystemExit(
+            "NATIVE_PP_UNSUPPORTED_MODE: native_cpp requires CPU + fast_geometry"
+        )
+    executable_value = getattr(args, "native_pp_executable", None)
+    if executable_value is None:
+        raise SystemExit("NATIVE_PP_CONFIG_INVALID: native_pp_executable is required")
+    executable = Path(executable_value).expanduser()
+    try:
+        executable = executable.resolve()
+    except OSError:
+        executable = executable.absolute()
+    if not executable.is_file() or executable.is_symlink():
+        raise SystemExit(
+            f"NATIVE_PP_CONFIG_INVALID: native executable is not a regular file: {executable}"
+        )
+    args.native_pp_executable = executable
+
+
 def _validate_packaged_arguments(args: argparse.Namespace) -> None:
     if getattr(args, "data_root", None) is None:
         return
@@ -1551,6 +1649,7 @@ def main() -> None:
     args = _build_argument_parser().parse_args()
     if args.host != "127.0.0.1":
         raise SystemExit("INVALID_BIND_ADDRESS: only 127.0.0.1 is allowed")
+    _validate_native_arguments(args)
     _validate_packaged_arguments(args)
     data_root = getattr(args, "data_root", None)
     library_dir = getattr(args, "library_dir", None)
@@ -1565,6 +1664,7 @@ def main() -> None:
         package_version=getattr(args, "package_version", "dev"),
         edition=getattr(args, "edition", "dev"),
         compute_device=getattr(args, "compute_device", DEFAULT_COMPUTE_DEVICE),
+        pp_backend=getattr(args, "pp_backend", DEFAULT_PP_BACKEND),
         model_fingerprint=getattr(args, "model_sha256", None) or "",
         instance_token=getattr(args, "instance_token", "external"),
         log_path=log_path,
@@ -1589,6 +1689,8 @@ def main() -> None:
             "model_sha256": getattr(args, "model_sha256", None),
             "local_search_mode": args.local_search_mode,
             "inference_mode": args.inference_mode,
+            "pp_backend": getattr(args, "pp_backend", DEFAULT_PP_BACKEND),
+            "native_pp_executable": getattr(args, "native_pp_executable", None),
         },
         name="orientation-model-loader",
         daemon=True,

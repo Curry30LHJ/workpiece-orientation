@@ -25,6 +25,7 @@ from src.orientation_tcp_service import (
 from src.orientation_classifier import (
     ComputeDeviceError,
     ModelFingerprintError,
+    NativePPError,
     OrientationClassifierError,
     PropagationModelError,
 )
@@ -236,6 +237,89 @@ def test_runtime_loader_prewarms_requested_cpu_batch_pool_before_ready(monkeypat
         "predict_batch": True, "batch_ready": True, "batch_workers": 2,
         "batch_threads_per_worker": 2,
     }
+
+
+def test_runtime_loader_forwards_native_backend_arguments(monkeypatch, tmp_path):
+    captured = {}
+    executable = tmp_path / "ppshitu_rec_service.exe"
+    executable.write_bytes(b"fake")
+
+    class LoadedClassifier:
+        compute_device = "cpu"
+        inference_mode = "fast_geometry"
+        model_fingerprint = "e" * 64
+        geometry_calibrator = None
+        pp_backend = "native_cpp"
+
+        @classmethod
+        def load(cls, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return cls()
+
+        def prepare_batch_pool(self, **kwargs):
+            return {"batch_ready": False, "worker_count": 0, "fallback": "test"}
+
+        def native_backend_info(self):
+            return {
+                "backend": "native_cpp",
+                "service_version": "native/1",
+                "model_sha256": "f" * 64,
+                "feature_dim": 512,
+            }
+
+    class LoadedLibrary:
+        def __init__(self, root):
+            self.library_dir = None
+
+    class LoadedCatalog:
+        geometry_profiles = None
+
+        def __init__(self, library, classifier):
+            pass
+
+        def set_geometry_profiles(self, profiles):
+            self.geometry_profiles = profiles
+
+        def recover(self):
+            pass
+
+    class Profiles:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(service_module, "OrientationClassifier", LoadedClassifier)
+    monkeypatch.setattr(service_module, "WorkpieceLibrary", LoadedLibrary)
+    monkeypatch.setattr(service_module, "WorkpieceCatalog", LoadedCatalog)
+    monkeypatch.setattr(service_module, "GeometryMaskProfiles", Profiles)
+    monkeypatch.setattr(
+        service_module,
+        "prepare_runtime_data",
+        lambda root: SimpleNamespace(workpieces=tmp_path / "workpieces"),
+    )
+
+    runtime = ServiceRuntime(compute_device="cpu", pp_backend="native_cpp")
+    service_module._load_runtime(
+        runtime,
+        tmp_path,
+        tmp_path / "models",
+        None,
+        data_root=tmp_path / "data",
+        compute_device="cpu",
+        inference_mode="fast_geometry",
+        pp_backend="native_cpp",
+        native_pp_executable=executable,
+    )
+
+    assert captured["kwargs"]["pp_backend"] == "native_cpp"
+    assert captured["kwargs"]["native_pp_executable"] == executable
+    assert runtime.snapshot().pp_backend == "native_cpp"
 
 
 def test_batch_runtime_configuration_rejects_invalid_values_with_safe_defaults(monkeypatch, caplog):
@@ -2015,6 +2099,61 @@ def test_hello_reports_loading_phase_and_identity():
     assert response["instance_token"] == "launch-123"
 
 
+def test_hello_reports_native_backend_metadata():
+    runtime = ServiceRuntime(compute_device="cpu")
+
+    class NativeClassifier(FakeClassifier):
+        compute_device = "cpu"
+        model_fingerprint = "b" * 64
+
+        def native_backend_info(self):
+            return {
+                "backend": "native_cpp",
+                "service_version": "ppshitu-native-cpp/1",
+                "model_sha256": "c" * 64,
+                "feature_dim": 512,
+                "last_error": None,
+            }
+
+    assert runtime.set_ready(NativeClassifier(), FakeLibrary()) is True
+    response = OrientationCommandDispatcher(runtime).dispatch({
+        "version": 1, "request_id": "native-hello", "command": "hello",
+    })
+    assert response["ok"] is True
+    assert response["pp_backend"] == "native_cpp"
+    assert response["native_service_version"] == "ppshitu-native-cpp/1"
+    assert response["native_model_sha256"] == "c" * 64
+    assert response["feature_dim"] == 512
+
+
+def test_runtime_set_ready_reads_native_metadata_once():
+    runtime = ServiceRuntime()
+
+    class NativeClassifier(FakeClassifier):
+        def __init__(self):
+            super().__init__()
+            self.metadata_calls = 0
+
+        def native_backend_info(self):
+            self.metadata_calls += 1
+            return {
+                "backend": "native_cpp",
+                "service_version": "native/1",
+                "model_sha256": "d" * 64,
+                "feature_dim": 2,
+                "last_error": None,
+            }
+
+    classifier = NativeClassifier()
+    assert runtime.set_ready(classifier, FakeLibrary()) is True
+    assert classifier.metadata_calls == 1
+    snapshot = runtime.snapshot()
+    assert snapshot.pp_backend == "native_cpp"
+    assert snapshot.native_service_version == "native/1"
+    assert snapshot.native_model_sha256 == "d" * 64
+    assert snapshot.feature_dim == 2
+
+
 def test_loading_phase_and_progress_never_regress():
     runtime = ServiceRuntime()
     runtime.update_loading("loading_model", "正在加载模型", 35)
@@ -2086,6 +2225,37 @@ def test_local_search_mode_argument_defaults_to_adaptive(tmp_path):
     ])
 
     assert args.local_search_mode == "adaptive"
+
+
+def test_native_backend_arguments_are_parsed(tmp_path):
+    parser = service_module._build_argument_parser()
+    executable = tmp_path / "服务.exe"
+    args = parser.parse_args([
+        "--project-root", str(tmp_path),
+        "--model-dir", str(tmp_path / "models"),
+        "--library-dir", str(tmp_path / "library"),
+        "--pp-backend", "native_cpp",
+        "--native-pp-executable", str(executable),
+        "--compute-device", "cpu",
+        "--inference-mode", "fast_geometry",
+    ])
+    assert args.pp_backend == "native_cpp"
+    assert args.native_pp_executable == executable
+
+
+def test_native_backend_validation_rejects_missing_executable(tmp_path):
+    parser = service_module._build_argument_parser()
+    args = parser.parse_args([
+        "--project-root", str(tmp_path),
+        "--model-dir", str(tmp_path / "models"),
+        "--library-dir", str(tmp_path / "library"),
+        "--pp-backend", "native_cpp",
+        "--native-pp-executable", str(tmp_path / "missing.exe"),
+        "--compute-device", "cpu",
+        "--inference-mode", "fast_geometry",
+    ])
+    with pytest.raises(SystemExit, match="NATIVE_PP_CONFIG_INVALID"):
+        service_module._validate_native_arguments(args)
 
 
 def test_local_search_mode_argument_rejects_unknown_value(tmp_path):
