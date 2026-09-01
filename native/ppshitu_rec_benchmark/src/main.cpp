@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <bcrypt.h>
 #include <psapi.h>
 
 #include "feature_extractor.h"
@@ -32,6 +33,10 @@
 
 namespace {
 
+#ifndef WORKPIECE_GIT_COMMIT
+#define WORKPIECE_GIT_COMMIT "unknown"
+#endif
+
 using workpiece::ppshitu::BatchTensor;
 using workpiece::ppshitu::FeatureExtractor;
 using workpiece::ppshitu::ImageTensor;
@@ -59,8 +64,8 @@ struct Options {
   int threads = 1;
   int workers = 1;
   int batch_size = 1;
-  int warmup = 0;
-  int iterations = 1;
+  int warmup = 50;
+  int iterations = 200;
   bool preprocess_only = false;
 };
 
@@ -82,6 +87,133 @@ std::string WideToUtf8(const std::wstring& value) {
 
 std::string PathToUtf8(const std::filesystem::path& path) {
   return WideToUtf8(path.wstring());
+}
+
+class Sha256Hasher {
+ public:
+  Sha256Hasher() {
+    if (BCryptOpenAlgorithmProvider(&algorithm_, BCRYPT_SHA256_ALGORITHM,
+                                    nullptr, 0) < 0) {
+      throw std::runtime_error("unable to open SHA-256 provider");
+    }
+    DWORD object_length = 0;
+    DWORD returned = 0;
+    if (BCryptGetProperty(algorithm_, BCRYPT_OBJECT_LENGTH,
+                          reinterpret_cast<PUCHAR>(&object_length),
+                          sizeof(object_length), &returned, 0) < 0 ||
+        object_length == 0) {
+      BCryptCloseAlgorithmProvider(algorithm_, 0);
+      algorithm_ = nullptr;
+      throw std::runtime_error("unable to query SHA-256 provider");
+    }
+    object_.resize(object_length);
+    if (BCryptCreateHash(algorithm_, &hash_, object_.data(), object_length,
+                         nullptr, 0, 0) < 0) {
+      BCryptCloseAlgorithmProvider(algorithm_, 0);
+      algorithm_ = nullptr;
+      throw std::runtime_error("unable to create SHA-256 hash");
+    }
+  }
+
+  Sha256Hasher(const Sha256Hasher&) = delete;
+  Sha256Hasher& operator=(const Sha256Hasher&) = delete;
+
+  ~Sha256Hasher() {
+    if (hash_ != nullptr) {
+      BCryptDestroyHash(hash_);
+    }
+    if (algorithm_ != nullptr) {
+      BCryptCloseAlgorithmProvider(algorithm_, 0);
+    }
+  }
+
+  void Update(const unsigned char* data, std::size_t length) {
+    while (length > 0) {
+      const ULONG chunk = static_cast<ULONG>(std::min<std::size_t>(
+          length, std::numeric_limits<ULONG>::max()));
+      if (BCryptHashData(hash_, const_cast<PUCHAR>(data), chunk, 0) < 0) {
+        throw std::runtime_error("unable to update SHA-256 hash");
+      }
+      data += chunk;
+      length -= chunk;
+    }
+  }
+
+  std::string Finish() {
+    std::array<unsigned char, 32> digest{};
+    if (BCryptFinishHash(hash_, digest.data(),
+                         static_cast<ULONG>(digest.size()), 0) < 0) {
+      throw std::runtime_error("unable to finish SHA-256 hash");
+    }
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(digest.size() * 2);
+    for (const unsigned char value : digest) {
+      result.push_back(hex[value >> 4]);
+      result.push_back(hex[value & 0x0f]);
+    }
+    return result;
+  }
+
+ private:
+  BCRYPT_ALG_HANDLE algorithm_ = nullptr;
+  BCRYPT_HASH_HANDLE hash_ = nullptr;
+  std::vector<unsigned char> object_;
+};
+
+void HashFile(Sha256Hasher* hasher, const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    throw std::runtime_error("unable to open file for hashing: " +
+                             PathToUtf8(path));
+  }
+  // Keep the streaming buffer on the heap. A 1 MiB std::array exhausted the
+  // default Windows executable stack before inference could start.
+  std::vector<unsigned char> buffer(64 * 1024);
+  while (stream) {
+    stream.read(reinterpret_cast<char*>(buffer.data()),
+                static_cast<std::streamsize>(buffer.size()));
+    const std::streamsize count = stream.gcount();
+    if (count > 0) {
+      hasher->Update(buffer.data(), static_cast<std::size_t>(count));
+    }
+  }
+  if (!stream.eof()) {
+    throw std::runtime_error("unable to read file for hashing: " +
+                             PathToUtf8(path));
+  }
+}
+
+std::string Sha256File(const std::filesystem::path& path) {
+  Sha256Hasher hasher;
+  HashFile(&hasher, path);
+  return hasher.Finish();
+}
+
+std::string ModelFingerprint(const std::filesystem::path& root) {
+  if (!std::filesystem::is_directory(root)) {
+    throw std::runtime_error("model directory does not exist");
+  }
+  std::vector<std::filesystem::path> files;
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator(root)) {
+    if (entry.is_regular_file()) {
+      files.push_back(entry.path());
+    }
+  }
+  std::sort(files.begin(), files.end(), [&](const auto& left, const auto& right) {
+    return left.lexically_relative(root).generic_u8string() <
+           right.lexically_relative(root).generic_u8string();
+  });
+  Sha256Hasher hasher;
+  for (const auto& file : files) {
+    const std::string relative =
+        file.lexically_relative(root).generic_u8string();
+    hasher.Update(reinterpret_cast<const unsigned char*>(relative.data()),
+                  relative.size());
+    HashFile(&hasher, file);
+  }
+  return hasher.Finish();
 }
 
 std::string JsonEscape(const std::string& value) {
@@ -191,8 +323,8 @@ void PrintHelp() {
       << "  --threads <n>         Paddle CPU threads (default: 1)\n"
       << "  --workers <n>         Independent predictors (default: 1)\n"
       << "  --batch-size <n>      Images per predictor Run() (default: 1)\n"
-      << "  --warmup <n>          Unmeasured iterations (default: 0)\n"
-      << "  --iterations <n>      Measured iterations (default: 1)\n"
+      << "  --warmup <n>          Unmeasured iterations (default: 50)\n"
+      << "  --iterations <n>      Measured iterations (default: 200)\n"
       << "  --dump-embeddings <path>  Write normalized float32 rows\n"
       << "  --preprocess-only     Stop after NCHW preprocessing\n"
       << "  --dump-inputs <path>  Write row-major NCHW float32 values\n"
@@ -880,11 +1012,19 @@ std::string BuildInferenceReport(
     const std::vector<double>& preprocess_samples,
     const std::vector<double>& inference_samples,
     const std::vector<double>& normalize_samples,
-    const std::vector<double>& total_samples, std::uint64_t peak_working_set) {
+    const std::vector<double>& total_samples, std::uint64_t peak_working_set,
+    const std::string& model_fingerprint,
+    const std::vector<std::string>& input_hashes) {
   std::ostringstream report;
   report << std::setprecision(10)
          << "{\"schema_version\":1,\"ok\":true,"
          << "\"mode\":\"feature_extraction\","
+         << "\"git_commit\":\"" << JsonEscape(WORKPIECE_GIT_COMMIT)
+         << "\",\"runtime\":{\"paddle_inference_version\":\""
+         << JsonEscape(paddle_infer::GetVersion())
+         << "\",\"opencv_version\":\"" << JsonEscape(CV_VERSION)
+         << "\"},\"model_fingerprint\":\""
+         << JsonEscape(model_fingerprint) << "\","
          << "\"input_count\":" << image_paths.size() << ','
          << "\"feature_dimension\":" << last.columns << ','
          << "\"worker_count\":" << options.workers << ','
@@ -900,6 +1040,13 @@ std::string BuildInferenceReport(
       report << ',';
     }
     report << '\"' << JsonEscape(PathToUtf8(image_paths[index])) << '\"';
+  }
+  report << "],\"input_sha256\":[";
+  for (std::size_t index = 0; index < input_hashes.size(); ++index) {
+    if (index != 0) {
+      report << ',';
+    }
+    report << '\"' << JsonEscape(input_hashes[index]) << '\"';
   }
   report << "],\"predictor_instance_ids\":[";
   for (std::size_t index = 0; index < extractors.size(); ++index) {
@@ -927,6 +1074,18 @@ int RunInference(const Options& options) {
                 "IMAGE_LIST_INVALID", exception.what());
   }
 
+  std::string model_fingerprint;
+  std::vector<std::string> input_hashes;
+  try {
+    input_hashes.reserve(image_paths.size());
+    for (const auto& image_path : image_paths) {
+      input_hashes.push_back(Sha256File(image_path));
+    }
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kInputUnreadable,
+                "FINGERPRINT_FAILED", exception.what());
+  }
+
   std::vector<std::unique_ptr<FeatureExtractor>> extractors;
   extractors.reserve(static_cast<std::size_t>(options.workers));
   try {
@@ -936,6 +1095,12 @@ int RunInference(const Options& options) {
       extractors.push_back(
           std::make_unique<FeatureExtractor>(predictor_options));
     }
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kModelLoadFailed,
+                "MODEL_LOAD_FAILED", exception.what());
+  }
+  try {
+    model_fingerprint = ModelFingerprint(options.model_dir);
   } catch (const std::exception& exception) {
     return Fail(options.report, ExitCode::kModelLoadFailed,
                 "MODEL_LOAD_FAILED", exception.what());
@@ -988,7 +1153,8 @@ int RunInference(const Options& options) {
           BuildInferenceReport(options, image_paths, extractors, last,
                                decode_samples, preprocess_samples,
                                inference_samples, normalize_samples,
-                               total_samples, peak_working_set))) {
+                               total_samples, peak_working_set,
+                               model_fingerprint, input_hashes))) {
     std::cerr << "unable to write inference report\n";
     return static_cast<int>(ExitCode::kReportWriteFailed);
   }

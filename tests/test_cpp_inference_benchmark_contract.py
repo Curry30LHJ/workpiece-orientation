@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -151,6 +152,8 @@ def test_native_cli_help_documents_required_inputs(native_exe):
     assert "--model-dir" in result.stdout
     assert "--image-list" in result.stdout
     assert "--report" in result.stdout
+    assert "default: 50" in result.stdout
+    assert "default: 200" in result.stdout
 
 
 @pytest.mark.integration
@@ -405,6 +408,15 @@ def test_native_real_batch_preserves_order_and_returns_unit_embeddings(
         "total",
     }
     assert report["peak_working_set_bytes"] > 0
+    assert len(report["input_sha256"]) == 5
+    assert all(len(value) == 64 for value in report["input_sha256"])
+    assert report["input_sha256"] == [
+        hashlib.sha256(path.read_bytes()).hexdigest() for path in five_images
+    ]
+    assert len(report["model_fingerprint"]) == 64
+    assert report["runtime"]["paddle_inference_version"]
+    assert report["runtime"]["opencv_version"]
+    assert report["git_commit"]
 
 
 @pytest.mark.integration

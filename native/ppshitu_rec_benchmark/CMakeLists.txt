@@ -32,6 +32,16 @@ find_package(OpenCV REQUIRED PATHS
     "${OPENCV_ROOT}/build"
     NO_DEFAULT_PATH)
 
+execute_process(
+    COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    OUTPUT_VARIABLE WORKPIECE_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT WORKPIECE_GIT_COMMIT)
+  set(WORKPIECE_GIT_COMMIT "unknown")
+endif()
+
 add_executable(ppshitu_rec_benchmark
     src/main.cpp
     src/preprocess.cpp
@@ -44,7 +54,11 @@ target_include_directories(ppshitu_rec_benchmark SYSTEM PRIVATE
 target_link_libraries(ppshitu_rec_benchmark PRIVATE
     "${PADDLE_INFERENCE_LIBRARY}"
     ${OpenCV_LIBS}
-    Psapi)
+    Psapi
+    Bcrypt)
+
+target_compile_definitions(ppshitu_rec_benchmark PRIVATE
+    WORKPIECE_GIT_COMMIT="${WORKPIECE_GIT_COMMIT}")
 
 if(MSVC)
   target_compile_options(ppshitu_rec_benchmark PRIVATE
