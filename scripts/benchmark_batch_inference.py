@@ -24,6 +24,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+REQUEST_TIMEOUT_SECONDS = 120.0
+
 
 def percentiles_ms(samples: Iterable[float]) -> dict[str, float]:
     """Return stable linear percentiles without optional numeric packages."""
@@ -146,6 +148,13 @@ def run_batch_measurements(client: Any, process: Any, workpiece_id: str, image_p
     last_response: dict[str, Any] = {}
     measured_labels: list[str] = []
     try:
+        # Model loading on a CPU target can take substantially longer than the
+        # short request-connect timeout used by the initial socket. Expand the
+        # read timeout for the handshake so a slow but healthy backend is not
+        # misreported as a failed benchmark.
+        set_timeout = getattr(client, "set_timeout", None)
+        if callable(set_timeout):
+            set_timeout(startup_timeout_seconds)
         deadline = time.monotonic() + startup_timeout_seconds
         while True:
             hello_id = str(uuid.uuid4())
@@ -159,6 +168,8 @@ def run_batch_measurements(client: Any, process: Any, workpiece_id: str, image_p
             if time.monotonic() >= deadline:
                 raise TimeoutError("timed out waiting for ready backend hello")
             time.sleep(0.1)
+        if callable(set_timeout):
+            set_timeout(REQUEST_TIMEOUT_SECONDS)
         for _ in range(warmup):
             payload = batch_request(workpiece_id, paths)
             last_response = client.request(payload)
@@ -182,6 +193,9 @@ class _JsonClient:
     def __init__(self, sock: socket.socket):
         self.sock = sock
         self.file = sock.makefile("rwb")
+
+    def set_timeout(self, timeout_seconds: float) -> None:
+        self.sock.settimeout(max(0.001, float(timeout_seconds)))
 
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.file.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))

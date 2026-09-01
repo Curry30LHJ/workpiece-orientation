@@ -206,6 +206,61 @@ def test_batch_benchmark_waits_for_loading_hello_without_command_before_timing(t
     assert len({request["request_id"] for request in client.requests}) == 5
 
 
+def test_batch_benchmark_expands_socket_timeout_during_slow_startup(tmp_path):
+    module = _batch_benchmark_module()
+    images = [tmp_path / f"{index}.png" for index in range(5)]
+
+    class Client:
+        def __init__(self):
+            self.requests = []
+            self.timeouts = []
+
+        def set_timeout(self, seconds):
+            self.timeouts.append(seconds)
+
+        def request(self, payload):
+            self.requests.append(payload)
+            if payload["command"] == "hello":
+                return {
+                    "ok": True,
+                    "request_id": payload["request_id"],
+                    "command": "hello",
+                    "ready": True,
+                    "capabilities": {"predict_batch": True, "batch_ready": True},
+                }
+            return {
+                "ok": True,
+                "request_id": payload["request_id"],
+                "items": [
+                    {
+                        "index": index,
+                        "image_path": str(path),
+                        "ok": True,
+                        "prediction": {"label": "front"},
+                    }
+                    for index, path in enumerate(images)
+                ],
+            }
+
+    class Process:
+        def poll(self):
+            return None
+
+    client = Client()
+    module.run_batch_measurements(
+        client,
+        Process(),
+        "wp",
+        images,
+        warmup=0,
+        iterations=1,
+        startup_timeout_seconds=42.0,
+    )
+
+    assert client.timeouts[0] == pytest.approx(42.0)
+    assert client.timeouts[-1] == pytest.approx(module.REQUEST_TIMEOUT_SECONDS)
+
+
 def test_batch_benchmark_accepts_missing_response_command_but_rejects_wrong_command():
     module = _batch_benchmark_module()
     paths = [f"{index}.png" for index in range(5)]
