@@ -7,6 +7,7 @@
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QLabel>
 #include <QMessageBox>
 #include <QCloseEvent>
@@ -610,7 +611,10 @@ void MainWindow::connectBackendSignals() {
     }
     if (manager_ == nullptr) {
         connect(client_, &BackendClient::handshakeSucceeded,
-                this, &MainWindow::onBackendReady);
+                this, [this](quint64, const QJsonObject &metadata) {
+                    onBackendMetadataUpdated(metadata);
+                    onBackendReady();
+                });
     }
     connect(client_, &BackendClient::stateChanged,
             this, &MainWindow::onClientStateChanged);
@@ -626,6 +630,8 @@ void MainWindow::connectBackendSignals() {
                 onClientTransportFailed(code, message);
             });
     if (manager_ != nullptr) {
+        connect(manager_, &BackendProcessManager::backendMetadataUpdated,
+                this, &MainWindow::onBackendMetadataUpdated);
         connect(manager_, &BackendProcessManager::backendReady,
                 this, &MainWindow::onBackendReady);
         connect(manager_, &BackendProcessManager::backendLoading,
@@ -642,6 +648,29 @@ void MainWindow::connectBackendSignals() {
                 retryingAcceptedClose_ = false;
             });
         });
+    }
+}
+
+void MainWindow::onBackendMetadataUpdated(const QJsonObject &metadata) {
+    backendMetadata_ = metadata;
+}
+
+void MainWindow::applyBackendMetadata(BackendStatusDetails &details) const {
+    const QString backend = backendMetadata_.value(QStringLiteral("pp_backend"))
+                                .toString()
+                                .trimmed()
+                                .toLower();
+    details.ppBackend = backend.isEmpty() ? QStringLiteral("python") : backend;
+    details.nativeServiceVersion = backendMetadata_
+        .value(QStringLiteral("native_service_version")).toString();
+    details.nativeModelSha256 = backendMetadata_
+        .value(QStringLiteral("native_model_sha256")).toString();
+    const QJsonValue featureDim = backendMetadata_.value(QStringLiteral("feature_dim"));
+    if (featureDim.isDouble()) {
+        const int value = featureDim.toInt(-1);
+        if (value > 0 && qFuzzyCompare(featureDim.toDouble(), double(value))) {
+            details.nativeFeatureDim = value;
+        }
     }
 }
 
@@ -898,6 +927,7 @@ void MainWindow::setReplaceConfirmationHandler(std::function<bool(const QString 
 }
 
 void MainWindow::setBackendError(const QString &message) {
+    backendMetadata_ = QJsonObject();
     backendReady_ = false;
     backendReadyHandled_ = false;
     clientBusy_ = false;
@@ -1497,6 +1527,7 @@ void MainWindow::submitTemplateConfirmation(const QString &workpieceId, const QS
 
 void MainWindow::restartBackend() {
     if (manager_ != nullptr) {
+        backendMetadata_ = QJsonObject();
         BackendStatusDetails details;
         details.state = backendEverReady_
             ? BackendUiState::Recovering : BackendUiState::Starting;
@@ -1530,6 +1561,7 @@ void MainWindow::onBackendReady() {
     details.state = BackendUiState::Ready;
     details.connectionDetail = QStringLiteral("已连接");
     details.modelDetail = QStringLiteral("已加载");
+    applyBackendMetadata(details);
     details.canRestart = true;
     presentBackendState(details);
     updateButtonStates();
@@ -1551,6 +1583,7 @@ void MainWindow::onBackendReady() {
 
 void MainWindow::onBackendLoading(const QString &phase, const QString &message,
                                   int progress) {
+    backendMetadata_ = QJsonObject();
     const bool recovering = manager_ != nullptr && backendEverReady_
         && backendPresentationState_ == BackendUiState::Recovering;
     backendReadyHandled_ = false;
@@ -1595,6 +1628,7 @@ void MainWindow::onBackendLoading(const QString &phase, const QString &message,
 
 void MainWindow::onBackendUnavailable(const QString &reason, const QString &code,
                                       const QString &action, const QString &logPath) {
+    backendMetadata_ = QJsonObject();
     const CommandOwner interruptedOwner = pendingOwner_;
     const QString interruptedTask = pendingCommand_;
     const quint64 interruptedRefreshTransactionId = pendingRefreshTransactionId_;
@@ -1737,6 +1771,9 @@ void MainWindow::pollEvolutionJobs() {
 }
 
 void MainWindow::onClientStateChanged(BackendClient::State state, const QString &detail) {
+    if (state != BackendClient::State::Ready && state != BackendClient::State::Busy) {
+        backendMetadata_ = QJsonObject();
+    }
     clientBusy_ = state == BackendClient::State::Busy;
     if (manager_ != nullptr && !backendReadyHandled_) {
         backendReady_ = false;
@@ -1755,6 +1792,7 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
         details.state = BackendUiState::Ready;
         details.connectionDetail = QStringLiteral("已连接");
         details.modelDetail = QStringLiteral("已加载");
+        applyBackendMetadata(details);
         details.canRestart = manager_ != nullptr;
         presentBackendState(details);
     } else if (state == BackendClient::State::Busy) {
@@ -1762,6 +1800,7 @@ void MainWindow::onClientStateChanged(BackendClient::State state, const QString 
         details.state = BackendUiState::Busy;
         details.connectionDetail = QStringLiteral("已连接");
         details.modelDetail = QStringLiteral("已加载");
+        applyBackendMetadata(details);
         details.currentTask = detail;
         details.canRestart = manager_ != nullptr;
         presentBackendState(details);

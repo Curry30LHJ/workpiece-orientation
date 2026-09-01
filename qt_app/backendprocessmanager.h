@@ -25,6 +25,10 @@ public:
 
 signals:
     void backendReady();
+    // Emitted immediately before backendReady with the validated HELLO
+    // metadata.  The separate signal keeps the legacy ready signal ABI/API
+    // unchanged while allowing the UI to display native backend details.
+    void backendMetadataUpdated(const QJsonObject &metadata);
     void backendLoading(const QString &phase, const QString &message, int progress);
     void backendUnavailable(const QString &reason, const QString &code = QString(),
                             const QString &action = QString(),

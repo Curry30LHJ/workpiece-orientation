@@ -34,9 +34,34 @@ bool readOptionalString(const QJsonObject &object, const QString &key, QString *
     return readString(object, key, value, error);
 }
 
+bool readOptionalStringAllowEmpty(const QJsonObject &object, const QString &key,
+                                  QString *value, QString *error) {
+    const QJsonValue jsonValue = object.value(key);
+    if (jsonValue.isUndefined()) {
+        return true;
+    }
+    if (!jsonValue.isString()) {
+        setError(error, QStringLiteral("Configuration field must be a string: %1").arg(key));
+        return false;
+    }
+    *value = jsonValue.toString();
+    return true;
+}
+
 bool requireExistingFile(const QString &path, const QString &key, QString *error) {
     if (!QFileInfo::exists(path) || !QFileInfo(path).isFile()) {
         setError(error, QStringLiteral("Configuration path does not exist: %1 (%2)").arg(key, path));
+        return false;
+    }
+    return true;
+}
+
+bool requireNativeExecutable(const QString &path, QString *error) {
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile() || info.isSymLink()) {
+        setError(error,
+                 QStringLiteral("Native PP-ShiTu executable must be a regular file: %1")
+                     .arg(path));
         return false;
     }
     return true;
@@ -120,6 +145,24 @@ std::optional<AppConfig> AppConfig::load(const QString &path, QString *error) {
                                error)) {
         return std::nullopt;
     }
+
+    const QJsonValue ppBackendValue = object.value(QStringLiteral("pp_backend"));
+    if (!ppBackendValue.isUndefined()) {
+        if (!ppBackendValue.isString()) {
+            setError(error, QStringLiteral("pp_backend must be python or native_cpp"));
+            return std::nullopt;
+        }
+        config.ppBackend = ppBackendValue.toString().trimmed().toLower();
+    }
+    if (config.ppBackend != QStringLiteral("python")
+        && config.ppBackend != QStringLiteral("native_cpp")) {
+        setError(error, QStringLiteral("pp_backend must be python or native_cpp"));
+        return std::nullopt;
+    }
+    if (!readOptionalStringAllowEmpty(object, QStringLiteral("native_pp_executable"),
+                                      &config.nativePpExecutable, error)) {
+        return std::nullopt;
+    }
     if (config.launchMode == BackendLaunchMode::PackagedExecutable) {
         for (const QString &key : {QStringLiteral("backend_executable"),
                                   QStringLiteral("paddle_config"),
@@ -151,6 +194,7 @@ std::optional<AppConfig> AppConfig::load(const QString &path, QString *error) {
     config.modelDir = resolvedPath(config.modelDir);
     config.libraryDir = resolvedPath(config.libraryDir);
     config.dataRoot = resolvedPath(config.dataRoot);
+    config.nativePpExecutable = resolvedPath(config.nativePpExecutable);
     const QJsonValue searchModeValue = object.value(QStringLiteral("local_search_mode"));
     if (!searchModeValue.isUndefined()) {
         if (!searchModeValue.isString()) {
@@ -188,6 +232,13 @@ std::optional<AppConfig> AppConfig::load(const QString &path, QString *error) {
         }
         config.inferenceMode = mode;
     }
+    if (config.ppBackend == QStringLiteral("native_cpp")
+        && (config.computeDevice != QStringLiteral("cpu")
+            || config.inferenceMode != QStringLiteral("fast_geometry"))) {
+        setError(error, QStringLiteral(
+            "native_cpp requires compute_device=cpu and inference_mode=fast_geometry"));
+        return std::nullopt;
+    }
     const QString hostText = object.value(QStringLiteral("host")).toString();
     if (hostText != QStringLiteral("127.0.0.1")) {
         setError(error, QStringLiteral("host must be 127.0.0.1"));
@@ -211,6 +262,16 @@ std::optional<AppConfig> AppConfig::load(const QString &path, QString *error) {
     if (startupTimeout <= 0 || requestTimeout <= 0) {
         setError(error, QStringLiteral("timeouts must be positive"));
         return std::nullopt;
+    }
+    if (config.ppBackend == QStringLiteral("native_cpp")) {
+        if (config.nativePpExecutable.isEmpty()) {
+            setError(error, QStringLiteral(
+                "native_pp_executable is required when pp_backend is native_cpp"));
+            return std::nullopt;
+        }
+        if (!requireNativeExecutable(config.nativePpExecutable, error)) {
+            return std::nullopt;
+        }
     }
     if (config.launchMode == BackendLaunchMode::PythonScript) {
         if (config.pythonExecutable.isEmpty() || config.backendScript.isEmpty()

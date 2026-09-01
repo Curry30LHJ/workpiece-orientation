@@ -4,6 +4,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <QTimer>
 #include <QUuid>
 #include <QtGlobal>
@@ -19,6 +20,16 @@ const QString kConflictAction = QStringLiteral(
 const QString kStartAction = QStringLiteral(
     "请检查后端程序及依赖文件是否完整，然后重新启动应用");
 const QString kTimeoutAction = QStringLiteral("请查看后端日志并重试");
+const QString kNativeMetadataAction = QStringLiteral(
+    "请确认 native PP-ShiTu 服务已完成预热，并使用匹配的模型与特征维度");
+
+bool isLowerSha256(const QString &value) {
+    if (value.size() != 64) {
+        return false;
+    }
+    static const QRegularExpression pattern(QStringLiteral("^[0-9a-f]{64}$"));
+    return pattern.match(value).hasMatch();
+}
 }
 
 BackendProcessManager::BackendProcessManager(const AppConfig &config, BackendClient *client,
@@ -246,6 +257,21 @@ void BackendProcessManager::onHandshakeSucceeded(quint64 generation,
         emit backendLoading(QStringLiteral("loading_runtime"),
                             QStringLiteral("正在加载运行环境"), 0);
     }
+    if (config_.ppBackend == QStringLiteral("native_cpp")) {
+        const QString serviceVersion = metadata.value(
+            QStringLiteral("native_service_version")).toString().trimmed();
+        const QString modelSha256 = metadata.value(
+            QStringLiteral("native_model_sha256")).toString().trimmed();
+        const QJsonValue featureDimValue = metadata.value(QStringLiteral("feature_dim"));
+        const int featureDim = featureDimValue.toInt(-1);
+        if (serviceVersion.isEmpty() || !isLowerSha256(modelSha256)
+            || !featureDimValue.isDouble() || featureDim <= 0) {
+            markUnavailable(QStringLiteral("native PP-ShiTu 握手元数据无效"),
+                            QStringLiteral("BACKEND_PROTOCOL_ERROR"),
+                            kNativeMetadataAction, configuredLogPath());
+            return;
+        }
+    }
     backendProgress_ = 100;
     readyInstanceToken_ = metadata.value(QStringLiteral("instance_token")).toString();
     reusingExternalDevelopmentService_ = !launchRequested_
@@ -254,6 +280,7 @@ void BackendProcessManager::onHandshakeSucceeded(quint64 generation,
         owned_ = true;
         emit serviceOwnershipChanged(true);
     }
+    emit backendMetadataUpdated(metadata);
     emit backendReady();
 }
 
@@ -500,6 +527,7 @@ QStringList BackendProcessManager::backendArguments() const {
     }
     arguments.append({
         QStringLiteral("--compute-device"), config_.computeDevice,
+        QStringLiteral("--pp-backend"), config_.ppBackend,
         QStringLiteral("--model-sha256"), config_.modelSha256,
         QStringLiteral("--edition"), config_.edition,
         QStringLiteral("--package-version"), config_.packageVersion,
@@ -508,6 +536,10 @@ QStringList BackendProcessManager::backendArguments() const {
         QStringLiteral("--local-search-mode"), config_.localSearchMode,
         QStringLiteral("--inference-mode"), config_.inferenceMode,
     });
+    if (config_.ppBackend == QStringLiteral("native_cpp")) {
+        arguments.append({QStringLiteral("--native-pp-executable"),
+                          config_.nativePpExecutable});
+    }
     return arguments;
 }
 
@@ -522,6 +554,15 @@ bool BackendProcessManager::identityMatches(const QJsonObject &metadata,
         }
         return true;
     };
+    const QString reportedBackend = metadata.contains(QStringLiteral("pp_backend"))
+        ? metadata.value(QStringLiteral("pp_backend")).toString()
+        : QStringLiteral("python");
+    if (reportedBackend != config_.ppBackend) {
+        if (reason != nullptr) {
+            *reason = QStringLiteral("后端身份不匹配：pp_backend");
+        }
+        return false;
+    }
     if (mismatch(QStringLiteral("package_version"), config_.packageVersion)
         || mismatch(QStringLiteral("edition"), config_.edition)
         || mismatch(QStringLiteral("compute_device"), config_.computeDevice)

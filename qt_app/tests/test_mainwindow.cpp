@@ -2937,6 +2937,32 @@ private slots:
         QVERIFY(status->property("messageKind").toString() != QStringLiteral("error"));
     }
 
+    void nativeHandshakeMetadataIsRenderedAndClearedOnReload() {
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(37659), &client, &launcher);
+        MainWindow window(&client, &manager);
+        const QString digest = QString(64, QLatin1Char('c'));
+        emit manager.backendMetadataUpdated(QJsonObject{
+            {QStringLiteral("pp_backend"), QStringLiteral("native_cpp")},
+            {QStringLiteral("native_service_version"), QStringLiteral("ppshitu-native-cpp/1")},
+            {QStringLiteral("native_model_sha256"), digest},
+            {QStringLiteral("feature_dim"), 512},
+        });
+        emit manager.backendReady();
+
+        auto *model = window.findChild<QLabel *>(QStringLiteral("backendModelDetailLabel"));
+        QVERIFY(model != nullptr);
+        QVERIFY(model->text().contains(QStringLiteral("PP-ShiTu C++")));
+        QVERIFY(model->text().contains(QStringLiteral("512")));
+        QVERIFY(model->toolTip().contains(digest));
+
+        emit manager.backendLoading(QStringLiteral("loading_model"),
+                                    QStringLiteral("重新加载"), 20);
+        QVERIFY(!model->text().contains(QStringLiteral("PP-ShiTu C++")));
+        QVERIFY(!model->toolTip().contains(digest));
+    }
+
     void readyWithEmptyLibraryShowsNormalEmptyState() {
         BackendClient client;
         PassiveLauncher launcher;

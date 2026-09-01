@@ -79,6 +79,17 @@ private:
         };
     }
 
+    static QJsonObject validNativeDevelopmentConfig(const QTemporaryDir &temporary) {
+        QJsonObject object = validConfig(temporary);
+        const QString executable = temporary.filePath(QStringLiteral("native_pp.exe"));
+        QFile(executable).open(QIODevice::WriteOnly);
+        object[QStringLiteral("pp_backend")] = QStringLiteral("native_cpp");
+        object[QStringLiteral("native_pp_executable")] = QStringLiteral("native_pp.exe");
+        object[QStringLiteral("compute_device")] = QStringLiteral("cpu");
+        object[QStringLiteral("inference_mode")] = QStringLiteral("fast_geometry");
+        return object;
+    }
+
 private slots:
     void rejectsNonLoopbackHost() {
         QTemporaryDir temporary;
@@ -110,6 +121,76 @@ private slots:
         QCOMPARE(config->localSearchMode, QStringLiteral("adaptive"));
         QCOMPARE(config->inferenceMode, QStringLiteral("legacy"));
         QCOMPARE(config->launchMode, BackendLaunchMode::PythonScript);
+        QCOMPARE(config->ppBackend, QStringLiteral("python"));
+        QVERIFY(config->nativePpExecutable.isEmpty());
+    }
+
+    void acceptsNativeBackendAndResolvesExecutable() {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const QJsonObject object = validNativeDevelopmentConfig(temporary);
+        QString error;
+
+        const auto config = AppConfig::load(writeConfig(temporary, object), &error);
+
+        QVERIFY2(config.has_value(), qPrintable(error));
+        QCOMPARE(config->ppBackend, QStringLiteral("native_cpp"));
+        QCOMPARE(config->nativePpExecutable,
+                 temporary.filePath(QStringLiteral("native_pp.exe")));
+        QCOMPARE(config->computeDevice, QStringLiteral("cpu"));
+        QCOMPARE(config->inferenceMode, QStringLiteral("fast_geometry"));
+    }
+
+    void rejectsUnknownPpBackend() {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        QJsonObject object = validConfig(temporary);
+        object[QStringLiteral("pp_backend")] = QStringLiteral("cuda");
+        QString error;
+
+        const auto config = AppConfig::load(writeConfig(temporary, object), &error);
+
+        QVERIFY(!config.has_value());
+        QVERIFY(error.contains(QStringLiteral("pp_backend")));
+    }
+
+    void rejectsNativeBackendWithoutExecutable() {
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        QJsonObject object = validConfig(temporary);
+        object[QStringLiteral("pp_backend")] = QStringLiteral("native_cpp");
+        object[QStringLiteral("compute_device")] = QStringLiteral("cpu");
+        object[QStringLiteral("inference_mode")] = QStringLiteral("fast_geometry");
+        QString error;
+
+        const auto config = AppConfig::load(writeConfig(temporary, object), &error);
+
+        QVERIFY(!config.has_value());
+        QVERIFY(error.contains(QStringLiteral("native")));
+    }
+
+    void rejectsNativeBackendOnUnsupportedMode_data() {
+        QTest::addColumn<QString>("device");
+        QTest::addColumn<QString>("inferenceMode");
+        QTest::newRow("gpu") << QStringLiteral("gpu") << QStringLiteral("fast_geometry");
+        QTest::newRow("legacy") << QStringLiteral("cpu") << QStringLiteral("legacy");
+    }
+
+    void rejectsNativeBackendOnUnsupportedMode() {
+        QFETCH(QString, device);
+        QFETCH(QString, inferenceMode);
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        QJsonObject object = validNativeDevelopmentConfig(temporary);
+        object[QStringLiteral("compute_device")] = device;
+        object[QStringLiteral("inference_mode")] = inferenceMode;
+        QString error;
+
+        const auto config = AppConfig::load(writeConfig(temporary, object), &error);
+
+        QVERIFY(!config.has_value());
+        QVERIFY(error.contains(QStringLiteral("native_cpp")));
+        QVERIFY(error.contains(QStringLiteral("fast_geometry")));
     }
 
     void resolvesDevelopmentFilesystemFieldsRelativeToConfig() {

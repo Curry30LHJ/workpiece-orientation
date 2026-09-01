@@ -28,6 +28,10 @@ struct BackendStatusDetails {
     BackendUiState state = BackendUiState::Disconnected;
     QString connectionDetail;
     QString modelDetail;
+    QString ppBackend = QStringLiteral("python");
+    int nativeFeatureDim = -1;
+    QString nativeServiceVersion;
+    QString nativeModelSha256;
     QString currentTask;
     QString recentError;
     bool canRestart = false;

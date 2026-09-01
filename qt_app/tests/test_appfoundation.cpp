@@ -70,6 +70,26 @@ private slots:
         QVERIFY(!restartButton->isVisible());
     }
 
+    void backendDetailsPanelShowsNativeBackendMetadata() {
+        AppHeader header;
+        BackendStatusDetails details;
+        details.state = BackendUiState::Ready;
+        details.connectionDetail = QStringLiteral("已连接");
+        details.modelDetail = QStringLiteral("已加载");
+        details.ppBackend = QStringLiteral("native_cpp");
+        details.nativeFeatureDim = 512;
+        details.nativeServiceVersion = QStringLiteral("ppshitu-native-cpp/1");
+        details.nativeModelSha256 = QString(64, QLatin1Char('b'));
+        header.setBackendDetails(details);
+
+        auto *model = header.findChild<QLabel *>(QStringLiteral("backendModelDetailLabel"));
+        QVERIFY(model != nullptr);
+        QVERIFY(model->text().contains(QStringLiteral("PP-ShiTu C++")));
+        QVERIFY(model->text().contains(QStringLiteral("512")));
+        QVERIFY(model->text().contains(QStringLiteral("ppshitu-native-cpp/1")));
+        QVERIFY(model->toolTip().contains(QString(64, QLatin1Char('b'))));
+    }
+
     void backendLifecycleLabelsDistinguishStartupLoadingAndRecovery() {
         AppHeader header;
         auto *label = header.findChild<QLabel *>(QStringLiteral("backendStatusLabel"));

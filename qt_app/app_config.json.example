@@ -7,6 +7,7 @@
   "model_dir": "E:/Project/wang/pp_813/third_party/models/shiru_rec/general_PPLCNetV2_base_pretrained_v1.0_infer",
   "library_dir": "E:/Project/wang/pp_813/runtime_library",
   "compute_device": "gpu",
+  "pp_backend": "python",
   "edition": "dev",
   "package_version": "dev",
   "local_search_mode": "adaptive",

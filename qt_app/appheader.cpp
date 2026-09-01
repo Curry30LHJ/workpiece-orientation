@@ -11,6 +11,7 @@
 #include <QSize>
 #include <QSizePolicy>
 #include <QStyle>
+#include <QStringList>
 #include <QVBoxLayout>
 
 namespace {
@@ -195,11 +196,37 @@ void AppHeader::setBackendState(BackendUiState state, const QString &detail) {
 void AppHeader::setBackendDetails(const BackendStatusDetails &details) {
     connectionDetailLabel_->setText(
         QStringLiteral("连接：%1").arg(details.connectionDetail));
-    modelDetailLabel_->setText(QStringLiteral("模型：%1").arg(details.modelDetail));
+    QString modelDetail = details.modelDetail;
+    if (details.ppBackend == QStringLiteral("native_cpp")) {
+        QStringList nativeParts{QStringLiteral("PP-ShiTu C++")};
+        if (details.nativeFeatureDim > 0) {
+            nativeParts.append(QStringLiteral("特征维度 %1").arg(details.nativeFeatureDim));
+        }
+        if (!details.nativeServiceVersion.isEmpty()) {
+            nativeParts.append(QStringLiteral("服务 %1").arg(details.nativeServiceVersion));
+        }
+        if (!details.nativeModelSha256.isEmpty()) {
+            nativeParts.append(QStringLiteral("模型摘要 %1…")
+                                   .arg(details.nativeModelSha256.left(12)));
+        }
+        modelDetail = modelDetail.isEmpty()
+            ? nativeParts.join(QStringLiteral(" · "))
+            : QStringLiteral("%1 · %2").arg(modelDetail,
+                                              nativeParts.join(QStringLiteral(" · ")));
+    }
+    modelDetailLabel_->setText(QStringLiteral("模型：%1").arg(modelDetail));
     currentTaskLabel_->setText(QStringLiteral("当前任务：%1").arg(details.currentTask));
     recentErrorLabel_->setText(QStringLiteral("最近错误：%1").arg(details.recentError));
     connectionDetailLabel_->setToolTip(connectionDetailLabel_->text());
-    modelDetailLabel_->setToolTip(modelDetailLabel_->text());
+    QString modelToolTip = modelDetailLabel_->text();
+    if (details.ppBackend == QStringLiteral("native_cpp")) {
+        modelToolTip += QStringLiteral("\n后端：native_cpp");
+        if (!details.nativeModelSha256.isEmpty()) {
+            modelToolTip += QStringLiteral("\n模型 SHA-256：%1")
+                .arg(details.nativeModelSha256);
+        }
+    }
+    modelDetailLabel_->setToolTip(modelToolTip);
     currentTaskLabel_->setToolTip(currentTaskLabel_->text());
     recentErrorLabel_->setToolTip(recentErrorLabel_->text());
     restartBackendButton_->setEnabled(details.canRestart);

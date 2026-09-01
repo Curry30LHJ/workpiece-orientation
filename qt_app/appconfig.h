@@ -18,6 +18,12 @@ struct AppConfig {
     QString libraryDir;
     QString dataRoot;
     QString modelSha256;
+    // PP-ShiTu implementation selected by the TCP backend.  Python remains
+    // the compatibility default for existing configuration files.
+    QString ppBackend = QStringLiteral("python");
+    // Required only when ppBackend is native_cpp; resolved to an absolute
+    // regular executable path by AppConfig::load().
+    QString nativePpExecutable;
     QString computeDevice = QStringLiteral("gpu");
     QString edition = QStringLiteral("dev");
     QString packageVersion = QStringLiteral("dev");

@@ -76,6 +76,7 @@ private slots:
                                   int libraryRevision, int draftRevision);
 
     void onBackendReady();
+    void onBackendMetadataUpdated(const QJsonObject &metadata);
     void onBackendLoading(const QString &phase, const QString &message, int progress);
     void onBackendUnavailable(const QString &reason, const QString &code = QString(),
                               const QString &action = QString(),
@@ -109,6 +110,7 @@ private:
 
     void initializeUi();
     void connectBackendSignals();
+    void applyBackendMetadata(BackendStatusDetails &details) const;
     void presentBackendState(const BackendStatusDetails &details);
     void sendPageCommand(CommandOwner owner, const QString &command,
                          const QJsonObject &fields = QJsonObject(),
@@ -206,6 +208,7 @@ private:
     bool backendReadyHandled_ = false;
     BackendUiState backendPresentationState_ = BackendUiState::Disconnected;
     bool backendEverReady_ = false;
+    QJsonObject backendMetadata_;
     QString backendRecoveryDetail_;
     bool backendFailureIsRecoverable_ = false;
     bool clientBusy_ = false;

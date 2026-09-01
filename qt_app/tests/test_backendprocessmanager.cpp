@@ -104,6 +104,13 @@ public:
         modelFingerprint = modelSha256;
         token = instanceToken;
     }
+    void setNativeMetadata(const QString &serviceVersion,
+                           const QString &modelSha256, int featureDim) {
+        ppBackend = QStringLiteral("native_cpp");
+        nativeServiceVersion = serviceVersion;
+        nativeModelSha256 = modelSha256;
+        nativeFeatureDim = featureDim;
+    }
 
 private slots:
     void acceptConnection() {
@@ -153,21 +160,29 @@ private slots:
                 }
                 if (loadingResponses > 0) {
                     --loadingResponses;
-                    send({{"version", 1}, {"request_id", id}, {"ok", true},
-                          {"service", "workpiece-orientation"}, {"ready", false},
-                          {"status", "loading"}, {"phase", "loading_model"},
-                          {"message", "模型加载中"}, {"progress", 50},
-                          {"package_version", packageVersion}, {"edition", packageEdition},
-                          {"compute_device", computeDevice},
-                          {"model_fingerprint", modelFingerprint},
-                          {"instance_token", token}});
+                    QJsonObject response{{"version", 1}, {"request_id", id}, {"ok", true},
+                                         {"service", "workpiece-orientation"},
+                                         {"ready", false}, {"status", "loading"},
+                                         {"phase", "loading_model"},
+                                         {"message", "模型加载中"}, {"progress", 50},
+                                         {"package_version", packageVersion},
+                                         {"edition", packageEdition},
+                                         {"compute_device", computeDevice},
+                                         {"model_fingerprint", modelFingerprint},
+                                         {"instance_token", token}};
+                    appendNativeMetadata(&response);
+                    send(response);
                 } else {
-                    send({{"version", 1}, {"request_id", id}, {"ok", true},
-                          {"service", "workpiece-orientation"}, {"ready", true},
-                          {"package_version", packageVersion}, {"edition", packageEdition},
-                          {"compute_device", computeDevice},
-                          {"model_fingerprint", modelFingerprint},
-                          {"instance_token", token}});
+                    QJsonObject response{{"version", 1}, {"request_id", id}, {"ok", true},
+                                         {"service", "workpiece-orientation"},
+                                         {"ready", true},
+                                         {"package_version", packageVersion},
+                                         {"edition", packageEdition},
+                                         {"compute_device", computeDevice},
+                                         {"model_fingerprint", modelFingerprint},
+                                         {"instance_token", token}};
+                    appendNativeMetadata(&response);
+                    send(response);
                 }
             } else if (object.value(QStringLiteral("command")).toString() == QStringLiteral("shutdown")) {
                 lastShutdownToken = object.value(QStringLiteral("instance_token")).toString();
@@ -180,6 +195,16 @@ private slots:
     }
 
 private:
+    void appendNativeMetadata(QJsonObject *response) const {
+        if (response == nullptr || ppBackend.isEmpty()) {
+            return;
+        }
+        response->insert(QStringLiteral("pp_backend"), ppBackend);
+        response->insert(QStringLiteral("native_service_version"), nativeServiceVersion);
+        response->insert(QStringLiteral("native_model_sha256"), nativeModelSha256);
+        response->insert(QStringLiteral("feature_dim"), nativeFeatureDim);
+    }
+
     void send(const QJsonObject &object) {
         socket->write(QJsonDocument(object).toJson(QJsonDocument::Compact) + "\n");
         socket->flush();
@@ -194,6 +219,10 @@ private:
     QString computeDevice = QStringLiteral("gpu");
     QString modelFingerprint;
     QString token;
+    QString ppBackend;
+    QString nativeServiceVersion;
+    QString nativeModelSha256;
+    int nativeFeatureDim = -1;
     QString lastShutdownToken;
     bool respondToShutdown = true;
     HelloBehavior helloBehavior = HelloBehavior::Ready;
@@ -278,6 +307,7 @@ private slots:
             QStringLiteral("--paddle-config"), config.paddleConfigPath,
             QStringLiteral("--data-root"), config.dataRoot,
             QStringLiteral("--compute-device"), config.computeDevice,
+            QStringLiteral("--pp-backend"), config.ppBackend,
             QStringLiteral("--model-sha256"), config.modelSha256,
             QStringLiteral("--edition"), config.edition,
             QStringLiteral("--package-version"), config.packageVersion,
@@ -288,6 +318,46 @@ private slots:
             QStringLiteral("--local-search-mode"), config.localSearchMode,
             QStringLiteral("--inference-mode"), config.inferenceMode,
         }));
+    }
+
+    void nativeBackendArgumentsAndMetadataArePublished() {
+        const quint16 port = unusedPort();
+        HandshakeServer server;
+        BackendClient client;
+        FakeProcessLauncher launcher;
+        AppConfig config = configFor(port, 1500);
+        config.ppBackend = QStringLiteral("native_cpp");
+        config.nativePpExecutable = QStringLiteral("native/ppshitu_rec_service.exe");
+        config.computeDevice = QStringLiteral("cpu");
+        config.inferenceMode = QStringLiteral("fast_geometry");
+        BackendProcessManager manager(config, &client, &launcher);
+        QSignalSpy metadataSpy(&manager, &BackendProcessManager::backendMetadataUpdated);
+        QSignalSpy readySpy(&manager, &BackendProcessManager::backendReady);
+        QObject::connect(&launcher, &FakeProcessLauncher::startRequested, &server, [&]() {
+            server.setIdentity(config.packageVersion, config.edition, config.computeDevice,
+                               config.modelSha256,
+                               argumentValue(launcher.lastArguments,
+                                             QStringLiteral("--instance-token")));
+            server.setNativeMetadata(QStringLiteral("ppshitu-native-cpp/1"),
+                                     QString(64, QLatin1Char('b')), 512);
+            QVERIFY(server.listen(port));
+        });
+
+        manager.start();
+
+        QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 2000);
+        QCOMPARE(metadataSpy.count(), 1);
+        const QJsonObject metadata = metadataSpy.at(0).at(0).toJsonObject();
+        QCOMPARE(metadata.value(QStringLiteral("pp_backend")).toString(),
+                 QStringLiteral("native_cpp"));
+        QCOMPARE(metadata.value(QStringLiteral("native_service_version")).toString(),
+                 QStringLiteral("ppshitu-native-cpp/1"));
+        QCOMPARE(metadata.value(QStringLiteral("feature_dim")).toInt(), 512);
+        QCOMPARE(argumentValue(launcher.lastArguments, QStringLiteral("--pp-backend")),
+                 QStringLiteral("native_cpp"));
+        QCOMPARE(argumentValue(launcher.lastArguments,
+                               QStringLiteral("--native-pp-executable")),
+                 config.nativePpExecutable);
     }
 
     void mismatchedExternalPackageIsRejectedWithoutTermination() {
