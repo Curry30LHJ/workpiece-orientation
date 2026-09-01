@@ -26,6 +26,7 @@ from src.orientation_classifier import (
     TemplateCache,
     WorkpieceNotFoundError,
 )
+from src.native_pp_protocol import NativeHello, NativeResult
 from src.paddleclas_inference_compat import install_optional_sklearn_stubs
 from src.fast_geometry import FastGeometryProcessor
 from src.fast_orientation import FastOrientationEngine
@@ -102,6 +103,56 @@ class _LifecycleCountingPredictor:
         self.close_calls += 1
         if self.close_calls > 1:
             raise AssertionError("worker predictor closed more than once")
+
+
+class _FakeNativeClient:
+    """Small process-free native client used to test classifier selection."""
+
+    instances = []
+    feature_dimension = 2
+
+    def __init__(self, executable, model_dir, *, threads=1, request_timeout_s=30.0, **kwargs):
+        self.executable = Path(executable)
+        self.model_dir = Path(model_dir)
+        self.threads = threads
+        self.request_timeout_s = request_timeout_s
+        self.hello = None
+        self.closed = 0
+        self.predict_calls = []
+        type(self).instances.append(self)
+
+    @property
+    def ready(self):
+        return self.hello is not None and self.closed == 0
+
+    @property
+    def feature_dim(self):
+        return None if self.hello is None else self.hello.feature_dim
+
+    @property
+    def last_stderr(self):
+        return ""
+
+    def start(self):
+        self.hello = NativeHello(
+            service_version="fake-native/1",
+            model_sha256=__import__("src.model_fingerprint", fromlist=["model_directory_sha256"])
+            .model_directory_sha256(self.model_dir),
+            feature_dim=self.feature_dimension,
+            max_batch=256,
+            threads=self.threads,
+        )
+        return self.hello
+
+    def predict(self, images):
+        self.predict_calls.append(tuple(images))
+        return NativeResult(
+            embeddings=np.asarray([[1.0, 0.0] for _ in images], dtype=np.float32),
+            timings_ms={"preprocess_ms": 0.0, "inference_ms": 0.0, "postprocess_ms": 0.0},
+        )
+
+    def close(self):
+        self.closed += 1
 
 
 class _RecordingLock:
@@ -1531,6 +1582,138 @@ def test_cpu_load_applies_thread_override_and_enables_slot_dedup(tmp_path, monke
     assert captured["config"].Global.cpu_num_threads == 4
     assert loaded.cpu_num_threads == 4
     assert loaded.fast_engine.deduplicate_identical_slots is True
+
+
+def test_native_load_uses_persistent_client_without_importing_paddle(tmp_path, monkeypatch):
+    import builtins
+    import src.orientation_classifier as classifier_module
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    executable = tmp_path / "ppshitu_rec_service.exe"
+    executable.write_bytes(b"fake executable")
+    _FakeNativeClient.instances = []
+    monkeypatch.setattr(classifier_module, "NativePPClient", _FakeNativeClient)
+    real_import = builtins.__import__
+
+    def reject_paddle(name, *args, **kwargs):
+        if name == "paddle" or name.startswith("paddle."):
+            raise AssertionError("native backend must not import Paddle in the host process")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_paddle)
+    loaded = OrientationClassifier.load(
+        tmp_path,
+        model_dir,
+        pp_backend="native_cpp",
+        native_pp_executable=executable,
+        compute_device="cpu",
+        inference_mode="fast_geometry",
+    )
+
+    assert loaded.global_predictor is None
+    assert loaded.pp_backend == "native_cpp"
+    assert loaded.native_model_dir == model_dir
+    assert len(_FakeNativeClient.instances) == 1
+    assert _FakeNativeClient.instances[0].threads == loaded.cpu_num_threads
+    assert loaded.native_backend_info() == {
+        "backend": "native_cpp",
+        "service_version": "fake-native/1",
+        "model_sha256": _FakeNativeClient.instances[0].hello.model_sha256,
+        "feature_dim": 2,
+        "last_error": None,
+    }
+    loaded.close()
+    loaded.close()
+    assert _FakeNativeClient.instances[0].closed == 1
+
+
+@pytest.mark.parametrize(
+    "backend,device,mode,code",
+    [
+        ("native_cpp", "gpu", "fast_geometry", "NATIVE_PP_UNSUPPORTED_MODE"),
+        ("native_cpp", "cpu", "legacy", "NATIVE_PP_UNSUPPORTED_MODE"),
+        ("native_cpp", "cpu", "compare", "NATIVE_PP_UNSUPPORTED_MODE"),
+    ],
+)
+def test_native_load_rejects_unsupported_device_or_mode(tmp_path, backend, device, mode, code):
+    with pytest.raises(ComputeDeviceError) as raised:
+        OrientationClassifier.load(
+            tmp_path,
+            tmp_path / "model",
+            pp_backend=backend,
+            native_pp_executable=tmp_path / "service.exe",
+            compute_device=device,
+            inference_mode=mode,
+        )
+    assert raised.value.code == code
+
+
+def test_native_global_embeddings_reverses_bgr_and_makes_contiguous(tmp_path, monkeypatch):
+    import src.orientation_classifier as classifier_module
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    executable = tmp_path / "service.exe"
+    executable.write_bytes(b"fake")
+    _FakeNativeClient.instances = []
+    monkeypatch.setattr(classifier_module, "NativePPClient", _FakeNativeClient)
+    loaded = OrientationClassifier.load(
+        tmp_path,
+        model_dir,
+        pp_backend="native_cpp",
+        native_pp_executable=executable,
+        compute_device="cpu",
+        inference_mode="fast_geometry",
+    )
+    image = np.zeros((2, 3, 3), dtype=np.uint8)
+    image[..., 0] = 11
+    image[..., 1] = 22
+    image[..., 2] = 33
+    loaded._global_embeddings([image])
+    sent = _FakeNativeClient.instances[0].predict_calls[-1][0]
+    assert sent.flags.c_contiguous
+    assert tuple(sent[0, 0]) == (33, 22, 11)
+    loaded.close()
+
+
+def test_native_batch_pool_uses_one_independent_client_per_worker(tmp_path, monkeypatch):
+    import src.orientation_classifier as classifier_module
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    executable = tmp_path / "service.exe"
+    executable.write_bytes(b"fake")
+    _FakeNativeClient.instances = []
+    monkeypatch.setattr(classifier_module, "NativePPClient", _FakeNativeClient)
+    scalar = _FakeNativeClient(executable, model_dir, threads=4)
+    scalar.start()
+    classifier = OrientationClassifier(
+        global_predictor=None,
+        extractor=None,
+        matcher=None,
+        device="cpu",
+        compute_device="cpu",
+        inference_mode="fast_geometry",
+        pp_backend="native_cpp",
+        native_pp_client=scalar,
+        fast_engine=make_fast_engine(),
+        model_fingerprint="native-model",
+    )
+    classifier.native_pp_executable = executable
+    classifier.native_model_dir = model_dir
+    classifier.cpu_num_threads = 4
+
+    status = classifier.prepare_batch_pool(worker_count=2, threads_per_worker=1)
+    assert status["batch_ready"] is True
+    assert len(_FakeNativeClient.instances) == 3
+    assert _FakeNativeClient.instances[1] is not _FakeNativeClient.instances[2]
+    assert _FakeNativeClient.instances[1].threads == 1
+    assert _FakeNativeClient.instances[2].threads == 1
+
+    classifier.close()
+    classifier.close()
+    assert all(client.closed == 1 for client in _FakeNativeClient.instances)
 
 
 def test_gpu_load_ignores_cpu_slot_dedup_and_cpu_thread_override(tmp_path, monkeypatch):

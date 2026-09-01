@@ -32,8 +32,9 @@ from src.geometry_profile_schema import materialize_runtime_profile
 from src.model_execution_gate import PriorityModelGate
 from src.model_fingerprint import model_directory_sha256
 from src.paddleclas_inference_compat import create_rec_predictor, install_optional_sklearn_stubs
+from src.native_pp_client import NativePPClient, NativePPError
 from src.fast_geometry import FastGeometryProcessor
-from src.fast_orientation import FastOrientationEngine, FastRuntimeCache
+from src.fast_orientation import FAST_FEATURE_LAYOUT, FastOrientationEngine, FastRuntimeCache
 from src.parallel_inference import BatchInferencePool, BatchItemResult, BatchWorkItem
 
 
@@ -53,6 +54,8 @@ INFERENCE_MODES = ("legacy", "fast_geometry", "compare")
 DEFAULT_INFERENCE_MODE = "legacy"
 COMPUTE_DEVICES = ("gpu", "cpu")
 DEFAULT_COMPUTE_DEVICE = "gpu"
+PP_BACKENDS = ("python", "native_cpp")
+DEFAULT_PP_BACKEND = "python"
 CPU_THREADS_ENV = "WORKPIECE_CPU_THREADS"
 CPU_SLOT_DEDUP_ENV = "WORKPIECE_CPU_DEDUPLICATE_SLOTS"
 DEFAULT_CPU_NUM_THREADS = 4
@@ -159,6 +162,7 @@ class _BatchSession:
     predictor: Any
     engine: FastOrientationEngine
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    feature_dim: int | None = None
 
     def close(self) -> None:
         for name in ("close", "destroy", "shutdown"):
@@ -271,6 +275,23 @@ def _validate_compute_device(value: str) -> str:
     return device
 
 
+def _validate_pp_backend(value: str) -> str:
+    backend = str(value).strip().lower()
+    if backend not in PP_BACKENDS:
+        raise ValueError("pp_backend must be 'python' or 'native_cpp'")
+    return backend
+
+
+def _validate_native_request_timeout(value: object) -> float:
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("native_request_timeout_s must be finite and positive") from exc
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("native_request_timeout_s must be finite and positive")
+    return timeout
+
+
 def _select_paddle_device(paddle: Any, device: str) -> str:
     if device == "gpu":
         if not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() < 1:
@@ -361,6 +382,9 @@ class OrientationClassifier:
         model_fingerprint: str = "unconfigured",
         fast_engine: FastOrientationEngine | None = None,
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        pp_backend: str = DEFAULT_PP_BACKEND,
+        native_pp_client: NativePPClient | None = None,
+        native_request_timeout_s: float = 30.0,
     ) -> None:
         self.global_predictor = global_predictor
         self.extractor = extractor
@@ -374,6 +398,14 @@ class OrientationClassifier:
         self.inference_mode = _validate_inference_mode(inference_mode)
         self.model_fingerprint = _validate_model_fingerprint(model_fingerprint)
         self.compute_device = _validate_compute_device(compute_device)
+        self.pp_backend = _validate_pp_backend(pp_backend)
+        self.native_pp_client = native_pp_client
+        self.native_pp_executable: Path | None = None
+        self.native_model_dir: Path | None = None
+        self.native_request_timeout_s = _validate_native_request_timeout(
+            native_request_timeout_s
+        )
+        self._native_last_error: object | None = None
         self.cpu_num_threads = None
         self.fast_engine = fast_engine
         self._inference_lock = threading.RLock()
@@ -386,6 +418,7 @@ class OrientationClassifier:
         self._batch_threads_per_worker = 1
         self._batch_fallback: str | None = None
         self._batch_predictor_factory: Callable[..., Any] | None = None
+        self._closed = False
 
     def _fast_runtime_transaction_lock(self, root: Path) -> threading.Lock:
         guard = getattr(self, "_fast_runtime_transaction_guard", None)
@@ -412,10 +445,17 @@ class OrientationClassifier:
         paddle_config_path: Path | None = None,
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
         expected_model_fingerprint: str | None = None,
+        pp_backend: str = DEFAULT_PP_BACKEND,
+        native_pp_executable: Path | None = None,
+        native_request_timeout_s: float = 30.0,
     ) -> "OrientationClassifier":
         """Load the production Paddle and Torch models lazily at service startup."""
         inference_mode = _validate_inference_mode(inference_mode)
         compute_device = _validate_compute_device(compute_device)
+        pp_backend = _validate_pp_backend(pp_backend)
+        native_request_timeout_s = _validate_native_request_timeout(
+            native_request_timeout_s
+        )
         model_fingerprint = cls._model_directory_fingerprint(model_dir)
         if (
             expected_model_fingerprint is not None
@@ -425,6 +465,84 @@ class OrientationClassifier:
                 "MODEL_FINGERPRINT_MISMATCH",
                 "模型目录指纹与期望值不一致",
             )
+
+        if pp_backend == "native_cpp":
+            if compute_device != "cpu" or inference_mode != "fast_geometry":
+                raise ComputeDeviceError(
+                    "NATIVE_PP_UNSUPPORTED_MODE",
+                    "native_cpp 仅支持 CPU + fast_geometry 模式",
+                )
+            if not Path(model_dir).is_dir():
+                raise ComputeDeviceError(
+                    "NATIVE_PP_CONFIG_INVALID",
+                    "native_cpp 模型目录不存在",
+                )
+            if native_pp_executable is None:
+                raise ComputeDeviceError(
+                    "NATIVE_PP_CONFIG_INVALID",
+                    "native_cpp 必须配置 native_pp_executable",
+                )
+            executable = Path(native_pp_executable).expanduser()
+            try:
+                executable = executable.resolve()
+            except OSError:
+                executable = executable.absolute()
+            if not executable.is_file() or executable.is_symlink():
+                raise ComputeDeviceError(
+                    "NATIVE_PP_CONFIG_INVALID",
+                    f"native_cpp 可执行文件不存在或不是普通文件: {executable}",
+                )
+            # Keep the same ASCII staging policy used by the Python Paddle
+            # path.  The source fingerprint above remains the compatibility
+            # identity; the staged directory is only an implementation path.
+            from src.paddleclas_inference_compat import prepare_paddle_model_path
+            try:
+                native_model_dir = prepare_paddle_model_path(Path(model_dir))
+            except Exception as exc:
+                raise ComputeDeviceError(
+                    "MODEL_PATH_UNSUPPORTED",
+                    "native_cpp 无法准备模型路径；请将程序解压到纯 ASCII 路径后重试",
+                ) from exc
+            cpu_num_threads = _resolve_cpu_num_threads(None)
+            client = NativePPClient(
+                executable,
+                native_model_dir,
+                threads=cpu_num_threads,
+                request_timeout_s=native_request_timeout_s,
+            )
+            try:
+                client.start()
+            except Exception:
+                client.close()
+                raise
+            from src.geometry_calibration import GeometryCalibrator
+
+            calibrator = GeometryCalibrator()
+            classifier = cls(
+                None,
+                None,
+                None,
+                "cpu",
+                geometry_calibrator=calibrator,
+                local_search_mode=local_search_mode,
+                inference_mode=inference_mode,
+                model_fingerprint=model_fingerprint,
+                compute_device="cpu",
+                pp_backend=pp_backend,
+                native_pp_client=client,
+                native_request_timeout_s=native_request_timeout_s,
+            )
+            classifier.cpu_num_threads = cpu_num_threads
+            classifier.native_pp_executable = executable
+            classifier.native_model_dir = Path(native_model_dir)
+            classifier.fast_engine = FastOrientationEngine(
+                classifier._global_embeddings,
+                FastGeometryProcessor(calibrator),
+                image_reader=_read_image,
+                deduplicate_identical_slots=_resolve_cpu_slot_dedup("cpu"),
+            )
+            return classifier
+
         extractor = matcher = device = None
         if inference_mode in {"legacy", "compare"}:
             # On Windows, Paddle and PyTorch can expose incompatible DLLs when
@@ -517,6 +635,95 @@ class OrientationClassifier:
         )
         return classifier
 
+    def native_backend_info(self) -> dict[str, object]:
+        """Return stable runtime metadata for diagnostics and service HELLO."""
+        if self.pp_backend != "native_cpp":
+            return {
+                "backend": "python",
+                "service_version": "",
+                "model_sha256": "",
+                "feature_dim": None,
+                "last_error": None,
+            }
+        client = self.native_pp_client
+        hello = getattr(client, "hello", None) if client is not None else None
+        feature_dim = getattr(hello, "feature_dim", None) if hello is not None else None
+        if feature_dim is not None:
+            try:
+                feature_dim = int(feature_dim)
+            except (TypeError, ValueError):
+                feature_dim = None
+        return {
+            "backend": "native_cpp",
+            "service_version": str(getattr(hello, "service_version", "") or ""),
+            "model_sha256": str(getattr(hello, "model_sha256", "") or ""),
+            "feature_dim": feature_dim,
+            "last_error": self._native_last_error,
+        }
+
+    def _record_native_error(self, error: BaseException) -> None:
+        code = getattr(error, "code", None)
+        message = getattr(error, "message", None) or str(error)
+        self._native_last_error = {
+            "code": str(code) if code else type(error).__name__,
+            "message": str(message),
+        }
+
+    @property
+    def native_feature_dim(self) -> int | None:
+        info = self.native_backend_info()
+        value = info.get("feature_dim")
+        return value if isinstance(value, int) and value > 0 else None
+
+    def _validate_native_cache_dimension(self, cache: TemplateCache | None) -> None:
+        """Reject a fast cache trained with a different PP feature width."""
+        if self.pp_backend != "native_cpp" or cache is None:
+            return
+        expected = self.native_feature_dim
+        if expected is None:
+            return
+        runtime = getattr(cache, "fast_runtime", None)
+        if runtime is not None:
+            try:
+                head_dim = int(runtime.ridge_head.feature_dim)
+            except (AttributeError, TypeError, ValueError):
+                head_dim = 0
+            if head_dim <= 0 or head_dim % len(FAST_FEATURE_LAYOUT) != 0:
+                raise OrientationClassifierError(
+                    "NATIVE_PP_DIMENSION_MISMATCH: fast cache feature layout is invalid"
+                )
+            cache_dim = head_dim // len(FAST_FEATURE_LAYOUT)
+            if cache_dim != expected:
+                raise OrientationClassifierError(
+                    "NATIVE_PP_DIMENSION_MISMATCH: native feature dimension "
+                    f"{expected} differs from cache dimension {cache_dim}"
+                )
+        for label in ("front", "back"):
+            vectors = getattr(cache, "global_vectors", {}).get(label)
+            if vectors is None:
+                continue
+            values = np.asarray(vectors)
+            if values.ndim >= 2 and values.shape[1] != expected:
+                raise OrientationClassifierError(
+                    "NATIVE_PP_DIMENSION_MISMATCH: native feature dimension "
+                    f"{expected} differs from {label} template dimension {values.shape[1]}"
+                )
+
+    def close(self) -> None:
+        """Close all batch sessions and the scalar native client exactly once."""
+        with self._batch_lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._close_batch_pool_locked()
+            client = self.native_pp_client
+            self.native_pp_client = None
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    LOGGER.debug("native predictor cleanup failed", exc_info=True)
+
     def batch_capabilities(self) -> dict[str, object]:
         supported = self.compute_device == "cpu" and self.inference_mode == "fast_geometry"
         return {
@@ -566,6 +773,8 @@ class OrientationClassifier:
                 pass
 
     def _new_batch_predictor(self, threads_per_worker: int) -> Any:
+        if self.pp_backend == "native_cpp":
+            raise RuntimeError("native backend uses independent NativePPClient sessions")
         clone = getattr(self.global_predictor, "clone", None)
         if callable(clone):
             try:
@@ -629,6 +838,9 @@ class OrientationClassifier:
         self, *, worker_count: int | None = None, threads_per_worker: int = 1
     ) -> dict[str, object]:
         self._batch_fallback = None
+        if self._closed:
+            self._batch_fallback = "classifier is closed"
+            return {"batch_ready": False, "worker_count": 0, "fallback": self._batch_fallback}
         if isinstance(threads_per_worker, bool) or not isinstance(threads_per_worker, int) or threads_per_worker <= 0:
             exc = ValueError("threads_per_worker must be a positive integer")
             self._batch_fallback = str(exc)
@@ -647,7 +859,66 @@ class OrientationClassifier:
         count = min(4, limit, requested)
         sessions: list[_BatchSession] = []
         try:
+            def create_native_worker(_slot: int) -> _BatchSession:
+                executable = self.native_pp_executable
+                model_dir = self.native_model_dir
+                if executable is None or model_dir is None:
+                    raise RuntimeError("native backend paths are unavailable")
+                client: NativePPClient | None = None
+                try:
+                    client = NativePPClient(
+                        executable,
+                        model_dir,
+                        threads=threads_per_worker,
+                        request_timeout_s=self.native_request_timeout_s,
+                    )
+                    hello = client.start()
+                    scalar_dim = self.native_feature_dim
+                    if scalar_dim is not None and hello.feature_dim != scalar_dim:
+                        raise OrientationClassifierError(
+                            "NATIVE_PP_DIMENSION_MISMATCH: batch worker dimension differs "
+                            "from scalar worker"
+                        )
+                    session_lock = threading.Lock()
+
+                    def embed(images, *, _client=client, _lock=session_lock):
+                        rgb = [
+                            np.ascontiguousarray(image[:, :, ::-1])
+                            for image in images
+                        ]
+                        with _lock:
+                            returned = _client.predict(rgb).embeddings
+                        values = np.asarray(returned, dtype=np.float32)
+                        if values.ndim != 2 or values.shape[0] != len(images):
+                            raise OrientationClassifierError(
+                                "global predictor returned unexpected batch size"
+                            )
+                        if values.shape[1] != hello.feature_dim:
+                            raise OrientationClassifierError(
+                                "NATIVE_PP_DIMENSION_MISMATCH: worker result dimension changed"
+                            )
+                        return [np.asarray(item, dtype=np.float32) for item in values]
+
+                    engine = FastOrientationEngine(
+                        embed,
+                        self.fast_engine.geometry,
+                        image_reader=self.fast_engine.image_reader,
+                        deduplicate_identical_slots=self.fast_engine.deduplicate_identical_slots,
+                    )
+                    return _BatchSession(
+                        predictor=client,
+                        engine=engine,
+                        lock=session_lock,
+                        feature_dim=hello.feature_dim,
+                    )
+                except Exception:
+                    if client is not None:
+                        self._close_batch_predictor(client)
+                    raise
+
             def create_worker(_slot: int) -> _BatchSession:
+                if self.pp_backend == "native_cpp":
+                    return create_native_worker(_slot)
                 predictor: Any | None = None
                 try:
                     predictor = self._new_batch_predictor(threads_per_worker)
@@ -704,6 +975,7 @@ class OrientationClassifier:
             })
         # Capture one immutable caller-provided snapshot for every worker.
         cache_snapshot = cache
+        self._validate_native_cache_dimension(cache_snapshot)
         with self._batch_lifecycle_lock:
             pool = self._batch_pool
             sessions = tuple(self._batch_sessions)
@@ -786,8 +1058,52 @@ class OrientationClassifier:
     def _global_embeddings(self, images: Sequence[np.ndarray]) -> list[np.ndarray]:
         if not images:
             return []
-        rgb_images = [image[:, :, ::-1] for image in images]
+        rgb_images = [np.ascontiguousarray(image[:, :, ::-1]) for image in images]
         with self._inference_lock:
+            if self.pp_backend == "native_cpp":
+                client = self.native_pp_client
+                if client is None:
+                    error = OrientationClassifierError(
+                        "NATIVE_PP_NOT_READY: native client is unavailable"
+                    )
+                    self._record_native_error(error)
+                    raise error
+                try:
+                    returned = client.predict(rgb_images).embeddings
+                except NativePPError as exc:
+                    self._record_native_error(exc)
+                    raise
+                values = np.asarray(returned, dtype=np.float32)
+                if values.ndim != 2 or values.shape[0] != len(images):
+                    error = OrientationClassifierError(
+                        "NATIVE_PP_DIMENSION_MISMATCH: native result batch shape is invalid"
+                    )
+                    self._record_native_error(error)
+                    raise error
+                expected_dim = self.native_feature_dim
+                if expected_dim is not None and values.shape[1] != expected_dim:
+                    error = OrientationClassifierError(
+                        "NATIVE_PP_DIMENSION_MISMATCH: native result dimension changed"
+                    )
+                    self._record_native_error(error)
+                    raise error
+                embeddings = [np.asarray(item, dtype=np.float32) for item in values]
+                for embedding in embeddings:
+                    norm = float(np.linalg.norm(embedding.astype(np.float64)))
+                    if embedding.size == 0 or not np.isfinite(embedding).all() or norm <= 0.0:
+                        error = OrientationClassifierError(
+                            "NATIVE_PP_PROTOCOL_ERROR: native embedding is invalid"
+                        )
+                        self._record_native_error(error)
+                        raise error
+                    if abs(norm - 1.0) > 1e-3:
+                        error = OrientationClassifierError(
+                            "NATIVE_PP_PROTOCOL_ERROR: native embedding is not normalized"
+                        )
+                        self._record_native_error(error)
+                        raise error
+                return embeddings
+
             embeddings = self.global_predictor.predict(rgb_images)
         if len(embeddings) != len(images):
             raise OrientationClassifierError("global predictor returned unexpected batch size")
@@ -877,6 +1193,7 @@ class OrientationClassifier:
                 progress_callback=self._adapt_fast_progress(progress_callback),
             )
             cache = replace(cache, fast_runtime=fast_runtime)
+        self._validate_native_cache_dimension(cache)
         return cache
 
     @staticmethod
@@ -2632,6 +2949,7 @@ class OrientationClassifier:
                 FastOrientationEngine._validate_cache(runtime)
             except ValueError as exc:
                 raise OrientationClassifierError(str(exc)) from exc
+            self._validate_native_cache_dimension(cache)
 
             if isinstance(image_path, np.ndarray):
                 image = image_path
