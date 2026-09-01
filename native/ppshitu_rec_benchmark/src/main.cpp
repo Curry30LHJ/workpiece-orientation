@@ -1,20 +1,30 @@
 #include <windows.h>
+#include <psapi.h>
 
+#include "feature_extractor.h"
 #include "preprocess.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -23,8 +33,11 @@
 namespace {
 
 using workpiece::ppshitu::BatchTensor;
+using workpiece::ppshitu::FeatureExtractor;
 using workpiece::ppshitu::ImageTensor;
+using workpiece::ppshitu::PredictionBatch;
 using workpiece::ppshitu::PreprocessOptions;
+using workpiece::ppshitu::PredictorOptions;
 
 enum class ExitCode : int {
   kSuccess = 0,
@@ -41,8 +54,13 @@ struct Options {
   std::filesystem::path image_list;
   std::filesystem::path report;
   std::filesystem::path dump_inputs;
+  std::filesystem::path dump_embeddings;
   PreprocessOptions preprocess;
   int threads = 1;
+  int workers = 1;
+  int batch_size = 1;
+  int warmup = 0;
+  int iterations = 1;
   bool preprocess_only = false;
 };
 
@@ -171,6 +189,11 @@ void PrintHelp() {
       << "  --report <path>       JSON report output\n\n"
       << "Options:\n"
       << "  --threads <n>         Paddle CPU threads (default: 1)\n"
+      << "  --workers <n>         Independent predictors (default: 1)\n"
+      << "  --batch-size <n>      Images per predictor Run() (default: 1)\n"
+      << "  --warmup <n>          Unmeasured iterations (default: 0)\n"
+      << "  --iterations <n>      Measured iterations (default: 1)\n"
+      << "  --dump-embeddings <path>  Write normalized float32 rows\n"
       << "  --preprocess-only     Stop after NCHW preprocessing\n"
       << "  --dump-inputs <path>  Write row-major NCHW float32 values\n"
       << "  --input-width <n>     Resize width (default: 224)\n"
@@ -232,6 +255,9 @@ std::optional<std::array<float, 3>> ParseFloatTriplet(
 bool IsValueArgument(const std::wstring& key) {
   return key == L"--model-dir" || key == L"--image-list" ||
          key == L"--report" || key == L"--threads" ||
+         key == L"--workers" || key == L"--batch-size" ||
+         key == L"--warmup" || key == L"--iterations" ||
+         key == L"--dump-embeddings" ||
          key == L"--dump-inputs" || key == L"--input-width" ||
          key == L"--input-height" || key == L"--scale" ||
          key == L"--mean-rgb" || key == L"--std-rgb";
@@ -290,6 +316,40 @@ std::optional<Options> ParseArguments(int argc, wchar_t** argv,
     }
     options.threads = *parsed;
   }
+  if (const auto found = values.find(L"--workers"); found != values.end()) {
+    const auto parsed = ParseNonNegativeInteger(found->second);
+    if (!parsed || *parsed == 0) {
+      *error = "workers must be a positive integer";
+      return std::nullopt;
+    }
+    options.workers = *parsed;
+  }
+  if (const auto found = values.find(L"--batch-size");
+      found != values.end()) {
+    const auto parsed = ParseNonNegativeInteger(found->second);
+    if (!parsed || *parsed == 0) {
+      *error = "batch size must be a positive integer";
+      return std::nullopt;
+    }
+    options.batch_size = *parsed;
+  }
+  if (const auto found = values.find(L"--warmup"); found != values.end()) {
+    const auto parsed = ParseNonNegativeInteger(found->second);
+    if (!parsed) {
+      *error = "warmup must be a non-negative integer";
+      return std::nullopt;
+    }
+    options.warmup = *parsed;
+  }
+  if (const auto found = values.find(L"--iterations");
+      found != values.end()) {
+    const auto parsed = ParseNonNegativeInteger(found->second);
+    if (!parsed || *parsed == 0) {
+      *error = "iterations must be a positive integer";
+      return std::nullopt;
+    }
+    options.iterations = *parsed;
+  }
   if (const auto found = values.find(L"--input-width");
       found != values.end()) {
     const auto parsed = ParseNonNegativeInteger(found->second);
@@ -337,12 +397,24 @@ std::optional<Options> ParseArguments(int argc, wchar_t** argv,
       found != values.end()) {
     options.dump_inputs = found->second;
   }
+  if (const auto found = values.find(L"--dump-embeddings");
+      found != values.end()) {
+    options.dump_embeddings = found->second;
+  }
   if (options.preprocess_only && options.dump_inputs.empty()) {
     *error = "--dump-inputs is required with --preprocess-only";
     return std::nullopt;
   }
   if (!options.preprocess_only && !options.dump_inputs.empty()) {
     *error = "--dump-inputs requires --preprocess-only";
+    return std::nullopt;
+  }
+  if (options.preprocess_only && !options.dump_embeddings.empty()) {
+    *error = "--dump-embeddings cannot be used with --preprocess-only";
+    return std::nullopt;
+  }
+  if (!options.preprocess_only && options.dump_embeddings.empty()) {
+    *error = "--dump-embeddings is required for feature extraction";
     return std::nullopt;
   }
   return options;
@@ -622,6 +694,307 @@ int RunPreprocessOnly(const Options& options) {
   return static_cast<int>(ExitCode::kSuccess);
 }
 
+struct ChunkResult {
+  std::size_t begin = 0;
+  std::size_t rows = 0;
+  std::size_t columns = 0;
+  std::vector<float> embeddings;
+  double decode_ms = 0.0;
+  double preprocess_ms = 0.0;
+  double inference_ms = 0.0;
+  double normalize_ms = 0.0;
+};
+
+struct IterationResult {
+  std::vector<float> embeddings;
+  std::size_t rows = 0;
+  std::size_t columns = 0;
+  double decode_ms = 0.0;
+  double preprocess_ms = 0.0;
+  double inference_ms = 0.0;
+  double normalize_ms = 0.0;
+  double total_ms = 0.0;
+};
+
+ChunkResult ProcessChunk(
+    FeatureExtractor* extractor,
+    const std::vector<std::filesystem::path>& image_paths,
+    std::size_t begin, std::size_t end,
+    const PreprocessOptions& preprocess_options) {
+  ChunkResult chunk;
+  chunk.begin = begin;
+  std::vector<ImageTensor> images;
+  images.reserve(end - begin);
+  for (std::size_t index = begin; index < end; ++index) {
+    ImageTensor image = workpiece::ppshitu::LoadAndPreprocess(
+        image_paths[index], preprocess_options);
+    chunk.decode_ms += image.decode_ms;
+    chunk.preprocess_ms += image.preprocess_ms;
+    images.push_back(std::move(image));
+  }
+  const BatchTensor batch = workpiece::ppshitu::StackBatch(images);
+  PredictionBatch prediction = extractor->Predict(batch);
+  chunk.rows = prediction.rows;
+  chunk.columns = prediction.columns;
+  chunk.embeddings = std::move(prediction.embeddings);
+  chunk.inference_ms = prediction.inference_ms;
+  chunk.normalize_ms = prediction.normalize_ms;
+  if (chunk.rows != end - begin) {
+    throw std::runtime_error("predictor returned an unexpected chunk row count");
+  }
+  return chunk;
+}
+
+IterationResult RunOneIteration(
+    const Options& options,
+    const std::vector<std::filesystem::path>& image_paths,
+    const std::vector<std::unique_ptr<FeatureExtractor>>& extractors) {
+  const auto total_start = std::chrono::steady_clock::now();
+  const std::size_t batch_size = static_cast<std::size_t>(options.batch_size);
+  const std::size_t chunk_count =
+      (image_paths.size() + batch_size - 1) / batch_size;
+  std::vector<std::optional<ChunkResult>> chunks(chunk_count);
+
+  auto run_chunk = [&](std::size_t chunk_index, std::size_t worker_index) {
+    const std::size_t begin = chunk_index * batch_size;
+    const std::size_t end = std::min(begin + batch_size, image_paths.size());
+    chunks[chunk_index] = ProcessChunk(extractors[worker_index].get(),
+                                       image_paths, begin, end,
+                                       options.preprocess);
+  };
+
+  if (extractors.size() == 1) {
+    for (std::size_t chunk = 0; chunk < chunk_count; ++chunk) {
+      run_chunk(chunk, 0);
+    }
+  } else {
+    std::atomic<std::size_t> next_chunk{0};
+    std::mutex failure_mutex;
+    std::exception_ptr failure;
+    std::vector<std::thread> workers;
+    workers.reserve(extractors.size());
+    for (std::size_t worker = 0; worker < extractors.size(); ++worker) {
+      workers.emplace_back([&, worker]() {
+        while (true) {
+          const std::size_t chunk =
+              next_chunk.fetch_add(1, std::memory_order_relaxed);
+          if (chunk >= chunk_count) {
+            return;
+          }
+          try {
+            run_chunk(chunk, worker);
+          } catch (...) {
+            std::lock_guard<std::mutex> lock(failure_mutex);
+            if (!failure) {
+              failure = std::current_exception();
+            }
+            return;
+          }
+        }
+      });
+    }
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
+    if (failure) {
+      std::rethrow_exception(failure);
+    }
+  }
+
+  IterationResult result;
+  result.rows = image_paths.size();
+  for (const std::optional<ChunkResult>& candidate : chunks) {
+    if (!candidate) {
+      throw std::runtime_error("a scheduled prediction chunk did not finish");
+    }
+    const ChunkResult& chunk = *candidate;
+    if (result.columns == 0) {
+      result.columns = chunk.columns;
+      result.embeddings.resize(result.rows * result.columns);
+    }
+    if (chunk.columns != result.columns ||
+        chunk.embeddings.size() != chunk.rows * chunk.columns) {
+      throw std::runtime_error("recognition feature dimension changed");
+    }
+    std::copy(chunk.embeddings.begin(), chunk.embeddings.end(),
+              result.embeddings.begin() + chunk.begin * result.columns);
+    result.decode_ms += chunk.decode_ms;
+    result.preprocess_ms += chunk.preprocess_ms;
+    result.inference_ms += chunk.inference_ms;
+    result.normalize_ms += chunk.normalize_ms;
+  }
+  const auto total_end = std::chrono::steady_clock::now();
+  result.total_ms =
+      std::chrono::duration<double, std::milli>(total_end - total_start)
+          .count();
+  return result;
+}
+
+double Percentile(const std::vector<double>& samples, double quantile) {
+  if (samples.empty()) {
+    throw std::invalid_argument("timing samples must not be empty");
+  }
+  std::vector<double> sorted = samples;
+  std::sort(sorted.begin(), sorted.end());
+  const double position = (sorted.size() - 1) * quantile;
+  const std::size_t lower = static_cast<std::size_t>(std::floor(position));
+  const std::size_t upper = static_cast<std::size_t>(std::ceil(position));
+  const double fraction = position - lower;
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction;
+}
+
+void AppendTimingSeries(std::ostringstream* report, const std::string& name,
+                        const std::vector<double>& samples, bool comma) {
+  *report << '\"' << name << "\":{\"samples\":[";
+  for (std::size_t index = 0; index < samples.size(); ++index) {
+    if (index != 0) {
+      *report << ',';
+    }
+    *report << samples[index];
+  }
+  *report << "],\"p50\":" << Percentile(samples, 0.50)
+          << ",\"p95\":" << Percentile(samples, 0.95)
+          << ",\"p99\":" << Percentile(samples, 0.99)
+          << ",\"max\":" << *std::max_element(samples.begin(), samples.end())
+          << '}';
+  if (comma) {
+    *report << ',';
+  }
+}
+
+std::uint64_t PeakWorkingSetBytes() {
+  PROCESS_MEMORY_COUNTERS counters{};
+  counters.cb = static_cast<DWORD>(sizeof(counters));
+  if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters,
+                            static_cast<DWORD>(sizeof(counters)))) {
+    throw std::runtime_error("unable to query process memory counters");
+  }
+  return static_cast<std::uint64_t>(counters.PeakWorkingSetSize);
+}
+
+std::string BuildInferenceReport(
+    const Options& options,
+    const std::vector<std::filesystem::path>& image_paths,
+    const std::vector<std::unique_ptr<FeatureExtractor>>& extractors,
+    const IterationResult& last, const std::vector<double>& decode_samples,
+    const std::vector<double>& preprocess_samples,
+    const std::vector<double>& inference_samples,
+    const std::vector<double>& normalize_samples,
+    const std::vector<double>& total_samples, std::uint64_t peak_working_set) {
+  std::ostringstream report;
+  report << std::setprecision(10)
+         << "{\"schema_version\":1,\"ok\":true,"
+         << "\"mode\":\"feature_extraction\","
+         << "\"input_count\":" << image_paths.size() << ','
+         << "\"feature_dimension\":" << last.columns << ','
+         << "\"worker_count\":" << options.workers << ','
+         << "\"batch_size\":" << options.batch_size << ','
+         << "\"threads\":" << options.threads << ','
+         << "\"warmup\":" << options.warmup << ','
+         << "\"iterations\":" << options.iterations << ','
+         << "\"peak_working_set_bytes\":" << peak_working_set << ','
+         << "\"stage_aggregation\":\"sum_worker_time\","
+         << "\"ordered_images\":[";
+  for (std::size_t index = 0; index < image_paths.size(); ++index) {
+    if (index != 0) {
+      report << ',';
+    }
+    report << '\"' << JsonEscape(PathToUtf8(image_paths[index])) << '\"';
+  }
+  report << "],\"predictor_instance_ids\":[";
+  for (std::size_t index = 0; index < extractors.size(); ++index) {
+    if (index != 0) {
+      report << ',';
+    }
+    report << extractors[index]->instance_id();
+  }
+  report << "],\"timings_ms\":{";
+  AppendTimingSeries(&report, "decode", decode_samples, true);
+  AppendTimingSeries(&report, "preprocess", preprocess_samples, true);
+  AppendTimingSeries(&report, "inference", inference_samples, true);
+  AppendTimingSeries(&report, "normalize", normalize_samples, true);
+  AppendTimingSeries(&report, "total", total_samples, false);
+  report << "}}";
+  return report.str();
+}
+
+int RunInference(const Options& options) {
+  std::vector<std::filesystem::path> image_paths;
+  try {
+    image_paths = ReadImageList(options.image_list);
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kInputUnreadable,
+                "IMAGE_LIST_INVALID", exception.what());
+  }
+
+  std::vector<std::unique_ptr<FeatureExtractor>> extractors;
+  extractors.reserve(static_cast<std::size_t>(options.workers));
+  try {
+    const PredictorOptions predictor_options{options.model_dir, options.threads,
+                                             true};
+    for (int worker = 0; worker < options.workers; ++worker) {
+      extractors.push_back(
+          std::make_unique<FeatureExtractor>(predictor_options));
+    }
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kModelLoadFailed,
+                "MODEL_LOAD_FAILED", exception.what());
+  }
+
+  try {
+    for (int iteration = 0; iteration < options.warmup; ++iteration) {
+      RunOneIteration(options, image_paths, extractors);
+    }
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kInferenceFailed,
+                "WARMUP_FAILED", exception.what());
+  }
+
+  std::vector<double> decode_samples;
+  std::vector<double> preprocess_samples;
+  std::vector<double> inference_samples;
+  std::vector<double> normalize_samples;
+  std::vector<double> total_samples;
+  IterationResult last;
+  try {
+    for (int iteration = 0; iteration < options.iterations; ++iteration) {
+      IterationResult current =
+          RunOneIteration(options, image_paths, extractors);
+      decode_samples.push_back(current.decode_ms);
+      preprocess_samples.push_back(current.preprocess_ms);
+      inference_samples.push_back(current.inference_ms);
+      normalize_samples.push_back(current.normalize_ms);
+      total_samples.push_back(current.total_ms);
+      last = std::move(current);
+    }
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kInferenceFailed,
+                "INFERENCE_FAILED", exception.what());
+  }
+
+  if (!WriteFloat32Atomically(options.dump_embeddings, last.embeddings)) {
+    return Fail(options.report, ExitCode::kReportWriteFailed,
+                "DUMP_WRITE_FAILED", "unable to write embedding dump");
+  }
+  std::uint64_t peak_working_set = 0;
+  try {
+    peak_working_set = PeakWorkingSetBytes();
+  } catch (const std::exception& exception) {
+    return Fail(options.report, ExitCode::kReportWriteFailed,
+                "MEMORY_QUERY_FAILED", exception.what());
+  }
+  if (!WriteJsonAtomically(
+          options.report,
+          BuildInferenceReport(options, image_paths, extractors, last,
+                               decode_samples, preprocess_samples,
+                               inference_samples, normalize_samples,
+                               total_samples, peak_working_set))) {
+    std::cerr << "unable to write inference report\n";
+    return static_cast<int>(ExitCode::kReportWriteFailed);
+  }
+  return static_cast<int>(ExitCode::kSuccess);
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -652,6 +1025,5 @@ int wmain(int argc, wchar_t** argv) {
   if (options->preprocess_only) {
     return RunPreprocessOnly(*options);
   }
-  return Fail(options->report, ExitCode::kInferenceFailed, "NOT_IMPLEMENTED",
-              "feature extraction is not implemented yet");
+  return RunInference(*options);
 }

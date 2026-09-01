@@ -20,6 +20,8 @@ struct ImageTensor {
   int channels = 3;
   int height = 0;
   int width = 0;
+  double decode_ms = 0.0;
+  double preprocess_ms = 0.0;
 };
 
 struct BatchTensor {
@@ -36,4 +38,3 @@ ImageTensor LoadAndPreprocess(const std::filesystem::path& path,
 BatchTensor StackBatch(const std::vector<ImageTensor>& images);
 
 }  // namespace workpiece::ppshitu
-

@@ -1,5 +1,6 @@
 #include "preprocess.h"
 
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -51,19 +52,22 @@ std::vector<unsigned char> ReadBytes(const std::filesystem::path& path) {
 ImageTensor LoadAndPreprocess(const std::filesystem::path& path,
                               const PreprocessOptions& options) {
   ValidateOptions(options);
+  const auto decode_start = std::chrono::steady_clock::now();
   const std::vector<unsigned char> bytes = ReadBytes(path);
   if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     throw std::runtime_error("encoded image is too large to decode");
   }
   const cv::Mat encoded(1, static_cast<int>(bytes.size()), CV_8UC1,
                         const_cast<unsigned char*>(bytes.data()));
-  const cv::Mat bgr = cv::imdecode(encoded, cv::IMREAD_UNCHANGED);
+  const cv::Mat bgr = cv::imdecode(encoded, cv::IMREAD_COLOR);
   if (bgr.empty()) {
     throw std::runtime_error("unable to decode image");
   }
   if (bgr.depth() != CV_8U || bgr.channels() != 3) {
     throw std::runtime_error("image must be an 8-bit three-channel image");
   }
+  const auto decode_end = std::chrono::steady_clock::now();
+  const auto preprocess_start = decode_end;
 
   cv::Mat rgb;
   cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
@@ -95,6 +99,13 @@ ImageTensor LoadAndPreprocess(const std::filesystem::path& path,
       }
     }
   }
+  const auto preprocess_end = std::chrono::steady_clock::now();
+  output.decode_ms =
+      std::chrono::duration<double, std::milli>(decode_end - decode_start)
+          .count();
+  output.preprocess_ms = std::chrono::duration<double, std::milli>(
+                             preprocess_end - preprocess_start)
+                             .count();
   return output;
 }
 

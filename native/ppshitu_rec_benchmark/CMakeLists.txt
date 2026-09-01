@@ -34,15 +34,19 @@ find_package(OpenCV REQUIRED PATHS
 
 add_executable(ppshitu_rec_benchmark
     src/main.cpp
-    src/preprocess.cpp)
+    src/preprocess.cpp
+    src/feature_extractor.cpp)
 target_include_directories(ppshitu_rec_benchmark PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ppshitu_rec_benchmark SYSTEM PRIVATE
     "${PADDLE_INFERENCE_ROOT}/paddle/include"
     ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(ppshitu_rec_benchmark PRIVATE
     "${PADDLE_INFERENCE_LIBRARY}"
-    ${OpenCV_LIBS})
+    ${OpenCV_LIBS}
+    Psapi)
 
 if(MSVC)
-  target_compile_options(ppshitu_rec_benchmark PRIVATE /utf-8 /W4 /permissive-)
+  target_compile_options(ppshitu_rec_benchmark PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
 endif()

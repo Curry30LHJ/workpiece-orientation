@@ -27,6 +27,19 @@ def native_exe():
     return path
 
 
+@pytest.fixture
+def native_model_dir():
+    configured = os.environ.get("WORKPIECE_CPP_MODEL_DIR")
+    if not configured:
+        pytest.skip("WORKPIECE_CPP_MODEL_DIR is not configured")
+    path = Path(configured)
+    required = [path / "inference.pdmodel", path / "inference.pdiparams"]
+    missing = [str(candidate) for candidate in required if not candidate.is_file()]
+    if missing:
+        pytest.fail("WORKPIECE_CPP_MODEL_DIR is incomplete: " + ", ".join(missing))
+    return path
+
+
 def test_build_script_rejects_missing_paddle_root_before_configuring(tmp_path):
     missing_paddle = tmp_path / "missing-paddle"
     missing_opencv = tmp_path / "missing-opencv"
@@ -300,3 +313,140 @@ def test_native_preprocess_rejects_malformed_image_list(native_exe, tmp_path):
     assert result.returncode == 3
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["error"]["code"] == "IMAGE_LIST_INVALID"
+
+
+@pytest.fixture
+def five_images():
+    images = sorted((REPO_ROOT / "data" / "1_M1" / "0").glob("*.png"))[:5]
+    if len(images) != 5:
+        pytest.fail("the native benchmark contract requires five M1 images")
+    return images
+
+
+@pytest.fixture
+def native_run(native_exe, native_model_dir, tmp_path):
+    invocation = 0
+
+    def run(
+        image_paths,
+        *,
+        workers=1,
+        batch_size=1,
+        warmup=0,
+        iterations=1,
+        threads=1,
+    ):
+        nonlocal invocation
+        invocation += 1
+        image_list = tmp_path / f"images-{invocation}.json"
+        report_path = tmp_path / f"report-{invocation}.json"
+        embeddings_path = tmp_path / f"embeddings-{invocation}.f32"
+        image_list.write_text(
+            json.dumps([str(path) for path in image_paths], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                str(native_exe),
+                "--model-dir",
+                str(native_model_dir),
+                "--image-list",
+                str(image_list),
+                "--report",
+                str(report_path),
+                "--dump-embeddings",
+                str(embeddings_path),
+                "--workers",
+                str(workers),
+                "--batch-size",
+                str(batch_size),
+                "--warmup",
+                str(warmup),
+                "--iterations",
+                str(iterations),
+                "--threads",
+                str(threads),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        assert report_path.is_file(), result.stderr
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert result.returncode == 0, report
+        embeddings = np.fromfile(embeddings_path, dtype=np.float32).reshape(
+            report["input_count"], report["feature_dimension"]
+        )
+        return report, embeddings
+
+    return run
+
+
+@pytest.mark.integration
+def test_native_real_batch_preserves_order_and_returns_unit_embeddings(
+    native_run, five_images
+):
+    report, embeddings = native_run(
+        five_images, workers=1, batch_size=5, warmup=1, iterations=1
+    )
+
+    assert report["ok"] is True
+    assert report["input_count"] == 5
+    assert report["batch_size"] == 5
+    assert embeddings.shape == (5, report["feature_dimension"])
+    np.testing.assert_allclose(
+        np.linalg.norm(embeddings, axis=1), np.ones(5), rtol=0, atol=1e-5
+    )
+    assert report["ordered_images"] == [str(path) for path in five_images]
+    assert set(report["timings_ms"]) >= {
+        "decode",
+        "preprocess",
+        "inference",
+        "normalize",
+        "total",
+    }
+    assert report["peak_working_set_bytes"] > 0
+
+
+@pytest.mark.integration
+def test_four_workers_report_four_distinct_predictor_instances(
+    native_run, five_images
+):
+    report, embeddings = native_run(
+        five_images, workers=4, batch_size=1, warmup=1, iterations=1
+    )
+
+    assert report["worker_count"] == 4
+    assert len(set(report["predictor_instance_ids"])) == 4
+    assert embeddings.shape[0] == 5
+
+
+@pytest.mark.integration
+def test_native_inference_reports_missing_model_as_model_load_failure(
+    native_exe, five_images, tmp_path
+):
+    image_list = tmp_path / "images.json"
+    image_list.write_text(json.dumps([str(five_images[0])]), encoding="utf-8")
+    report_path = tmp_path / "report.json"
+    embeddings_path = tmp_path / "embeddings.f32"
+
+    result = subprocess.run(
+        [
+            str(native_exe),
+            "--model-dir",
+            str(tmp_path / "missing-model"),
+            "--image-list",
+            str(image_list),
+            "--report",
+            str(report_path),
+            "--dump-embeddings",
+            str(embeddings_path),
+            "--iterations",
+            "1",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 4
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["error"]["code"] == "MODEL_LOAD_FAILED"
