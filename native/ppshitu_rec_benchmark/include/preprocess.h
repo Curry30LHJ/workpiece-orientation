@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <vector>
 
@@ -31,6 +32,16 @@ struct BatchTensor {
   int height = 0;
   int width = 0;
 };
+
+// The byte buffer is tightly packed HWC RGB uint8 data.  No channel swap is
+// performed by this entry point; file decoding below is responsible for the
+// one BGR->RGB conversion needed by the existing benchmark path.
+ImageTensor PreprocessRgb(const std::uint8_t* data,
+                          std::size_t data_size,
+                          int width,
+                          int height,
+                          int channels,
+                          const PreprocessOptions& options);
 
 ImageTensor LoadAndPreprocess(const std::filesystem::path& path,
                               const PreprocessOptions& options);

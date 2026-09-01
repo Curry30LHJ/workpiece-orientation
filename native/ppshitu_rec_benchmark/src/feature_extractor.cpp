@@ -43,6 +43,26 @@ std::size_t CheckedElementCount(const std::vector<int>& shape) {
   return count;
 }
 
+std::size_t CheckedBatchElementCount(const BatchTensor& batch) {
+  if (batch.batch == 0 || batch.channels <= 0 || batch.height <= 0 ||
+      batch.width <= 0) {
+    throw std::invalid_argument("invalid prediction batch shape");
+  }
+  std::size_t count = batch.batch;
+  const std::size_t dimensions[] = {
+      static_cast<std::size_t>(batch.channels),
+      static_cast<std::size_t>(batch.height),
+      static_cast<std::size_t>(batch.width),
+  };
+  for (const std::size_t dimension : dimensions) {
+    if (count > std::numeric_limits<std::size_t>::max() / dimension) {
+      throw std::invalid_argument("prediction batch dimensions overflow");
+    }
+    count *= dimension;
+  }
+  return count;
+}
+
 }  // namespace
 
 FeatureExtractor::FeatureExtractor(const PredictorOptions& options) {
@@ -89,14 +109,10 @@ FeatureExtractor::FeatureExtractor(const PredictorOptions& options) {
 }
 
 PredictionBatch FeatureExtractor::Predict(const BatchTensor& batch) {
-  if (batch.batch == 0 || batch.channels != 3 || batch.height <= 0 ||
-      batch.width <= 0) {
+  if (batch.channels != 3) {
     throw std::invalid_argument("invalid prediction batch shape");
   }
-  const std::size_t expected_values =
-      batch.batch * static_cast<std::size_t>(batch.channels) *
-      static_cast<std::size_t>(batch.height) *
-      static_cast<std::size_t>(batch.width);
+  const std::size_t expected_values = CheckedBatchElementCount(batch);
   if (batch.nchw.size() != expected_values ||
       batch.batch > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     throw std::invalid_argument("prediction batch data does not match its shape");
@@ -129,6 +145,14 @@ PredictionBatch FeatureExtractor::Predict(const BatchTensor& batch) {
   PredictionBatch result;
   result.rows = batch.batch;
   result.columns = output_count / batch.batch;
+  if (result.columns == 0) {
+    throw std::runtime_error("recognition output feature dimension is zero");
+  }
+  if (feature_dimension_ == 0) {
+    feature_dimension_ = result.columns;
+  } else if (feature_dimension_ != result.columns) {
+    throw std::runtime_error("recognition feature dimension changed");
+  }
   result.embeddings.resize(output_count);
   output->CopyToCpu(result.embeddings.data());
   const auto inference_end = std::chrono::steady_clock::now();
@@ -160,6 +184,8 @@ PredictionBatch FeatureExtractor::Predict(const BatchTensor& batch) {
   result.normalize_ms = std::chrono::duration<double, std::milli>(
                             normalize_end - normalize_start)
                             .count();
+  result.timings.inference_ms = result.inference_ms;
+  result.timings.postprocess_ms = result.normalize_ms;
   return result;
 }
 

@@ -41,6 +41,20 @@ def native_model_dir():
     return path
 
 
+@pytest.fixture
+def native_preprocess_probe():
+    configured = os.environ.get("WORKPIECE_CPP_PREPROCESS_PROBE_EXE")
+    if not configured:
+        pytest.skip("WORKPIECE_CPP_PREPROCESS_PROBE_EXE is not configured")
+    path = Path(configured)
+    if not path.is_file():
+        pytest.fail(
+            "WORKPIECE_CPP_PREPROCESS_PROBE_EXE points to a missing file: "
+            f"{path}"
+        )
+    return path
+
+
 def test_build_script_rejects_missing_paddle_root_before_configuring(tmp_path):
     missing_paddle = tmp_path / "missing-paddle"
     missing_opencv = tmp_path / "missing-opencv"
@@ -225,6 +239,80 @@ def _run_preprocess(native_exe, tmp_path, image_paths):
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
     return result, report, dump_path
+
+
+def _run_raw_preprocess_probe(probe, rgb, *, channels=3, raw_bytes=None):
+    height, width = rgb.shape[:2]
+    payload = (
+        np.asarray(rgb, dtype=np.uint8).tobytes()
+        if raw_bytes is None
+        else raw_bytes
+    )
+    return subprocess.run(
+        [
+            str(probe),
+            "--raw-rgb",
+            str(width),
+            str(height),
+            str(channels),
+            payload.hex(),
+            "--output-width",
+            str(width),
+            "--output-height",
+            str(height),
+        ],
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.integration
+def test_native_rgb_preprocess_matches_file_path(
+    native_exe, native_preprocess_probe, tmp_path
+):
+    rgb = np.array(
+        [
+            [[0, 0, 0], [255, 0, 0]],
+            [[0, 255, 0], [0, 0, 255]],
+        ],
+        dtype=np.uint8,
+    )
+    image_path = tmp_path / "rgb-reference.png"
+    _write_lossless_png(image_path, rgb[:, :, ::-1])
+
+    raw_result = _run_raw_preprocess_probe(native_preprocess_probe, rgb)
+    assert raw_result.returncode == 0, raw_result.stderr.decode(errors="replace")
+    raw_values = np.frombuffer(raw_result.stdout, dtype="<f4")
+
+    file_result, report, dump_path = _run_preprocess(native_exe, tmp_path, [image_path])
+    assert file_result.returncode == 0, file_result.stderr
+    assert report["ok"] is True
+    file_values = np.fromfile(dump_path, dtype=np.float32)
+    np.testing.assert_allclose(raw_values, file_values, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "channels,needle",
+    [(2, "channel"), (3, "byte")],
+)
+def test_native_rgb_preprocess_rejects_bad_record(
+    native_preprocess_probe, channels, needle
+):
+    rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+    raw_bytes = None
+    if channels == 2:
+        rgb = rgb[:, :, :2]
+    else:
+        raw_bytes = b"\0" * 11
+    result = _run_raw_preprocess_probe(
+        native_preprocess_probe,
+        rgb,
+        channels=channels,
+        raw_bytes=raw_bytes,
+    )
+    assert result.returncode != 0
+    assert needle in result.stderr.decode(errors="replace").lower()
 
 
 @pytest.mark.integration

@@ -52,20 +52,43 @@ add_executable(ppshitu_protocol_probe
 target_link_libraries(ppshitu_protocol_probe PRIVATE
     ppshitu_protocol)
 
-add_executable(ppshitu_rec_benchmark
-    src/main.cpp
-    src/preprocess.cpp
+add_library(ppshitu_preprocess STATIC
+    src/preprocess.cpp)
+target_include_directories(ppshitu_preprocess PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ppshitu_preprocess SYSTEM PRIVATE
+    ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(ppshitu_preprocess PUBLIC
+    ${OpenCV_LIBS})
+
+add_library(ppshitu_core STATIC
     src/feature_extractor.cpp)
+target_include_directories(ppshitu_core PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ppshitu_core SYSTEM PRIVATE
+    "${PADDLE_INFERENCE_ROOT}/paddle/include"
+    ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(ppshitu_core PUBLIC
+    ppshitu_preprocess
+    "${PADDLE_INFERENCE_LIBRARY}"
+    ${OpenCV_LIBS}
+    Psapi
+    Bcrypt)
+
+add_executable(ppshitu_rec_benchmark
+    src/main.cpp)
 target_include_directories(ppshitu_rec_benchmark PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(ppshitu_rec_benchmark SYSTEM PRIVATE
     "${PADDLE_INFERENCE_ROOT}/paddle/include"
     ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(ppshitu_rec_benchmark PRIVATE
-    "${PADDLE_INFERENCE_LIBRARY}"
-    ${OpenCV_LIBS}
-    Psapi
-    Bcrypt)
+    ppshitu_core)
+
+add_executable(ppshitu_preprocess_probe
+    src/preprocess_probe_main.cpp)
+target_link_libraries(ppshitu_preprocess_probe PRIVATE
+    ppshitu_preprocess)
 
 target_compile_definitions(ppshitu_rec_benchmark PRIVATE
     WORKPIECE_GIT_COMMIT="${WORKPIECE_GIT_COMMIT}")
@@ -75,6 +98,12 @@ if(MSVC)
       /utf-8 /W4 /permissive-)
   target_compile_options(ppshitu_protocol_probe PRIVATE
       /utf-8 /W4 /permissive-)
+  target_compile_options(ppshitu_preprocess PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
+  target_compile_options(ppshitu_core PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
   target_compile_options(ppshitu_rec_benchmark PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
+  target_compile_options(ppshitu_preprocess_probe PRIVATE
       /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
 endif()
