@@ -2,7 +2,8 @@
   "schema_version": 1,
   "verified_on": "2026-09-01",
   "platform": "windows-x64",
-  "source_git_commit": "e0383ede781b1682c216535b3e2a58aec4a81329",
+  "source_git_commit": "571747d2706351657b2c87bf33c6dfead961b3dc",
+  "integration_branch": "feature/20260901/ppshitu-cpp-inference",
   "toolchain": {
     "generator": "Visual Studio 16 2019",
     "architecture": "x64",
@@ -56,10 +57,20 @@
     ]
   },
   "native_artifact": {
-    "logical_path": ".native-build/ppshitu-cpp/Release/ppshitu_rec_benchmark.exe",
-    "size_bytes": 165376,
-    "sha256": "BECF4443DAE60B574035EA86903B5F8C45B045C4D4F59EBD2FC2B8B9E6493F90",
-    "built_from_commit": "e0383ede781b1682c216535b3e2a58aec4a81329"
+    "logical_path": ".native-build/ppshitu-cpp-task4/Release/ppshitu_rec_service.exe",
+    "role": "persistent_service",
+    "size_bytes": 132096,
+    "sha256": "22B7C3B577B83B8AB9DA1EDCFD09DA2AA44E598FDF70276775F6F3721FC8BEFD",
+    "built_from_commit": "571747d2706351657b2c87bf33c6dfead961b3dc",
+    "service_version": "ppshitu-native-cpp/1",
+    "protocol_version": 1,
+    "feature_dimension": 512
+  },
+  "benchmark_artifact": {
+    "logical_path": ".native-build/ppshitu-cpp-task4/Release/ppshitu_rec_benchmark.exe",
+    "size_bytes": 166400,
+    "sha256": "5D1F7B67073050C7E6DE5ED8633CB524B4103E05759B983BE5D15B7578AEBFDF",
+    "built_from_commit": "571747d2706351657b2c87bf33c6dfead961b3dc"
   },
   "staged_runtime_dlls": [
     {
@@ -98,5 +109,12 @@
       "size_bytes": 121158656,
       "sha256": "4B1C820E7F46EB02771C020C471AE84164BF316E7B60BEE7A3FBFA4A63771D4B"
     }
-  ]
+  ],
+  "verification": {
+    "model_fingerprint": "b5c295881006bdc7438a86a358f52289f510fe70c9f2429fc23b6d7a4427ec4a",
+    "cache_identity_unchanged": true,
+    "target_hardware": "Intel Core i5-8250U",
+    "target_hardware_measured": false,
+    "native_mode": "opt_in_cpu_fast_geometry"
+  }
 }
