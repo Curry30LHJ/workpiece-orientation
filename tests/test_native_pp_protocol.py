@@ -1,16 +1,21 @@
 import io
+import os
+from pathlib import Path
 import struct
+import subprocess
 
 import numpy as np
 import pytest
 
 from src.native_pp_protocol import (
+    CLOSE,
     ERROR,
     HELLO,
     IMAGE_HEADER,
     MAGIC,
     NativeHello,
     NativeProtocolError,
+    PREDICT,
     PROTOCOL_VERSION,
     RESULT,
     Frame,
@@ -160,3 +165,40 @@ def test_write_frame_flushes_and_read_frame_returns_clean_eof():
     frame = read_frame(stream, max_payload_bytes=32)
     assert frame == Frame(HELLO, 0, b"ok")
     assert read_frame(stream, max_payload_bytes=32) is None
+
+
+@pytest.fixture
+def cpp_protocol_probe():
+    configured = os.environ.get("WORKPIECE_CPP_PROTOCOL_PROBE_EXE")
+    if not configured:
+        pytest.skip("WORKPIECE_CPP_PROTOCOL_PROBE_EXE is not configured")
+    path = Path(configured)
+    if not path.is_file():
+        pytest.fail(f"WORKPIECE_CPP_PROTOCOL_PROBE_EXE points to a missing file: {path}")
+    return path
+
+
+@pytest.mark.integration
+def test_cpp_probe_accepts_python_close_frame(cpp_protocol_probe):
+    encoded = encode_frame(CLOSE, 4, b"", max_payload_bytes=256)
+    result = subprocess.run(
+        [str(cpp_protocol_probe), "--max-payload", "256"],
+        input=encoded,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stdout == b""
+
+
+@pytest.mark.integration
+def test_cpp_probe_rejects_payload_over_limit(cpp_protocol_probe):
+    encoded = HEADER.pack(MAGIC, PROTOCOL_VERSION, PREDICT, 257, 4)
+    result = subprocess.run(
+        [str(cpp_protocol_probe), "--max-payload", "256"],
+        input=encoded,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert result.stdout == b""
