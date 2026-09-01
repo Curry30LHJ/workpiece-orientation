@@ -627,6 +627,33 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == BackendClient::State::Ready, 1000);
     }
 
+    void zeroTotalProgressFrameIsIgnoredForCompatibility() {
+        FakeTcpServer server;
+        QVERIFY(server.start());
+        BackendClient client;
+        QSignalSpy handshakeSpy(&client, &BackendClient::handshakeSucceeded);
+        connectWithHello(server, client);
+        QTRY_COMPARE_WITH_TIMEOUT(handshakeSpy.count(), 1, 1000);
+        QSignalSpy progressSpy(&client, &BackendClient::progressReceived);
+        QSignalSpy transportSpy(&client, &BackendClient::transportFailed);
+
+        const QString requestId = client.sendRequest(QStringLiteral("register"));
+        QVERIFY(!requestId.isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(server.requests().size() == 2, 1000);
+        server.sendJson({
+            {"version", 1}, {"request_id", requestId}, {"event", "progress"},
+            {"command", "register"},
+            {"progress", QJsonObject{{"phase", "fast_augmentation"},
+                                      {"completed", 0}, {"total", 0}}},
+        });
+
+        QTRY_COMPARE_WITH_TIMEOUT(progressSpy.count(), 1, 1000);
+        QCOMPARE(transportSpy.count(), 0);
+        QCOMPARE(client.state(), BackendClient::State::Busy);
+        server.sendJson({{"version", 1}, {"request_id", requestId}, {"ok", true}});
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), BackendClient::State::Ready, 1000);
+    }
+
     void disconnectClearsPendingRequest() {
         FakeTcpServer server;
         QVERIFY(server.start());

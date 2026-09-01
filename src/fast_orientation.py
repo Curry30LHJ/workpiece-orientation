@@ -294,10 +294,15 @@ class FastOrientationEngine:
             label: len(samples[label]) - len(originals[label])
             for label in ("front", "back")
         }
-        if total_augmented == 0:
-            self._progress(progress_callback, "fast_augmentation", 0, 0, "augmented_samples")
+        # A zero-total progress frame is not a progress unit: the Qt client
+        # quite correctly rejects it as malformed.  Omit the phase entirely
+        # when both sides are above the few-shot augmentation threshold.
 
-        features = self._embed_samples(samples)
+        features = self._embed_samples(
+            samples,
+            progress_callback=progress_callback,
+            emit_progress=total_originals > 2,
+        )
         self._progress(progress_callback, "fast_ridge", 0, 1, "ridge_head")
         head = fit_ridge_head(
             np.stack(features["front"]),
@@ -476,16 +481,33 @@ class FastOrientationEngine:
         if callback is not None:
             callback({"phase": phase, "completed": completed, "total": total, "unit": unit})
 
-    def _embed_samples(self, samples: Mapping[str, Sequence[_TrainingSample]]) -> dict[str, list[np.ndarray]]:
+    def _embed_samples(
+        self,
+        samples: Mapping[str, Sequence[_TrainingSample]],
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        emit_progress: bool = False,
+    ) -> dict[str, list[np.ndarray]]:
         ordered = [sample for label in ("front", "back") for sample in samples[label]]
         images = [image for sample in ordered for image in sample.images]
         embeddings: list[np.ndarray] = []
-        for start in range(0, len(images), FAST_BUILD_IMAGE_BATCH):
+        batch_count = (len(images) + FAST_BUILD_IMAGE_BATCH - 1) // FAST_BUILD_IMAGE_BATCH
+        if emit_progress and batch_count > 0:
+            self._progress(progress_callback, "fast_embedding", 0, batch_count, "embedding_batches")
+        for batch_index, start in enumerate(range(0, len(images), FAST_BUILD_IMAGE_BATCH), start=1):
             chunk = images[start:start + FAST_BUILD_IMAGE_BATCH]
             returned = self.embed_batch(chunk)
             if not isinstance(returned, Sequence) or len(returned) != len(chunk):
                 raise _feature_error("embedder returned an unexpected batch size")
             embeddings.extend(returned)
+            if emit_progress:
+                self._progress(
+                    progress_callback,
+                    "fast_embedding",
+                    batch_index,
+                    batch_count,
+                    "embedding_batches",
+                )
         packed: list[np.ndarray] = []
         expected_slot_dim: int | None = None
         for index in range(0, len(embeddings), len(FAST_FEATURE_LAYOUT)):

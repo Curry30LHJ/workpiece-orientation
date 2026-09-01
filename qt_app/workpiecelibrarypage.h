@@ -81,6 +81,7 @@ private:
     void stopRegistrationProgress();
     void publishRegistrationTaskStatus(const QString &phase, int completed,
                                        int total, qint64 elapsedMs);
+    int registrationOverallProgress(const QJsonObject &progress) const;
     void publishRegistrationFailure();
     qint64 currentRegistrationElapsedMs() const;
 
@@ -104,4 +105,7 @@ private:
     int registrationTaskCompleted_ = 0;
     int registrationTaskTotal_ = 0;
     qint64 registrationTaskElapsedMs_ = -1;
+    int registrationFrontCount_ = 0;
+    int registrationBackCount_ = 0;
+    int registrationOverallProgress_ = 0;
 };

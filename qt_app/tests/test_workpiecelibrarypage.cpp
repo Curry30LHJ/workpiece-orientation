@@ -8,6 +8,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
+#include <QProgressBar>
 #include <QSignalSpy>
 #include <QTableWidget>
 #include <QTabWidget>
@@ -505,6 +506,25 @@ private slots:
             QStringLiteral("registrationProgressLabel"))->text();
         QVERIFY(progress.contains(expected));
         QVERIFY(progress.contains(QStringLiteral("1/3")));
+    }
+
+    void registrationProgressUsesOverallPercentageWhenProvided() {
+        WorkpieceLibraryPage page;
+        auto *bar = page.findChild<QProgressBar *>(QStringLiteral("registrationProgressBar"));
+        QVERIFY(bar != nullptr);
+
+        page.setRegistrationProgress(QJsonObject{
+            {QStringLiteral("phase"), QStringLiteral("fast_embedding")},
+            {QStringLiteral("completed"), 1},
+            {QStringLiteral("total"), 4},
+            {QStringLiteral("overall_progress"), 83},
+        }, 27);
+
+        QCOMPARE(bar->minimum(), 0);
+        QCOMPARE(bar->maximum(), 100);
+        QCOMPARE(bar->value(), 83);
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("registrationProgressLabel"))
+                    ->text().contains(QStringLiteral("整体 83%")));
     }
 
     void registrationResultShowsFastCacheStateAndRevision() {

@@ -776,7 +776,10 @@ def test_register_adapts_legacy_and_structured_builder_progress_to_dicts(tmp_pat
     ]
     assert all(isinstance(event, dict) for event in builder_events)
     assert all({"phase", "completed", "total"} <= event.keys() for event in builder_events)
-    assert builder_events == [
+    assert [
+        {key: event[key] for key in ("phase", "completed", "total", "unit") if key in event}
+        for event in builder_events
+    ] == [
         {"phase": "features", "completed": 1, "total": 3},
         {"phase": "fast_originals", "completed": 2, "total": 3, "unit": "templates"},
         {
@@ -787,6 +790,31 @@ def test_register_adapts_legacy_and_structured_builder_progress_to_dicts(tmp_pat
         },
         {"phase": "fast_ridge", "completed": 1, "total": 1, "unit": "ridge_head"},
     ]
+
+
+def test_register_progress_contains_monotonic_overall_percentage(tmp_path):
+    events: list[dict] = []
+
+    def builder(front, back, progress_callback=None):
+        progress_callback({"phase": "fast_originals", "completed": 1, "total": 3, "unit": "templates"})
+        progress_callback({"phase": "fast_embedding", "completed": 1, "total": 2, "unit": "embedding_batches"})
+        progress_callback({"phase": "fast_embedding", "completed": 2, "total": 2, "unit": "embedding_batches"})
+        return fake_builder(front, back)
+
+    library = WorkpieceLibrary(tmp_path / "lib")
+    library.register(
+        "M7",
+        image_set(tmp_path, "front", 10, 2),
+        image_set(tmp_path, "back", 20, 3),
+        False,
+        builder,
+        progress_callback=events.append,
+    )
+
+    percentages = [event["overall_progress"] for event in events]
+    assert percentages == sorted(percentages)
+    assert percentages[-1] == 100
+    assert all(event["overall_total"] == 100 for event in events)
 
 
 def test_annotation_document_reads_legacy_groups_and_only_safe_groups_as_active(tmp_path):

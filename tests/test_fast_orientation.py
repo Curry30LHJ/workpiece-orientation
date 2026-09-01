@@ -534,3 +534,47 @@ def test_augmentation_progress_is_emitted_as_samples_are_generated(tmp_path):
     assert first_augmentation < second_original
     assert [event["completed"] for event in augmentation] == list(range(1, 23))
     assert all(event["total"] == 22 and event["unit"] == "augmented_samples" for event in augmentation)
+
+
+def test_build_does_not_emit_zero_total_augmentation_progress(tmp_path):
+    """A side at the augmentation threshold must not create an invalid event."""
+    events: list[dict] = []
+    front = write_markers(tmp_path, "front", 20, base=10)
+    back = write_markers(tmp_path, "back", 20, base=100)
+    engine, _ = fake_engine()
+
+    engine.build_cache(
+        front,
+        back,
+        geometry_profile=None,
+        library_revision=1,
+        model_fingerprint="m",
+        progress_callback=events.append,
+    )
+
+    assert not any(
+        event["phase"] == "fast_augmentation" and event["total"] == 0
+        for event in events
+    )
+
+
+def test_large_build_reports_embedding_batch_progress(tmp_path):
+    events: list[dict] = []
+    front = write_markers(tmp_path, "front", 20, base=10)
+    back = write_markers(tmp_path, "back", 20, base=100)
+    engine, _ = fake_engine()
+
+    engine.build_cache(
+        front,
+        back,
+        geometry_profile=None,
+        library_revision=1,
+        model_fingerprint="m",
+        progress_callback=events.append,
+    )
+
+    embedding = [event for event in events if event["phase"] == "fast_embedding"]
+    assert embedding
+    assert embedding[0]["completed"] == 0
+    assert embedding[0]["total"] > 0
+    assert embedding[-1]["completed"] == embedding[-1]["total"]

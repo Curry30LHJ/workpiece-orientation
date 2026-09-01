@@ -80,6 +80,77 @@ CacheSaver = Callable[[WorkpieceRecord, TemplateCache], None]
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
+# Registration callbacks historically exposed the current phase's
+# ``completed``/``total`` pair.  Keep those fields unchanged for existing
+# consumers, while adding a monotonic percentage for a UI progress bar.  The
+# ranges deliberately leave room for phases whose exact unit count is only
+# known once the model has started building its cache.
+_REGISTRATION_PROGRESS_RANGES: dict[str, tuple[int, int]] = {
+    "validating": (0, 10),
+    "copying": (10, 20),
+    "features": (20, 55),
+    "fast_originals": (55, 70),
+    "fast_augmentation": (70, 80),
+    "fast_embedding": (80, 95),
+    "fast_ridge": (95, 99),
+    "committing": (99, 100),
+}
+
+
+class _RegistrationProgress:
+    """Add an operation-level percentage without changing phase semantics."""
+
+    def __init__(
+        self,
+        *,
+        front_count: int,
+        back_count: int,
+    ) -> None:
+        self.front_count = max(0, int(front_count))
+        self.back_count = max(0, int(back_count))
+        self.side_total = self.front_count + self.back_count
+        self.last = 0
+
+    @staticmethod
+    def _ratio(completed: Any, total: Any) -> float | None:
+        if type(completed) is not int or type(total) is not int or total <= 0:
+            return None
+        return max(0.0, min(1.0, completed / total))
+
+    def _event_ratio(self, event: Mapping[str, Any]) -> float | None:
+        phase = event.get("phase")
+        completed = event.get("completed", 0)
+        total = event.get("total", 0)
+        if phase in {"validating", "copying"}:
+            phase_completed = event.get("phase_completed", completed)
+            phase_total = event.get("phase_total", total)
+            if type(phase_completed) is not int or type(phase_total) is not int:
+                return None
+            label = event.get("label")
+            if label in {"front", "back"} and self.side_total > 0:
+                offset = self.front_count if label == "back" else 0
+                return max(0.0, min(1.0, (offset + phase_completed) / self.side_total))
+            return self._ratio(phase_completed, phase_total)
+        return self._ratio(completed, total)
+
+    def enrich(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        enriched = dict(event)
+        phase = enriched.get("phase")
+        bounds = _REGISTRATION_PROGRESS_RANGES.get(phase)
+        if bounds is not None:
+            ratio = self._event_ratio(enriched)
+            if phase == "committing":
+                ratio = 1.0
+            if ratio is not None:
+                start, end = bounds
+                candidate = int(round(start + (end - start) * ratio))
+                self.last = max(self.last, min(100, max(0, candidate)))
+        enriched["overall_progress"] = self.last
+        enriched["overall_completed"] = self.last
+        enriched["overall_total"] = 100
+        return enriched
+
+
 def _adapt_cache_progress(
     report: ProgressCallback,
     *,
@@ -357,10 +428,11 @@ class WorkpieceLibrary:
         target: Path,
         *,
         start_index: int,
+        on_image: Callable[[int, int], None] | None = None,
     ) -> tuple[Path, ...]:
         copied: list[Path] = []
         candidate_index = start_index
-        for source in paths:
+        for completed, source in enumerate(paths, start=1):
             while True:
                 width = max(2, len(str(candidate_index)))
                 destination = target / f"{candidate_index:0{width}d}{source.suffix.lower()}"
@@ -369,6 +441,8 @@ class WorkpieceLibrary:
                     break
             shutil.copy2(source, destination)
             copied.append(destination)
+            if on_image is not None:
+                on_image(completed, len(paths))
         return tuple(copied)
 
     def register(
@@ -383,12 +457,25 @@ class WorkpieceLibrary:
     ) -> tuple[WorkpieceRecord, TemplateCache]:
         display_name = _validate_name(name)
         total = len(front_images) + len(back_images)
+        operation_progress = _RegistrationProgress(
+            front_count=len(front_images),
+            back_count=len(back_images),
+        )
 
         def report(event: dict[str, Any]) -> None:
             if progress_callback is None:
                 return
+            if (
+                event.get("phase") in _REGISTRATION_PROGRESS_RANGES
+                and type(event.get("total")) is int
+                and event.get("total") <= 0
+                and event.get("phase") != "committing"
+            ):
+                # Do not put a zero-total unit on the wire; the TCP client
+                # treats it as malformed progress.
+                return
             try:
-                progress_callback(event)
+                progress_callback(operation_progress.enrich(event))
             except Exception:
                 LOGGER.debug("Ignoring registration progress callback failure", exc_info=True)
 
@@ -553,15 +640,29 @@ class WorkpieceLibrary:
             + len(front_images)
             + len(back_images)
         )
+        operation_progress = _RegistrationProgress(
+            # Copying callbacks cover only newly appended files; feature
+            # callbacks carry the complete staged template counts themselves.
+            front_count=len(front_images),
+            back_count=len(back_images),
+        )
 
         def report(event: dict[str, Any]) -> None:
             if progress_callback is None:
                 return
+            if (
+                event.get("phase") in _REGISTRATION_PROGRESS_RANGES
+                and type(event.get("total")) is int
+                and event.get("total") <= 0
+                and event.get("phase") != "committing"
+            ):
+                return
             try:
-                progress_callback(event)
+                progress_callback(operation_progress.enrich(event))
             except Exception:
                 LOGGER.debug("Ignoring append progress callback failure", exc_info=True)
 
+        report({"phase": "validating", "completed": 0, "total": total})
         seen_images: dict[str, Path] = {}
         for path in (*base_record.front_images, *base_record.back_images):
             image = read_color_image(path)
@@ -570,8 +671,38 @@ class WorkpieceLibrary:
             resolved = Path(path).resolve()
             seen_images[f"path:{str(resolved).casefold()}"] = resolved
             seen_images[f"content:{_image_fingerprint(image)}"] = resolved
-        new_front = _validate_images(front_images, "front", seen_images) if front_images else ()
-        new_back = _validate_images(back_images, "back", seen_images) if back_images else ()
+        new_front = (
+            _validate_images(
+                front_images,
+                "front",
+                seen_images,
+                lambda label, completed, side_total: report({
+                    "phase": "validating",
+                    "label": label,
+                    "phase_completed": completed,
+                    "phase_total": side_total,
+                    "completed": 0,
+                    "total": total,
+                }),
+            )
+            if front_images else ()
+        )
+        new_back = (
+            _validate_images(
+                back_images,
+                "back",
+                seen_images,
+                lambda label, completed, side_total: report({
+                    "phase": "validating",
+                    "label": label,
+                    "phase_completed": completed,
+                    "phase_total": side_total,
+                    "completed": 0,
+                    "total": total,
+                }),
+            )
+            if back_images else ()
+        )
         all_front = tuple(base_record.front_images) + new_front
         all_back = tuple(base_record.back_images) + new_back
         item_digests = tuple(
@@ -590,11 +721,27 @@ class WorkpieceLibrary:
                 new_front,
                 staging / "0",
                 start_index=len(base_record.front_images),
+                on_image=lambda completed, side_total: report({
+                    "phase": "copying",
+                    "label": "front",
+                    "phase_completed": completed,
+                    "phase_total": side_total,
+                    "completed": 0,
+                    "total": total,
+                }),
             )
             staged_new_back = self._copy_appended_templates(
                 new_back,
                 staging / "1",
                 start_index=len(base_record.back_images),
+                on_image=lambda completed, side_total: report({
+                    "phase": "copying",
+                    "label": "back",
+                    "phase_completed": completed,
+                    "phase_total": side_total,
+                    "completed": 0,
+                    "total": total,
+                }),
             )
             staged_front = staged_existing_front + staged_new_front
             staged_back = staged_existing_back + staged_new_back

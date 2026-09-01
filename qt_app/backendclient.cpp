@@ -283,7 +283,8 @@ void BackendClient::handleResponse(const QJsonObject &response) {
         const int total = progress.value(QStringLiteral("total")).toInt(-1);
         const int completed = progress.value(QStringLiteral("completed")).toInt(-1);
         if (progress.value(QStringLiteral("phase")).toString().isEmpty()
-            || total <= 0 || completed < 0 || completed > total) {
+            || total < 0 || completed < 0 || completed > total
+            || (total == 0 && completed != 0)) {
             failTransport(QStringLiteral("PROTOCOL_ERROR"), QStringLiteral("后端进度数据无效"));
             return;
         }

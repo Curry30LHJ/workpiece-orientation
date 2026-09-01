@@ -48,6 +48,7 @@ QString phaseText(const QString &phase) {
     if (phase == QStringLiteral("features")) return QStringLiteral("提取特征");
     if (phase == QStringLiteral("fast_originals")) return QStringLiteral("提取快速特征");
     if (phase == QStringLiteral("fast_augmentation")) return QStringLiteral("生成旋转增强");
+    if (phase == QStringLiteral("fast_embedding")) return QStringLiteral("批量提取快速特征");
     if (phase == QStringLiteral("fast_ridge")) return QStringLiteral("构建快速判别器");
     if (phase == QStringLiteral("committing")) return QStringLiteral("提交更新");
     if (phase == QStringLiteral("active")) return QStringLiteral("已生效");
@@ -364,13 +365,15 @@ void WorkpieceLibraryPage::setRegistrationProgress(const QJsonObject &progress,
     const QString phase = progress.value(QStringLiteral("phase")).toString();
     const int total = progress.value(QStringLiteral("total")).toInt(1);
     const int completed = progress.value(QStringLiteral("completed")).toInt();
+    registrationOverallProgress_ = registrationOverallProgress(progress);
     const qint64 effectiveElapsed = elapsedMs >= 0 ? elapsedMs
         : (registrationElapsedClock_.isValid() ? registrationElapsedClock_.elapsed() : 0);
-    ui->registrationProgressBar->setRange(0, qMax(1, total));
-    ui->registrationProgressBar->setValue(qBound(0, completed, qMax(1, total)));
+    ui->registrationProgressBar->setRange(0, 100);
+    ui->registrationProgressBar->setValue(registrationOverallProgress_);
     ui->registrationProgressLabel->setText(
-        QStringLiteral("建库进度：%1（%2/%3）")
-            .arg(phaseText(phase)).arg(completed).arg(total));
+        QStringLiteral("建库进度：%1（%2/%3，整体 %4%）")
+            .arg(phaseText(phase)).arg(completed).arg(total)
+            .arg(registrationOverallProgress_));
     ui->registrationElapsedLabel->setText(
         QStringLiteral("耗时：%1 ms").arg(effectiveElapsed));
     publishRegistrationTaskStatus(phase, completed, total, effectiveElapsed);
@@ -403,6 +406,9 @@ void WorkpieceLibraryPage::setRegistrationResult(const QJsonObject &response) {
     }
     presentLabel(ui->latestRegistrationResultLabel, result,
                  fastCacheMessageKind(fastCache));
+    registrationOverallProgress_ = 100;
+    ui->registrationProgressBar->setRange(0, 100);
+    ui->registrationProgressBar->setValue(100);
     ui->latestRegistrationResultLabel->setToolTip(fastCacheRevision);
     showMessage(result);
     ui->libraryMessageLabel->setToolTip(fastCacheRevision);
@@ -830,12 +836,68 @@ QString WorkpieceLibraryPage::browsedDisplayName() const {
 void WorkpieceLibraryPage::startRegistrationProgress() {
     registrationElapsedClock_.start();
     registrationElapsedTimer_.start();
-    const int total = frontTemplatePaths_.size() + backTemplatePaths_.size();
-    ui->registrationProgressBar->setRange(0, qMax(1, total));
+    registrationFrontCount_ = frontTemplatePaths_.size();
+    registrationBackCount_ = backTemplatePaths_.size();
+    registrationOverallProgress_ = 0;
+    const int total = registrationFrontCount_ + registrationBackCount_;
+    ui->registrationProgressBar->setRange(0, 100);
     ui->registrationProgressBar->setValue(0);
     ui->registrationProgressLabel->setText(
         QStringLiteral("建库进度：准备中（共 %1 张）").arg(total));
     ui->registrationElapsedLabel->setText(QStringLiteral("耗时：0 ms"));
+}
+
+int WorkpieceLibraryPage::registrationOverallProgress(const QJsonObject &progress) const {
+    const int reported = progress.value(QStringLiteral("overall_progress")).toInt(-1);
+    if (reported >= 0 && reported <= 100) {
+        return qMax(registrationOverallProgress_, reported);
+    }
+
+    const QString phase = progress.value(QStringLiteral("phase")).toString();
+    int start = 0;
+    int end = 0;
+    if (phase == QStringLiteral("validating")) {
+        end = 10;
+    } else if (phase == QStringLiteral("copying")) {
+        start = 10; end = 20;
+    } else if (phase == QStringLiteral("features")) {
+        start = 20; end = 55;
+    } else if (phase == QStringLiteral("fast_originals")) {
+        start = 55; end = 70;
+    } else if (phase == QStringLiteral("fast_augmentation")) {
+        start = 70; end = 80;
+    } else if (phase == QStringLiteral("fast_embedding")) {
+        start = 80; end = 95;
+    } else if (phase == QStringLiteral("fast_ridge")) {
+        start = 95; end = 99;
+    } else if (phase == QStringLiteral("committing")) {
+        start = 99; end = 100;
+    } else {
+        return registrationOverallProgress_;
+    }
+
+    int completed = progress.value(QStringLiteral("completed")).toInt(0);
+    int total = progress.value(QStringLiteral("total")).toInt(0);
+    if ((phase == QStringLiteral("validating") || phase == QStringLiteral("copying"))
+        && progress.value(QStringLiteral("phase_total")).isDouble()) {
+        completed = progress.value(QStringLiteral("phase_completed")).toInt(completed);
+        total = progress.value(QStringLiteral("phase_total")).toInt(total);
+        const QString label = progress.value(QStringLiteral("label")).toString();
+        if (!label.isEmpty() && registrationFrontCount_ + registrationBackCount_ > 0) {
+            const int offset = label == QStringLiteral("back") ? registrationFrontCount_ : 0;
+            completed += offset;
+            total = registrationFrontCount_ + registrationBackCount_;
+        }
+    }
+    if (phase == QStringLiteral("committing")) {
+        return 100;
+    }
+    if (total <= 0) {
+        return registrationOverallProgress_;
+    }
+    const int boundedCompleted = qBound(0, completed, total);
+    const int candidate = start + ((end - start) * boundedCompleted + total / 2) / total;
+    return qMax(registrationOverallProgress_, qBound(0, candidate, 100));
 }
 
 void WorkpieceLibraryPage::stopRegistrationProgress() {
