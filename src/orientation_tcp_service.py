@@ -41,41 +41,17 @@ def _windows_short_path(path: Path) -> Path | None:
 
 
 def _prepare_windows_frozen_import_path() -> None:
-    """Prefer the 8.3 runtime root when a frozen app is deeply installed.
+    """Keep PyInstaller's frozen import root unchanged.
 
-    NumPy extension imports are resolved from ``sys._MEIPASS``.  Even with a
-    long-path-aware manifest, some Windows extension loaders still reject a
-    fully-qualified ``.pyd`` path longer than ``MAX_PATH``.  A short 8.3 alias
-    points at the same onedir tree and lets the loader open the extension
-    without copying or changing the package layout.
+    PyInstaller's finder captures ``sys._MEIPASS`` during bootstrap. Replacing
+    it with an 8.3 alias afterwards can hide frozen modules. Native DLL lookup
+    is handled separately by :func:`_prepare_windows_numpy_dll_path`.
     """
 
-    if os.name != "nt" or not getattr(sys, "frozen", False):
-        return
-    runtime_root = Path(sys.executable).resolve().parent
-    short_root = _windows_short_path(runtime_root)
-    if short_root is None:
-        return
-    # Do not call ``Path.resolve`` on the short alias here: Windows resolves
-    # an 8.3 spelling back to its long canonical spelling, which would make a
-    # useful alias look identical and silently disable the workaround.
-    if os.path.normcase(os.path.abspath(str(short_root))) == os.path.normcase(
-        os.path.abspath(str(runtime_root))
-    ):
-        return
-    short_value = str(short_root)
-    setattr(sys, "_MEIPASS", short_value)
-    runtime_value = os.path.normcase(os.path.abspath(str(runtime_root)))
-    rewritten: list[str] = []
-    for entry in sys.path:
-        try:
-            value = os.path.normcase(os.path.abspath(str(entry)))
-        except (OSError, TypeError, ValueError):
-            value = ""
-        if value == runtime_value:
-            continue
-        rewritten.append(entry)
-    sys.path[:] = [short_value, *rewritten]
+    # PyInstaller's finder captures ``sys._MEIPASS`` during bootstrap.  Do
+    # not rewrite it after bootstrap; the DLL search path is handled below.
+    return
+
 
 
 def _add_windows_dll_directory(path: Path, seen: set[str]) -> None:
@@ -126,7 +102,7 @@ _prepare_windows_numpy_dll_path()
 
 # Qt launches this file by path. Add the repository root for that entrypoint
 # so absolute ``src.*`` imports work both by file path and by ``python -m``.
-if __package__ in (None, ""):
+if __package__ in (None, "") and not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.orientation_classifier import (

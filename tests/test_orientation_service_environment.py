@@ -62,7 +62,9 @@ def test_prepare_windows_numpy_dll_path_adds_frozen_runtime_dirs(monkeypatch, tm
     assert service._WINDOWS_DLL_DIRECTORY_HANDLES == handles
 
 
-def test_prepare_windows_frozen_import_path_uses_short_runtime_root(monkeypatch, tmp_path: Path):
+def test_prepare_windows_frozen_import_path_does_not_mutate_pyinstaller_finder(
+    monkeypatch, tmp_path: Path
+):
     runtime_root = tmp_path / ("中文安装路径" * 8) / "backend"
     runtime_root.mkdir(parents=True)
     short_root = tmp_path / "BACKEN~1"
@@ -74,11 +76,17 @@ def test_prepare_windows_frozen_import_path_uses_short_runtime_root(monkeypatch,
     monkeypatch.setattr(service.os, "name", "nt")
     monkeypatch.setattr(service, "_windows_short_path", lambda path: short_root if path == runtime_root else None)
 
+    original_meipass = service.sys._MEIPASS
+    original_path = list(service.sys.path)
+
     service._prepare_windows_frozen_import_path()
 
-    assert service.sys._MEIPASS == str(short_root)
-    assert service.sys.path[0] == str(short_root)
-    assert str(runtime_root) not in service.sys.path
+    # PyInstaller's frozen finder captures its original runtime root during
+    # bootstrap.  Rewriting ``sys._MEIPASS`` or ``sys.path`` afterwards makes
+    # package imports resolve against a different spelling of the tree and
+    # can hide modules such as ``src.orientation_classifier`` on Windows.
+    assert service.sys._MEIPASS == original_meipass
+    assert service.sys.path == original_path
 
 
 def _required_service_args(tmp_path: Path) -> list[str]:
