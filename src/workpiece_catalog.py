@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import json
 import logging
 import threading
-from typing import Any, Sequence
+import time
+from typing import Any, Mapping, Sequence
 import uuid
 
 from src.image_io import read_color_image
+from src.fast_cache_jobs import FastCacheJobManager
 from src.interference_masks import build_active_mask_map, validate_region
 from src.orientation_classifier import TemplateCache
 from src.workpiece_library import (
@@ -18,10 +20,15 @@ from src.workpiece_library import (
     StaleWorkpieceRevisionError,
     WorkpieceLibrary,
     WorkpieceRecord,
+    _call_cache_builder,
 )
 
 
 LOGGER = logging.getLogger(__name__)
+SUMMARY_READ_ATTEMPTS = 3
+FAST_CACHE_CAPABILITY_ERROR = (
+    "FAST_CACHE_CAPABILITY_UNAVAILABLE: staged fast-cache persistence is unavailable"
+)
 
 
 class WorkpieceCatalogError(RuntimeError):
@@ -30,6 +37,10 @@ class WorkpieceCatalogError(RuntimeError):
 
 class RestoreConflictError(WorkpieceCatalogError):
     """Raised when restoring would collide with an active workpiece."""
+
+
+class BatchResultProtocolError(WorkpieceCatalogError):
+    """Raised when a batch classifier violates the ordered-result contract."""
 
 
 @dataclass(frozen=True)
@@ -43,7 +54,8 @@ class ActiveWorkpieceSnapshot:
 class WorkpieceCatalog:
     """Own persistent lifecycle transitions and classifier cache publication."""
 
-    def __init__(self, library: WorkpieceLibrary, classifier: Any, geometry_profiles: Any | None = None):
+    def __init__(self, library: WorkpieceLibrary, classifier: Any, geometry_profiles: Any | None = None,
+                 fast_jobs: FastCacheJobManager | None = None):
         self.library = library
         self.classifier = classifier
         self.geometry_profiles = geometry_profiles
@@ -51,10 +63,225 @@ class WorkpieceCatalog:
         self._operations: dict[str, Any] = {}
         self._operation_events: dict[str, threading.Event] = {}
         self._snapshots: dict[str, ActiveWorkpieceSnapshot] = {}
+        self.fast_jobs = fast_jobs or FastCacheJobManager()
 
     def _activate(self, record: WorkpieceRecord, cache: TemplateCache) -> None:
+        previous = self._snapshots.get(record.id)
+        try:
+            self.classifier.set_template_cache(record.id, cache)
+        except Exception:
+            self._restore_active_snapshot(record.id, previous)
+            raise
         self._snapshots[record.id] = ActiveWorkpieceSnapshot(record, cache)
-        self.classifier.set_template_cache(record.id, cache)
+
+    def _restore_active_snapshot(
+        self,
+        workpiece_id: str,
+        snapshot: ActiveWorkpieceSnapshot | None,
+    ) -> None:
+        if snapshot is None:
+            remover = getattr(self.classifier, "remove_template_cache", None)
+            if callable(remover):
+                remover(workpiece_id)
+            self._snapshots.pop(workpiece_id, None)
+            return
+        self.classifier.set_template_cache(workpiece_id, snapshot.cache)
+        self._snapshots[workpiece_id] = snapshot
+
+    def _fast_mode_requested(self) -> bool:
+        return getattr(self.classifier, "inference_mode", None) in {"fast_geometry", "compare"}
+
+    def _fast_cache_capability_error(self) -> str | None:
+        if not self._fast_mode_requested():
+            return None
+        methods = (
+            "build_fast_runtime_cache",
+            "save_fast_runtime_cache",
+            "stage_fast_runtime_cache",
+            "commit_staged_fast_runtime_cache",
+            "finalize_staged_fast_runtime_cache",
+            "discard_staged_fast_runtime_cache",
+            "rollback_committed_fast_runtime_cache",
+        )
+        if all(callable(getattr(self.classifier, name, None)) for name in methods):
+            return None
+        return FAST_CACHE_CAPABILITY_ERROR
+
+    def _fast_cache_enabled(self) -> bool:
+        return self._fast_mode_requested() and self._fast_cache_capability_error() is None
+
+    def _schedule_fast_cache(self, record: WorkpieceRecord, cache: TemplateCache) -> None:
+        if not self._fast_cache_enabled() or getattr(cache, "fast_runtime", None) is not None:
+            return
+        geometry_revision = getattr(cache, "geometry_profile_revision", None)
+        geometry_profile = getattr(cache, "geometry_profile", None)
+
+        def build(progress):
+            return self.classifier.build_fast_runtime_cache(
+                record,
+                geometry_profile,
+                progress,
+            )
+
+        def publish(runtime) -> bool:
+            def matches_current_revision() -> bool:
+                current = self._snapshots.get(record.id)
+                return (
+                    current is not None
+                    and current.record.revision == record.revision
+                    and getattr(current.cache, "geometry_profile_revision", None) == geometry_revision
+                )
+
+            with self._lock:
+                if not matches_current_revision():
+                    return False
+            try:
+                staged = self._stage_fast_runtime(record, runtime, geometry_revision)
+            except Exception:
+                with self._lock:
+                    if not matches_current_revision():
+                        return False
+                raise
+            committed = None
+            try:
+                with self._lock:
+                    if not matches_current_revision():
+                        return False
+                    current = self._snapshots[record.id]
+                    updated_cache = replace(current.cache, fast_runtime=runtime)
+                    committed = self.classifier.commit_staged_fast_runtime_cache(
+                        current.record,
+                        staged,
+                    )
+                    try:
+                        self._activate(current.record, updated_cache)
+                    except Exception:
+                        if committed is not None:
+                            self.classifier.rollback_committed_fast_runtime_cache(committed)
+                            committed = None
+                        raise
+                if committed is not None:
+                    try:
+                        self.classifier.finalize_staged_fast_runtime_cache(committed)
+                    except Exception as exc:
+                        LOGGER.warning("Unable to clean committed fast cache staging: %s", exc)
+                return True
+            finally:
+                if staged is not None and committed is None:
+                    self.classifier.discard_staged_fast_runtime_cache(staged)
+
+        self.fast_jobs.schedule(
+            workpiece_id=record.id,
+            library_revision=record.revision,
+            geometry_profile_revision=geometry_revision,
+            build=build,
+            publish=publish,
+        )
+
+    def _stage_fast_runtime(self, record: WorkpieceRecord, runtime: Any, geometry_revision: int | None):
+        methods = (
+            "stage_fast_runtime_cache",
+            "commit_staged_fast_runtime_cache",
+            "finalize_staged_fast_runtime_cache",
+            "discard_staged_fast_runtime_cache",
+            "rollback_committed_fast_runtime_cache",
+        )
+        if not all(callable(getattr(self.classifier, name, None)) for name in methods):
+            raise WorkpieceCatalogError("classifier does not support staged fast-cache persistence")
+        staged = self.classifier.stage_fast_runtime_cache(
+            record,
+            runtime,
+            geometry_profile_revision=geometry_revision,
+        )
+        if staged is None:
+            raise WorkpieceCatalogError("classifier returned no staged fast-cache payload")
+        return staged
+
+    def _build_fast_candidate(
+        self,
+        record: WorkpieceRecord,
+        cache: TemplateCache,
+    ) -> TemplateCache:
+        if not self._fast_cache_enabled():
+            return cache
+        runtime = self.classifier.build_fast_runtime_cache(
+            record,
+            getattr(cache, "geometry_profile", None),
+            None,
+        )
+        return replace(cache, fast_runtime=runtime)
+
+    def _materialize_fast_profile(
+        self,
+        record: WorkpieceRecord,
+        base_cache: TemplateCache,
+    ) -> TemplateCache:
+        geometry_revision = None
+        geometry_profile = None
+        geometry_profiles = self.geometry_profiles
+        if geometry_profiles is not None:
+            recover_profile = getattr(geometry_profiles, "recover_active_profile", None)
+            if callable(recover_profile):
+                profile_snapshot = recover_profile(record)
+            else:
+                geometry_profiles.sync_library_revision(record)
+                profile_snapshot = geometry_profiles.snapshot(record.id)
+            active_revision = profile_snapshot.get("active_revision")
+            active_profile = profile_snapshot.get("active")
+            if type(active_revision) is int and isinstance(active_profile, dict):
+                geometry_revision = active_revision
+                geometry_profile = dict(active_profile)
+                geometry_profile["profile_revision"] = active_revision
+        runtime = getattr(base_cache, "fast_runtime", None)
+        runtime_library_revision = getattr(runtime, "library_revision", None)
+        runtime_geometry_revision = getattr(runtime, "geometry_profile_revision", None)
+        if isinstance(runtime, dict):
+            runtime_library_revision = runtime.get("library_revision")
+            runtime_geometry_revision = runtime.get("geometry_profile_revision")
+        if (
+            runtime_library_revision != record.revision
+            or runtime_geometry_revision != geometry_revision
+        ):
+            runtime = None
+        return replace(
+            base_cache,
+            geometry_profile=geometry_profile,
+            geometry_profile_revision=geometry_revision,
+            fast_runtime=runtime,
+        )
+
+    def fast_cache_status(self, workpiece_id: str) -> dict[str, Any]:
+        job = self.fast_jobs.snapshot(workpiece_id)
+        with self._lock:
+            current = self._snapshots.get(workpiece_id)
+            ready = current is not None and getattr(current.cache, "fast_runtime", None) is not None
+            current_revision = None if current is None else current.record.revision
+            geometry_revision = (
+                None if current is None else getattr(current.cache, "geometry_profile_revision", None)
+            )
+        if job is not None and (
+            current is None
+            or job.library_revision == current_revision
+            and job.geometry_profile_revision == geometry_revision
+        ):
+            state = "not_ready" if job.state == "stale" and current is not None else job.state
+            return {
+                "state": state,
+                "completed": job.completed,
+                "total": job.total,
+                "elapsed_ms": job.elapsed_ms,
+                "error": job.error,
+            }
+        return {
+            "state": "ready" if ready else "not_ready",
+            "completed": 0,
+            "total": 0,
+            "elapsed_ms": 0.0,
+            "error": None if ready else self._fast_cache_capability_error(),
+        }
+
+    def shutdown(self) -> None:
+        self.fast_jobs.shutdown()
 
     def capture_snapshot(self, workpiece_id: str) -> ActiveWorkpieceSnapshot:
         with self._lock:
@@ -91,8 +318,24 @@ class WorkpieceCatalog:
             return result
 
     def _load_template_cache(self, record: WorkpieceRecord):
+        recover_staging = getattr(
+            self.classifier,
+            "recover_fast_runtime_cache_staging",
+            None,
+        )
+        if callable(recover_staging):
+            recover_staging(record)
         loader = getattr(self.classifier, "load_template_cache", None)
         return loader(record) if callable(loader) else None
+
+    def _recover_recycled_fast_cache_staging(self, record: WorkpieceRecord) -> None:
+        recover_staging = getattr(
+            self.classifier,
+            "recover_recycled_fast_runtime_cache_staging",
+            None,
+        )
+        if callable(recover_staging):
+            recover_staging(record, self.library.library_dir)
 
     def _save_template_cache(self, record: WorkpieceRecord, cache) -> None:
         saver = getattr(self.classifier, "save_template_cache", None)
@@ -116,11 +359,166 @@ class WorkpieceCatalog:
             )
             self._activate(record, cache)
             self._save_template_cache(record, cache)
+            self._schedule_fast_cache(record, cache)
             return record, cache
 
+    @staticmethod
+    def _summary_from_snapshot(
+        record: WorkpieceRecord,
+        metadata: dict[str, Any],
+        detectable: bool,
+        geometry_profiles: Any | None,
+    ) -> dict[str, Any]:
+        geometry = geometry_profiles.snapshot(record.id) if geometry_profiles is not None else {}
+        active = geometry.get("active") if isinstance(geometry, dict) else None
+        rules = active.get("rules") if isinstance(active, dict) else None
+        return {
+            "id": record.id,
+            "name": record.name,
+            "revision": record.revision,
+            "template_counts": {
+                "front": len(record.front_images),
+                "back": len(record.back_images),
+            },
+            "updated_at": metadata.get("updated_at"),
+            "geometry_status": geometry.get("profile_status") or "not_configured"
+            if isinstance(geometry, dict) else "not_configured",
+            "geometry_rule_count": len(rules) if isinstance(rules, list) else 0,
+            "detectable": detectable,
+        }
+
+    def list_workpiece_summaries(self) -> list[dict[str, Any]]:
+        for _ in range(SUMMARY_READ_ATTEMPTS):
+            with self._lock:
+                geometry_profiles = self.geometry_profiles
+                captured = [
+                    (
+                        record,
+                        self.library.get_workpiece_metadata(record.id),
+                        record.id in self._snapshots,
+                    )
+                    for item in self.library.list_workpieces()
+                    for record in (self.library.get(item["id"]),)
+                ]
+                captured_signatures = [self._record_signature(record) for record, _, _ in captured]
+            summaries = []
+            stable = True
+            for record, metadata, detectable in captured:
+                try:
+                    summary = self._summary_from_snapshot(
+                        record,
+                        metadata,
+                        detectable,
+                        geometry_profiles,
+                    )
+                except KeyError:
+                    with self._lock:
+                        if not self._record_is_current(record, geometry_profiles):
+                            stable = False
+                            break
+                    raise
+                with self._lock:
+                    if not self._record_is_current(record, geometry_profiles):
+                        stable = False
+                        break
+                summaries.append(summary)
+                summary["fast_cache"] = self.fast_cache_status(record.id)
+            if not stable:
+                continue
+            with self._lock:
+                current_signatures = [
+                    self._record_signature(self.library.get(item["id"]))
+                    for item in self.library.list_workpieces()
+                ]
+                if (
+                    current_signatures == captured_signatures
+                    and self.geometry_profiles is geometry_profiles
+                ):
+                    return summaries
+        raise StaleWorkpieceRevisionError(
+            "Workpiece list changed repeatedly while reading summaries"
+        )
+
     def list_workpieces(self):
+        return self.list_workpiece_summaries()
+
+    def get_workpiece_details(self, workpiece_id: str) -> dict[str, Any]:
+        for _ in range(SUMMARY_READ_ATTEMPTS):
+            with self._lock:
+                record = self.library.get(workpiece_id)
+                metadata = self.library.get_workpiece_metadata(workpiece_id)
+                inventory = self.library.get_template_inventory(workpiece_id)
+                detectable = record.id in self._snapshots
+                geometry_profiles = self.geometry_profiles
+            try:
+                summary = self._summary_from_snapshot(
+                    record,
+                    metadata,
+                    detectable,
+                    geometry_profiles,
+                )
+                templates = self._template_details(record, inventory)
+            except KeyError:
+                with self._lock:
+                    if not self._record_is_current(record, geometry_profiles):
+                        continue
+                raise
+            with self._lock:
+                if self._record_is_current(record, geometry_profiles):
+                    summary["fast_cache"] = self.fast_cache_status(record.id)
+                    return {**summary, "templates": templates}
         with self._lock:
-            return self.library.list_workpieces()
+            self.library.get(workpiece_id)
+        raise StaleWorkpieceRevisionError(
+            f"Workpiece changed repeatedly while reading details: {workpiece_id}"
+        )
+
+    @staticmethod
+    def _record_signature(record: WorkpieceRecord) -> tuple[str, int, Path, str]:
+        return record.id, record.revision, record.root, record.state
+
+    def _record_is_current(
+        self,
+        record: WorkpieceRecord,
+        geometry_profiles: Any | None,
+    ) -> bool:
+        if self.geometry_profiles is not geometry_profiles:
+            return False
+        try:
+            current = self.library.get(record.id)
+        except KeyError:
+            return False
+        return self._record_signature(current) == self._record_signature(record)
+
+    @staticmethod
+    def _template_details(
+        record: WorkpieceRecord,
+        inventory: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        template_paths = {
+            (direction, path.name): path.resolve()
+            for direction, paths in (("front", record.front_images), ("back", record.back_images))
+            for path in paths
+        }
+        templates = []
+        for item in inventory:
+            direction = item["direction"]
+            filename = item["filename"]
+            path = template_paths.get((direction, filename))
+            if path is None:
+                label_dir = "0" if direction == "front" else "1"
+                path = (record.root / label_dir / filename).resolve()
+            templates.append(
+                {
+                    "template_id": item["template_id"],
+                    "direction": direction,
+                    "preview_path": str(path),
+                    "source": item["source"],
+                    "added_at": item.get("added_at"),
+                    "readable": read_color_image(path) is not None,
+                }
+            )
+        return templates
 
     def get(self, workpiece_id: str) -> WorkpieceRecord:
         with self._lock:
@@ -206,18 +604,62 @@ class WorkpieceCatalog:
                     raise WorkpieceCatalogError(
                         f"Workpiece revision changed: expected {expected_revision}, current {record.revision}"
                     )
-                candidate = self._prepare_legacy_annotation_cache(record)
-                if candidate is None:
-                    raise WorkpieceCatalogError("no active legacy annotation cache is available")
-                updated = self.library.replace_geometry_profile_pointers(
-                    workpiece_id,
-                    expected_revision=expected_revision,
-                    active_revision=None,
-                    previous_active_revision=None,
-                )
-                self._activate(updated, candidate)
-                self._save_template_cache(updated, candidate)
+                current = self._snapshots.get(workpiece_id)
+                if current is None or current.record.revision != expected_revision:
+                    raise WorkpieceCatalogError("runtime revision changed before legacy rollback")
+                target = replace(record, revision=expected_revision + 1)
+                base_cache = current.cache
+            candidate = self._prepare_legacy_annotation_cache(record, base_cache=base_cache)
+            if candidate is None:
+                raise WorkpieceCatalogError("no active legacy annotation cache is available")
+            candidate = self._build_fast_candidate(target, candidate)
+            runtime = getattr(candidate, "fast_runtime", None) if self._fast_cache_enabled() else None
+            staged = self._stage_fast_runtime(target, runtime, None) if runtime is not None else None
+            committed = None
+            try:
+                with self._lock:
+                    record = self.library.get(workpiece_id)
+                    current = self._snapshots.get(workpiece_id)
+                    if (
+                        record.revision != expected_revision
+                        or current is None
+                        or current.record.revision != expected_revision
+                    ):
+                        raise WorkpieceCatalogError(
+                            f"Workpiece revision changed: expected {expected_revision}, current {record.revision}"
+                        )
+                    if runtime is not None:
+                        committed = self.classifier.commit_staged_fast_runtime_cache(target, staged)
+                    activated = False
+                    try:
+                        self._activate(target, candidate)
+                        activated = True
+                        updated = self.library.replace_geometry_profile_pointers(
+                            workpiece_id,
+                            expected_revision=expected_revision,
+                            active_revision=None,
+                            previous_active_revision=None,
+                        )
+                    except Exception:
+                        try:
+                            if activated:
+                                self._restore_active_snapshot(workpiece_id, current)
+                        finally:
+                            if committed is not None:
+                                self.classifier.rollback_committed_fast_runtime_cache(committed)
+                                committed = None
+                        raise
+                persisted = replace(candidate, fast_runtime=None) if runtime is not None else candidate
+                self._save_template_cache(updated, persisted)
+                if committed is not None:
+                    try:
+                        self.classifier.finalize_staged_fast_runtime_cache(committed)
+                    except Exception as exc:
+                        LOGGER.warning("Unable to clean committed fast cache staging: %s", exc)
                 return updated
+            finally:
+                if staged is not None and committed is None:
+                    self.classifier.discard_staged_fast_runtime_cache(staged)
 
         return self._idempotent(operation_id, action)
 
@@ -406,6 +848,10 @@ class WorkpieceCatalog:
             cache_loader=self._load_template_cache,
             cache_saver=self._save_template_cache,
         )
+        for summary in self.library.list_recycled():
+            self._recover_recycled_fast_cache_staging(
+                self.library.get_recycled(summary["id"])
+            )
         with self._lock:
             for record, cache in recovered:
                 self._activate(record, cache)
@@ -414,13 +860,26 @@ class WorkpieceCatalog:
             candidate = None
             if geometry_profiles is not None:
                 try:
-                    candidate = geometry_profiles.rebuild_active_cache(record.id, record)
-                    if candidate is None:
-                        candidate = self._prepare_legacy_annotation_cache(
-                            record,
-                            base_cache=base_cache,
+                    if getattr(self.classifier, "inference_mode", None) in {
+                        "fast_geometry", "compare"
+                    }:
+                        candidate = self._materialize_fast_profile(record, base_cache)
+                    else:
+                        recover_profile = getattr(
+                            geometry_profiles,
+                            "recover_active_profile",
+                            None,
                         )
-                    geometry_profiles.sync_library_revision(record)
+                        if callable(recover_profile):
+                            recover_profile(record)
+                        else:
+                            geometry_profiles.sync_library_revision(record)
+                        candidate = geometry_profiles.rebuild_active_cache(record.id, record)
+                        if candidate is None:
+                            candidate = self._prepare_legacy_annotation_cache(
+                                record,
+                                base_cache=base_cache,
+                            )
                 except Exception as exc:
                     LOGGER.warning("Unable to restore active geometry profile for %s: %s", record.id, exc)
             else:
@@ -439,6 +898,10 @@ class WorkpieceCatalog:
                     current = self._snapshots.get(record.id)
                     if current is not None and current.record.revision == record.revision:
                         self._activate(record, candidate)
+            with self._lock:
+                current = self._snapshots.get(record.id)
+            if current is not None and current.record.revision == record.revision:
+                self._schedule_fast_cache(current.record, current.cache)
         return recovered
 
     def predict(self, workpiece_id: str, image_path: Path):
@@ -448,6 +911,179 @@ class WorkpieceCatalog:
             image_path,
             library_revision=snapshot.record.revision,
         )
+
+    def _predict_many_with_diagnostics(
+        self, workpiece_id: str, image_paths: Sequence[Path]
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Run one ordered batch and return request-local execution details."""
+        paths = tuple(Path(path) for path in image_paths)
+        started = time.perf_counter()
+        if not paths:
+            return [], {
+                "batch_mode": "serial",
+                "batch_timings_ms": {"decode": 0.0, "inference": 0.0, "postprocess": 0.0, "total": 0.0},
+                "worker_count": 0,
+                "fallback": "serial_batch_unavailable",
+            }
+        snapshot = self.capture_snapshot(workpiece_id)
+        capabilities: Mapping[str, object] = {}
+        capabilities_reader = getattr(self.classifier, "batch_capabilities", None)
+        if callable(capabilities_reader):
+            try:
+                value = capabilities_reader()
+                if isinstance(value, Mapping):
+                    capabilities = value
+            except Exception:
+                capabilities = {}
+        batch_reader = getattr(self.classifier, "predict_many_with_cache", None)
+        batch_ready = (
+            capabilities.get("batch_ready")
+            if callable(capabilities_reader)
+            else getattr(self.classifier, "batch_ready", False)
+        )
+        use_batch = callable(batch_reader) and batch_ready is True
+        worker_value = capabilities.get("worker_count", 0)
+        worker_count = worker_value if isinstance(worker_value, int) and not isinstance(worker_value, bool) and worker_value >= 0 else 0
+        reported_fallback = capabilities.get("fallback")
+        reported_fallback = reported_fallback if isinstance(reported_fallback, str) and reported_fallback else None
+        item_timings = {"decode": 0.0, "postprocess": 0.0}
+
+        def item_error(exc: BaseException) -> dict[str, object]:
+            code = getattr(exc, "code", None)
+            if not isinstance(code, str) or not code:
+                if type(exc).__name__ == "ImageUnreadableError":
+                    code = "IMAGE_UNREADABLE"
+                else:
+                    text = str(exc)
+                    code = text.split(":", 1)[0] if text.startswith("FAST_CACHE_") else "MODEL_ERROR"
+            return {"code": code, "message": str(exc) or type(exc).__name__}
+
+        def is_fast_cache_error(exc: BaseException) -> bool:
+            code = getattr(exc, "code", None)
+            return (isinstance(code, str) and code.startswith("FAST_CACHE_")) or str(exc).startswith("FAST_CACHE_")
+
+        def collect_item_timings(prediction: object) -> None:
+            if not isinstance(prediction, Mapping):
+                return
+            timings = prediction.get("timings_ms")
+            if not isinstance(timings, Mapping):
+                return
+            for name in item_timings:
+                value = timings.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                    item_timings[name] += float(value)
+
+        def diagnostics(
+            mode: str,
+            inference_ms: float,
+            fallback: str | None,
+            actual_worker_count: int = worker_count,
+        ) -> dict[str, object]:
+            return {
+                "batch_mode": mode,
+                "batch_timings_ms": {
+                    "decode": item_timings["decode"],
+                    "inference": inference_ms,
+                    "postprocess": item_timings["postprocess"],
+                    "total": (time.perf_counter() - started) * 1000.0,
+                },
+                "worker_count": actual_worker_count if mode == "batch" else 0,
+                "fallback": fallback,
+            }
+
+        def scalar_results(fallback: str) -> tuple[list[dict[str, object]], dict[str, object]]:
+            scalar: list[dict[str, object]] = []
+            predict_one = getattr(self.classifier, "predict_with_cache")
+            inference_started = time.perf_counter()
+            for index, path in enumerate(paths):
+                try:
+                    prediction = predict_one(snapshot.cache, path, library_revision=snapshot.record.revision)
+                    collect_item_timings(prediction)
+                    scalar.append({"index": index, "image_path": str(path), "ok": True, "prediction": prediction})
+                except Exception as exc:
+                    if is_fast_cache_error(exc):
+                        raise
+                    scalar.append({"index": index, "image_path": str(path), "ok": False, "error": item_error(exc)})
+            return scalar, diagnostics("serial", (time.perf_counter() - inference_started) * 1000.0, fallback)
+
+        if use_batch:
+            inference_started = time.perf_counter()
+            try:
+                batch_output = batch_reader(
+                    snapshot.cache,
+                    paths,
+                    library_revision=snapshot.record.revision,
+                )
+                execution = getattr(batch_output, "execution", None)
+                raw_results = list(batch_output)
+            except Exception as exc:
+                if is_fast_cache_error(exc):
+                    raise
+                return scalar_results("serial_after_batch_failure")
+            inference_ms = (time.perf_counter() - inference_started) * 1000.0
+            actual_mode = "batch"
+            actual_worker_count = worker_count
+            actual_fallback = None
+            if isinstance(execution, Mapping):
+                reported_mode = execution.get("batch_mode")
+                if reported_mode in ("batch", "serial"):
+                    actual_mode = reported_mode
+                reported_workers = execution.get("worker_count")
+                if isinstance(reported_workers, int) and not isinstance(reported_workers, bool) and reported_workers >= 0:
+                    actual_worker_count = reported_workers
+                reported_execution_fallback = execution.get("fallback")
+                if isinstance(reported_execution_fallback, str) and reported_execution_fallback:
+                    actual_fallback = reported_execution_fallback
+            if actual_mode == "serial":
+                actual_worker_count = 0
+                actual_fallback = actual_fallback or "serial_batch_unavailable"
+            if len(raw_results) != len(paths):
+                raise BatchResultProtocolError(
+                    f"batch result count mismatch: expected {len(paths)}, got {len(raw_results)}"
+                )
+            indexed_results: list[Mapping[str, object] | None] = [None] * len(paths)
+            for raw in raw_results:
+                if not isinstance(raw, Mapping):
+                    raise BatchResultProtocolError("batch result item must be an object with an index")
+                result_index = raw.get("index")
+                if not isinstance(result_index, int) or isinstance(result_index, bool) or not 0 <= result_index < len(paths):
+                    raise BatchResultProtocolError("batch result index is invalid")
+                if indexed_results[result_index] is not None:
+                    raise BatchResultProtocolError("batch result index is duplicated")
+                reported_path = raw.get("image_path")
+                if reported_path is not None and reported_path != str(paths[result_index]):
+                    raise BatchResultProtocolError("batch result image_path does not match its index")
+                indexed_results[result_index] = raw
+            results: list[dict[str, object]] = []
+            for index, path in enumerate(paths):
+                raw = indexed_results[index]
+                if raw is None:
+                    raise BatchResultProtocolError("batch result index is missing")
+                if raw.get("error") is not None:
+                    error = raw.get("error")
+                    if isinstance(error, Mapping):
+                        error_payload = dict(error)
+                    else:
+                        error_type = str(raw.get("error_type", ""))
+                        code = "IMAGE_UNREADABLE" if error_type == "ImageUnreadableError" else "MODEL_ERROR"
+                        error_payload = {"code": code, "message": str(error)}
+                    results.append({"index": index, "image_path": str(path), "ok": False, "error": error_payload})
+                else:
+                    prediction = dict(raw)
+                    prediction.pop("index", None)
+                    prediction.pop("image_path", None)
+                    collect_item_timings(prediction)
+                    results.append({"index": index, "image_path": str(path), "ok": True, "prediction": prediction})
+            return results, diagnostics(actual_mode, inference_ms, actual_fallback, actual_worker_count)
+
+        if capabilities.get("supported") is True and batch_ready is not True:
+            return scalar_results(reported_fallback or "batch_pool_not_ready")
+        return scalar_results(reported_fallback or "serial_batch_unavailable")
+
+    def predict_many(self, workpiece_id: str, image_paths: Sequence[Path]) -> list[dict[str, object]]:
+        """Predict an ordered batch against one immutable catalog snapshot."""
+        items, _ = self._predict_many_with_diagnostics(workpiece_id, image_paths)
+        return items
 
     def commit_prepared_append(
         self,
@@ -478,6 +1114,7 @@ class WorkpieceCatalog:
         *,
         operation_id: str | None = None,
         progress_callback=None,
+        source: str = "manual_append",
     ):
         base = self.capture_snapshot(workpiece_id)
         prepared = self.library.prepare_append(
@@ -487,13 +1124,21 @@ class WorkpieceCatalog:
             self.classifier.build_template_cache,
             operation_id=operation_id or uuid.uuid4().hex,
             progress_callback=progress_callback,
+            source=source,
         )
         try:
             effective = self._prepare_effective_staged_cache(prepared)
             saver = getattr(self.classifier, "save_template_cache", None)
             if callable(saver):
                 saver(prepared.staged_record, effective)
+            total = len(prepared.staged_record.front_images) + len(prepared.staged_record.back_images)
+            if progress_callback is not None:
+                try:
+                    progress_callback({"phase": "committing", "completed": total, "total": total})
+                except Exception:
+                    LOGGER.debug("Ignoring append progress callback failure", exc_info=True)
             record = self.commit_prepared_append(prepared, effective)
+            self._schedule_fast_cache(record, effective)
             return record, effective
         except Exception:
             self.library.abort_prepared(prepared)
@@ -512,18 +1157,68 @@ class WorkpieceCatalog:
         """Switch the persistent geometry pointer and runtime cache together."""
         def action():
             with self._lock:
-                record = self.library.replace_geometry_profile_pointers(
-                    workpiece_id,
-                    expected_revision=expected_revision,
-                    active_revision=profile_revision,
-                    previous_active_revision=previous_profile_revision,
-                )
-                # set_template_cache is an in-memory reference swap; it does not
-                # run model inference.  The durable cache writer stores only the
-                # unmasked base cache so recovery can rebuild any active profile.
-                self._activate(record, candidate_cache)
-                self._save_template_cache(record, candidate_cache)
+                current = self.library.get(workpiece_id)
+                if current.revision != expected_revision:
+                    raise StaleWorkpieceRevisionError(
+                        f"Workpiece revision changed: expected {expected_revision}, current {current.revision}"
+                    )
+                target = replace(current, revision=expected_revision + 1)
+            prepared_cache = self._build_fast_candidate(target, candidate_cache)
+            runtime = getattr(prepared_cache, "fast_runtime", None) if self._fast_cache_enabled() else None
+            staged = (
+                self._stage_fast_runtime(target, runtime, profile_revision)
+                if runtime is not None else None
+            )
+            committed = None
+            try:
+                with self._lock:
+                    current = self.library.get(workpiece_id)
+                    current_snapshot = self._snapshots.get(workpiece_id)
+                    if (
+                        current.revision != expected_revision
+                        or current_snapshot is None
+                        or current_snapshot.record.revision != expected_revision
+                    ):
+                        raise StaleWorkpieceRevisionError(
+                            f"Workpiece revision changed: expected {expected_revision}, "
+                            f"current {current.revision}"
+                        )
+                    if runtime is not None:
+                        committed = self.classifier.commit_staged_fast_runtime_cache(target, staged)
+                    activated = False
+                    try:
+                        # Activation is an in-memory swap.  Publish it before the
+                        # durable pointer so a failed classifier swap cannot advance
+                        # the manifest revision.
+                        self._activate(target, prepared_cache)
+                        activated = True
+                        record = self.library.replace_geometry_profile_pointers(
+                            workpiece_id,
+                            expected_revision=expected_revision,
+                            active_revision=profile_revision,
+                            previous_active_revision=previous_profile_revision,
+                        )
+                    except Exception:
+                        try:
+                            if activated:
+                                self._restore_active_snapshot(workpiece_id, current_snapshot)
+                        finally:
+                            if committed is not None:
+                                self.classifier.rollback_committed_fast_runtime_cache(committed)
+                                committed = None
+                        raise
+                persisted = replace(prepared_cache, fast_runtime=None) if runtime is not None else prepared_cache
+                self._save_template_cache(record, persisted)
+                if committed is not None:
+                    try:
+                        self.classifier.finalize_staged_fast_runtime_cache(committed)
+                    except Exception as exc:
+                        LOGGER.warning("Unable to clean committed fast cache staging: %s", exc)
+                self._schedule_fast_cache(record, prepared_cache)
                 return record
+            finally:
+                if staged is not None and committed is None:
+                    self.classifier.discard_staged_fast_runtime_cache(staged)
 
         return self._idempotent(operation_id, action)
 
@@ -545,12 +1240,16 @@ class WorkpieceCatalog:
         def action():
             with self._lock:
                 recycled = self.library.get_recycled(workpiece_id)
+            self._recover_recycled_fast_cache_staging(recycled)
             cache = self._load_template_cache(recycled)
-            if cache is None:
-                cache = self.classifier.build_template_cache(
+            rebuilt_base = cache is None
+            if rebuilt_base:
+                cache = _call_cache_builder(
+                    self.classifier.build_template_cache,
                     recycled.front_images,
                     recycled.back_images,
                     None,
+                    library_revision=recycled.revision + 1,
                 )
             with self._lock:
                 try:
@@ -562,7 +1261,12 @@ class WorkpieceCatalog:
                 self._activate(record, cache)
             effective = cache
             geometry_profiles = self.geometry_profiles
-            if geometry_profiles is not None:
+            if self._fast_mode_requested():
+                try:
+                    effective = self._materialize_fast_profile(record, cache)
+                except Exception as exc:
+                    LOGGER.warning("Unable to restore active geometry profile for %s: %s", record.id, exc)
+            elif geometry_profiles is not None:
                 try:
                     candidate = geometry_profiles.rebuild_active_cache(record.id, record)
                     if candidate is None:
@@ -580,13 +1284,18 @@ class WorkpieceCatalog:
                     current = self._snapshots.get(record.id)
                     if current is not None and current.record.revision == record.revision:
                         self._activate(record, effective)
-            self._save_template_cache(record, effective)
+            if rebuilt_base or not self._fast_cache_enabled():
+                self._save_template_cache(record, effective)
+            self._schedule_fast_cache(record, effective)
             return record
 
         return self._idempotent(operation_id, action)
 
     def purge(self, workpiece_id: str, *, operation_id: str):
         def action():
+            with self._lock:
+                recycled = self.library.get_recycled(workpiece_id)
+            self._recover_recycled_fast_cache_staging(recycled)
             with self._lock:
                 self.library.purge(workpiece_id)
                 self._snapshots.pop(workpiece_id, None)

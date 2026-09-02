@@ -1,14 +1,16 @@
 import json
 import hashlib
 import os
+from datetime import datetime
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 
-from src.orientation_classifier import TemplateCache
+from src.orientation_classifier import OrientationClassifier, TemplateCache
 from src.workpiece_library import (
     FeatureBuildError,
     InvalidTemplateSetError,
@@ -36,6 +38,21 @@ def fake_builder(front: list[Path], back: list[Path], progress_callback=None) ->
             "back": np.ones((len(back), 2), dtype=np.float32),
         },
         local_features={"front": [{} for _ in front], "back": [{} for _ in back]},
+    )
+
+
+def fast_revision_builder(
+    front: list[Path],
+    back: list[Path],
+    progress_callback=None,
+    *,
+    library_revision: int = 1,
+) -> TemplateCache:
+    cache = fake_builder(front, back, progress_callback)
+    return TemplateCache(
+        global_vectors=cache.global_vectors,
+        local_features=cache.local_features,
+        fast_runtime=SimpleNamespace(library_revision=library_revision),
     )
 
 
@@ -155,6 +172,264 @@ def test_register_creates_uuid_manifest_and_label_folders(tmp_path: Path):
     assert manifest["template_counts"] == {"front": 5, "back": 5}
     assert len(list((record.root / "0").glob("*"))) == 5
     assert len(list((record.root / "1").glob("*"))) == 5
+
+
+def test_register_writes_inventory_for_every_copied_template(tmp_path: Path):
+    library = WorkpieceLibrary(tmp_path / "library")
+    record, _ = library.register(
+        "M7",
+        image_set(tmp_path, "front-inventory", 10, 2),
+        image_set(tmp_path, "back-inventory", 20, 3),
+        False,
+        fake_builder,
+    )
+
+    manifest = json.loads((record.root / "manifest.json").read_text(encoding="utf-8"))
+    inventory = manifest["template_inventory"]
+
+    assert [(item["template_id"], item["direction"], item["filename"]) for item in inventory] == [
+        ("front:00.png", "front", "00.png"),
+        ("front:01.png", "front", "01.png"),
+        ("back:00.png", "back", "00.png"),
+        ("back:01.png", "back", "01.png"),
+        ("back:02.png", "back", "02.png"),
+    ]
+    assert {item["source"] for item in inventory} == {"initial_registration"}
+    assert {item["added_at"] for item in inventory} == {manifest["created_at"]}
+
+
+def test_prepare_append_preserves_inventory_and_adds_confirmed_templates(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    original_inventory = json.loads(manifest_path.read_text(encoding="utf-8"))["template_inventory"]
+    original_manifest = manifest_path.read_bytes()
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "confirmed-front.png", 31)],
+        [write_image(tmp_path / "confirmed-back.png", 41)],
+        fake_builder,
+        operation_id="confirmed-1",
+        source="confirmed_inspection",
+    )
+    try:
+        staged_manifest = json.loads(
+            (prepared.staging_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        staged_inventory = staged_manifest["template_inventory"]
+
+        assert manifest_path.read_bytes() == original_manifest
+        assert staged_inventory[:4] == original_inventory
+        assert [(item["template_id"], item["source"]) for item in staged_inventory[4:]] == [
+            ("front:02.png", "confirmed_inspection"),
+            ("back:02.png", "confirmed_inspection"),
+        ]
+        for item in staged_inventory[4:]:
+            added_at = datetime.fromisoformat(item["added_at"])
+            assert added_at.utcoffset() is not None
+            assert added_at.utcoffset().total_seconds() == 0
+
+        assert library.get_template_inventory(record.id) == original_inventory
+        committed, retired = library.commit_prepared(prepared)
+        assert library.get_template_inventory(committed.id) == staged_inventory
+        library.remove_retired(retired)
+    finally:
+        library.abort_prepared(prepared)
+
+
+def test_prepare_append_builds_fast_cache_for_staged_library_revision(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "fast-front.png", 31)],
+        [],
+        fast_revision_builder,
+        operation_id="fast-revision-append",
+    )
+    try:
+        assert prepared.staged_record.revision == 2
+        assert prepared.candidate_cache.fast_runtime.library_revision == 2
+    finally:
+        library.abort_prepared(prepared)
+
+
+def test_append_across_filename_width_keeps_existing_inventory_stable(tmp_path: Path):
+    library = WorkpieceLibrary(tmp_path / "wide-library")
+    record, _ = library.register(
+        "M-wide",
+        image_set(tmp_path, "wide-front", 1, 100),
+        [write_image(tmp_path / "wide-back.png", 200)],
+        False,
+        fake_builder,
+    )
+    original_inventory = library.get_template_inventory(record.id)
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "wide-front-new.png", 201)],
+        [],
+        fake_builder,
+        operation_id="wide-append-1",
+    )
+    committed, retired = library.commit_prepared(prepared)
+    library.remove_retired(retired)
+    inventory = library.get_template_inventory(committed.id)
+
+    assert inventory[:101] == original_inventory
+    assert inventory[-1]["template_id"] == "front:100.png"
+    assert len({item["template_id"] for item in inventory}) == 102
+    for item in inventory:
+        label_dir = "0" if item["direction"] == "front" else "1"
+        template_path = committed.root / label_dir / item["filename"]
+        assert template_path.is_file()
+        assert cv2.imread(str(template_path)) is not None
+
+    loaded = []
+    build_calls = []
+    cache_io = OrientationClassifier.__new__(OrientationClassifier)
+    cache_io.save_template_cache(committed, prepared.candidate_cache)
+
+    def cache_loader(candidate):
+        loaded.append(candidate)
+        return cache_io.load_template_cache(candidate)
+
+    def unexpected_builder(front, back, progress_callback=None):
+        build_calls.append((tuple(front), tuple(back)))
+        return fake_builder(front, back, progress_callback)
+
+    restarted = WorkpieceLibrary(library.library_dir)
+    recovered = restarted.recover(
+        unexpected_builder,
+        cache_loader=cache_loader,
+    )
+    recovered_record = recovered[0][0]
+
+    assert [path.name for path in recovered_record.front_images] == [
+        *(f"{index:02d}.png" for index in range(100)),
+        "100.png",
+    ]
+    expected_template_ids = [
+        *(f"front:{index:02d}.png" for index in range(100)),
+        "back:00.png",
+        "front:100.png",
+    ]
+    assert [item["template_id"] for item in restarted.get_template_inventory(record.id)] == expected_template_ids
+    assert [item.id for item in loaded] == [record.id]
+    assert build_calls == []
+    assert recovered[0][1].global_vectors["front"].shape == (101, 2)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_source", "duplicate_entry", "wrong_template_id", "missing_template"],
+)
+def test_present_malformed_template_inventory_is_rejected_without_rewrite(tmp_path, corruption):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if corruption == "missing_source":
+        manifest["template_inventory"][0].pop("source")
+    elif corruption == "duplicate_entry":
+        manifest["template_inventory"][1] = dict(manifest["template_inventory"][0])
+    elif corruption == "wrong_template_id":
+        manifest["template_inventory"][0]["template_id"] = "front:not-the-file.png"
+    else:
+        manifest["template_inventory"].pop()
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    before = manifest_path.read_bytes()
+
+    with pytest.raises(InvalidTemplateSetError, match="template_inventory"):
+        library.get_template_inventory(record.id)
+
+    assert manifest_path.read_bytes() == before
+
+
+def test_aborted_prepared_append_leaves_active_manifest_unchanged(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    before = manifest_path.read_bytes()
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "aborted-front.png", 34)],
+        [],
+        fake_builder,
+        operation_id="aborted-1",
+    )
+
+    library.abort_prepared(prepared)
+
+    assert manifest_path.read_bytes() == before
+
+
+def test_failed_prepared_append_leaves_active_manifest_unchanged(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    before = manifest_path.read_bytes()
+
+    def raising_builder(front, back, progress_callback=None):
+        raise FeatureBuildError("feature extraction failed")
+
+    with pytest.raises(FeatureBuildError):
+        library.prepare_append(
+            record,
+            [write_image(tmp_path / "failed-inventory-front.png", 35)],
+            [],
+            raising_builder,
+            operation_id="failed-inventory-1",
+        )
+
+    assert manifest_path.read_bytes() == before
+
+
+def test_replace_registration_builds_fresh_inventory_for_replacement_only(tmp_path: Path):
+    library, old = _registered_library(tmp_path)
+
+    replacement, _ = library.register(
+        "M7",
+        [write_image(tmp_path / "replacement-front.png", 50)],
+        image_set(tmp_path, "replacement-back", 60, 3),
+        True,
+        fake_builder,
+    )
+
+    inventory = library.get_template_inventory(replacement.id)
+    assert replacement.id != old.id
+    assert [item["template_id"] for item in inventory] == [
+        "front:00.png",
+        "back:00.png",
+        "back:01.png",
+        "back:02.png",
+    ]
+    assert {item["source"] for item in inventory} == {"initial_registration"}
+    assert old.id not in {item["id"] for item in library.list_workpieces()}
+
+
+def test_workpiece_metadata_uses_created_append_and_legacy_timestamps(tmp_path: Path):
+    library, record = _registered_library(tmp_path)
+    manifest_path = record.root / "manifest.json"
+    created_at = json.loads(manifest_path.read_text(encoding="utf-8"))["created_at"]
+
+    assert library.get_workpiece_metadata(record.id)["updated_at"] == created_at
+
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "metadata-front.png", 36)],
+        [],
+        fake_builder,
+        operation_id="metadata-append-1",
+    )
+    committed, retired = library.commit_prepared(prepared)
+    library.remove_retired(retired)
+    appended_at = json.loads(manifest_path.read_text(encoding="utf-8"))["updated_at"]
+    assert appended_at != created_at
+    assert library.get_workpiece_metadata(committed.id)["updated_at"] == appended_at
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("created_at")
+    manifest.pop("updated_at")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert library.get_workpiece_metadata(committed.id)["updated_at"] is None
 
 
 def test_register_accepts_unicode_source_paths(tmp_path: Path):
@@ -315,6 +590,27 @@ def test_recover_rebuilds_and_saves_when_cache_loader_misses(tmp_path):
     assert saved == [(record.id, recovered[0][1])]
 
 
+def test_recover_rebuilds_fast_cache_for_manifest_library_revision(tmp_path):
+    library, record = _registered_library(tmp_path)
+    prepared = library.prepare_append(
+        record,
+        [write_image(tmp_path / "recovery-front.png", 31)],
+        [],
+        fake_builder,
+        operation_id="recovery-revision-append",
+    )
+    committed, retired = library.commit_prepared(prepared)
+    library.remove_retired(retired)
+
+    recovered = WorkpieceLibrary(library.library_dir).recover(
+        fast_revision_builder,
+        cache_loader=lambda candidate: None,
+    )
+
+    assert recovered[0][0].revision == committed.revision == 2
+    assert recovered[0][1].fast_runtime.library_revision == committed.revision
+
+
 def test_recover_restores_valid_backup_when_formal_directory_is_missing(tmp_path):
     library = WorkpieceLibrary(tmp_path / "lib")
     record, _ = library.register(
@@ -436,6 +732,89 @@ def test_register_reports_progress_without_affecting_cache_result(tmp_path):
     assert record.name == "M7"
     assert len(cache.local_features["front"]) == 1
     assert any(event["phase"] == "committing" for event in events)
+
+
+def test_register_adapts_legacy_and_structured_builder_progress_to_dicts(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "lib")
+    events = []
+
+    def mixed_progress_builder(front, back, progress_callback=None):
+        progress_callback("front", 1, len(front))
+        progress_callback({
+            "phase": "fast_originals",
+            "completed": 2,
+            "total": 3,
+            "unit": "templates",
+        })
+        progress_callback({
+            "phase": "fast_augmentation",
+            "completed": 11,
+            "total": 33,
+            "unit": "augmented_samples",
+        })
+        progress_callback({
+            "phase": "fast_ridge",
+            "completed": 1,
+            "total": 1,
+            "unit": "ridge_head",
+        })
+        return fake_builder(front, back)
+
+    library.register(
+        "M7",
+        image_set(tmp_path, "front", 10, 1),
+        image_set(tmp_path, "back", 20, 2),
+        False,
+        mixed_progress_builder,
+        progress_callback=events.append,
+    )
+
+    builder_events = [
+        event for event in events
+        if event["phase"] in {"features", "fast_originals", "fast_augmentation", "fast_ridge"}
+        and event["completed"] > 0
+    ]
+    assert all(isinstance(event, dict) for event in builder_events)
+    assert all({"phase", "completed", "total"} <= event.keys() for event in builder_events)
+    assert [
+        {key: event[key] for key in ("phase", "completed", "total", "unit") if key in event}
+        for event in builder_events
+    ] == [
+        {"phase": "features", "completed": 1, "total": 3},
+        {"phase": "fast_originals", "completed": 2, "total": 3, "unit": "templates"},
+        {
+            "phase": "fast_augmentation",
+            "completed": 11,
+            "total": 33,
+            "unit": "augmented_samples",
+        },
+        {"phase": "fast_ridge", "completed": 1, "total": 1, "unit": "ridge_head"},
+    ]
+
+
+def test_register_progress_contains_monotonic_overall_percentage(tmp_path):
+    events: list[dict] = []
+
+    def builder(front, back, progress_callback=None):
+        progress_callback({"phase": "fast_originals", "completed": 1, "total": 3, "unit": "templates"})
+        progress_callback({"phase": "fast_embedding", "completed": 1, "total": 2, "unit": "embedding_batches"})
+        progress_callback({"phase": "fast_embedding", "completed": 2, "total": 2, "unit": "embedding_batches"})
+        return fake_builder(front, back)
+
+    library = WorkpieceLibrary(tmp_path / "lib")
+    library.register(
+        "M7",
+        image_set(tmp_path, "front", 10, 2),
+        image_set(tmp_path, "back", 20, 3),
+        False,
+        builder,
+        progress_callback=events.append,
+    )
+
+    percentages = [event["overall_progress"] for event in events]
+    assert percentages == sorted(percentages)
+    assert percentages[-1] == 100
+    assert all(event["overall_total"] == 100 for event in events)
 
 
 def test_annotation_document_reads_legacy_groups_and_only_safe_groups_as_active(tmp_path):

@@ -7,7 +7,7 @@ document format by the catalog in the next implementation step.
 
 from __future__ import annotations
 
-from copy import deepcopy
+from copy import copy, deepcopy
 import json
 import logging
 import math
@@ -652,7 +652,63 @@ class GeometryMaskProfiles:
             document["library_revision"] = int(record.revision)
             _atomic_write_json(self._profile_root(record) / "profile.json", document)
 
-    def rebuild_active_cache(self, workpiece_id: str, record: Any | None = None) -> Any | None:
+    def recover_active_profile(self, record: Any) -> dict[str, Any]:
+        """Reconcile a recovered profile document with an explicit manifest pointer."""
+        with self._lock:
+            document, status, error = self._load_document(record)
+            if status == "corrupt":
+                raise CorruptGeometryProfileError(error or "geometry profile is corrupt")
+            manifest = self._manifest(record)
+            if "geometry_mask_active_revision" in manifest:
+                active_revision = manifest["geometry_mask_active_revision"]
+                if active_revision is None:
+                    active_profile = None
+                elif type(active_revision) is int and active_revision > 0:
+                    revision_path = (
+                        self._profile_root(record)
+                        / "revisions"
+                        / f"{active_revision}.json"
+                    )
+                    try:
+                        payload = json.loads(revision_path.read_text(encoding="utf-8"))
+                        active_profile = payload["profile"]
+                        if not isinstance(active_profile, Mapping):
+                            raise ValueError("immutable profile is not an object")
+                        active_profile = deepcopy(dict(active_profile))
+                    except Exception as exc:
+                        raise CorruptGeometryProfileError(
+                            f"unable to load active geometry revision {active_revision}"
+                        ) from exc
+                else:
+                    raise CorruptGeometryProfileError(
+                        "manifest geometry_mask_active_revision is invalid"
+                    )
+                recovered = {
+                    "library_revision": int(record.revision),
+                    "active_revision": active_revision,
+                    "previous_active_revision": manifest.get(
+                        "geometry_mask_previous_active_revision"
+                    ),
+                    "active": active_profile,
+                }
+                if any(document.get(key) != value for key, value in recovered.items()):
+                    document.update(recovered)
+                    _atomic_write_json(self._profile_root(record) / "profile.json", document)
+            elif document["library_revision"] != record.revision:
+                document["library_revision"] = int(record.revision)
+                _atomic_write_json(self._profile_root(record) / "profile.json", document)
+            return {
+                "active_revision": document["active_revision"],
+                "active": deepcopy(document["active"]),
+            }
+
+    def rebuild_active_cache(
+        self,
+        workpiece_id: str,
+        record: Any | None = None,
+        *,
+        build_fast_runtime: bool = True,
+    ) -> Any | None:
         """Build the active geometry view from its immutable revision file."""
         with self._lock:
             record = record or self._record(workpiece_id)
@@ -670,6 +726,13 @@ class GeometryMaskProfiles:
                 LOGGER.warning("Unable to load active geometry profile %s: %s", path, exc)
                 return None
             classifier = getattr(self.catalog, "classifier", None)
+            if (
+                not build_fast_runtime
+                and getattr(classifier, "inference_mode", None) in {"fast_geometry", "compare"}
+                and getattr(classifier, "fast_engine", None) is not None
+            ):
+                classifier = copy(classifier)
+                classifier.fast_engine = None
             prepare = getattr(classifier, "prepare_geometry_cache", None)
             if not callable(prepare):
                 return None

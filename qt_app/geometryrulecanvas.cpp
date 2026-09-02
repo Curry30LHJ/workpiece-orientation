@@ -41,7 +41,8 @@ void GeometryRuleCanvas::setImage(const QImage &image) {
     image_ = image;
     // A fitted contour belongs to the previous image and must never be
     // displayed on a newly selected template.
-    fitShape_ = QJsonObject();
+    fittedShape_ = QJsonObject();
+    effectiveShape_ = QJsonObject();
     maskOverlay_ = QImage();
     dragging_ = false;
     panning_ = false;
@@ -83,18 +84,38 @@ void GeometryRuleCanvas::setCoarseShape(const QJsonObject &shape) {
 }
 
 void GeometryRuleCanvas::setFitOverlay(const QJsonObject &fit, const QImage &maskOverlay) {
-    // The effective shape is the boundary actually used by the mask after
-    // applying the signed offset. Prefer it over the raw fitted contour so
-    // the preview matches the production mask semantics.
-    fitShape_ = fit.value(QStringLiteral("effective_shape")).toObject();
-    if (fitShape_.isEmpty()) {
-        fitShape_ = fit.value(QStringLiteral("fitted_shape")).toObject();
-    }
-    if (fitShape_.isEmpty() && fit.contains(QStringLiteral("shape"))) {
-        fitShape_ = fit;
+    fittedShape_ = fit.value(QStringLiteral("fitted_shape")).toObject();
+    effectiveShape_ = fit.value(QStringLiteral("effective_shape")).toObject();
+    if (fittedShape_.isEmpty() && effectiveShape_.isEmpty()
+            && fit.contains(QStringLiteral("shape"))) {
+        fittedShape_ = fit;
     }
     maskOverlay_ = maskOverlay;
     update();
+}
+
+void GeometryRuleCanvas::setGuideVisible(bool visible) {
+    guideVisible_ = visible;
+    update();
+}
+
+void GeometryRuleCanvas::setFittedBoundaryVisible(bool visible) {
+    fittedBoundaryVisible_ = visible;
+    update();
+}
+
+void GeometryRuleCanvas::setEffectiveBoundaryVisible(bool visible) {
+    effectiveBoundaryVisible_ = visible;
+    update();
+}
+
+void GeometryRuleCanvas::setMaskOverlayVisible(bool visible) {
+    maskOverlayVisible_ = visible;
+    update();
+}
+
+QJsonObject GeometryRuleCanvas::fitShape() const {
+    return effectiveShape_.isEmpty() ? fittedShape_ : effectiveShape_;
 }
 
 void GeometryRuleCanvas::setRotationDegrees(qreal degrees) {
@@ -275,14 +296,25 @@ void GeometryRuleCanvas::paintEvent(QPaintEvent *event) {
     }
     const QRectF target = imageTarget();
     painter.drawImage(target, image_);
-    if (!maskOverlay_.isNull() && maskOverlay_.size() == image_.size()) {
+    if (maskOverlayVisible_ && !maskOverlay_.isNull()
+            && maskOverlay_.size() == image_.size()) {
         painter.drawImage(target, orangeMask(maskOverlay_));
     }
-    QPen fitPen(QColor(35, 165, 75), 2.0);
-    drawShape(&painter, fitShape_, fitPen);
-    QPen coarsePen(QColor(0, 170, 200), 2.0, Qt::DashLine);
-    drawShape(&painter, coarseShape_, coarsePen);
-    drawHandles(&painter, coarseShape_);
+    if (guideVisible_) {
+        QPen guidePen(QColor(0, 170, 200), 2.0, Qt::DashLine);
+        drawShape(&painter, coarseShape_, guidePen);
+    }
+    if (fittedBoundaryVisible_) {
+        QPen fittedPen(QColor(35, 165, 75), 2.0);
+        drawShape(&painter, fittedShape_, fittedPen);
+    }
+    if (effectiveBoundaryVisible_) {
+        QPen effectivePen(QColor(245, 145, 35), 2.0, Qt::DashLine);
+        drawShape(&painter, effectiveShape_, effectivePen);
+    }
+    if (guideVisible_) {
+        drawHandles(&painter, coarseShape_);
+    }
 }
 
 void GeometryRuleCanvas::mousePressEvent(QMouseEvent *event) {
@@ -298,7 +330,8 @@ void GeometryRuleCanvas::mousePressEvent(QMouseEvent *event) {
         return;
     }
     setFocus();
-    fitShape_ = QJsonObject();
+    fittedShape_ = QJsonObject();
+    effectiveShape_ = QJsonObject();
     maskOverlay_ = QImage();
     dragStart_ = imagePoint(event->pos());
     dragging_ = true;

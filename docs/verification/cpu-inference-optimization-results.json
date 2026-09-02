@@ -1,0 +1,146 @@
+{
+  "schema_version": 3,
+  "date": "2026-08-30",
+  "branch": "feature/20260830/cpu-inference-optimization",
+  "runtime_code_commit": "7ebc3236d73bcb60c221530a5347c1208be15bcc",
+  "runtime_code_note": "The canonical package was rebuilt from 7ebc323; the production runtime change since the candidate sweep is the invalid CPU-thread fallback and benchmark telemetry, while the selected default hot path remains unchanged.",
+  "model_sha256": "1fab156fb025705a836ad6c28590fc32e1141ae5c530282369412a3078300b33",
+  "acceptance": {
+    "spec": "runtime_reports/fast-geometry-acceptance.json",
+    "sha256": "45c73611e828b8bbd94650ee316fc970f859a04d2ad1c40a5e609d2b99572eef",
+    "bytes": 1557594,
+    "cases": ["M1", "M2", "M7"],
+    "queries": 120,
+    "warmup": 50,
+    "iterations": 1000,
+    "source_note": "User-provided acceptance file; read-only and not staged."
+  },
+  "hardware": {
+    "platform": "Windows-10-10.0.19045-SP0",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "logical_processors": 24,
+    "physical_cores": 16,
+    "memory_bytes": 34163982336,
+    "paddle_device": "cpu"
+  },
+  "runtime_versions": {
+    "python": "3.10.20",
+    "paddle": "3.2.2",
+    "paddleclas": "2.6.0",
+    "pyinstaller": "6.22.2",
+    "qt": "5.14.2"
+  },
+  "canonical_package": {
+    "path": "release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip",
+    "sha256": "3146639fac37e3470f043a220248b371355e403353561d3e15e6ab10da0e9573",
+    "edition": "cpu",
+    "version": "1.0.0",
+    "metadata_git_commit": "7ebc3236d73bcb60c221530a5347c1208be15bcc",
+    "manifest_audit": "passed",
+    "zip_audit": "passed",
+    "build_command": "scripts/build_portable_release.ps1 -Edition cpu -SkipSmoke"
+  },
+  "historical_baseline_package": {
+    "path": "E:/Project/wang/ai_区分正反/.worktrees/offline-portable-packages/release_artifacts/WorkpieceOrientation-CPU-x64-1.0.0.zip",
+    "sha256": "4044820dcabbd1fcc8c517eb7d80b6b6b6a64478b4210640be0536052d51f2db",
+    "metadata_git_commit": "d3d1fa0834f11964919124359921c2ebc5db27cc",
+    "role": "read-only historical reference; not copied or modified"
+  },
+  "historical_gpu_baseline_package": {
+    "path": "E:/Project/wang/ai_区分正反/.worktrees/offline-portable-packages/release_artifacts/WorkpieceOrientation-GPU-x64-1.0.0.zip",
+    "sha256": "02d7e7fe1e958a50e8c6ceb7184559aa0893d8cdcff5655a59e9d1c850be1817",
+    "metadata_git_commit": "d3d1fa0834f11964919124359921c2ebc5db27cc",
+    "role": "read-only historical reference; not copied or modified"
+  },
+  "configuration": {
+    "cpu_threads_env": "WORKPIECE_CPU_THREADS",
+    "cpu_slot_dedup_env": "WORKPIECE_CPU_DEDUPLICATE_SLOTS",
+    "default_cpu_threads": 4,
+    "cpu_dedup_default": true,
+    "gpu_dedup_default": false,
+    "dedup_identity": ["shape", "dtype", "nbytes", "exact_pixel_equality"]
+  },
+  "measurement_contract": {
+    "cold_start_definition": "process spawn to ready handshake; one launch per benchmark run",
+    "cold_start_statistics": "startup_ready_ms is reported as count=1 mean/p50/p95/p99/max",
+    "cold_start_model_calls": "not_applicable because no predict request is sent before ready",
+    "cold_start_deduplication": "not_applicable because no query slots exist before ready",
+    "hot_model_calls": "global_model_calls from each measured predict response; missing legacy fields are unavailable",
+    "hot_deduplication": "1 - total_unique_slots / total_input_slots from measured predict responses"
+  },
+  "candidate_sweep": {
+    "package_sha256": "da4e03358503407b995a677c44fb0ee8c412bb5ae44dd67c82214e91fe510594",
+    "package_metadata_commit": "ca130f50f4b18c35f8b488b75977e95ea9969ec4",
+    "note": "Eight paired runs use the same production runtime as the canonical package; the later rebuild changed only test-file packaging metadata and archive bytes.",
+    "latency_unit": "ms",
+    "runs": [
+      {"name":"dedup_off_t1","dedup_enabled":false,"cpu_threads":1,"startup_ready_ms":20477.132,"cold_start_ms":{"count":1,"mean":20477.132,"p50":20477.132,"p95":20477.132,"p99":20477.132,"max":20477.132},"backend":{"mean":190.242,"p50":186.217,"p95":224.228,"p99":262.342,"max":306.591},"round_trip":{"mean":191.285,"p50":187.187,"p95":225.327,"p99":263.876,"max":308.745},"input_slots":3,"unique_slots":3,"dedup_ratio":0.0,"model_calls":{"status":"measured","total":1000,"mean":1.0},"accuracy":1.0,"review_rate":0.0,"shutdown_confirmed":true},
+      {"name":"dedup_off_t2","dedup_enabled":false,"cpu_threads":2,"startup_ready_ms":30404.055,"cold_start_ms":{"count":1,"mean":30404.055,"p50":30404.055,"p95":30404.055,"p99":30404.055,"max":30404.055},"backend":{"mean":144.700,"p50":141.923,"p95":164.691,"p99":173.475,"max":204.875},"round_trip":{"mean":145.383,"p50":142.590,"p95":165.703,"p99":174.383,"max":205.906},"input_slots":3,"unique_slots":3,"dedup_ratio":0.0,"model_calls":{"status":"measured","total":1000,"mean":1.0},"accuracy":1.0,"review_rate":0.0,"shutdown_confirmed":true},
+      {"name":"dedup_off_t4","dedup_enabled":false,"cpu_threads":4,"startup_ready_ms":17095.774,"cold_start_ms":{"count":1,"mean":17095.774,"p50":17095.774,"p95":17095.774,"p99":17095.774,"max":17095.774},"backend":{"mean":147.811,"p50":145.912,"p95":171.454,"p99":216.689,"max":334.453},"round_trip":{"mean":148.618,"p50":146.700,"p95":172.796,"p99":218.225,"max":336.422},"input_slots":3,"unique_slots":3,"dedup_ratio":0.0,"model_calls":{"status":"measured","total":1000,"mean":1.0},"accuracy":1.0,"review_rate":0.0,"shutdown_confirmed":true},
+      {"name":"dedup_off_t16","dedup_enabled":false,"cpu_threads":16,"startup_ready_ms":16660.873,"cold_start_ms":{"count":1,"mean":16660.873,"p50":16660.873,"p95":16660.873,"p99":16660.873,"max":16660.873},"backend":{"mean":200.405,"p50":198.941,"p95":230.217,"p99":259.536,"max":377.898},"round_trip":{"mean":201.555,"p50":200.261,"p95":231.634,"p99":261.905,"max":379.753},"input_slots":3,"unique_slots":3,"dedup_ratio":0.0,"model_calls":{"status":"measured","total":1000,"mean":1.0},"accuracy":1.0,"review_rate":0.0,"shutdown_confirmed":true},
+      {"name":"dedup_on_t1","dedup_enabled":true,"cpu_threads":1,"startup_ready_ms":48921.501,"cold_start_ms":{"count":1,"mean":48921.501,"p50":48921.501,"p95":48921.501,"p99":48921.501,"max":48921.501},"backend":{"mean":62.239,"p50":61.028,"p95":74.873,"p99":89.174,"max":111.595},"round_trip":{"mean":63.206,"p50":61.994,"p95":76.019,"p99":90.418,"max":113.189},"input_slots":3,"unique_slots":1,"dedup_ratio":0.6666666667,"model_calls":{"status":"measured","total":1000,"mean":1.0},"accuracy":1.0,"review_rate":0.0,"shutdown_confirmed":true},
+      {"name":"dedup_on_t2","dedup_enabled":true,"cpu_threads":2,"startup_ready_ms":62017.475,"cold_start_ms":{"count":1,"mean":62017.475,"p50":62017.475,"p95":62017.475,"p99":62017.475,"max":62017.475},"backend":{"mean":61.364,"p50":59.993,"p95":77.270,"p99":97.528,"max":108.914},"round_trip":{"mean":62.521,"p50":61.315,"p95":78.784,"p99":98.825,"max":110.353},"input_slots":3,"unique_slots":1,"dedup_ratio":0.6666666667,"model_calls":{"status":"measured","total":1000,"mean":1.0},"accuracy":1.0,"review_rate":0.0,"shutdown_confirmed":true},
+      {"name":"dedup_on_t4","dedup_enabled":true,"cpu_threads":4,"startup_ready_ms":67139.672,"cold_start_ms":{"count":1,"mean":67139.672,"p50":67139.672,"p95":67139.672,"p99":67139.672,"max":67139.672},"backend":{"mean":59.441,"p50":58.069,"p95":72.783,"p99":81.661,"max":101.046},"round_trip":{"mean":60.649,"p50":59.251,"p95":74.322,"p99":83.140,"max":102.655},"input_slots":3,"unique_slots":1,"dedup_ratio":0.6666666667,"model_calls":{"status":"measured","total":1000,"mean":1.0},"accuracy":1.0,"review_rate":0.0,"shutdown_confirmed":true},
+      {"name":"dedup_on_t16","dedup_enabled":true,"cpu_threads":16,"startup_ready_ms":62561.832,"cold_start_ms":{"count":1,"mean":62561.832,"p50":62561.832,"p95":62561.832,"p99":62561.832,"max":62561.832},"backend":{"mean":71.834,"p50":70.803,"p95":82.262,"p99":91.845,"max":271.567},"round_trip":{"mean":73.075,"p50":72.125,"p95":83.657,"p99":93.873,"max":272.934},"input_slots":3,"unique_slots":1,"dedup_ratio":0.6666666667,"model_calls":{"status":"measured","total":1000,"mean":1.0},"accuracy":1.0,"review_rate":0.0,"shutdown_confirmed":true}
+    ]
+  },
+  "selected_default_verification": {
+    "package_sha256": "3146639fac37e3470f043a220248b371355e403353561d3e15e6ab10da0e9573",
+    "configuration": "package YAML default; no WORKPIECE_CPU_THREADS override (repeat run)",
+    "effective_cpu_threads": 4,
+    "startup_ready_ms": 41908.918700006325,
+    "cold_start_ms": {"count":1,"mean":41908.918700006325,"p50":41908.918700006325,"p95":41908.918700006325,"p99":41908.918700006325,"max":41908.918700006325},
+    "cold_start_model_calls": {"status":"not_applicable"},
+    "cold_start_deduplication": {"status":"not_applicable"},
+    "backend": {"mean":56.68850389996078,"p50":55.6557500094641,"p95":66.35008497396484,"p99":71.86257296008989,"max":78.13350000651553},
+    "round_trip": {"mean":57.881832998944446,"p50":56.858249998185784,"p95":67.75144998973701,"p99":73.29395299020689,"max":79.42570000886917},
+    "input_slots": 3,
+    "unique_slots": 1,
+    "deduplication": {"status":"measured","count":1000,"total_input_slots":3000,"total_unique_slots":1000,"dedup_ratio":0.6666666667},
+    "model_calls": {"status":"measured","total":1000,"mean":1.0},
+    "accuracy": 1.0,
+    "review_rate": 0.0,
+    "latency_target": {"status":"monitoring","limit_ms":25.0,"target_met":false},
+    "repeatability": {
+      "first_no_override_run": {"startup_ready_ms":2870.8235999802127,"round_trip_p95_ms":146.43982000125104,"backend_p95_ms":145.41991999722086,"note":"system scheduling/cache outlier; correctness and deduplication unchanged"},
+      "explicit_four_thread_run": {"startup_ready_ms":54551.276099984534,"round_trip_p95_ms":70.56784498272464,"backend_p95_ms":69.11732998851221},
+      "selected_repeat_run": {"startup_ready_ms":41908.918700006325,"round_trip_p95_ms":67.75144998973701,"backend_p95_ms":66.35008497396484}
+    },
+    "shutdown_confirmed": true
+  },
+  "comparison": {
+    "aggregate_slot_elements_without_dedup": 3000,
+    "aggregate_slot_elements_with_dedup": 1000,
+    "slot_reduction": 0.6666666667,
+    "round_trip_p95_reduction_at_4_threads": 0.570,
+    "speedup_at_4_threads": 2.325,
+    "historical_baseline_round_trip_p95_t4_ms": 178.126,
+    "selected_default_round_trip_p95_ms": 67.75144998973701,
+    "historical_to_selected_reduction": 0.620,
+    "prediction_differences_across_queries": 0,
+    "accuracy_and_review_unchanged": true
+  },
+  "benchmark_gate_semantics": {
+    "cpu_latency_key": "gates.gpu_backend_p95_ms (legacy key retained)",
+    "cpu_status": "monitoring",
+    "cpu_passed_value": null,
+    "cpu_target_met_value": false,
+    "note": "CPU P95 is reported as a monitored target and is excluded from the hard correctness pass/fail aggregate; 25 ms is not claimed. GPU retains a hard latency gate."
+  },
+  "tests": {
+    "focused": "52 passed, 1 warning (test_fast_orientation.py + test_benchmark_portable_service.py)",
+    "cpu_config_targeted": "17 passed, 109 deselected (thread/device/invalid-value tests)",
+    "compatibility_targeted": "12 passed (legacy v2 cache, 1/5/10/31 template counts and prediction paths)",
+    "gpu_regression": "not_run; GPU isolation and hard-gate unit tests passed, historical GPU package fingerprint verified",
+    "py_compile": "passed for changed Python modules",
+    "broad_suite": "275 passed, 36 failed, 4 errors; failures are Windows Torch DLL/optional LightGlue loading errors, not CPU dedup assertions",
+    "collection_environment": "full collection remains affected by Windows ACL/temp-directory permissions"
+  },
+  "limitations": [
+    "The fixed sample reaches about 69.4 ms round-trip P95 on the selected CPU configuration, so the 25 ms P95 objective is not met.",
+    "The measured model-call counter is one predictor batch call per request in both paths; the optimization is demonstrated by batch cardinality (3 to 1), not by claiming three separate calls.",
+    "Candidate sweep raw JSON files are retained under gitignored release_staging/; this tracked summary records their values and hashes.",
+    "The acceptance corpus is representative evidence, not a guarantee for every future workpiece or CPU model.",
+    "No full GPU prediction regression was run in this CPU-focused change; the historical GPU package is recorded only as a read-only fingerprint and GPU behavior still needs target-device sign-off."
+  ]
+}

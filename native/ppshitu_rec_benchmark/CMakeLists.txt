@@ -1,0 +1,123 @@
+cmake_minimum_required(VERSION 3.20)
+project(ppshitu_rec_benchmark LANGUAGES CXX)
+
+if(POLICY CMP0144)
+  cmake_policy(SET CMP0144 NEW)
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT DEFINED PADDLE_INFERENCE_ROOT)
+  message(FATAL_ERROR "PADDLE_INFERENCE_ROOT is required")
+endif()
+if(NOT DEFINED OPENCV_ROOT)
+  message(FATAL_ERROR "OPENCV_ROOT is required")
+endif()
+
+set(PADDLE_INFERENCE_HEADER
+    "${PADDLE_INFERENCE_ROOT}/paddle/include/paddle_inference_api.h")
+set(PADDLE_INFERENCE_LIBRARY
+    "${PADDLE_INFERENCE_ROOT}/paddle/lib/paddle_inference.lib")
+if(NOT EXISTS "${PADDLE_INFERENCE_HEADER}")
+  message(FATAL_ERROR "Missing Paddle header: ${PADDLE_INFERENCE_HEADER}")
+endif()
+if(NOT EXISTS "${PADDLE_INFERENCE_LIBRARY}")
+  message(FATAL_ERROR "Missing Paddle library: ${PADDLE_INFERENCE_LIBRARY}")
+endif()
+
+find_package(OpenCV REQUIRED PATHS
+    "${OPENCV_ROOT}"
+    "${OPENCV_ROOT}/build"
+    NO_DEFAULT_PATH)
+
+execute_process(
+    COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    OUTPUT_VARIABLE WORKPIECE_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT WORKPIECE_GIT_COMMIT)
+  set(WORKPIECE_GIT_COMMIT "unknown")
+endif()
+
+add_library(ppshitu_protocol STATIC
+    src/ppshitu_protocol.cpp)
+target_include_directories(ppshitu_protocol PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+add_executable(ppshitu_protocol_probe
+    src/protocol_probe_main.cpp)
+target_link_libraries(ppshitu_protocol_probe PRIVATE
+    ppshitu_protocol)
+
+add_library(ppshitu_preprocess STATIC
+    src/preprocess.cpp)
+target_include_directories(ppshitu_preprocess PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ppshitu_preprocess SYSTEM PRIVATE
+    ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(ppshitu_preprocess PUBLIC
+    ${OpenCV_LIBS})
+
+add_library(ppshitu_core STATIC
+    src/feature_extractor.cpp)
+target_include_directories(ppshitu_core PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ppshitu_core SYSTEM PRIVATE
+    "${PADDLE_INFERENCE_ROOT}/paddle/include"
+    ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(ppshitu_core PUBLIC
+    ppshitu_preprocess
+    "${PADDLE_INFERENCE_LIBRARY}"
+    ${OpenCV_LIBS}
+    Psapi
+    Bcrypt)
+
+add_executable(ppshitu_rec_benchmark
+    src/main.cpp)
+target_include_directories(ppshitu_rec_benchmark PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ppshitu_rec_benchmark SYSTEM PRIVATE
+    "${PADDLE_INFERENCE_ROOT}/paddle/include"
+    ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(ppshitu_rec_benchmark PRIVATE
+    ppshitu_core)
+
+add_executable(ppshitu_preprocess_probe
+    src/preprocess_probe_main.cpp)
+target_link_libraries(ppshitu_preprocess_probe PRIVATE
+    ppshitu_preprocess)
+
+add_executable(ppshitu_rec_service
+    src/service_main.cpp
+    src/native_service.cpp)
+target_include_directories(ppshitu_rec_service PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ppshitu_rec_service SYSTEM PRIVATE
+    "${PADDLE_INFERENCE_ROOT}/paddle/include"
+    ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(ppshitu_rec_service PRIVATE
+    ppshitu_core
+    ppshitu_protocol)
+
+target_compile_definitions(ppshitu_rec_benchmark PRIVATE
+    WORKPIECE_GIT_COMMIT="${WORKPIECE_GIT_COMMIT}")
+
+if(MSVC)
+  target_compile_options(ppshitu_protocol PRIVATE
+      /utf-8 /W4 /permissive-)
+  target_compile_options(ppshitu_protocol_probe PRIVATE
+      /utf-8 /W4 /permissive-)
+  target_compile_options(ppshitu_preprocess PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
+  target_compile_options(ppshitu_core PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
+  target_compile_options(ppshitu_rec_benchmark PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
+  target_compile_options(ppshitu_preprocess_probe PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
+  target_compile_options(ppshitu_rec_service PRIVATE
+      /utf-8 /W4 /permissive- /external:anglebrackets /external:W0)
+endif()

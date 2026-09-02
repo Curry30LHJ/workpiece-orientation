@@ -536,6 +536,27 @@ def test_markdown_reports_environment_stage_counts_latency_and_gate():
     assert "模板/查询重叠" in markdown
 
 
+def test_markdown_includes_the_exact_copyable_parent_command():
+    rows = release_rows()
+    report = _compare_worker_payloads(
+        payload("exhaustive", rows), payload("adaptive", rows)
+    )
+    command = (
+        '"E:\\python\\anaconda3\\envs\\shitu\\python.exe" '
+        'scripts\\benchmark_adaptive_local_search.py --project-root E:\\Project\\wang\\pp_813 '
+        '--model-dir E:\\Project\\wang\\pp_813\\third_party\\models\\shiru_rec '
+        '--library-dir E:\\Project\\wang\\pp_813\\runtime_library --warmup 1 '
+        '--output-json docs\\verification\\qt-ui-redesign-benchmark.json '
+        '--output-markdown docs\\verification\\qt-ui-redesign-benchmark.md'
+    )
+    report["reproduction_command"] = command
+
+    markdown = _render_markdown(report)
+
+    assert "## 精确复现命令" in markdown
+    assert f"```powershell\n{command}\n```" in markdown
+
+
 def test_compare_and_markdown_render_do_not_load_model_runtimes(monkeypatch):
     from types import ModuleType
 
@@ -614,7 +635,12 @@ def test_parent_writes_both_reports_and_returns_two_when_a_worker_fails(
     assert report["input_fingerprint_match"] is False
     assert report["input_fingerprint_issues"][0]["code"] == "benchmark_execution_failed"
     assert report["error"]["type"] == "CalledProcessError"
-    assert "执行错误" in output_markdown.read_text(encoding="utf-8")
+    markdown = output_markdown.read_text(encoding="utf-8")
+    assert "执行错误" in markdown
+    assert "## 精确复现命令" in markdown
+    assert str(Path(sys.executable).resolve()) in markdown
+    assert f"--project-root {tmp_path.resolve()}" in markdown
+    assert report["reproduction_command"] in markdown
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

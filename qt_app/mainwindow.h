@@ -1,22 +1,28 @@
 #pragma once
 
 #include <QMainWindow>
-#include <QElapsedTimer>
+#include <QHash>
 #include <QJsonObject>
-#include <QPointer>
+#include <QQueue>
 #include <QJsonArray>
 #include <QStringList>
 #include <QTimer>
-#include <QVector>
 
 #include <functional>
 
+#include "appheader.h"
 #include "backendclient.h"
 
 class BackendProcessManager;
+class InspectionPage;
+class WorkpieceLibraryPage;
+class QLabel;
 class QPushButton;
-class AnnotationManagerDialog;
-class GeometryMaskManagerDialog;
+class QTableWidget;
+class QTextEdit;
+class GeometryRulesPage;
+class TaskStatusWidget;
+class QCloseEvent;
 
 namespace Ui {
 class MainWindow;
@@ -36,28 +42,24 @@ public:
     void setBatchImagePaths(const QStringList &paths);
     void setReplaceConfirmationHandler(std::function<bool(const QString &)> handler);
     void setBackendError(const QString &message);
+    bool requestPage(AppPage page);
+
+protected:
+    void closeEvent(QCloseEvent *event) override;
 
 private slots:
-    void chooseFrontTemplates();
-    void chooseBackTemplates();
+    void showInspection();
+    void showWorkpieceLibrary();
+    void showGeometryRules();
     void chooseInspectionImage();
     void chooseBatchImages();
     void refreshWorkpieces();
     void submitRegistration();
     void submitPrediction();
     void submitBatchPrediction();
-    void deleteSelectedWorkpiece();
     void confirmFrontTemplate();
     void confirmBackTemplate();
     void rejectTemplateConfirmation();
-    void openAnnotationEditor();
-    void openAnnotationManager();
-    void openGeometryMaskManager();
-    void saveAnnotationGroups(const QJsonArray &groups, int baseRevision);
-    void setAnnotationGroupEnabled(const QString &groupId, bool enabled, int baseRevision);
-    void deleteAnnotationGroup(const QString &groupId, int baseRevision);
-    void reviewAnnotation(const QString &groupId, const QString &templateId,
-                          const QString &action, const QJsonArray &regions, int baseRevision);
     void restartBackend();
     void pollEvolutionJobs();
     void pollGeometryValidation();
@@ -74,8 +76,11 @@ private slots:
                                   int libraryRevision, int draftRevision);
 
     void onBackendReady();
-    void onBackendLoading(const QString &message);
-    void onBackendUnavailable(const QString &reason);
+    void onBackendMetadataUpdated(const QJsonObject &metadata);
+    void onBackendLoading(const QString &phase, const QString &message, int progress);
+    void onBackendUnavailable(const QString &reason, const QString &code = QString(),
+                              const QString &action = QString(),
+                              const QString &logPath = QString());
     void onClientStateChanged(BackendClient::State state, const QString &detail);
     void onClientProgress(const QString &command, const QJsonObject &progress);
     void onClientResponse(const QString &command, const QJsonObject &response);
@@ -83,24 +88,18 @@ private slots:
     void onClientTransportFailed(const QString &code, const QString &message);
 
 private:
-    enum class BatchResultState {
-        Pending,
-        Submitting,
-        QueuedFront,
-        QueuedBack,
-        Rejected,
-        SubmitFailed,
-    };
+    enum class CommandOwner { None, System, UserRefresh, Inspection, Library, Geometry };
+    enum class GeometryDirtyDecision { Save, Discard, Cancel };
+    enum class ActiveTaskCloseDecision { ExitApplication, ContinueRunning };
+    enum class PendingNavigationKind { None, Page, Workpiece, CloseWindow };
+    enum class GeometrySaveIntent { None, Normal, Navigation, PublishWorkflow };
 
-    struct BatchResult {
-        QString imagePath;
-        QString workpieceId;
-        QJsonObject response;
-        QString label;
-        bool needsReview = false;
-        double elapsedMs = 0.0;
-        BatchResultState state = BatchResultState::Pending;
-        QString submitError;
+    struct QueuedCommandIntent {
+        CommandOwner owner = CommandOwner::None;
+        QString command;
+        QJsonObject fields;
+        quint64 refreshTransactionId = 0;
+        quint64 geometryTargetGeneration = 0;
     };
 
     enum class ResultContext {
@@ -111,93 +110,171 @@ private:
 
     void initializeUi();
     void connectBackendSignals();
+    void applyBackendMetadata(BackendStatusDetails &details) const;
+    void presentBackendState(const BackendStatusDetails &details);
+    void sendPageCommand(CommandOwner owner, const QString &command,
+                         const QJsonObject &fields = QJsonObject(),
+                         quint64 refreshTransactionId = 0);
+    void dispatchQueuedCommand();
+    bool dispatchGeometryWorkflowContinuation();
+    void stageGeometryWorkflowContinuation(const QString &command,
+                                           const QJsonObject &fields);
+    void clearGeometryWorkflowTarget();
+    void setGeometryOperationEditingLocked(bool locked);
+    void setGeometryProfileLoadGeneration(quint64 generation);
+    void updateGeometryEditingLock();
+    void issuePageCommand(const QueuedCommandIntent &intent,
+                          bool includesMandatoryRefresh = false,
+                          bool includesUserRefresh = false);
+    void clearPendingCommand();
     void updateButtonStates();
-    void updateTemplateLabels();
     void updatePreview();
     void clearInspectionState();
     void clearBatchState();
     void clearBatchResults();
-    void sendRegistration(bool replace);
-    void requestWorkpieceRefresh(bool preserveRegistrationSummary);
-    void sendNextBatchPrediction();
-    void appendBatchResult(const QJsonObject &response);
-    void finishBatchPrediction();
-    void renderPredictionResult(const QString &imagePath, const QJsonObject &response,
-                                const QString &sourceText);
-    void selectBatchResult(int index, bool userInitiated);
-    void updateBatchRow(int index);
-    int preferredPendingBatchResult(int afterIndex = -1) const;
-    void updateBatchSummary();
-    QString batchResultStateText(BatchResultState state) const;
-    bool currentBatchResultCanBeProcessed() const;
-    void submitCurrentConfirmation(const QString &orientation);
+    void requestWorkpieceRefresh(bool preserveRegistrationSummary,
+                                 CommandOwner owner = CommandOwner::System);
+    void dispatchDeferredUserRefresh();
     void submitTemplateConfirmation(const QString &workpieceId, const QString &imagePath,
                                     const QString &orientation);
-    void startRegistrationProgress();
-    void stopRegistrationProgress();
-    void updateRegistrationElapsed();
-    bool validateRegistration(QString *error) const;
     bool validateImagePath(const QString &path, QString *error) const;
     QStringList normalizedPaths(const QStringList &paths) const;
     QString selectedWorkpieceId() const;
     QString orientationText(const QString &label) const;
-    QString decisionSourceText(const QString &source) const;
-    QString formatScore(const QJsonObject &scores, const QString &key) const;
     void showLibraryMessage(const QString &message, bool error = false);
-    void requestAnnotationSnapshot(const QString &workpieceId);
-    void sendAnnotationMutation(const QString &command, const QJsonObject &fields);
     void requestGeometryProfile(const QString &workpieceId);
+    bool startGeometryDraftSave(const QJsonObject &draft, int libraryRevision,
+                                int draftRevision, GeometrySaveIntent intent);
+    bool dispatchStagedGeometryDraftSave();
+    void clearStagedGeometryDraftSave();
     bool maybeContinueGeometryPublish(const QJsonObject &job);
+    void applyGeometryValidationJob(const QJsonObject &job);
+    void bindGeometryValidationContext(const QString &workpieceId,
+                                       int libraryRevision, int draftRevision);
+    void clearGeometryValidationContext();
+    bool geometryValidationMatchesPage(const QJsonObject &job) const;
+    GeometryDirtyDecision promptForDirtyGeometry();
+    ActiveTaskCloseDecision promptForActiveTaskClose();
+    bool hasActiveTask() const;
+    bool beginPendingGeometryNavigation(PendingNavigationKind kind,
+                                        AppPage page = AppPage::Inspection,
+                                        const QString &workpieceId = QString());
+    bool tryStartPendingGeometrySave();
+    void cancelPendingGeometryNavigation();
+    void completePendingGeometryNavigation();
+    void applyWorkpieceListResponse(const QJsonObject &response,
+                                    quint64 refreshTransactionId,
+                                    bool includedMandatoryRefresh,
+                                    const QString &preferredTarget = QString());
+    void setCurrentPageUnchecked(AppPage page);
+    bool applyDetectionWorkpieceChange(const QString &workpieceId);
+    void refreshDetectionWorkpieceConsumers();
+    void ensureGeometryProfileForCurrentWorkpiece();
 
     Ui::MainWindow *ui;
+    AppHeader *appHeader_ = nullptr;
+    TaskStatusWidget *globalTaskStatus_ = nullptr;
+    InspectionPage *inspectionPage_ = nullptr;
+    WorkpieceLibraryPage *workpieceLibraryPage_ = nullptr;
+    AppPage currentPage_ = AppPage::Inspection;
     BackendClient *client_ = nullptr;
     BackendProcessManager *manager_ = nullptr;
-    QStringList frontTemplatePaths_;
-    QStringList backTemplatePaths_;
     QString inspectionImagePath_;
     QStringList batchImagePaths_;
-    int batchIndex_ = 0;
+    QJsonArray workpieceSummaries_;
+    CommandOwner pendingOwner_ = CommandOwner::None;
     QString pendingCommand_;
-    QString pendingWorkpieceName_;
-    bool pendingReplace_ = false;
-    bool registrationInFlight_ = false;
-    bool registrationSummaryVisible_ = false;
+    QJsonObject pendingFields_;
+    QQueue<QueuedCommandIntent> queuedMutationCommands_;
+    QQueue<QueuedCommandIntent> queuedInternalCommands_;
+    bool hasReplaceRegistrationContinuation_ = false;
+    QJsonObject replaceRegistrationContinuationFields_;
+    bool hasLatestDetailsIntent_ = false;
+    QJsonObject latestDetailsFields_;
+    quint64 latestDetailsRefreshTransactionId_ = 0;
+    bool mandatoryWorkpieceRefresh_ = false;
+    bool mandatoryRefreshRetryRequired_ = false;
+    bool mandatoryDetailsRetryRequired_ = false;
+    QString activeMandatoryDetailsWorkpieceId_;
+    quint64 nextMandatoryRefreshTransactionId_ = 0;
+    quint64 activeMandatoryRefreshTransactionId_ = 0;
+    quint64 queuedMandatoryRefreshTransactionId_ = 0;
+    quint64 pendingRefreshTransactionId_ = 0;
+    bool deferredUserWorkpieceRefresh_ = false;
+    bool pendingRefreshIncludesMandatory_ = false;
+    bool pendingRefreshIncludesUser_ = false;
     bool batchInFlight_ = false;
-    int batchFrontCount_ = 0;
-    int batchBackCount_ = 0;
-    int batchUncertainCount_ = 0;
-    int batchReviewCount_ = 0;
     bool backendReady_ = false;
+    bool backendReadyHandled_ = false;
+    BackendUiState backendPresentationState_ = BackendUiState::Disconnected;
+    bool backendEverReady_ = false;
+    QJsonObject backendMetadata_;
+    QString backendRecoveryDetail_;
+    bool backendFailureIsRecoverable_ = false;
     bool clientBusy_ = false;
-    QElapsedTimer registrationElapsedClock_;
-    QTimer *registrationElapsedTimer_ = nullptr;
     QTimer *evolutionPollTimer_ = nullptr;
     QTimer *geometryPollTimer_ = nullptr;
-    std::function<bool(const QString &)> replaceConfirmationHandler_;
-    QPushButton *deleteWorkpieceButton_ = nullptr;
+    QPushButton *chooseImageButton_ = nullptr;
+    QPushButton *predictButton_ = nullptr;
+    QPushButton *chooseBatchImagesButton_ = nullptr;
+    QPushButton *batchPredictButton_ = nullptr;
     QPushButton *confirmFrontButton_ = nullptr;
     QPushButton *confirmBackButton_ = nullptr;
     QPushButton *rejectConfirmationButton_ = nullptr;
-    QPushButton *annotationEditorButton_ = nullptr;
+    QLabel *currentImageLabel_ = nullptr;
+    QLabel *resultLabel_ = nullptr;
+    QLabel *reviewLabel_ = nullptr;
+    QLabel *batchSummaryLabel_ = nullptr;
+    QLabel *currentResultTargetLabel_ = nullptr;
+    QTextEdit *evidenceTextEdit_ = nullptr;
+    QTableWidget *batchResultsTableWidget_ = nullptr;
     QString lastPredictionWorkpieceId_;
     QString lastPredictionImagePath_;
     QJsonObject lastPredictionResponse_;
     QString pendingPredictionWorkpieceId_;
     QString pendingPredictionImagePath_;
-    QString batchWorkpieceId_;
-    QVector<BatchResult> batchResults_;
-    int selectedBatchResultIndex_ = -1;
-    int pendingConfirmationBatchIndex_ = -1;
+    QString pendingConfirmationRecordId_;
     QString pendingConfirmationOrientation_;
+    QJsonObject pendingConfirmationMutation_;
+    QHash<QString, QJsonObject> uncertainConfirmationMutations_;
     ResultContext resultContext_ = ResultContext::None;
-    bool changingBatchSelection_ = false;
-    bool batchSelectionPinned_ = false;
-    bool batchCompletedSuccessfully_ = false;
-    QPointer<AnnotationManagerDialog> annotationManagerDialog_;
-    QString annotationWorkpieceId_;
-    QPointer<GeometryMaskManagerDialog> geometryMaskManagerDialog_;
+    GeometryRulesPage *geometryRulesPage_ = nullptr;
     QString geometryWorkpieceId_;
+    QString geometryRequestedWorkpieceId_;
+    QString currentDetectionWorkpieceId_;
+    quint64 geometryTargetGeneration_ = 0;
+    quint64 pendingGeometryTargetGeneration_ = 0;
+    quint64 geometryProfileLoadGeneration_ = 0;
+    bool geometryOperationEditingLocked_ = false;
+    bool geometryForceProfileReload_ = false;
     QString geometryValidationJobId_;
+    QString geometryValidationContextWorkpieceId_;
+    int geometryValidationContextLibraryRevision_ = -1;
+    int geometryValidationContextDraftRevision_ = -1;
+    quint64 geometryValidationContextTargetGeneration_ = 0;
+    QString geometryValidationContextJobId_;
+    PendingNavigationKind pendingNavigationKind_ = PendingNavigationKind::None;
+    AppPage pendingNavigationPage_ = AppPage::Inspection;
+    QString pendingNavigationWorkpieceId_;
+    QJsonObject pendingNavigationWorkpieceListResponse_;
+    quint64 pendingNavigationRefreshTransactionId_ = 0;
+    bool pendingNavigationResponseIncludedMandatory_ = false;
+    bool skipDirtyCloseGuardOnce_ = false;
+    bool backendShutdownPending_ = false;
+    bool backendShutdownComplete_ = false;
+    bool retryingAcceptedClose_ = false;
+    GeometrySaveIntent geometrySaveIntent_ = GeometrySaveIntent::None;
+    GeometrySaveIntent stagedGeometrySaveIntent_ = GeometrySaveIntent::None;
+    QString stagedGeometrySaveWorkpieceId_;
+    QJsonObject stagedGeometrySaveDraft_;
+    int stagedGeometrySaveLibraryRevision_ = -1;
+    int stagedGeometrySaveDraftRevision_ = -1;
     bool geometryPublishAfterValidation_ = false;
     QString geometryPublishOverrideReason_;
+    QString geometryWorkflowWorkpieceId_;
+    int geometryWorkflowLibraryRevision_ = -1;
+    int geometryWorkflowDraftRevision_ = -1;
+    QString geometryWorkflowJobId_;
+    QString geometryWorkflowContinuationCommand_;
+    QJsonObject geometryWorkflowContinuationFields_;
 };

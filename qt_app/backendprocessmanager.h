@@ -25,14 +25,23 @@ public:
 
 signals:
     void backendReady();
-    void backendLoading(const QString &message);
-    void backendUnavailable(const QString &reason);
+    // Emitted immediately before backendReady with the validated HELLO
+    // metadata.  The separate signal keeps the legacy ready signal ABI/API
+    // unchanged while allowing the UI to display native backend details.
+    void backendMetadataUpdated(const QJsonObject &metadata);
+    void backendLoading(const QString &phase, const QString &message, int progress);
+    void backendUnavailable(const QString &reason, const QString &code = QString(),
+                            const QString &action = QString(),
+                            const QString &logPath = QString());
     void serviceOwnershipChanged(bool owned);
+    void shutdownFinished();
 
 private slots:
     void tryConnect();
-    void onHandshakeSucceeded();
-    void onTransportFailed(const QString &code, const QString &message);
+    void onHandshakeLoading(quint64 generation, const QJsonObject &metadata);
+    void onHandshakeSucceeded(quint64 generation, const QJsonObject &metadata);
+    void onTransportFailed(quint64 generation, const QString &code,
+                           const QString &message, const QJsonObject &details);
     void onResponseReceived(const QString &command, const QJsonObject &response);
     void onStartupTimeout();
     void onStopEscalationTimeout();
@@ -44,8 +53,14 @@ private:
 
     void launchBackend();
     void relaunchAfterRestartExit();
-    void markUnavailable(const QString &reason);
+    void completeShutdown();
+    void markUnavailable(const QString &reason, const QString &code,
+                         const QString &action, const QString &logPath = QString());
+    QString backendProgram() const;
     QStringList backendArguments() const;
+    bool identityMatches(const QJsonObject &metadata, QString *reason) const;
+    bool canControlOwnedProcess() const;
+    QString configuredLogPath() const;
     int stopEscalationIntervalMs() const;
 
     AppConfig config_;
@@ -53,10 +68,19 @@ private:
     ProcessLauncher *launcher_;
     bool ownsLauncher_ = false;
     bool owned_ = false;
+    bool launchedProcess_ = false;
     bool launchRequested_ = false;
+    bool prelaunchProbeConnected_ = false;
+    bool reusingExternalDevelopmentService_ = false;
     bool shuttingDown_ = false;
+    bool shutdownFinishedEmitted_ = false;
+    bool terminalFailure_ = false;
     bool stoppingOwnedProcess_ = false;
     RestartPhase restartPhase_ = RestartPhase::Idle;
+    quint64 startupGeneration_ = 0;
+    QString launchInstanceToken_;
+    QString readyInstanceToken_;
+    int backendProgress_ = 0;
     QTimer *retryTimer_;
     QTimer *startupTimer_;
     QTimer *stopEscalationTimer_;

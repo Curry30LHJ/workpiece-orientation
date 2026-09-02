@@ -15,9 +15,14 @@ from typing import Callable
 
 from src.image_io import read_color_image
 from src.interference_masks import resolve_propagated_region
-from src.orientation_classifier import PropagationModelError
+from src.orientation_classifier import ImageUnreadableError, PropagationModelError
+from src.native_pp_client import NativePPError
 from src.workpiece_catalog import WorkpieceCatalog
-from src.workpiece_library import IMAGE_EXTENSIONS
+from src.workpiece_library import (
+    IMAGE_EXTENSIONS,
+    InvalidTemplateSetError,
+    WorkpieceLibraryError,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -54,6 +59,7 @@ class TemplateEvolution:
     MAX_PROJECTION_FAILURES = 3
 
     def __init__(self, catalog: WorkpieceCatalog, storage_dir: Path, *, clock: Callable[[], float] | None = None,
+                 duration_clock: Callable[[], float] | None = None,
                  start_worker: bool = True, geometry_profiles=None):
         self.catalog = catalog
         self.geometry_profiles = geometry_profiles or getattr(catalog, "geometry_profiles", None)
@@ -63,6 +69,8 @@ class TemplateEvolution:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._clock = clock or time.time
+        self._duration_clock = duration_clock or time.perf_counter
+        self._duration_started: dict[str, float] = {}
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._jobs: dict[str, dict] = {}
@@ -125,10 +133,34 @@ class TemplateEvolution:
             self._jobs = {}
             LOGGER.error("Quarantined invalid template evolution jobs at %s: %s", quarantine, exc)
             return
+        changed = False
         for job in self._jobs.values():
-            if job.get("state") == "building":
-                job["state"] = "queued"
-                job["error"] = "backend restarted during build"
+            state = job.get("state")
+            total = len(job.get("items", []))
+            defaults = {
+                "phase": "active" if state == "completed" else "queued",
+                "completed": total if state == "completed" else 0,
+                "total": total,
+                "progress": 100 if state == "completed" else 0,
+                "recovery_detail": None,
+                "started_at": None,
+                "finished_at": None,
+                "elapsed_ms": None,
+                "error_code": None,
+                "error_phase": None,
+                "retryable": None,
+            }
+            for key, value in defaults.items():
+                if key not in job:
+                    job[key] = value
+                    changed = True
+            if state == "building":
+                self._reset_queued_progress(job)
+                job["error"] = None
+                job["recovery_detail"] = "上次缓存构建因后端重启中断，任务已重新排队并将自动重试"
+                changed = True
+        if changed:
+            self._persist()
 
     def _persist(self) -> None:
         temp = self.jobs_path.with_suffix(".tmp")
@@ -140,7 +172,14 @@ class TemplateEvolution:
         temp.replace(self.jobs_path)
 
     def _snapshot(self, job: dict) -> dict:
-        return deepcopy(job)
+        snapshot = deepcopy(job)
+        if snapshot.get("state") == "building":
+            duration_started = self._duration_started.get(str(snapshot.get("job_id")))
+            if duration_started is not None:
+                snapshot["elapsed_ms"] = self._duration_ms(
+                    duration_started, float(self._duration_clock())
+                )
+        return snapshot
 
     def _existing_digests(self, workpiece_id: str) -> set[str]:
         record = self.catalog.get(workpiece_id)
@@ -185,7 +224,14 @@ class TemplateEvolution:
                     "workpiece_id": workpiece_id,
                     "base_revision": record.revision,
                     "state": "queued",
+                    "phase": "queued",
+                    "completed": 0,
+                    "total": 0,
                     "progress": 0,
+                    "recovery_detail": None,
+                    "started_at": None,
+                    "finished_at": None,
+                    "elapsed_ms": None,
                     "warnings": [],
                     "error": None,
                     "last_submitted_at": now,
@@ -199,6 +245,7 @@ class TemplateEvolution:
             staged = self.staging_dir / f"{target_job['job_id']}-{len(target_job['items'])}{suffix}"
             shutil.copy2(source, staged)
             target_job["items"].append({"orientation": orientation, "path": str(staged), "digest": digest})
+            target_job["total"] = len(target_job["items"])
             self._operation_results[operation_id] = target_job["job_id"]
             self._persist()
             self._condition.notify_all()
@@ -650,16 +697,53 @@ class TemplateEvolution:
             if not force and self._clock() - float(job["last_submitted_at"]) < self.COALESCE_SECONDS:
                 return None
             job["state"] = "building"
-            job["progress"] = 10
+            job["phase"] = "validating"
+            job["completed"] = 0
+            job["total"] = len(job.get("items", []))
+            job["progress"] = 0
+            job["recovery_detail"] = None
+            job["error"] = None
+            job["error_code"] = None
+            job["error_phase"] = None
+            job["retryable"] = None
+            job["started_at"] = float(self._clock())
+            job["finished_at"] = None
+            job["elapsed_ms"] = 0
+            self._duration_started[job["job_id"]] = float(self._duration_clock())
             self._persist()
+
+        def update_progress(event: dict[str, object]) -> None:
+            phase = event.get("phase")
+            if phase not in {"copying", "features", "committing"}:
+                return
+            completed = max(0, int(event.get("completed", 0)))
+            total = max(0, int(event.get("total", 0)))
+            with self._condition:
+                current_job = self._jobs.get(job["job_id"])
+                if current_job is not job or current_job.get("state") != "building":
+                    return
+                current_job["phase"] = phase
+                current_job["completed"] = completed
+                current_job["total"] = total
+                current_job["progress"] = 0 if total == 0 else min(99, completed * 100 // total)
+                self._update_elapsed(current_job)
+                self._persist()
+        phase = "validation"
         try:
             current = self.catalog.get(job["workpiece_id"])
             if self._matches_committed_template_update(job, current):
                 with self._condition:
                     job["state"] = "completed"
+                    job["phase"] = "active"
+                    job["completed"] = job.get("total", 0)
                     job["progress"] = 100
                     job["revision"] = current.revision
                     job["error"] = None
+                    job["error_code"] = None
+                    job["error_phase"] = None
+                    job["retryable"] = None
+                    job["recovery_detail"] = None
+                    self._finish_elapsed(job)
                     self._cleanup_payload(job)
                     self._persist()
                     return self._snapshot(job)
@@ -671,27 +755,43 @@ class TemplateEvolution:
                         "workpiece revision changed without a matching template operation"
                     )
                 job["base_revision"] = current.revision
+            phase = "geometry_validation"
             geometry_review = self._requires_geometry_review(job, current)
             if geometry_review is not None:
                 with self._condition:
                     job["state"] = "needs_review"
                     job["error"] = geometry_review.get("reason", "new template geometry could not be fitted")
+                    job["error_code"] = "GEOMETRY_REVIEW_REQUIRED"
+                    job["error_phase"] = "geometry_validation"
+                    job["retryable"] = True
                     job["review_reason"] = "geometry_mask_low_confidence"
                     job["geometry_review"] = geometry_review
+                    self._finish_elapsed(job)
                     self._persist()
                     return self._snapshot(job)
             front = [Path(item["path"]) for item in job["items"] if item["orientation"] == "front"]
             back = [Path(item["path"]) for item in job["items"] if item["orientation"] == "back"]
+            phase = "template_cache"
             record, _ = self.catalog.append_templates(
                 job["workpiece_id"],
                 front,
                 back,
                 operation_id=job["job_id"],
+                progress_callback=update_progress,
+                source="confirmed_inspection",
             )
             with self._condition:
                 job["state"] = "completed"
+                job["phase"] = "active"
+                job["completed"] = job.get("total", 0)
                 job["progress"] = 100
                 job["revision"] = record.revision
+                job["error"] = None
+                job["error_code"] = None
+                job["error_phase"] = None
+                job["retryable"] = None
+                job["recovery_detail"] = None
+                self._finish_elapsed(job)
                 self._cleanup_payload(job)
                 self._persist()
                 return self._snapshot(job)
@@ -699,6 +799,13 @@ class TemplateEvolution:
             with self._condition:
                 job["state"] = "failed"
                 job["error"] = str(exc)
+                job["error_code"], job["retryable"] = self._classify_failure(exc, phase)
+                job["error_phase"] = phase
+                LOGGER.exception(
+                    "template evolution job failed job_id=%s workpiece_id=%s phase=%s code=%s",
+                    job.get("job_id"), job.get("workpiece_id"), phase, job.get("error_code"),
+                )
+                self._finish_elapsed(job)
                 self._persist()
                 return self._snapshot(job)
 
@@ -773,11 +880,22 @@ class TemplateEvolution:
                 job["state"] = "cancelled"
                 self._cleanup_payload(job)
             elif action == "retry" and job["state"] in {"failed", "needs_review"}:
-                job["state"] = "queued"
+                self._reset_queued_progress(job)
+                self._duration_started.pop(job_id, None)
                 job["error"] = None
+                job["error_code"] = None
+                job["error_phase"] = None
+                job["retryable"] = None
+                job["recovery_detail"] = None
                 job["last_submitted_at"] = float(self._clock())
             elif action == "resolve-review" and job["state"] == "needs_review":
-                job["state"] = "queued"
+                self._reset_queued_progress(job)
+                self._duration_started.pop(job_id, None)
+                job["error"] = None
+                job["error_code"] = None
+                job["error_phase"] = None
+                job["retryable"] = None
+                job["recovery_detail"] = None
             else:
                 raise TemplateEvolutionError(f"job action is not valid for state {job['state']}")
             self._persist()
@@ -792,6 +910,72 @@ class TemplateEvolution:
                     self._cleanup_payload(job)
             self._persist()
             self._condition.notify_all()
+
+    @staticmethod
+    def _reset_queued_progress(job: dict) -> None:
+        job["state"] = "queued"
+        job["phase"] = "queued"
+        job["completed"] = 0
+        job["total"] = len(job.get("items", []))
+        job["progress"] = 0
+        job["started_at"] = None
+        job["finished_at"] = None
+        job["elapsed_ms"] = None
+        job["error_code"] = None
+        job["error_phase"] = None
+        job["retryable"] = None
+
+    @staticmethod
+    def _classify_failure(exc: Exception, phase: str) -> tuple[str, bool]:
+        """Return a stable client-facing code without changing the original message."""
+        # Native PP-ShiTu failures already carry a protocol-level code.  Keep
+        # it intact so the Qt client can tell a missing model/cache from a
+        # generic template-cache failure and offer the right recovery action.
+        native_code = getattr(exc, "code", None)
+        if isinstance(exc, NativePPError) and isinstance(native_code, str) and native_code:
+            return native_code, True
+        if isinstance(exc, DuplicateTemplateError):
+            return "DUPLICATE_TEMPLATE", False
+        if isinstance(exc, InvalidConfirmationError):
+            return "INVALID_CONFIRMATION", False
+        if isinstance(exc, ImageUnreadableError):
+            return "IMAGE_UNREADABLE", False
+        if isinstance(exc, StaleEvolutionError):
+            return "STALE_EVOLUTION", True
+        if isinstance(exc, InvalidTemplateSetError):
+            return "INVALID_TEMPLATE_SET", False
+        if isinstance(exc, PropagationModelError):
+            return "MODEL_ERROR", True
+        text = str(exc).strip()
+        prefixed_code = text.partition(":")[0].strip()
+        if prefixed_code.startswith(("NATIVE_PP_", "FAST_CACHE_")):
+            return prefixed_code, True
+        if isinstance(exc, WorkpieceLibraryError) or phase == "template_cache":
+            return "TEMPLATE_CACHE_BUILD_FAILED", True
+        return "EVOLUTION_JOB_FAILED", True
+
+    @staticmethod
+    def _duration_ms(started_at: float, finished_at: float) -> int:
+        return max(0, int(round((finished_at - started_at) * 1000.0)))
+
+    def _update_elapsed(self, job: dict) -> None:
+        duration_started = self._duration_started.get(str(job.get("job_id")))
+        if duration_started is None:
+            return
+        job["elapsed_ms"] = self._duration_ms(
+            duration_started, float(self._duration_clock())
+        )
+
+    def _finish_elapsed(self, job: dict) -> None:
+        wall_finished = float(self._clock())
+        wall_started = job.get("started_at")
+        job["finished_at"] = (
+            wall_finished
+            if wall_started is None
+            else max(float(wall_started), wall_finished)
+        )
+        self._update_elapsed(job)
+        self._duration_started.pop(str(job.get("job_id")), None)
 
     @staticmethod
     def _cleanup_payload(job: dict) -> None:

@@ -1,13 +1,17 @@
+from dataclasses import replace
 from pathlib import Path
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 
-from src.orientation_classifier import OrientationClassifier, TemplateCache
+from src.fast_geometry import FastGeometryProcessor
+from src.fast_orientation import FastOrientationEngine
+from src.orientation_classifier import OrientationClassifier, OrientationClassifierError, TemplateCache
 from src.geometry_mask_profiles import GeometryMaskProfiles
 from src.workpiece_catalog import RestoreConflictError, WorkpieceCatalog
 from src.workpiece_library import StaleWorkpieceRevisionError, WorkpieceLibrary
@@ -26,6 +30,36 @@ def builder(front, back, progress_callback=None):
         },
         local_features={"front": [{} for _ in front], "back": [{} for _ in back]},
     )
+
+
+class PersistedGlobalPredictor:
+    def predict(self, images):
+        embeddings = []
+        for item in images:
+            mean = float(np.mean(item)) / 255.0
+            embeddings.append(np.asarray([mean, 1.0 - mean], dtype=np.float32))
+        return embeddings
+
+
+def persisted_fast_classifier(inference_mode):
+    classifier = OrientationClassifier(
+        global_predictor=PersistedGlobalPredictor(),
+        extractor=object() if inference_mode == "compare" else None,
+        matcher=object() if inference_mode == "compare" else None,
+        device="cpu",
+        extract_features_fn=lambda item, *_args, **_kwargs: {
+            "marker": int(item[0, 0, 0])
+        },
+        score_feature_pair_fn=lambda *_args, **_kwargs: {"score": 1.0},
+        inference_mode=inference_mode,
+        model_fingerprint="catalog-model-a",
+    )
+    classifier.fast_engine = FastOrientationEngine(
+        classifier._global_embeddings,
+        FastGeometryProcessor(object()),
+        image_reader=lambda path: cv2.imread(str(path), cv2.IMREAD_COLOR),
+    )
+    return classifier
 
 
 class FakeClassifier:
@@ -84,6 +118,123 @@ class FakeClassifier:
         return {"label": "front", "library_revision": library_revision}
 
 
+class BatchCatalogClassifier(FakeClassifier):
+    def __init__(self):
+        super().__init__()
+        self.snapshot_calls = 0
+        self.batch_paths = None
+
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        self.snapshot_calls += 1
+        self.batch_paths = list(image_paths)
+        return [
+            {"index": index, "image_path": str(path), "label": "front", "library_revision": library_revision}
+            for index, path in enumerate(image_paths)
+        ]
+
+    def batch_capabilities(self):
+        return {"batch_ready": True, "worker_count": 1, "threads_per_worker": 1}
+
+
+class LegacyReadyBatchCatalogClassifier(BatchCatalogClassifier):
+    batch_capabilities = None
+    batch_ready = True
+
+
+class PartialFailureCatalogClassifier(FakeClassifier):
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        if Path(image_path).name == "bad.png":
+            raise OSError("unable to decode image")
+        return super().predict_with_cache(cache, image_path, library_revision=library_revision)
+
+
+class FastCacheFailureCatalogClassifier(FakeClassifier):
+    def predict_with_cache(self, cache, image_path, *, library_revision=None):
+        raise OrientationClassifierError("FAST_CACHE_NOT_READY: cache is unavailable")
+
+
+class ReorderedBatchCatalogClassifier(BatchCatalogClassifier):
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        return list(reversed([
+            {"index": index, "image_path": str(path), "label": f"label-{index}"}
+            for index, path in enumerate(image_paths)
+        ]))
+
+
+class MalformedBatchCatalogClassifier(BatchCatalogClassifier):
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        return [
+            {"index": 0, "image_path": str(image_paths[0]), "label": "front"},
+            {"index": 0, "image_path": str(image_paths[1]), "label": "back"},
+        ]
+
+
+class RequestLocalBatchResults(list):
+    def __init__(self, items, execution):
+        super().__init__(items)
+        self.execution = execution
+
+
+class ClosedPoolFallbackCatalogClassifier(BatchCatalogClassifier):
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        return RequestLocalBatchResults(
+            [
+                {"index": index, "image_path": str(path), "label": "front"}
+                for index, path in enumerate(image_paths)
+            ],
+            {"batch_mode": "serial", "worker_count": 0, "fallback": "serial_closed_pool"},
+        )
+
+
+class ConcurrentExecutionCatalogClassifier(BatchCatalogClassifier):
+    def __init__(self):
+        super().__init__()
+        self.barrier = threading.Barrier(2)
+
+    def predict_many_with_cache(self, cache, image_paths, *, library_revision=None):
+        self.barrier.wait(timeout=2)
+        mode = "serial" if Path(image_paths[0]).name.startswith("serial") else "batch"
+        return RequestLocalBatchResults(
+            [
+                {"index": index, "image_path": str(path), "label": "front"}
+                for index, path in enumerate(image_paths)
+            ],
+            {
+                "batch_mode": mode,
+                "worker_count": 0 if mode == "serial" else 2,
+                "fallback": "serial_closed_pool" if mode == "serial" else None,
+            },
+        )
+
+
+class PoolNotReadyCatalogClassifier(FakeClassifier):
+    def batch_capabilities(self):
+        return {
+            "supported": True,
+            "batch_ready": False,
+            "worker_count": 2,
+        }
+
+
+class RevisionAwareFastClassifier(FakeClassifier):
+    inference_mode = "fast_geometry"
+
+    def build_template_cache(
+        self,
+        front,
+        back,
+        progress_callback=None,
+        *,
+        library_revision=1,
+    ):
+        cache = builder(front, back, progress_callback)
+        return TemplateCache(
+            global_vectors=cache.global_vectors,
+            local_features=cache.local_features,
+            fast_runtime=SimpleNamespace(library_revision=library_revision),
+        )
+
+
 class BlockingPredictClassifier(FakeClassifier):
     def __init__(self):
         super().__init__()
@@ -136,6 +287,56 @@ class SlowAppendClassifier(FakeClassifier):
         return super().build_template_cache(front, back, progress_callback)
 
 
+class SummaryGeometryProfiles:
+    def snapshot(self, workpiece_id):
+        return {
+            "profile_status": "ok",
+            "active": {"rules": [{"rule_id": "glare"}, {"rule_id": "intrusion"}]},
+        }
+
+
+class BlockingCatalogGeometryProfiles:
+    def __init__(self):
+        self.catalog = None
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def snapshot(self, workpiece_id):
+        self.calls += 1
+        if self.calls == 1:
+            self.started.set()
+            assert self.release.wait(2.0)
+        record = self.catalog.get(workpiece_id)
+        return {
+            "profile_status": "ok",
+            "active": {"rules": []},
+            "library_revision": record.revision,
+        }
+
+
+class AlwaysMutatingSummaryGeometryProfiles:
+    def __init__(self):
+        self.catalog = None
+        self.calls = 0
+
+    def snapshot(self, workpiece_id):
+        self.calls += 1
+        current = self.catalog.capture_snapshot(workpiece_id)
+        self.catalog.publish_geometry_profile(
+            workpiece_id,
+            current.cache,
+            profile_revision=self.calls,
+            previous_profile_revision=None,
+            expected_revision=current.record.revision,
+            operation_id=f"summary-churn-{self.calls}",
+        )
+        return {
+            "profile_status": "ok",
+            "active": {"rules": []},
+        }
+
+
 def create_catalog(tmp_path):
     library = WorkpieceLibrary(tmp_path / "library")
     classifier = FakeClassifier()
@@ -144,6 +345,430 @@ def create_catalog(tmp_path):
     back = [image(tmp_path / "back.png", 20)]
     record, _ = catalog.register("M7", front, back, False)
     return catalog, classifier, record
+
+
+def create_catalog_with_counts(tmp_path, front_count, back_count):
+    classifier = FakeClassifier()
+    library = WorkpieceLibrary(tmp_path / "summary-library")
+    catalog = WorkpieceCatalog(library, classifier, SummaryGeometryProfiles())
+    front = [
+        image(tmp_path / f"summary-front-{i}.png", 10 + i)
+        for i in range(front_count)
+    ]
+    back = [
+        image(tmp_path / f"summary-back-{i}.png", 80 + i)
+        for i in range(back_count)
+    ]
+    record, _ = catalog.register("M-summary", front, back, False)
+    return catalog, classifier, record
+
+
+def test_predict_batch_captures_one_snapshot_and_returns_input_order(tmp_path, monkeypatch):
+    library = WorkpieceLibrary(tmp_path / "batch-library")
+    classifier = BatchCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    front = [image(tmp_path / "batch-front.png", 10)]
+    back = [image(tmp_path / "batch-back.png", 20)]
+    record, _ = catalog.register("M7", front, back, False)
+    captured = catalog.capture_snapshot
+    calls = []
+
+    def count_capture(workpiece_id):
+        calls.append(workpiece_id)
+        return captured(workpiece_id)
+
+    monkeypatch.setattr(catalog, "capture_snapshot", count_capture)
+
+    result = catalog.predict_many(record.id, [Path("a.png"), Path("b.png"), Path("c.png")])
+
+    assert [item["index"] for item in result] == [0, 1, 2]
+    assert calls == [record.id]
+
+
+def test_predict_many_uses_legacy_batch_ready_attribute_without_capabilities(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "legacy-batch-library")
+    classifier = LegacyReadyBatchCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "legacy-front.png", 10)], [image(tmp_path / "legacy-back.png", 20)], False)
+
+    result = catalog.predict_many(record.id, [Path("a.png"), Path("b.png")])
+
+    assert [item["index"] for item in result] == [0, 1]
+    assert classifier.batch_paths == [Path("a.png"), Path("b.png")]
+
+
+def test_predict_many_keeps_partial_scalar_errors_in_input_order(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "partial-batch-library")
+    classifier = PartialFailureCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "partial-front.png", 10)], [image(tmp_path / "partial-back.png", 20)], False)
+
+    result = catalog.predict_many(record.id, [Path("a.png"), Path("bad.png"), Path("c.png")])
+
+    assert [item["index"] for item in result] == [0, 1, 2]
+    assert [item["ok"] for item in result] == [True, False, True]
+    assert result[1]["error"]["code"] == "MODEL_ERROR"
+
+
+def test_predict_many_reraises_fast_cache_errors_from_scalar_fallback(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "fast-cache-batch-library")
+    classifier = FastCacheFailureCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "fast-front.png", 10)], [image(tmp_path / "fast-back.png", 20)], False)
+
+    with pytest.raises(OrientationClassifierError, match="FAST_CACHE_NOT_READY"):
+        catalog.predict_many(record.id, [Path("a.png")])
+
+
+def test_predict_many_reorders_batch_results_by_declared_index(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "reordered-batch-library")
+    classifier = ReorderedBatchCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "reordered-front.png", 10)], [image(tmp_path / "reordered-back.png", 20)], False)
+
+    result = catalog.predict_many(record.id, [Path("a.png"), Path("b.png")])
+
+    assert [item["index"] for item in result] == [0, 1]
+    assert [item["prediction"]["label"] for item in result] == ["label-0", "label-1"]
+
+
+def test_predict_many_rejects_duplicate_batch_result_indices(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "malformed-batch-library")
+    classifier = MalformedBatchCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "malformed-batch-front.png", 10)], [image(tmp_path / "malformed-batch-back.png", 20)], False)
+
+    with pytest.raises(Exception, match="batch result"):
+        catalog.predict_many(record.id, [Path("a.png"), Path("b.png")])
+
+
+def test_predict_many_uses_request_local_closed_pool_execution_diagnostics(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "closed-pool-catalog-library")
+    classifier = ClosedPoolFallbackCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "closed-front.png", 10)], [image(tmp_path / "closed-back.png", 20)], False)
+
+    _, diagnostics = catalog._predict_many_with_diagnostics(record.id, [Path("a.png")])
+
+    assert diagnostics["batch_mode"] == "serial"
+    assert diagnostics["worker_count"] == 0
+    assert diagnostics["fallback"] == "serial_closed_pool"
+
+
+def test_predict_many_keeps_concurrent_execution_diagnostics_request_local(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "concurrent-diagnostics-library")
+    classifier = ConcurrentExecutionCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "concurrent-front.png", 10)], [image(tmp_path / "concurrent-back.png", 20)], False)
+    results = {}
+
+    def run(key, path):
+        results[key] = catalog._predict_many_with_diagnostics(record.id, [Path(path)])[1]
+
+    serial = threading.Thread(target=run, args=("serial", "serial.png"))
+    batch = threading.Thread(target=run, args=("batch", "batch.png"))
+    serial.start()
+    batch.start()
+    serial.join(timeout=3)
+    batch.join(timeout=3)
+
+    assert not serial.is_alive()
+    assert not batch.is_alive()
+    assert results["serial"]["batch_mode"] == "serial"
+    assert results["serial"]["worker_count"] == 0
+    assert results["batch"]["batch_mode"] == "batch"
+    assert results["batch"]["worker_count"] == 2
+
+
+def test_predict_many_reports_supported_but_not_ready_pool_diagnostics(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "pool-not-ready-catalog-library")
+    classifier = PoolNotReadyCatalogClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "not-ready-front.png", 10)], [image(tmp_path / "not-ready-back.png", 20)], False)
+
+    _, diagnostics = catalog._predict_many_with_diagnostics(record.id, [Path("a.png")])
+
+    assert diagnostics["batch_mode"] == "serial"
+    assert diagnostics["worker_count"] == 0
+    assert diagnostics["fallback"] == "batch_pool_not_ready"
+
+
+def test_predict_many_keeps_unsupported_batch_diagnostics_unavailable(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "unsupported-batch-library")
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register("M7", [image(tmp_path / "unsupported-front.png", 10)], [image(tmp_path / "unsupported-back.png", 20)], False)
+
+    _, diagnostics = catalog._predict_many_with_diagnostics(record.id, [Path("a.png")])
+
+    assert diagnostics["batch_mode"] == "serial"
+    assert diagnostics["worker_count"] == 0
+    assert diagnostics["fallback"] == "serial_batch_unavailable"
+
+
+def test_workpiece_summary_reports_unequal_counts_and_rules(tmp_path):
+    catalog, _, record = create_catalog_with_counts(tmp_path, 1, 12)
+
+    summary = catalog.list_workpiece_summaries()[0]
+
+    assert summary["id"] == record.id
+    assert summary["template_counts"] == {"front": 1, "back": 12}
+    assert summary["geometry_rule_count"] == 2
+    assert summary["geometry_status"] == "ok"
+    assert summary["detectable"] is True
+    assert summary["fast_cache"] == {
+        "state": "not_ready",
+        "completed": 0,
+        "total": 0,
+        "elapsed_ms": 0.0,
+        "error": None,
+    }
+
+
+def test_details_return_all_unequal_and_over_thirty_templates(tmp_path):
+    catalog, _, record = create_catalog_with_counts(tmp_path, 31, 1)
+
+    details = catalog.get_workpiece_details(record.id)
+    template_ids = [item["template_id"] for item in details["templates"]]
+
+    assert details["template_counts"] == {"front": 31, "back": 1}
+    assert len(template_ids) == 32
+    assert len(set(template_ids)) == 32
+    assert template_ids[0] == "front:00.png"
+    assert template_ids[-1] == "back:00.png"
+    assert all(Path(item["preview_path"]).is_absolute() for item in details["templates"])
+    assert all(item["readable"] is True for item in details["templates"])
+
+
+def test_legacy_details_are_derived_without_manifest_or_cache_mutation(tmp_path):
+    classifier = CachingFakeClassifier()
+    library = WorkpieceLibrary(tmp_path / "legacy-library")
+    catalog = WorkpieceCatalog(library, classifier)
+    record, _ = catalog.register(
+        "M-legacy",
+        [image(tmp_path / f"legacy-front-{index}.png", 10 + index) for index in range(5)],
+        [image(tmp_path / f"legacy-back-{index}.png", 30 + index) for index in range(5)],
+        False,
+    )
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("template_inventory")
+    manifest.pop("created_at")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    before = manifest_path.read_bytes()
+    before_mtime = manifest_path.stat().st_mtime_ns
+    build_calls = classifier.build_calls
+    save_calls = list(classifier.save_calls)
+
+    details = catalog.get_workpiece_details(record.id)
+
+    assert details["template_counts"] == {"front": 5, "back": 5}
+    assert len(details["templates"]) == 10
+    assert {item["source"] for item in details["templates"]} == {"initial_registration"}
+    assert {item["added_at"] for item in details["templates"]} == {None}
+    assert manifest_path.read_bytes() == before
+    assert manifest_path.stat().st_mtime_ns == before_mtime
+    assert classifier.build_calls == build_calls
+    assert classifier.save_calls == save_calls
+
+
+def test_summary_detectable_reflects_runtime_snapshot_presence(tmp_path):
+    library = WorkpieceLibrary(tmp_path / "snapshot-library")
+    record, _ = library.register(
+        "M-snapshot",
+        [image(tmp_path / "snapshot-front.png", 10)],
+        [image(tmp_path / "snapshot-back.png", 20)],
+        False,
+        builder,
+    )
+    catalog = WorkpieceCatalog(library, FakeClassifier())
+
+    assert catalog.list_workpiece_summaries()[0]["detectable"] is False
+
+    catalog.recover()
+
+    assert catalog.list_workpiece_summaries()[0]["id"] == record.id
+    assert catalog.list_workpiece_summaries()[0]["detectable"] is True
+
+
+def test_details_keep_all_templates_and_mark_an_unreadable_preview(tmp_path):
+    catalog, _, record = create_catalog_with_counts(tmp_path, 2, 1)
+    record.front_images[1].write_bytes(b"corrupt")
+
+    details = catalog.get_workpiece_details(record.id)
+
+    assert len(details["templates"]) == 3
+    readable = {item["template_id"]: item["readable"] for item in details["templates"]}
+    assert readable == {
+        "front:00.png": True,
+        "front:01.png": False,
+        "back:00.png": True,
+    }
+
+
+def test_details_resolve_preview_paths_from_relative_library_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(Path("relative-library")), classifier)
+    record, _ = catalog.register(
+        "M-relative",
+        [image(tmp_path / "relative-front.png", 10)],
+        [image(tmp_path / "relative-back.png", 20)],
+        False,
+    )
+
+    details = catalog.get_workpiece_details(record.id)
+
+    assert all(Path(item["preview_path"]).is_absolute() for item in details["templates"])
+
+
+def test_append_forwards_source_and_details_switch_after_commit(tmp_path):
+    classifier = SlowAppendClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "append-details-library"), classifier)
+    record, _ = catalog.register(
+        "M-append-details",
+        [image(tmp_path / "append-details-front.png", 10)],
+        [image(tmp_path / "append-details-back.png", 20)],
+        False,
+    )
+    classifier.block_appends = True
+    result = []
+    errors = []
+
+    def append():
+        try:
+            result.append(catalog.append_templates(
+                record.id,
+                [image(tmp_path / "append-details-new.png", 30)],
+                [],
+                operation_id="append-details-1",
+                source="confirmed_inspection",
+            ))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=append)
+    worker.start()
+    assert classifier.build_started.wait(1.0)
+    old_details = catalog.get_workpiece_details(record.id)
+    try:
+        assert len(old_details["templates"]) == 2
+    finally:
+        classifier.release_build.set()
+        worker.join(timeout=2.0)
+
+    assert not errors
+    assert result
+    new_details = catalog.get_workpiece_details(record.id)
+    assert len(new_details["templates"]) == 3
+    assert new_details["templates"][-1]["source"] == "confirmed_inspection"
+
+
+def test_details_retry_after_append_during_geometry_snapshot(tmp_path):
+    profiles = BlockingCatalogGeometryProfiles()
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(
+        WorkpieceLibrary(tmp_path / "details-retry-library"),
+        classifier,
+        profiles,
+    )
+    profiles.catalog = catalog
+    record, _ = catalog.register(
+        "M-details-retry",
+        [image(tmp_path / "details-retry-front.png", 10)],
+        [image(tmp_path / "details-retry-back.png", 20)],
+        False,
+    )
+    results = []
+    errors = []
+
+    def read_details():
+        try:
+            results.append(catalog.get_workpiece_details(record.id))
+        except Exception as exc:
+            errors.append(exc)
+
+    reader = threading.Thread(target=read_details)
+    reader.start()
+    assert profiles.started.wait(1.0)
+    try:
+        appended, _ = catalog.append_templates(
+            record.id,
+            [image(tmp_path / "details-retry-new.png", 30)],
+            [],
+            operation_id="details-retry-append",
+        )
+    finally:
+        profiles.release.set()
+        reader.join(timeout=2.0)
+
+    assert not reader.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert results[0]["revision"] == appended.revision
+    assert results[0]["template_counts"] == {"front": 2, "back": 1}
+    assert len(results[0]["templates"]) == 3
+    assert profiles.calls >= 2
+
+
+def test_summary_list_skips_recycled_record_during_geometry_snapshot(tmp_path):
+    profiles = BlockingCatalogGeometryProfiles()
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(
+        WorkpieceLibrary(tmp_path / "summary-retry-library"),
+        classifier,
+        profiles,
+    )
+    profiles.catalog = catalog
+    record, _ = catalog.register(
+        "M-summary-retry",
+        [image(tmp_path / "summary-retry-front.png", 10)],
+        [image(tmp_path / "summary-retry-back.png", 20)],
+        False,
+    )
+    results = []
+    errors = []
+
+    def read_summaries():
+        try:
+            results.append(catalog.list_workpiece_summaries())
+        except Exception as exc:
+            errors.append(exc)
+
+    reader = threading.Thread(target=read_summaries)
+    reader.start()
+    assert profiles.started.wait(1.0)
+    try:
+        catalog.recycle(record.id, operation_id="summary-retry-recycle")
+    finally:
+        profiles.release.set()
+        reader.join(timeout=2.0)
+
+    assert not reader.is_alive()
+    assert errors == []
+    assert results == [[]]
+
+
+def test_summary_list_reports_stale_after_all_snapshot_retries_change_revision(tmp_path):
+    profiles = AlwaysMutatingSummaryGeometryProfiles()
+    classifier = FakeClassifier()
+    catalog = WorkpieceCatalog(
+        WorkpieceLibrary(tmp_path / "summary-churn-library"),
+        classifier,
+        profiles,
+    )
+    profiles.catalog = catalog
+    catalog.register(
+        "M-summary-churn",
+        [image(tmp_path / "summary-churn-front.png", 10)],
+        [image(tmp_path / "summary-churn-back.png", 20)],
+        False,
+    )
+
+    with pytest.raises(StaleWorkpieceRevisionError, match="changed repeatedly"):
+        catalog.list_workpiece_summaries()
+
+    assert profiles.calls == 3
 
 
 def test_predict_releases_catalog_lock_before_classifier_runs(tmp_path):
@@ -219,6 +844,53 @@ def test_append_build_does_not_block_prediction_and_swaps_revision_after_commit(
     assert not append_errors
     assert appended
     assert catalog.predict(record.id, tmp_path / "query-after.png")["library_revision"] == record.revision + 1
+
+
+def test_append_reports_committing_before_atomic_snapshot_swap(tmp_path):
+    catalog, _, record = create_catalog(tmp_path)
+    events = []
+
+    def capture_progress(event):
+        events.append({
+            **event,
+            "active_revision": catalog.capture_snapshot(record.id).record.revision,
+        })
+
+    appended, _ = catalog.append_templates(
+        record.id,
+        [image(tmp_path / "commit-progress.png", 11)],
+        [],
+        operation_id="commit-progress",
+        progress_callback=capture_progress,
+    )
+
+    committing = [event for event in events if event["phase"] == "committing"]
+    assert len(committing) == 1
+    assert committing[0]["completed"] == 3
+    assert committing[0]["total"] == 3
+    assert committing[0]["active_revision"] == record.revision
+    assert appended.revision == record.revision + 1
+
+
+def test_committing_progress_observer_failure_does_not_abort_append(tmp_path):
+    catalog, _, record = create_catalog(tmp_path)
+    phases = []
+
+    def failing_observer(event):
+        phases.append(event["phase"])
+        if event["phase"] == "committing":
+            raise RuntimeError("observer failed")
+
+    appended, _ = catalog.append_templates(
+        record.id,
+        [image(tmp_path / "observer-failure.png", 12)],
+        [],
+        operation_id="observer-failure",
+        progress_callback=failing_observer,
+    )
+
+    assert "committing" in phases
+    assert appended.revision == record.revision + 1
 
 
 @pytest.mark.parametrize("front_count,back_count", [(1, 1), (5, 10), (10, 15), (35, 35)])
@@ -335,8 +1007,79 @@ def test_recycle_removes_prediction_and_restore_republishes_same_workpiece(tmp_p
     restored = catalog.restore(record.id, operation_id="restore-1")
 
     assert restored.id == record.id
-    assert catalog.list_workpieces() == [{"id": record.id, "name": "M7"}]
+    restored_summary = catalog.list_workpieces()[0]
+    assert {"id": restored_summary["id"], "name": restored_summary["name"]} == {
+        "id": record.id,
+        "name": "M7",
+    }
     assert record.id in classifier.caches
+
+
+def test_restore_cache_miss_builds_fast_cache_for_recycled_library_revision(tmp_path):
+    classifier = RevisionAwareFastClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7",
+        [image(tmp_path / "front.png", 10)],
+        [image(tmp_path / "back.png", 20)],
+        False,
+    )
+    updated, _ = catalog.append_templates(
+        record.id,
+        [image(tmp_path / "front-extra.png", 11)],
+        [],
+        operation_id="append-revision-2",
+    )
+    catalog.recycle(record.id, operation_id="recycle-revision-2")
+
+    restored = catalog.restore(record.id, operation_id="restore-revision-2")
+
+    assert restored.revision == updated.revision + 2 == 4
+    assert classifier.caches[record.id].fast_runtime.library_revision == restored.revision
+
+
+@pytest.mark.parametrize("inference_mode", ["fast_geometry", "compare"])
+def test_restore_queues_stale_fast_sidecar_rebuild_while_preserving_valid_base_cache(
+    tmp_path,
+    inference_mode,
+):
+    classifier = persisted_fast_classifier(inference_mode)
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7",
+        [image(tmp_path / "front.png", 10)],
+        [image(tmp_path / "back.png", 20)],
+        False,
+    )
+    catalog.recycle(record.id, operation_id=f"recycle-{inference_mode}")
+    recycled = catalog.library.get_recycled(record.id)
+    base_path = recycled.root / ".template_cache.pkl"
+    fast_path = recycled.root / ".fast_runtime_cache.pkl"
+
+    loaded_base = classifier.load_template_cache(recycled)
+
+    assert base_path.is_file()
+    assert fast_path.is_file()
+    assert loaded_base is not None
+    assert loaded_base.fast_runtime is None
+
+    restored = catalog.restore(record.id, operation_id=f"restore-{inference_mode}")
+    catalog.shutdown()
+    snapshot = catalog.capture_snapshot(record.id)
+    persisted = classifier.load_template_cache(restored)
+
+    assert restored.revision == 3
+    assert snapshot.cache.fast_runtime is not None
+    assert snapshot.cache.fast_runtime.library_revision == restored.revision
+    assert persisted is not None
+    assert persisted.fast_runtime is not None
+    assert persisted.fast_runtime.library_revision == restored.revision
+    result = classifier.predict_fast_with_cache(
+        snapshot.cache,
+        np.full((8, 8, 3), 10, dtype=np.uint8),
+        library_revision=restored.revision,
+    )
+    assert result["inference_engine"] == "fast_geometry"
 
 
 def test_restore_rejects_case_insensitive_name_conflict_without_mutating_recycle(tmp_path):
@@ -465,17 +1208,60 @@ def test_prepare_template_masks_returns_unpublished_candidate_with_snapshot_stat
 
 def test_catalog_recover_uses_classifier_cache_before_rebuilding(tmp_path):
     initial_library = WorkpieceLibrary(tmp_path / "library")
-    front = [image(tmp_path / "front.png", 10)]
-    back = [image(tmp_path / "back.png", 20)]
+    front = [image(tmp_path / f"front-{index}.png", 10 + index) for index in range(5)]
+    back = [image(tmp_path / f"back-{index}.png", 20 + index) for index in range(5)]
     record, expected_cache = initial_library.register("M7", front, back, False, builder)
+    manifest_path = record.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("template_inventory")
+    manifest.pop("created_at")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    before = manifest_path.read_bytes()
+    before_mtime = manifest_path.stat().st_mtime_ns
     classifier = CachingFakeClassifier(preloaded=expected_cache)
     catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
 
     recovered = catalog.recover()
+    details = catalog.get_workpiece_details(record.id)
 
     assert [item.id for item, _ in recovered] == [record.id]
     assert classifier.load_calls == [record.id]
     assert classifier.build_calls == 0
+    assert classifier.save_calls == []
+    assert len(details["templates"]) == 10
+    assert {item["added_at"] for item in details["templates"]} == {None}
+    assert manifest_path.read_bytes() == before
+    assert manifest_path.stat().st_mtime_ns == before_mtime
+
+
+def test_catalog_recover_resolves_fast_cache_staging_before_loading_cache(tmp_path):
+    initial_library = WorkpieceLibrary(tmp_path / "library")
+    record, expected_cache = initial_library.register(
+        "M7",
+        [image(tmp_path / "recovery-order-front.png", 10)],
+        [image(tmp_path / "recovery-order-back.png", 20)],
+        False,
+        builder,
+    )
+
+    class RecoveryAwareClassifier(CachingFakeClassifier):
+        def __init__(self):
+            super().__init__(preloaded=expected_cache)
+            self.recovery_order = []
+
+        def recover_fast_runtime_cache_staging(self, candidate_record):
+            self.recovery_order.append(("recover", candidate_record.id))
+
+        def load_template_cache(self, candidate_record):
+            self.recovery_order.append(("load", candidate_record.id))
+            return super().load_template_cache(candidate_record)
+
+    classifier = RecoveryAwareClassifier()
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+
+    catalog.recover()
+
+    assert classifier.recovery_order == [("recover", record.id), ("load", record.id)]
 
 
 def test_recover_does_not_hold_catalog_lock_during_geometry_rebuild(tmp_path):
@@ -737,3 +1523,103 @@ def test_first_geometry_publish_can_rollback_to_legacy_cache(tmp_path):
     )
     assert rolled["active_revision"] is None
     assert classifier.get_template_cache(record.id).ignored_regions
+
+
+def test_legacy_rollback_persists_none_geometry_sidecar_with_production_validator(tmp_path):
+    classifier = persisted_fast_classifier("fast_geometry")
+    catalog = WorkpieceCatalog(WorkpieceLibrary(tmp_path / "library"), classifier)
+    record, _ = catalog.register(
+        "M7",
+        [image(tmp_path / "front.png", 10)],
+        [image(tmp_path / "back.png", 20)],
+        False,
+    )
+    catalog.shutdown()
+    group = _active_legacy_group()
+    catalog.commit_annotation_document(
+        record.id,
+        [group],
+        expected_revision=record.revision,
+        operation_id="production-legacy-active",
+        active_groups=[group],
+    )
+    record = catalog.get(record.id)
+    profiles = GeometryMaskProfiles(
+        catalog,
+        start_worker=False,
+        storage_dir=tmp_path / "production-geometry-jobs",
+    )
+    catalog.set_geometry_profiles(profiles)
+    profile = profiles.snapshot(record.id)["draft"]
+    profile_root = record.root / "geometry_masks"
+    (profile_root / "revisions").mkdir(parents=True, exist_ok=True)
+    profile_path = profile_root / "profile.json"
+    profile_document = {
+        "schema_version": profile["schema_version"],
+        "library_revision": record.revision + 1,
+        "draft_revision": 0,
+        "active_revision": 1,
+        "previous_active_revision": None,
+        "draft": profile,
+        "active": profile,
+    }
+    profile_path.write_text(json.dumps(profile_document), encoding="utf-8")
+    (profile_root / "revisions" / "1.json").write_text(
+        json.dumps({
+            "profile": profile,
+            "previous_active_revision": None,
+            "previous_source": "legacy",
+        }),
+        encoding="utf-8",
+    )
+    current = catalog.capture_snapshot(record.id)
+    published = catalog.publish_geometry_profile(
+        record.id,
+        replace(
+            current.cache,
+            geometry_profile={**profile, "profile_revision": 1},
+            geometry_profile_revision=1,
+            fast_runtime=None,
+        ),
+        profile_revision=1,
+        previous_profile_revision=None,
+        expected_revision=record.revision,
+        operation_id="production-publish-geometry",
+    )
+    assert classifier.load_fast_runtime_cache(published) is not None
+
+    before = catalog.capture_snapshot(record.id)
+    original_stage = classifier.stage_fast_runtime_cache
+
+    def fail_stage(*_args, **_kwargs):
+        raise RuntimeError("staged legacy persistence failed")
+
+    classifier.stage_fast_runtime_cache = fail_stage
+    with pytest.raises(RuntimeError, match="staged legacy persistence failed"):
+        catalog.restore_legacy_annotation_cache(
+            record.id,
+            expected_revision=published.revision,
+            operation_id="production-rollback-stage-failure",
+        )
+    assert catalog.capture_snapshot(record.id) is before
+    assert catalog.get(record.id).revision == published.revision
+    classifier.stage_fast_runtime_cache = original_stage
+
+    restored = catalog.restore_legacy_annotation_cache(
+        record.id,
+        expected_revision=published.revision,
+        operation_id="production-rollback-legacy",
+    )
+    profile_document.update({
+        "library_revision": restored.revision,
+        "active_revision": None,
+        "previous_active_revision": None,
+        "active": None,
+    })
+    profile_path.write_text(json.dumps(profile_document), encoding="utf-8")
+
+    runtime = classifier.load_fast_runtime_cache(restored)
+    assert runtime is not None
+    assert runtime.library_revision == restored.revision
+    assert runtime.geometry_profile_revision is None
+    profiles.shutdown()

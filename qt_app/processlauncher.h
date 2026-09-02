@@ -16,6 +16,7 @@ public:
     virtual bool start(const QString &program, const QStringList &arguments, const QString &workingDirectory) = 0;
     virtual void terminate() = 0;
     virtual void kill() = 0;
+    virtual void release() = 0;
     virtual bool isRunning() const = 0;
 
 signals:
@@ -33,6 +34,7 @@ public:
     bool start(const QString &program, const QStringList &arguments, const QString &workingDirectory) override;
     void terminate() override;
     void kill() override;
+    void release() override;
     bool isRunning() const override;
 
 private:

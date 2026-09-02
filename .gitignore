@@ -16,6 +16,12 @@ pytest-debug-evo/
 runtime_library/
 .coverage
 htmlcov/
+release_artifacts/
+release_staging/
+deploy/pyinstaller-work/
+tmp_test/
+.tmp/
+tmps*/
 
 # Model and feature cache artifacts
 *.pdmodel
