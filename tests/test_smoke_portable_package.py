@@ -354,6 +354,34 @@ def _package_fixture(root: Path, *, edition: str = "gpu") -> Path:
     return root
 
 
+def test_start_backend_passes_native_cpp_arguments_from_relative_package_config(tmp_path):
+    package = _package_fixture(tmp_path / "package", edition="cpu")
+    config_path = package / "app_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update({
+        "pp_backend": "native_cpp",
+        "native_pp_executable": "backend/native_cpp/ppshitu_rec_service.exe",
+    })
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    launched = {}
+
+    class Process:
+        pass
+
+    def factory(args, cwd, **kwargs):
+        launched.update(args=args, cwd=cwd)
+        return Process()
+
+    smoke._start_backend(package, config, 43751, factory)
+    assert "--pp-backend" in launched["args"]
+    assert launched["args"][launched["args"].index("--pp-backend") + 1] == "native_cpp"
+    assert "--native-pp-executable" in launched["args"]
+    native_index = launched["args"].index("--native-pp-executable") + 1
+    assert Path(launched["args"][native_index]).resolve() == (
+        package / "backend" / "native_cpp" / "ppshitu_rec_service.exe"
+    ).resolve()
+
+
 def _dataset_fixture(root: Path) -> Path:
     for label in ("0", "1"):
         (root / label).mkdir(parents=True)

@@ -154,7 +154,9 @@ from src.geometry_calibration import GeometryCalibrationError
 from src.template_evolution import (
     AnnotationGroupNotFoundError,
     DuplicateTemplateError,
+    InvalidConfirmationError,
     InvalidAnnotationReviewError,
+    StaleEvolutionError,
     TemplateEvolution,
     TemplateEvolutionError,
 )
@@ -215,6 +217,25 @@ DEFAULT_STARTUP_ERROR_ACTION = "查看后端日志并联系技术支持"
 def _prefixed_fast_error_code(error: object) -> str | None:
     code = str(error).partition(":")[0].strip()
     return code if code in FAST_HARD_ERROR_CODES else None
+
+
+def _stable_classifier_error_code(error: object) -> str | None:
+    """Recover a protocol code from classifier errors that were wrapped.
+
+    The native client raises ``NativePPError`` directly in most paths, but
+    shape/validation guards intentionally use the broader
+    ``OrientationClassifierError`` and retain the code only as a prefix in
+    the message.  Preserve that prefix instead of collapsing it to
+    ``MODEL_ERROR``.
+    """
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code.strip():
+        return code.strip()
+    text = str(error).strip()
+    candidate = text.partition(":")[0].strip()
+    if candidate.startswith(("NATIVE_PP_", "FAST_CACHE_")):
+        return candidate
+    return None
 
 
 def _diagnostic_log_series(handler: TimedRotatingFileHandler) -> list[Path]:
@@ -1224,8 +1245,12 @@ class OrientationCommandDispatcher:
             return self._error(request_id, "INVALID_GEOMETRY", str(exc))
         except StaleWorkpieceRevisionError as exc:
             return self._error(request_id, "STALE_WORKPIECE_REVISION", str(exc))
+        except InvalidConfirmationError as exc:
+            return self._error(request_id, "INVALID_CONFIRMATION", str(exc))
         except DuplicateTemplateError as exc:
             return self._error(request_id, "DUPLICATE_TEMPLATE", str(exc))
+        except StaleEvolutionError as exc:
+            return self._error(request_id, "STALE_EVOLUTION", str(exc))
         except InvalidMaskError as exc:
             return self._error(request_id, "INVALID_MASK", str(exc))
         except AnnotationGroupNotFoundError as exc:
@@ -1248,7 +1273,11 @@ class OrientationCommandDispatcher:
             )
             return self._error(request_id, "MODEL_ERROR", str(exc))
         except OrientationClassifierError as exc:
-            return self._error(request_id, "MODEL_ERROR", str(exc))
+            return self._error(
+                request_id,
+                _stable_classifier_error_code(exc) or "MODEL_ERROR",
+                str(exc),
+            )
         except NativePPError as exc:
             return self._error(request_id, exc.code, exc.message)
         except Exception:

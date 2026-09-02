@@ -15,9 +15,14 @@ from typing import Callable
 
 from src.image_io import read_color_image
 from src.interference_masks import resolve_propagated_region
-from src.orientation_classifier import PropagationModelError
+from src.orientation_classifier import ImageUnreadableError, PropagationModelError
+from src.native_pp_client import NativePPError
 from src.workpiece_catalog import WorkpieceCatalog
-from src.workpiece_library import IMAGE_EXTENSIONS
+from src.workpiece_library import (
+    IMAGE_EXTENSIONS,
+    InvalidTemplateSetError,
+    WorkpieceLibraryError,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -141,6 +146,9 @@ class TemplateEvolution:
                 "started_at": None,
                 "finished_at": None,
                 "elapsed_ms": None,
+                "error_code": None,
+                "error_phase": None,
+                "retryable": None,
             }
             for key, value in defaults.items():
                 if key not in job:
@@ -694,6 +702,10 @@ class TemplateEvolution:
             job["total"] = len(job.get("items", []))
             job["progress"] = 0
             job["recovery_detail"] = None
+            job["error"] = None
+            job["error_code"] = None
+            job["error_phase"] = None
+            job["retryable"] = None
             job["started_at"] = float(self._clock())
             job["finished_at"] = None
             job["elapsed_ms"] = 0
@@ -716,6 +728,7 @@ class TemplateEvolution:
                 current_job["progress"] = 0 if total == 0 else min(99, completed * 100 // total)
                 self._update_elapsed(current_job)
                 self._persist()
+        phase = "validation"
         try:
             current = self.catalog.get(job["workpiece_id"])
             if self._matches_committed_template_update(job, current):
@@ -726,6 +739,9 @@ class TemplateEvolution:
                     job["progress"] = 100
                     job["revision"] = current.revision
                     job["error"] = None
+                    job["error_code"] = None
+                    job["error_phase"] = None
+                    job["retryable"] = None
                     job["recovery_detail"] = None
                     self._finish_elapsed(job)
                     self._cleanup_payload(job)
@@ -739,11 +755,15 @@ class TemplateEvolution:
                         "workpiece revision changed without a matching template operation"
                     )
                 job["base_revision"] = current.revision
+            phase = "geometry_validation"
             geometry_review = self._requires_geometry_review(job, current)
             if geometry_review is not None:
                 with self._condition:
                     job["state"] = "needs_review"
                     job["error"] = geometry_review.get("reason", "new template geometry could not be fitted")
+                    job["error_code"] = "GEOMETRY_REVIEW_REQUIRED"
+                    job["error_phase"] = "geometry_validation"
+                    job["retryable"] = True
                     job["review_reason"] = "geometry_mask_low_confidence"
                     job["geometry_review"] = geometry_review
                     self._finish_elapsed(job)
@@ -751,6 +771,7 @@ class TemplateEvolution:
                     return self._snapshot(job)
             front = [Path(item["path"]) for item in job["items"] if item["orientation"] == "front"]
             back = [Path(item["path"]) for item in job["items"] if item["orientation"] == "back"]
+            phase = "template_cache"
             record, _ = self.catalog.append_templates(
                 job["workpiece_id"],
                 front,
@@ -766,6 +787,9 @@ class TemplateEvolution:
                 job["progress"] = 100
                 job["revision"] = record.revision
                 job["error"] = None
+                job["error_code"] = None
+                job["error_phase"] = None
+                job["retryable"] = None
                 job["recovery_detail"] = None
                 self._finish_elapsed(job)
                 self._cleanup_payload(job)
@@ -775,6 +799,12 @@ class TemplateEvolution:
             with self._condition:
                 job["state"] = "failed"
                 job["error"] = str(exc)
+                job["error_code"], job["retryable"] = self._classify_failure(exc, phase)
+                job["error_phase"] = phase
+                LOGGER.exception(
+                    "template evolution job failed job_id=%s workpiece_id=%s phase=%s code=%s",
+                    job.get("job_id"), job.get("workpiece_id"), phase, job.get("error_code"),
+                )
                 self._finish_elapsed(job)
                 self._persist()
                 return self._snapshot(job)
@@ -853,12 +883,18 @@ class TemplateEvolution:
                 self._reset_queued_progress(job)
                 self._duration_started.pop(job_id, None)
                 job["error"] = None
+                job["error_code"] = None
+                job["error_phase"] = None
+                job["retryable"] = None
                 job["recovery_detail"] = None
                 job["last_submitted_at"] = float(self._clock())
             elif action == "resolve-review" and job["state"] == "needs_review":
                 self._reset_queued_progress(job)
                 self._duration_started.pop(job_id, None)
                 job["error"] = None
+                job["error_code"] = None
+                job["error_phase"] = None
+                job["retryable"] = None
                 job["recovery_detail"] = None
             else:
                 raise TemplateEvolutionError(f"job action is not valid for state {job['state']}")
@@ -885,6 +921,38 @@ class TemplateEvolution:
         job["started_at"] = None
         job["finished_at"] = None
         job["elapsed_ms"] = None
+        job["error_code"] = None
+        job["error_phase"] = None
+        job["retryable"] = None
+
+    @staticmethod
+    def _classify_failure(exc: Exception, phase: str) -> tuple[str, bool]:
+        """Return a stable client-facing code without changing the original message."""
+        # Native PP-ShiTu failures already carry a protocol-level code.  Keep
+        # it intact so the Qt client can tell a missing model/cache from a
+        # generic template-cache failure and offer the right recovery action.
+        native_code = getattr(exc, "code", None)
+        if isinstance(exc, NativePPError) and isinstance(native_code, str) and native_code:
+            return native_code, True
+        if isinstance(exc, DuplicateTemplateError):
+            return "DUPLICATE_TEMPLATE", False
+        if isinstance(exc, InvalidConfirmationError):
+            return "INVALID_CONFIRMATION", False
+        if isinstance(exc, ImageUnreadableError):
+            return "IMAGE_UNREADABLE", False
+        if isinstance(exc, StaleEvolutionError):
+            return "STALE_EVOLUTION", True
+        if isinstance(exc, InvalidTemplateSetError):
+            return "INVALID_TEMPLATE_SET", False
+        if isinstance(exc, PropagationModelError):
+            return "MODEL_ERROR", True
+        text = str(exc).strip()
+        prefixed_code = text.partition(":")[0].strip()
+        if prefixed_code.startswith(("NATIVE_PP_", "FAST_CACHE_")):
+            return prefixed_code, True
+        if isinstance(exc, WorkpieceLibraryError) or phase == "template_cache":
+            return "TEMPLATE_CACHE_BUILD_FAILED", True
+        return "EVOLUTION_JOB_FAILED", True
 
     @staticmethod
     def _duration_ms(started_at: float, finished_at: float) -> int:

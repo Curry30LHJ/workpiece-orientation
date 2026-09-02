@@ -6,7 +6,13 @@ import cv2
 import numpy as np
 import pytest
 
-from src.orientation_classifier import PropagationModelError, TemplateCache
+from src.orientation_classifier import (
+    ImageUnreadableError,
+    OrientationClassifierError,
+    PropagationModelError,
+    TemplateCache,
+)
+from src.native_pp_client import NativePPError
 from src.template_evolution import DuplicateTemplateError, TemplateEvolution
 from src.interference_masks import InvalidMaskError
 from src.workpiece_catalog import WorkpieceCatalog
@@ -793,6 +799,48 @@ def test_exact_duplicate_is_rejected_before_queue(tmp_path):
 
     with pytest.raises(DuplicateTemplateError):
         evolution.submit_confirmation(record.id, "front", duplicate, operation_id="confirm-duplicate")
+
+
+def test_failed_evolution_job_contains_retry_diagnostics(tmp_path, monkeypatch):
+    catalog, record = setup_catalog(tmp_path)
+    new_image = image(tmp_path / "cache-failure-front.png", 31)
+    evolution = TemplateEvolution(catalog, tmp_path / "jobs", start_worker=False)
+
+    def fail_cache_build(*args, **kwargs):
+        raise RuntimeError("cache build exploded")
+
+    monkeypatch.setattr(catalog, "append_templates", fail_cache_build)
+    job = evolution.submit_confirmation(record.id, "front", new_image, operation_id="confirm-cache-failure")
+
+    failed = evolution.run_next(force=True)
+
+    assert failed["state"] == "failed"
+    assert failed["error_code"] == "TEMPLATE_CACHE_BUILD_FAILED"
+    assert failed["error_phase"] == "template_cache"
+    assert failed["retryable"] is True
+    assert failed["error"] == "cache build exploded"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code", "expected_retryable"),
+    [
+        (NativePPError("NATIVE_PP_NOT_READY", "native service is unavailable"),
+         "NATIVE_PP_NOT_READY", True),
+        (OrientationClassifierError("NATIVE_PP_PROTOCOL_ERROR: wrapped native failure"),
+         "NATIVE_PP_PROTOCOL_ERROR", True),
+        (OrientationClassifierError("FAST_CACHE_NOT_READY: wrapped cache failure"),
+         "FAST_CACHE_NOT_READY", True),
+        (ImageUnreadableError("Unable to read image: missing.png"),
+         "IMAGE_UNREADABLE", False),
+    ],
+)
+def test_failed_evolution_job_preserves_specific_error_code(
+    error, expected_code, expected_retryable
+):
+    assert TemplateEvolution._classify_failure(error, "template_cache") == (
+        expected_code,
+        expected_retryable,
+    )
 
 
 def test_confirmation_during_build_creates_successor_after_predecessor(tmp_path):

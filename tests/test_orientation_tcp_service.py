@@ -32,6 +32,7 @@ from src.orientation_classifier import (
 from src.runtime_data import RuntimeDataError
 from src.workpiece_catalog import WorkpieceCatalog
 from src.workpiece_library import WorkpieceLibrary
+from src.template_evolution import InvalidConfirmationError
 from src.geometry_mask_profiles import (
     DuplicateLogicalRuleError,
     FittedGeometryMissingError,
@@ -1727,6 +1728,49 @@ def test_confirmation_and_job_commands_are_additive(client):
     assert jobs["jobs"][0]["job_id"] == "confirm-1"
     action = client.request("evolution_job_action", job_id="confirm-1", action="cancel")
     assert action["ok"] is True
+
+
+def test_invalid_confirmation_error_has_stable_code(client, running_server):
+    """A rejected confirmation must reach the client as an actionable error."""
+    assert client.request("hello")["ok"] is True
+    evolution = running_server.dispatcher.runtime.snapshot().evolution
+
+    def reject_confirmation(workpiece_id, orientation, image_path, *, operation_id):
+        raise InvalidConfirmationError("confirmation image is no longer readable")
+
+    evolution.submit_confirmation = reject_confirmation
+    response = client.request(
+        "submit_confirmation",
+        operation_id="invalid-confirmation",
+        workpiece_id="m7",
+        orientation="front",
+        image_path="missing.png",
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "INVALID_CONFIRMATION"
+    assert response["error"]["message"] == "confirmation image is no longer readable"
+
+
+def test_wrapped_native_confirmation_error_keeps_error_code(client, running_server):
+    """Classifier wrappers must not collapse native failures to MODEL_ERROR."""
+    assert client.request("hello")["ok"] is True
+    evolution = running_server.dispatcher.runtime.snapshot().evolution
+
+    def reject_confirmation(workpiece_id, orientation, image_path, *, operation_id):
+        raise OrientationClassifierError("NATIVE_PP_NOT_READY: native service is unavailable")
+
+    evolution.submit_confirmation = reject_confirmation
+    response = client.request(
+        "submit_confirmation",
+        operation_id="wrapped-native-confirmation",
+        workpiece_id="m7",
+        orientation="front",
+        image_path="candidate.png",
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "NATIVE_PP_NOT_READY"
 
 
 def test_annotation_snapshot_and_group_mutations_use_revision_and_operation_ids(client, running_server):

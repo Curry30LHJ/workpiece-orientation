@@ -913,6 +913,34 @@ private slots:
                     .contains(QStringLiteral("正面")));
     }
 
+    void duplicateConfirmationIsTerminalAndNotFailure() {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString path = writeImage(directory, QStringLiteral("duplicate.png"));
+        QVERIFY(!path.isEmpty());
+        InspectionPage page;
+        page.setCurrentWorkpiece(QStringLiteral("m1"), QStringLiteral("模型一"));
+        page.setBackendAvailable(true, false, QString());
+        page.showSingleResult(resultRecord(QStringLiteral("duplicate"), path));
+        auto *front = page.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"));
+        auto *list = page.findChild<QListWidget *>(QStringLiteral("recentInspectionList"));
+        QVERIFY(front != nullptr);
+        QVERIFY(list != nullptr);
+
+        front->click();
+        page.handleBackendResponse(QStringLiteral("submit_confirmation"), QJsonObject{
+            {QStringLiteral("job"), QJsonObject{
+                {QStringLiteral("job_id"), QStringLiteral("duplicate-job")},
+                {QStringLiteral("state"), QStringLiteral("failed")},
+                {QStringLiteral("error_code"), QStringLiteral("DUPLICATE_TEMPLATE")},
+                {QStringLiteral("error"), QStringLiteral("already present")}}},
+        });
+
+        QCOMPARE(list->item(0)->text().section(QLatin1Char('\n'), 1, 1),
+                 QStringLiteral("已在库中"));
+        QVERIFY(!front->isEnabled());
+    }
+
     void summarySeparatesGlobalAndLocalDecisionEvidence() {
         QTemporaryDir directory;
         QVERIFY(directory.isValid());

@@ -45,6 +45,20 @@ QString fastGeometryDescription(const QJsonObject &response) {
     if (status.isEmpty()) return QStringLiteral("未提供");
     return QStringLiteral("未应用（%1）").arg(status);
 }
+
+QString confirmationErrorCode(const QJsonObject &job) {
+    QString code = job.value(QStringLiteral("error_code")).toString().trimmed();
+    if (code.isEmpty() && job.value(QStringLiteral("error")).isObject()) {
+        code = job.value(QStringLiteral("error")).toObject()
+                   .value(QStringLiteral("code")).toString().trimmed();
+    }
+    if (code.isEmpty()) {
+        const QString prefix = job.value(QStringLiteral("error")).toString()
+                                   .section(QLatin1Char(':'), 0, 0).trimmed();
+        if (isAlreadyStoredErrorCode(prefix)) code = prefix;
+    }
+    return code;
+}
 }
 
 InspectionPage::InspectionPage(QWidget *parent)
@@ -404,7 +418,8 @@ void InspectionPage::setRecordDisposition(const QString &recordId,
         } else if (selectedRecordId_ == recordId
             && (disposition == BatchDisposition::QueuedFront
                 || disposition == BatchDisposition::QueuedBack
-                || disposition == BatchDisposition::Rejected)) {
+                || disposition == BatchDisposition::Rejected
+                || disposition == BatchDisposition::AlreadyStored)) {
             selectPreferredBatchRecord(recordId);
         } else {
             renderActiveState();
@@ -641,7 +656,9 @@ void InspectionPage::handleBackendResponse(const QString &command,
         const QString jobId = job.value(QStringLiteral("job_id")).toString();
         const QString state = job.value(QStringLiteral("state")).toString(QStringLiteral("queued"));
         if (state == QStringLiteral("failed")) {
-            setRecordDisposition(recordId, BatchDisposition::SubmitFailed, jobId,
+            setRecordDisposition(recordId,
+                                 confirmationFailureDisposition(confirmationErrorCode(job)),
+                                 jobId,
                                  job.value(QStringLiteral("error")).toString());
         } else {
             setRecordDisposition(
@@ -665,7 +682,8 @@ void InspectionPage::handleBackendResponse(const QString &command,
                 record.response.insert(QStringLiteral("evolution_state"),
                                        job.value(QStringLiteral("state")));
                 if (job.value(QStringLiteral("state")).toString() == QStringLiteral("failed")) {
-                    record.disposition = BatchDisposition::SubmitFailed;
+                    record.disposition = confirmationFailureDisposition(
+                        confirmationErrorCode(job));
                     record.submissionError = job.value(QStringLiteral("error")).toString();
                 }
                 recentRecords_.insert(recordId, record);
@@ -677,7 +695,8 @@ void InspectionPage::handleBackendResponse(const QString &command,
                 const QString state = job.value(QStringLiteral("state")).toString();
                 record.response.insert(QStringLiteral("evolution_state"), state);
                 if (state == QStringLiteral("failed")) {
-                    record.disposition = BatchDisposition::SubmitFailed;
+                    record.disposition = confirmationFailureDisposition(
+                        confirmationErrorCode(job));
                     record.submissionError = job.value(QStringLiteral("error")).toString();
                 }
                 batchRecords_.insert(recordId, record);
@@ -696,7 +715,7 @@ void InspectionPage::handleBackendFailure(const QString &command, const QString 
     if (command == QStringLiteral("submit_confirmation")
         && !pendingConfirmationRecordId_.isEmpty()) {
         setRecordDisposition(pendingConfirmationRecordId_,
-                             BatchDisposition::SubmitFailed, QString(), message);
+                             confirmationFailureDisposition(code), QString(), message);
         pendingConfirmationRecordId_.clear();
         pendingConfirmationOrientation_.clear();
         renderActiveState();
@@ -1318,6 +1337,9 @@ QString InspectionPage::dispositionText(const InspectionRecord &record) const {
     if (record.disposition == BatchDisposition::PredictionFailed) {
         return record.error.startsWith(QStringLiteral("结果未知"))
             ? QStringLiteral("结果未知") : QStringLiteral("预测失败");
+    }
+    if (record.disposition == BatchDisposition::AlreadyStored) {
+        return QStringLiteral("已在库中");
     }
     if (record.disposition == BatchDisposition::SubmitFailed) {
         return batchRecords_.contains(record.id)

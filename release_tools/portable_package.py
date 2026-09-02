@@ -41,6 +41,41 @@ _MSVC_RUNTIME_OPTIONAL = (
 )
 _MSVC_RUNTIME_ALL = _MSVC_RUNTIME_REQUIRED + _MSVC_RUNTIME_OPTIONAL
 
+# The native service is deliberately staged as a small, explicit runtime
+# closure.  Copying the whole CMake output directory would ship debug DLLs,
+# import libraries and build products that are both unnecessary and unsafe to
+# expose in an offline delivery.  These are the files produced by the
+# verified CPU/AVX Paddle-Inference + OpenCV build used by this repository.
+_NATIVE_CPP_RUNTIME_REQUIRED = (
+    "ppshitu_rec_service.exe",
+    "paddle_inference.dll",
+    "opencv_world460.dll",
+    "mkldnn.dll",
+    "mklml.dll",
+    "common.dll",
+    "libiomp5md.dll",
+)
+_NATIVE_CPP_RUNTIME_OPTIONAL = (
+    # Some Paddle/OpenCV builds resolve these through the host's VC runtime;
+    # include them when the native build directory contains them so the
+    # package remains usable on a clean/offline machine.  They are not made
+    # mandatory because the verified build can legally use the system copy.
+    "concrt140.dll",
+    "vcomp140.dll",
+    "dbghelp.dll",
+)
+_NATIVE_CPP_RUNTIME_ALLOWED = frozenset(
+    name.lower()
+    for name in (
+        *_NATIVE_CPP_RUNTIME_REQUIRED,
+        *_NATIVE_CPP_RUNTIME_OPTIONAL,
+        # Keep the child service independent of the parent Qt process: a
+        # Windows child searches its own executable directory first, so the
+        # coherent VC runtime set is duplicated beside the native service.
+        *_MSVC_RUNTIME_ALL,
+    )
+)
+
 
 def _is_dependency_loader(rel: str) -> bool:
     """Return whether a visible Python file is a required third-party loader.
@@ -351,15 +386,116 @@ class PackageLayout:
         return self.root / "data"
 
 
-def build_release_config(*, edition: str, version: str, model_sha256: str) -> dict[str, object]:
+def _normalise_pp_backend(value: object) -> str:
+    backend = str(value or "python").strip().lower()
+    if backend not in {"python", "native_cpp"}:
+        raise ValueError("pp_backend must be python or native_cpp")
+    return backend
+
+
+def _package_relative_path(value: object, *, field: str) -> str:
+    """Validate and normalize a path stored inside a portable package."""
+
+    raw = str(value or "").strip().replace("\\", "/")
+    # ``Path.is_absolute`` handles the native platform.  The explicit drive
+    # and leading-slash checks also protect metadata produced on another OS.
+    candidate = Path(raw)
+    if (
+        not raw
+        or candidate.is_absolute()
+        or raw.startswith("/")
+        # Reject both absolute and drive-relative Windows paths (``C:foo``
+        # is resolved against the process' current C: directory and can still
+        # escape the package).
+        or re.match(r"^[A-Za-z]:", raw)
+        or ".." in candidate.parts
+    ):
+        raise ValueError(f"{field} must be a relative package path")
+    return candidate.as_posix()
+
+
+def _native_runtime_files(directory: Path) -> dict[str, Path]:
+    """Resolve the explicit native runtime whitelist case-insensitively."""
+
+    directory = Path(directory)
+    if _is_reparse_point(directory):
+        raise PackageAuditError(f"native runtime directory is a reparse point: {directory}")
+    if not directory.is_dir():
+        raise FileNotFoundError(f"native runtime directory is missing: {directory}")
+    try:
+        entries = {
+            item.name.lower(): item
+            for item in directory.iterdir()
+            if item.is_file() and not _is_reparse_point(item)
+        }
+    except OSError as exc:
+        raise FileNotFoundError(f"native runtime directory is unreadable: {directory}") from exc
+    missing = [name for name in _NATIVE_CPP_RUNTIME_REQUIRED if name.lower() not in entries]
+    if missing:
+        raise FileNotFoundError(
+            "native runtime files missing: " + ", ".join(missing) + f" ({directory})"
+        )
+    selected = {
+        name: entries[name.lower()]
+        for name in (*_NATIVE_CPP_RUNTIME_REQUIRED, *_NATIVE_CPP_RUNTIME_OPTIONAL)
+        if name.lower() in entries
+    }
+    return selected
+
+
+def _find_optional_native_runtime(name: str, *, source_roots: Iterable[Path] = ()) -> Path | None:
+    """Find a non-debug optional DLL for the native child process."""
+
+    wanted = str(name).lower()
+    candidates: list[Path] = []
+    for root in source_roots:
+        root = Path(root)
+        if root.is_file():
+            root = root.parent
+        candidates.append(root)
+        try:
+            candidates.extend(item.parent for item in _iter_tree_files(root) if item.name.lower() == wanted)
+        except (OSError, PackageAuditError):
+            continue
+    candidates.extend(_msvc_runtime_candidates())
+    candidates.append(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32")
+    seen: set[str] = set()
+    for directory in candidates:
+        key = str(directory).replace("\\", "/").lower()
+        if key in seen or not directory.is_dir():
+            continue
+        seen.add(key)
+        try:
+            for item in directory.iterdir():
+                if item.is_file() and item.name.lower() == wanted and not _is_reparse_point(item):
+                    return item
+        except OSError:
+            continue
+    return None
+
+
+def build_release_config(*, edition: str, version: str, model_sha256: str,
+                         pp_backend: str = "python",
+                         native_pp_executable: str | None = None) -> dict[str, object]:
     edition = edition.lower()
     if edition not in {"gpu", "cpu"}:
         raise ValueError("edition must be gpu or cpu")
-    return {
+    backend = _normalise_pp_backend(pp_backend)
+    if backend == "native_cpp":
+        if edition != "cpu":
+            raise ValueError("native_cpp backend requires the cpu edition")
+        executable = _package_relative_path(
+            native_pp_executable,
+            field="native_pp_executable",
+        )
+    else:
+        executable = None
+    config: dict[str, object] = {
         "launch_mode": "packaged_executable", "backend_executable": "backend/orientation_backend.exe",
         "project_root": ".", "paddle_config": "backend/resources/inference_general.yaml",
         "model_dir": "models/shitu_rec", "data_root": "data", "model_sha256": model_sha256,
         "compute_device": edition, "edition": edition, "package_version": version,
+        "pp_backend": backend,
         "local_search_mode": "adaptive", "inference_mode": "fast_geometry", "host": "127.0.0.1",
         # Initial Paddle model loading can exceed one minute on a clean
         # offline machine; keep the Qt startup watchdog aligned with the
@@ -368,6 +504,9 @@ def build_release_config(*, edition: str, version: str, model_sha256: str) -> di
         "port": 37651, "startup_timeout_ms": 600000,
         "request_timeout_ms": 120000,
     }
+    if executable is not None:
+        config["native_pp_executable"] = executable
+    return config
 
 
 def _copy_tree(src: Path, dst: Path) -> None:
@@ -379,9 +518,19 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
                   model_dir: Path, output_root: Path, repository_root: Path | None = None,
                   guide: Path | None = None, notices: Path | None = None, git_commit: str = "unknown",
                   paddle_config: Path | None = None,
-                  msvc_runtime_dir: Path | None = None) -> PackageLayout:
+                  msvc_runtime_dir: Path | None = None,
+                  pp_backend: str = "python",
+                  native_cpp_runtime_dir: Path | None = None) -> PackageLayout:
     edition = edition.lower()
     if edition not in {"gpu", "cpu"} or not re.fullmatch(r"\d+\.\d+\.\d+", version): raise ValueError("invalid edition or version")
+    backend_kind = _normalise_pp_backend(pp_backend)
+    if backend_kind == "native_cpp" and edition != "cpu":
+        raise ValueError("native_cpp backend requires the cpu edition")
+    native_runtime: dict[str, Path] = {}
+    if backend_kind == "native_cpp":
+        if native_cpp_runtime_dir is None:
+            raise FileNotFoundError("native runtime directory is required for native_cpp")
+        native_runtime = _native_runtime_files(Path(native_cpp_runtime_dir))
     for source in (qt_release_dir, backend_dir, model_dir):
         if not Path(source).is_dir(): raise NotADirectoryError(source)
     qt_release_dir, backend_dir, model_dir = map(Path, (qt_release_dir, backend_dir, model_dir))
@@ -414,6 +563,31 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
         generated_config.unlink()
     (root / "backend").mkdir(exist_ok=True)
     _copy_runtime_tree(backend_dir, root / "backend", backend=True)
+    if backend_kind == "native_cpp":
+        native_target = root / "backend" / "native_cpp"
+        native_target.mkdir(parents=True, exist_ok=True)
+        for name, source in native_runtime.items():
+            if _is_reparse_point(source):
+                raise PackageAuditError(f"native runtime source is a reparse point: {source}")
+            shutil.copy2(source, native_target / name)
+        # A child process does not reliably inherit the parent executable's
+        # DLL search directory.  Keep the same VC runtime beside the native
+        # service, and opportunistically bundle OpenMP/debug-helper DLLs when
+        # the build requires them.  Missing optional files are acceptable;
+        # the explicit native whitelist above remains the hard contract.
+        for name, source in msvc_runtime.items():
+            target = native_target / name
+            if not target.exists():
+                shutil.copy2(source, target)
+        for name in _NATIVE_CPP_RUNTIME_OPTIONAL:
+            target = native_target / name
+            if target.exists():
+                continue
+            source = _find_optional_native_runtime(
+                name, source_roots=(Path(native_cpp_runtime_dir), qt_release_dir, backend_dir)
+            )
+            if source is not None:
+                shutil.copy2(source, target)
     model_target = root / "models" / "shitu_rec"
     model_target.mkdir(parents=True)
     required = {"inference.pdmodel", "inference.pdiparams", "inference.pdiparams.info"}
@@ -460,10 +634,56 @@ def stage_package(*, edition: str, version: str, qt_release_dir: Path, backend_d
     (licenses / "index.txt").write_text("Third-party license texts are listed in THIRD_PARTY-NOTICES.txt.\n", encoding="utf-8")
     if not guide or not Path(guide).is_file(): raise FileNotFoundError("offline guide is required")
     if not notices or not Path(notices).is_file(): raise FileNotFoundError("third-party notices are required")
-    shutil.copy2(guide, root / "使用说明.txt"); shutil.copy2(notices, root / "THIRD_PARTY-NOTICES.txt")
+    guide_target = root / "使用说明.txt"
+    # Keep the human-readable guide in sync with the package metadata.  The
+    # shared source guide historically carries a placeholder version, which
+    # is confusing when a recipient compares it with version.json.
+    guide_text = Path(guide).read_text(encoding="utf-8")
+    guide_text, replaced = re.subn(r"(?m)^版本：.*$", f"版本：{version}", guide_text, count=1)
+    guide_target.write_text(guide_text, encoding="utf-8")
+    if backend_kind == "native_cpp":
+        # The base guide is shared with the Python editions.  Add a small,
+        # package-local section so a recipient knows that the C++ service is
+        # launched by the Qt application and must not be started manually.
+        with guide_target.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n\n7. C++ PP-ShiTu 后端（CPU 版）\n"
+                "本压缩包已内置 native_cpp 后端及其运行时 DLL，仅支持 64 位 CPU。\n"
+                "请完整解压后双击 WorkpieceOrientation.exe；不要单独启动或移动 "
+                "backend\\native_cpp\\ppshitu_rec_service.exe。\n"
+                "程序会自动启动并校验 C++ 服务，首次启动需要等待模型加载。\n"
+                "该包不含已有工件库和几何规则；如需迁移，请先退出程序后复制 data 文件夹。\n"
+            )
+    shutil.copy2(notices, root / "THIRD_PARTY-NOTICES.txt")
     model_sha = model_directory_sha256(model_target)
-    (root / "app_config.json").write_text(json.dumps(build_release_config(edition=edition, version=version, model_sha256=model_sha), indent=2), encoding="utf-8")
-    metadata = {"version": version, "edition": edition, "git_commit": git_commit, "build_utc": datetime.now(timezone.utc).isoformat(), "python": "3.10", "paddle": "3.2.2", "paddleclas": "2.6.0", "pyinstaller": "6.22.2", "qt": "5.14.2", "model_sha256": model_sha}
+    native_executable = (
+        "backend/native_cpp/ppshitu_rec_service.exe"
+        if backend_kind == "native_cpp" else None
+    )
+    generated = build_release_config(
+        edition=edition,
+        version=version,
+        model_sha256=model_sha,
+        pp_backend=backend_kind,
+        native_pp_executable=native_executable,
+    )
+    (root / "app_config.json").write_text(json.dumps(generated, indent=2), encoding="utf-8")
+    metadata = {"version": version, "edition": edition, "git_commit": git_commit, "build_utc": datetime.now(timezone.utc).isoformat(), "python": "3.10", "paddle": "3.2.2", "paddleclas": "2.6.0", "pyinstaller": "6.22.2", "qt": "5.14.2", "model_sha256": model_sha, "pp_backend": backend_kind}
+    if backend_kind == "native_cpp":
+        service = root / "backend" / "native_cpp" / "ppshitu_rec_service.exe"
+        metadata["native_service_sha256"] = hashlib.sha256(service.read_bytes()).hexdigest()
+        # Keep the native dependency provenance next to the general notices
+        # when staging from a repository checkout.  These files are optional
+        # for the small unit-test fixtures and do not affect runtime loading.
+        if repository_root is not None:
+            native_source = Path(repository_root) / "native" / "ppshitu_rec_benchmark"
+            for source_name, target_name in (
+                ("NOTICE.md", "native-ppshitu-NOTICE.md"),
+                ("dependencies.json", "native-ppshitu-dependencies.json"),
+            ):
+                source = native_source / source_name
+                if source.is_file() and not source.is_symlink():
+                    shutil.copy2(source, licenses / target_name)
     (root / "version.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return PackageLayout(root, edition, version)
 
@@ -503,9 +723,49 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
     ver = {}
     try: cfg = json.loads((root / "app_config.json").read_text(encoding="utf-8")); ver = json.loads((root / "version.json").read_text(encoding="utf-8"))
     except Exception as exc: errors.append(f"invalid metadata: {exc}")
+    backend_kind = str(cfg.get("pp_backend", "python") or "python").strip().lower()
+    if backend_kind not in {"python", "native_cpp"}:
+        errors.append("unknown pp_backend")
     if cfg.get("edition") != edition or cfg.get("compute_device") != edition or cfg.get("package_version") != version: errors.append("edition/device/version mismatch")
     if ver.get("version") != version or ver.get("edition") != edition or not ver.get("git_commit") or ver.get("git_commit") == "unknown": errors.append("version metadata mismatch")
     if cfg.get("inference_mode") != "fast_geometry" or cfg.get("launch_mode") != "packaged_executable": errors.append("configuration must be packaged fast mode")
+    native_executable: Path | None = None
+    if backend_kind == "native_cpp":
+        if edition != "cpu" or cfg.get("compute_device") != "cpu":
+            errors.append("native_cpp package must be CPU")
+        try:
+            native_rel = _package_relative_path(
+                cfg.get("native_pp_executable"), field="native_pp_executable"
+            )
+            native_executable = root / native_rel
+            if not native_rel.lower().startswith("backend/native_cpp/"):
+                errors.append("native_pp_executable must be under backend/native_cpp")
+            if not native_executable.is_file():
+                errors.append("native C++ service executable missing")
+        except ValueError as exc:
+            errors.append(str(exc))
+        if str(ver.get("pp_backend", "")).strip().lower() != "native_cpp":
+            errors.append("version metadata native backend mismatch")
+        native_root = root / "backend" / "native_cpp"
+        for name in _NATIVE_CPP_RUNTIME_REQUIRED:
+            if not (native_root / name).is_file():
+                errors.append("native runtime missing: " + name)
+        if native_root.exists():
+            try:
+                native_entries = list(_iter_tree_files(native_root))
+            except PackageAuditError as exc:
+                errors.append(str(exc))
+                native_entries = []
+            for entry in native_entries:
+                if entry.name.lower() not in _NATIVE_CPP_RUNTIME_ALLOWED:
+                    errors.append("unexpected native runtime file: " + entry.relative_to(root).as_posix())
+        if native_executable is not None and native_executable.is_file():
+            expected_service_sha = str(ver.get("native_service_sha256", "")).strip().lower()
+            actual_service_sha = hashlib.sha256(native_executable.read_bytes()).hexdigest()
+            if expected_service_sha != actual_service_sha:
+                errors.append("native service fingerprint mismatch")
+    elif ver.get("pp_backend") not in (None, "", "python"):
+        errors.append("version metadata Python backend mismatch")
     model = root / "models" / "shitu_rec"
     if model.exists():
         digest = model_directory_sha256(model)
@@ -549,7 +809,10 @@ def audit_package(root: Path, *, edition: str, version: str, forbidden_roots: It
         if not any("paddle" in n and Path(n).suffix in {".dll", ".pyd"} for n in names): errors.append("Paddle GPU runtime missing")
         for family in ("cudnn", "cublas", "cudart"):
             if not any(family in n for n in names): errors.append(f"NVIDIA runtime family missing: {family}")
-    for exe in (root / "WorkpieceOrientation.exe", root / "backend" / "orientation_backend.exe"):
+    executables = [root / "WorkpieceOrientation.exe", root / "backend" / "orientation_backend.exe"]
+    if native_executable is not None:
+        executables.append(native_executable)
+    for exe in executables:
         if exe.exists():
             for dep in dependency_checker(exe, root) or []:
                 d = dep.lower()
@@ -677,9 +940,11 @@ def main() -> None:
     for arg in ("edition", "version", "qt-release-dir", "backend-dir", "model-dir", "output-root"): stage.add_argument("--" + arg, required=True)
     stage.add_argument("--guide", required=True); stage.add_argument("--notices", required=True); stage.add_argument("--git-commit", required=True)
     stage.add_argument("--repository-root"); stage.add_argument("--paddle-config"); stage.add_argument("--msvc-runtime-dir")
+    stage.add_argument("--pp-backend", choices=("python", "native_cpp"), default="python")
+    stage.add_argument("--native-cpp-runtime-dir")
     args = parser.parse_args()
     if args.command == "stage":
-        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), repository_root=Path(args.repository_root) if args.repository_root else None, guide=Path(args.guide), notices=Path(args.notices), git_commit=args.git_commit, paddle_config=Path(args.paddle_config) if args.paddle_config else None, msvc_runtime_dir=Path(args.msvc_runtime_dir) if args.msvc_runtime_dir else None); print(result.root)
+        result = stage_package(edition=args.edition, version=args.version, qt_release_dir=Path(args.qt_release_dir), backend_dir=Path(args.backend_dir), model_dir=Path(args.model_dir), output_root=Path(args.output_root), repository_root=Path(args.repository_root) if args.repository_root else None, guide=Path(args.guide), notices=Path(args.notices), git_commit=args.git_commit, paddle_config=Path(args.paddle_config) if args.paddle_config else None, msvc_runtime_dir=Path(args.msvc_runtime_dir) if args.msvc_runtime_dir else None, pp_backend=args.pp_backend, native_cpp_runtime_dir=Path(args.native_cpp_runtime_dir) if args.native_cpp_runtime_dir else None); print(result.root)
 
 
 if __name__ == "__main__": main()

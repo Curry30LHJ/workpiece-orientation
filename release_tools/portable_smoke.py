@@ -10,6 +10,7 @@ import subprocess
 import time
 import uuid
 import hashlib
+import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -151,6 +152,19 @@ def _package_config(root: Path) -> dict[str, Any]:
         value = config.get(key)
         if not isinstance(value, str) or Path(value).is_absolute() or ".." in Path(value).parts:
             raise ValueError(f"package config path must be relative: {key}")
+    backend = str(config.get("pp_backend", "python") or "python").strip().lower()
+    if backend not in {"python", "native_cpp"}:
+        raise ValueError(f"unsupported package pp_backend: {backend}")
+    config["pp_backend"] = backend
+    if backend == "native_cpp":
+        value = config.get("native_pp_executable")
+        if (not isinstance(value, str) or Path(value).is_absolute()
+                or value.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", value)
+                or ".." in Path(value).parts):
+            raise ValueError("package config path must be relative: native_pp_executable")
+        executable = root / value
+        if not executable.is_file():
+            raise ValueError(f"native C++ service executable is missing: {executable}")
     return config
 
 
@@ -229,6 +243,7 @@ def _cleanup_temp_package(path: Path | None, *, remove_parent: bool = True) -> N
 def _start_backend(root: Path, config: dict[str, Any], port: int,
                    process_factory: Callable[..., Any]) -> Any:
     token = str(uuid.uuid4())
+    backend_kind = str(config.get("pp_backend", "python") or "python").strip().lower()
     args = [str(root / config["backend_executable"]), "--host", "127.0.0.1", "--port", str(port),
             "--project-root", str(root / config["project_root"]), "--model-dir", str(root / config["model_dir"]),
             "--paddle-config", str(root / config["paddle_config"]), "--data-root", str(root / config["data_root"]),
@@ -237,6 +252,11 @@ def _start_backend(root: Path, config: dict[str, Any], port: int,
             "--instance-token", token, "--parent-pid", str(os.getpid()),
             "--local-search-mode", str(config.get("local_search_mode", "adaptive")),
             "--inference-mode", str(config.get("inference_mode", "fast_geometry"))]
+    # Keep the backend selection explicit in the smoke launch.  This prevents
+    # a native package from accidentally exercising the Python PP-ShiTu path.
+    args.extend(["--pp-backend", backend_kind])
+    if backend_kind == "native_cpp":
+        args.extend(["--native-pp-executable", str(root / config["native_pp_executable"])])
     try:
         return process_factory(args, cwd=str(root), token=token)
     except TypeError:
@@ -357,6 +377,20 @@ def run_smoke(options: SmokeOptions, *, process_factory: Callable[..., Any] | No
             if hello.get("status") != "loading":
                 raise RuntimeError(f"backend hello failed: {hello}")
             time.sleep(min(0.25, remaining_timeout()))
+        expected_backend = str(config.get("pp_backend", "python") or "python").strip().lower()
+        actual_backend = str(hello.get("pp_backend", "python") or "python").strip().lower()
+        if actual_backend != expected_backend:
+            raise RuntimeError(
+                f"backend identity mismatch: expected {expected_backend}, got {actual_backend}"
+            )
+        if expected_backend == "native_cpp":
+            if not str(hello.get("native_service_version", "") or "").strip():
+                raise RuntimeError("native backend hello omitted native service version")
+            feature_dim = hello.get("feature_dim")
+            if not isinstance(feature_dim, int) or feature_dim <= 0:
+                raise RuntimeError("native backend hello omitted feature dimension")
+        report["pp_backend"] = actual_backend
+        report["hello"] = hello
         instance_token = hello.get("instance_token")
         if not isinstance(instance_token, str) or not instance_token.strip():
             raise RuntimeError("backend hello omitted instance token")

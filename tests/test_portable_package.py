@@ -79,6 +79,86 @@ def test_generated_configs_are_relative_fast_and_device_specific():
     assert all("E:/" not in str(value) for value in gpu.values())
 
 
+def test_native_config_is_explicit_cpu_only_and_keeps_executable_relative():
+    model_sha = "a" * 64
+    config = build_release_config(
+        edition="cpu", version="1.0.0", model_sha256=model_sha,
+        pp_backend="native_cpp",
+        native_pp_executable="backend/native_cpp/ppshitu_rec_service.exe",
+    )
+    assert config["pp_backend"] == "native_cpp"
+    assert config["native_pp_executable"] == "backend/native_cpp/ppshitu_rec_service.exe"
+    with pytest.raises(ValueError, match="native_cpp.*cpu"):
+        build_release_config(
+            edition="gpu", version="1.0.0", model_sha256=model_sha,
+            pp_backend="native_cpp",
+            native_pp_executable="backend/native_cpp/ppshitu_rec_service.exe",
+        )
+    with pytest.raises(ValueError, match="relative"):
+        build_release_config(
+            edition="cpu", version="1.0.0", model_sha256=model_sha,
+            pp_backend="native_cpp", native_pp_executable="E:/native/service.exe",
+        )
+
+
+def test_stage_native_package_copies_runtime_and_records_native_identity(tmp_path: Path):
+    qt, backend, model, guide, notices, config = _minimal_stage_inputs(tmp_path / "inputs")
+    native = tmp_path / "native-runtime"
+    native.mkdir()
+    for name in (
+        "ppshitu_rec_service.exe", "paddle_inference.dll", "opencv_world460.dll",
+        "mkldnn.dll", "mklml.dll", "common.dll", "libiomp5md.dll",
+    ):
+        (native / name).write_bytes(b"MZ-native")
+    (native / "opencv_world460d.dll").write_bytes(b"MZ-debug")
+    (native / "ppshitu_rec_service.pdb").write_bytes(b"debug")
+
+    layout = stage_package(
+        edition="cpu", version="1.0.0", qt_release_dir=qt, backend_dir=backend,
+        model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+        git_commit="0" * 40, paddle_config=config,
+        pp_backend="native_cpp", native_cpp_runtime_dir=native,
+    )
+    native_root = layout.root / "backend" / "native_cpp"
+    assert all((native_root / name).is_file() for name in (
+        "ppshitu_rec_service.exe", "paddle_inference.dll", "opencv_world460.dll",
+        "mkldnn.dll", "mklml.dll", "common.dll", "libiomp5md.dll",
+    ))
+    assert not (native_root / "opencv_world460d.dll").exists()
+    assert not (native_root / "ppshitu_rec_service.pdb").exists()
+    generated = json.loads((layout.root / "app_config.json").read_text(encoding="utf-8"))
+    assert generated["pp_backend"] == "native_cpp"
+    assert generated["native_pp_executable"] == "backend/native_cpp/ppshitu_rec_service.exe"
+    metadata = json.loads((layout.root / "version.json").read_text(encoding="utf-8"))
+    assert metadata["pp_backend"] == "native_cpp"
+    assert len(metadata["native_service_sha256"]) == 64
+
+
+def test_stage_updates_guide_version_to_match_package(tmp_path: Path):
+    qt, backend, model, guide, notices, config = _minimal_stage_inputs(tmp_path / "inputs")
+    guide.write_text("离线说明\n版本：0.0.0\n", encoding="utf-8")
+    layout = stage_package(
+        edition="cpu", version="9.9.9", qt_release_dir=qt, backend_dir=backend,
+        model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+        git_commit="0" * 40, paddle_config=config,
+    )
+    assert "版本：9.9.9" in (layout.root / "使用说明.txt").read_text(encoding="utf-8")
+
+
+def test_stage_native_package_rejects_incomplete_runtime(tmp_path: Path):
+    qt, backend, model, guide, notices, config = _minimal_stage_inputs(tmp_path / "inputs")
+    native = tmp_path / "native-runtime"
+    native.mkdir()
+    (native / "ppshitu_rec_service.exe").write_bytes(b"MZ-native")
+    with pytest.raises(FileNotFoundError, match="native runtime"):
+        stage_package(
+            edition="cpu", version="1.0.0", qt_release_dir=qt, backend_dir=backend,
+            model_dir=model, output_root=tmp_path / "out", guide=guide, notices=notices,
+            git_commit="0" * 40, paddle_config=config,
+            pp_backend="native_cpp", native_cpp_runtime_dir=native,
+        )
+
+
 @pytest.mark.parametrize("bad_name", ["leak.py", "stub.pyi"])
 def test_audit_rejects_visible_python_source(tmp_path: Path, bad_name: str):
     root = minimal_stage(tmp_path / "package")

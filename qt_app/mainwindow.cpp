@@ -34,6 +34,54 @@ QStringList dialogFilters() {
     return kImageFilters;
 }
 
+QString confirmationFailureMessage(const QString &code, const QString &message) {
+    QString explanation;
+    if (code == QStringLiteral("DUPLICATE_TEMPLATE")) {
+        explanation = QStringLiteral(
+            "该图片与当前工件已有模板或待入库图片内容重复，无需重复入库");
+    } else if (code == QStringLiteral("INVALID_CONFIRMATION")
+               || code == QStringLiteral("IMAGE_UNREADABLE")) {
+        explanation = QStringLiteral(
+            "确认图片无法读取或格式无效，请确认文件仍存在且可读取");
+    } else if (code == QStringLiteral("STALE_EVOLUTION")
+               || code == QStringLiteral("STALE_WORKPIECE_REVISION")) {
+        explanation = QStringLiteral("工件版本已变化，请刷新工件后重新确认");
+    } else if (code == QStringLiteral("FAST_CACHE_BUILD_FAILED")) {
+        explanation = QStringLiteral("模板缓存更新失败，请查看后端日志后重试");
+    } else if (code == QStringLiteral("TEMPLATE_CACHE_BUILD_FAILED")) {
+        explanation = QStringLiteral("模板缓存重建失败，请查看后端日志后重试");
+    } else if (code == QStringLiteral("INVALID_TEMPLATE_SET")) {
+        explanation = QStringLiteral("确认图片未通过模板校验，请检查图片文件和工件版本");
+    } else if (code == QStringLiteral("GEOMETRY_REVIEW_REQUIRED")) {
+        explanation = QStringLiteral("该图片的几何边界需要复核，处理后才能入库");
+    } else if (code == QStringLiteral("EVOLUTION_JOB_FAILED")) {
+        explanation = QStringLiteral("后台入库任务失败，可修复后重试");
+    } else if (code == QStringLiteral("JOB_NOT_ACTIONABLE")) {
+        explanation = QStringLiteral("后台入库任务当前无法处理");
+    } else if (code == QStringLiteral("MODEL_ERROR")) {
+        explanation = QStringLiteral("后端模型处理失败");
+    } else if (code == QStringLiteral("INTERNAL_ERROR")) {
+        explanation = QStringLiteral("后端内部错误");
+    }
+    QString detail = explanation;
+    if (!code.isEmpty()) {
+        detail = detail.isEmpty() ? QStringLiteral("入库请求失败") : detail;
+        detail += QStringLiteral("（错误代码：%1）").arg(code);
+    }
+    if (!message.isEmpty()) {
+        if (!detail.isEmpty()) detail += QStringLiteral("：");
+        detail += message;
+    }
+    return detail.isEmpty() ? QStringLiteral("后台入库任务失败") : detail;
+}
+
+QString normalizedConfirmationErrorCode(const QString &code, const QString &message) {
+    const QString explicitCode = code.trimmed();
+    if (!explicitCode.isEmpty()) return explicitCode;
+    const QString prefix = message.section(QLatin1Char(':'), 0, 0).trimmed();
+    return prefix == QStringLiteral("DUPLICATE_TEMPLATE") ? prefix : QString();
+}
+
 }
 
 MainWindow::MainWindow(QWidget *parent)
@@ -1482,7 +1530,7 @@ void MainWindow::resolveGeometryMigration(const QString &conflictId, const QJson
 void MainWindow::submitTemplateConfirmation(const QString &workpieceId, const QString &imagePath,
                                             const QString &orientation) {
     if (imagePath.isEmpty() || workpieceId.isEmpty()
-        || client_ == nullptr || clientBusy_ || !backendReady_) {
+        || client_ == nullptr || !backendReady_) {
         return;
     }
     QJsonObject mutation = uncertainConfirmationMutations_.value(
@@ -1937,16 +1985,21 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
             == QStringLiteral("failed");
         const QString jobError = job.value(QStringLiteral("error")).toString(
             QStringLiteral("后台入库任务失败"));
+        const QString jobErrorCode = normalizedConfirmationErrorCode(
+            job.value(QStringLiteral("error_code")).toString(), jobError);
+        const QString failureDetail = confirmationFailureMessage(jobErrorCode, jobError);
+        const BatchDisposition failureDisposition =
+            confirmationFailureDisposition(jobErrorCode);
         if (!pendingConfirmationRecordId_.isEmpty()) {
             const QString completedRecordId = pendingConfirmationRecordId_;
             inspectionPage_->setRecordDisposition(
                 pendingConfirmationRecordId_,
-                jobFailed ? BatchDisposition::SubmitFailed
+                jobFailed ? failureDisposition
                           : (pendingConfirmationOrientation_ == QStringLiteral("front")
                                  ? BatchDisposition::QueuedFront
                                  : BatchDisposition::QueuedBack),
                 job.value(QStringLiteral("job_id")).toString(),
-                jobFailed ? jobError : QString());
+                jobFailed ? failureDetail : QString());
             pendingConfirmationRecordId_.clear();
             pendingConfirmationOrientation_.clear();
             pendingConfirmationMutation_ = QJsonObject();
@@ -1956,10 +2009,14 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
                        || responseOwner == CommandOwner::None)) {
             inspectionPage_->handleBackendResponse(command, response);
         }
-        showLibraryMessage(jobFailed
-                               ? QStringLiteral("确认入库失败：%1").arg(jobError)
-                               : QStringLiteral("确认图片已进入后台入库队列"),
-                           jobFailed);
+        if (jobFailed && isAlreadyStoredErrorCode(jobErrorCode)) {
+            showLibraryMessage(QStringLiteral("该图片已在库中，无需重复入库"));
+        } else {
+            showLibraryMessage(jobFailed
+                                   ? QStringLiteral("确认入库失败：%1").arg(failureDetail)
+                                   : QStringLiteral("确认图片已进入后台入库队列"),
+                               jobFailed);
+        }
         updateButtonStates();
         return;
     }
@@ -2114,9 +2171,22 @@ void MainWindow::onClientResponse(const QString &command, const QJsonObject &res
         workpieceLibraryPage_->setEvolutionJobs(jobs);
         if (!jobs.isEmpty()) {
             const QJsonObject latest = jobs.last().toObject();
-            showLibraryMessage(QStringLiteral("后台入库：%1，进度 %2%%")
-                                   .arg(latest.value(QStringLiteral("state")).toString())
-                                   .arg(latest.value(QStringLiteral("progress")).toInt()));
+            const QString state = latest.value(QStringLiteral("state")).toString();
+            if (state == QStringLiteral("failed")) {
+                const QString detail = confirmationFailureMessage(
+                    latest.value(QStringLiteral("error_code")).toString(),
+                    latest.value(QStringLiteral("error")).toString());
+                showLibraryMessage(QStringLiteral("后台入库失败：%1").arg(detail), true);
+            } else if (state == QStringLiteral("needs_review")) {
+                const QString detail = confirmationFailureMessage(
+                    latest.value(QStringLiteral("error_code")).toString(),
+                    latest.value(QStringLiteral("error")).toString());
+                showLibraryMessage(QStringLiteral("后台入库待复核：%1").arg(detail), true);
+            } else {
+                showLibraryMessage(QStringLiteral("后台入库：%1，进度 %2%%")
+                                       .arg(state)
+                                       .arg(latest.value(QStringLiteral("progress")).toInt()));
+            }
         }
         return;
     }
@@ -2214,11 +2284,15 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
         }
     } else if (failedCommand == QStringLiteral("submit_confirmation")
                && matchesOwner(CommandOwner::Inspection)) {
+        const QString effectiveCode = normalizedConfirmationErrorCode(code, message);
+        const QString failureDetail = confirmationFailureMessage(effectiveCode, message);
+        const BatchDisposition failureDisposition =
+            confirmationFailureDisposition(effectiveCode);
         if (!pendingConfirmationRecordId_.isEmpty()) {
             const QString failedRecordId = pendingConfirmationRecordId_;
             inspectionPage_->setRecordDisposition(
-                pendingConfirmationRecordId_, BatchDisposition::SubmitFailed,
-                QString(), message);
+                pendingConfirmationRecordId_, failureDisposition,
+                QString(), failureDetail);
             pendingConfirmationRecordId_.clear();
             pendingConfirmationOrientation_.clear();
             pendingConfirmationMutation_ = QJsonObject();
@@ -2228,7 +2302,11 @@ void MainWindow::onClientCommandFailed(const QString &command, const QString &co
                        || failureOwner == CommandOwner::None)) {
             inspectionPage_->handleBackendFailure(failedCommand, code, message);
         }
-        showLibraryMessage(QStringLiteral("确认入库失败：%1").arg(message), true);
+        if (isAlreadyStoredErrorCode(effectiveCode)) {
+            showLibraryMessage(QStringLiteral("该图片已在库中，无需重复入库"));
+        } else {
+            showLibraryMessage(QStringLiteral("确认入库失败：%1").arg(failureDetail), true);
+        }
     } else if (matchesOwner(CommandOwner::Geometry)
                && (failedCommand.startsWith(QStringLiteral("get_geometry_mask"))
                    || failedCommand.startsWith(QStringLiteral("preview_geometry_mask"))

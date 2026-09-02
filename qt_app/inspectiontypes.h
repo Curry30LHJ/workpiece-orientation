@@ -11,8 +11,17 @@ enum class InspectionUiState {
 enum class BatchFilter { All, NeedsReview, Unprocessed, Failed };
 enum class BatchDisposition {
     Pending, Submitting, PredictionFailed,
-    QueuedFront, QueuedBack, Rejected, SubmitFailed
+    QueuedFront, QueuedBack, Rejected, SubmitFailed, AlreadyStored
 };
+
+inline bool isAlreadyStoredErrorCode(const QString &code) {
+    return code.trimmed() == QStringLiteral("DUPLICATE_TEMPLATE");
+}
+
+inline BatchDisposition confirmationFailureDisposition(const QString &code) {
+    return isAlreadyStoredErrorCode(code)
+        ? BatchDisposition::AlreadyStored : BatchDisposition::SubmitFailed;
+}
 
 struct InspectionRecord {
     QString id;

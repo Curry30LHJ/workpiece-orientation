@@ -526,6 +526,11 @@ public:
     void failPredictionRow(int zeroBasedRow) { failedPredictionRow_ = zeroBasedRow; }
     void failNextConfirmation() { failNextConfirmation_ = true; }
     void failNextConfirmationJob() { failNextConfirmationJob_ = true; }
+    void failNextConfirmationWith(const QString &code, const QString &message) {
+        failNextConfirmation_ = true;
+        nextConfirmationErrorCode_ = code;
+        nextConfirmationErrorMessage_ = message;
+    }
     void disconnectClient() {
         if (socket_ != nullptr) socket_->abort();
     }
@@ -644,8 +649,11 @@ private slots:
                 if (failNextConfirmation_) {
                     failNextConfirmation_ = false;
                     send({{"version", 1}, {"request_id", requestId}, {"ok", false},
-                          {"error", QJsonObject{{"code", "MODEL_ERROR"},
-                                                {"message", "queue failed"}}}});
+                          {"error", QJsonObject{
+                              {"code", nextConfirmationErrorCode_},
+                              {"message", nextConfirmationErrorMessage_}}}});
+                    nextConfirmationErrorCode_ = QStringLiteral("MODEL_ERROR");
+                    nextConfirmationErrorMessage_ = QStringLiteral("queue failed");
                 } else if (failNextConfirmationJob_) {
                     failNextConfirmationJob_ = false;
                     send({{"version", 1}, {"request_id", requestId}, {"ok", true},
@@ -700,6 +708,8 @@ private:
     bool failNextWorkpieceRefresh_ = false;
     bool failNextConfirmation_ = false;
     bool failNextConfirmationJob_ = false;
+    QString nextConfirmationErrorCode_ = QStringLiteral("MODEL_ERROR");
+    QString nextConfirmationErrorMessage_ = QStringLiteral("queue failed");
     bool batchCapabilities_ = false;
     bool failNextBatchRequest_ = false;
     bool holdBatchResponses_ = false;
@@ -3748,6 +3758,84 @@ private slots:
         QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))->text()
                     .contains(QStringLiteral("job failed")));
         QTRY_VERIFY(frontButton->isEnabled());
+    }
+
+    void confirmationDuplicateShowsActionableCause() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setReviewRows(QSet<int>{0});
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(
+            dir, QStringLiteral("duplicate-confirmation"), 1));
+        auto *table = window.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        waitForBatchCompletion(window, 1);
+        server.failNextConfirmationWith(
+            QStringLiteral("DUPLICATE_TEMPLATE"),
+            QStringLiteral("Duplicate template content: sample.png"));
+
+        window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
+
+        QTRY_COMPARE(table->item(0, 4)->text(), QStringLiteral("已在库中"));
+        const QString message = window.findChild<QLabel *>(
+            QStringLiteral("libraryMessageLabel"))->text();
+        QVERIFY(message.contains(QStringLiteral("无需重复入库")));
+    }
+
+    void confirmationDuplicateIsShownAsAlreadyStored() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        server.setReviewRows(QSet<int>{0});
+        BackendClient client;
+        PassiveLauncher launcher;
+        BackendProcessManager manager(configFor(server.port()), &client, &launcher);
+        MainWindow window(&client, &manager);
+        QTemporaryDir dir;
+        startBatch(server, client, window, writeImages(
+            dir, QStringLiteral("duplicate-status"), 1));
+        auto *table = window.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        waitForBatchCompletion(window, 1);
+        server.failNextConfirmationWith(
+            QStringLiteral("DUPLICATE_TEMPLATE"),
+            QStringLiteral("Duplicate template content: sample.png"));
+
+        window.findChild<QPushButton *>(QStringLiteral("confirmFrontButton"))->click();
+
+        QTRY_COMPARE(table->item(0, 4)->text(), QStringLiteral("已在库中"));
+        QVERIFY(!window.findChild<QPushButton *>(
+            QStringLiteral("confirmFrontButton"))->isEnabled());
+        QVERIFY(window.findChild<QLabel *>(QStringLiteral("libraryMessageLabel"))
+                    ->text().contains(QStringLiteral("无需重复入库")));
+    }
+
+    void confirmationRequestIsQueuedWhenClientBecomesBusy() {
+        BatchPredictionServer server;
+        QVERIFY(server.listen());
+        BackendClient client;
+        MainWindow window(&client, nullptr);
+        QTemporaryDir dir;
+        const QStringList paths = writeImages(
+            dir, QStringLiteral("busy-confirmation"), 1);
+        startBatch(server, client, window, paths);
+        auto *inspectionPage = window.findChild<InspectionPage *>();
+        QVERIFY(inspectionPage != nullptr);
+        auto *table = window.findChild<QTableWidget *>(
+            QStringLiteral("batchResultsTableWidget"));
+        waitForBatchCompletion(window, 1);
+        const QString recordId = table->item(0, 0)->data(Qt::UserRole).toString();
+
+        emit client.stateChanged(BackendClient::State::Busy,
+                                 QStringLiteral("synthetic in-flight request"));
+        emit inspectionPage->confirmationRequested(
+            recordId, QStringLiteral("m1"), paths.at(0), QStringLiteral("front"));
+        emit client.stateChanged(BackendClient::State::Ready, QStringLiteral(""));
+
+        QTRY_COMPARE(server.confirmationCount(), 1);
     }
 
     void workpieceSwitchPreservesBatchButBlocksConfirmationUntilSwitchedBack() {

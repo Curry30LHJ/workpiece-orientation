@@ -180,3 +180,14 @@ def test_backend_source_audit_filters_python_explicitly_for_windows_powershell()
     script = (Path(__file__).parents[1] / "scripts" / "build_portable_backend.ps1").read_text(encoding="utf-8")
     assert "Extension -ieq '.py'" in script
     assert "-Include '*.py'" not in script
+
+
+def test_native_portable_release_script_is_explicit_and_separate():
+    root = Path(__file__).parents[1]
+    script_path = root / "scripts" / "build_native_portable_release.ps1"
+    assert script_path.is_file()
+    script = script_path.read_text(encoding="utf-8")
+    assert "NativeRuntimeDir" in script
+    assert "native_cpp" in script
+    assert "WorkpieceOrientation-CPU-NativeCPP-x64" in script
+    assert "ppshitu_rec_service.exe" in script
